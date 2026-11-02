@@ -73,7 +73,8 @@ private:
 
     KernelCore& m_kernel;
     KAlignedSpinLock m_spin_lock{};
-    s32 m_lock_count{};
+    // The holder's own state, off the line the other cores spin on.
+    alignas(64) s32 m_lock_count{};
     std::atomic<KThread*> m_owner_thread{};
 };
 
