@@ -158,31 +158,43 @@ bool CoreTiming::HasPendingEvents() const {
 
 void CoreTiming::ScheduleEvent(std::chrono::nanoseconds ns_into_future,
                                const std::shared_ptr<EventType>& event_type, bool absolute_time) {
+    bool earliest;
     {
         std::scoped_lock scope{basic_lock};
         const auto next_time{absolute_time ? ns_into_future : GetGlobalTimeNs() + ns_into_future};
 
-        auto h{event_queue.emplace(Event{next_time.count(), event_fifo_id++, event_type, 0})};
+        const u64 fifo_order = event_fifo_id++;
+        auto h{event_queue.emplace(Event{next_time.count(), fifo_order, event_type, 0})};
         (*h).handle = h;
+        earliest = event_queue.top().fifo_order == fifo_order;
     }
 
-    event.Set();
+    // The timing thread sleeps until the earliest event: wake it only when that changed (each
+    // wake is a futex call; kernel timeouts schedule an event for every timed wait).
+    if (earliest) {
+        event.Set();
+    }
 }
 
 void CoreTiming::ScheduleLoopingEvent(std::chrono::nanoseconds start_time,
                                       std::chrono::nanoseconds resched_time,
                                       const std::shared_ptr<EventType>& event_type,
                                       bool absolute_time) {
+    bool earliest;
     {
         std::scoped_lock scope{basic_lock};
         const auto next_time{absolute_time ? start_time : GetGlobalTimeNs() + start_time};
 
+        const u64 fifo_order = event_fifo_id++;
         auto h{event_queue.emplace(
-            Event{next_time.count(), event_fifo_id++, event_type, resched_time.count()})};
+            Event{next_time.count(), fifo_order, event_type, resched_time.count()})};
         (*h).handle = h;
+        earliest = event_queue.top().fifo_order == fifo_order;
     }
 
-    event.Set();
+    if (earliest) {
+        event.Set();
+    }
 }
 
 void CoreTiming::UnscheduleEvent(const std::shared_ptr<EventType>& event_type,
