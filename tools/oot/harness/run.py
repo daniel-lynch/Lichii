@@ -100,12 +100,15 @@ def host_load():
         load1 = float(open("/proc/loadavg").read().split()[0])
     except (OSError, ValueError):
         load1 = -1.0
-    out = subprocess.run(["pgrep", "-c", "-x", "ninja|cc1plus|c\\+\\+|cc1|clang|java|ld|ld.lld|mold"],
-                         capture_output=True, text=True).stdout.strip()
-    try:
-        builders = int(out)
-    except ValueError:
-        builders = -1
+    # Count only RUNNING build processes: a build parked with SIGSTOP (the emu-priority daemon pauses
+    # compiles while an emulator runs) costs nothing and must not block a run.
+    out = subprocess.run(["ps", "-eo", "stat=,comm="], capture_output=True, text=True).stdout
+    names = {"ninja", "cc1plus", "cc1", "c++", "g++", "clang", "clang++", "ld", "ld.lld", "mold", "java", "lto1", "as"}
+    builders = 0
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[1].strip() in names and "T" not in parts[0]:
+            builders += 1
     return load1, builders
 
 
