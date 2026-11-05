@@ -601,6 +601,7 @@ struct System::Impl {
 
     std::array<u64, Core::Hardware::NUM_CPU_CORES> dynarmic_ticks{};
     std::array<u8, 0x20> build_id{};
+    u64 main_module_base{};
 
     std::string current_application_filepath;
 
@@ -992,6 +993,14 @@ void System::SetApplicationProcessBuildID(const CurrentBuildProcessID& id) {
 
 const System::CurrentBuildProcessID& System::GetApplicationProcessBuildID() const {
     return impl->build_id;
+}
+
+void System::SetApplicationMainModuleBase(u64 base) {
+    impl->main_module_base = base;
+}
+
+u64 System::GetApplicationMainModuleBase() const {
+    return impl->main_module_base;
 }
 
 Service::SM::ServiceManager& System::ServiceManager() {

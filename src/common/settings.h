@@ -203,6 +203,10 @@ struct Values {
 
     // Core
     SwitchableSetting<bool> use_multi_core{linkage, true, "use_multi_core", Category::Core};
+    // Ocarina of Time (0400486024DEC000): scale the game's fixed 1/60 s step by 60 / measured
+    // presents per second (src/core/hle/service/nx2_realtime_step.h). Overridden by
+    // EDEN_NX2_REALTIME_STEP when that is set. Per game: [Core] oot_realtime_step.
+    SwitchableSetting<bool> oot_realtime_step{linkage, false, "oot_realtime_step", Category::Core};
     SwitchableSetting<MemoryLayout, true> memory_layout_mode{linkage,
                                                              MemoryLayout::Memory_4Gb,
                                                              "memory_layout_mode",

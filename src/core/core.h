@@ -393,6 +393,10 @@ public:
     void SetApplicationProcessBuildID(const CurrentBuildProcessID& id);
     [[nodiscard]] const CurrentBuildProcessID& GetApplicationProcessBuildID() const;
 
+    /// Where the application's main module was loaded (the "Module main loaded at" base), or 0.
+    void SetApplicationMainModuleBase(u64 base);
+    [[nodiscard]] u64 GetApplicationMainModuleBase() const;
+
     /// Register a host thread as an emulated CPU Core.
     void RegisterCoreThread(std::size_t id);
 

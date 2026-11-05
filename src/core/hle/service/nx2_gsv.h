@@ -73,6 +73,7 @@
 #include "core/hle/service/nx2_image_layout.h"
 #include "core/hle/service/nx2_video_input_queue.h"
 #include "core/hle/service/nx2_present_pacer.h"
+#include "core/hle/service/nx2_realtime_step.h"
 #include "core/hle/service/nx2_video_ready.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/hle/service/server_manager.h"
@@ -1720,6 +1721,9 @@ public:
         if (m_vsync_timer) {
             system.CoreTiming().UnscheduleEvent(m_vsync_timer);
         }
+        // Puts OoT's step back to 1/60 s if it was rewritten (a no-op unless still the running
+        // application's memory).
+        m_realtime_step.Restore(system, m_realtime_process);
         for (auto* event : m_events) {
             m_context.CloseEvent(event);
         }
@@ -1793,6 +1797,10 @@ private:
         const auto composited = std::chrono::steady_clock::now();
         PaceToVblank(w[12], ctx.GetThread().GetOwnerProcess());
         const auto paced = std::chrono::steady_clock::now();
+        // OoT real-time step (off by default): measured on the paced present, written before the
+        // reply so the game's next frame steps by it.
+        m_realtime_process = ctx.GetThread().GetOwnerProcess();
+        m_realtime_step.OnPresent(system, m_realtime_process, paced);
         if (Common::DkbFrameTrace::Enabled()) {
             const auto ms = [](auto duration) {
                 return std::chrono::duration<double, std::milli>(duration).count();
@@ -1879,6 +1887,8 @@ private:
     // present faster than that. Every slot is reported free here: hold each present until the
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     Nx2PresentPacer m_present_pacer;
+    Nx2RealtimeStep::OotRealtimeStep m_realtime_step;
+    Kernel::KProcess* m_realtime_process{};
     u32 m_swap_word{};
 
     struct FrameTrace {
