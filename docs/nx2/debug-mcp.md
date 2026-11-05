@@ -196,6 +196,9 @@ Cost: one 64x36 nearest blit and a 9 KiB copy per present (GPU), and on the CPU 
 pass per completed probe; the measured numbers are in `flash_stats`. Off unless started:
 `FlashEnabled()` is one relaxed atomic load per present, the same flag as `capture_on_flash`.
 The monitor and the white-fraction trigger can run at the same time and share the probes.
+Measured on the RTX host (OoT harness runs 20261105-180556 and -181234, about 9000 presents
+each): CPU 0.011-0.012 ms mean per present (max 0.14 ms), GPU blit+copy 0.010-0.011 ms mean
+(max 0.42 ms), no dropped probes.
 
 ### Server boundaries
 

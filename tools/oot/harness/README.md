@@ -77,6 +77,7 @@ section has the totals, the largest jumps, dropped probes and the measured CPU/G
 present. The first flash arms one frame dump into
 `<run>/debug/flash-monitor-<session>/first-flash/` (read it with tools/oot/framedump/); the dump
 stalls the window it lands in for a few seconds, so `--no-flash-capture` when fps matters more.
+Measured cost: about 0.012 ms CPU and 0.011 ms GPU per present (runs 20261105-180556/-181234).
 `--no-flash` runs without the debug server; a binary without `flash_monitor` (before
 feat/harness-flash-detect) leaves the columns at `-` and logs a failed `flash-monitor` step.
 
