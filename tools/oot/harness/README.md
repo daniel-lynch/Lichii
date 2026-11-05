@@ -54,6 +54,32 @@ before and after and records any change in `run.json` (`live_files_changed`).
   check the log for "Emulation cleanup completed"; SIGKILL after `--shutdown-timeout`. Core dumps
   of the emulator are disabled unless `--keep-cores`.
 
+## Flash and flicker (on by default)
+
+Screenshots cannot catch a single-frame white flash or texture flicker, so every run also counts
+them on the emulator side. The harness starts the debug server (`EDEN_NX2_DEBUG_SERVER=
+127.0.0.1:<--debug-port, 6545>`, loopback only; `EDEN_NX2_DEBUG_DIR=<run>/debug`) and, once in
+game, sends `flash_monitor` (`debugsrv.py` is the small JSON-lines client). From then on every
+present is downsampled on the GPU to 64x36 and read back asynchronously
+(`src/video_core/nx2_flicker_meter.cpp`, design and cost in docs/nx2/debug-mcp.md):
+
+- **flashes**: frames whose centre-half mean luma (0-255) is at least `--flash-jump` (6) above
+  BOTH neighbouring frames, i.e. a one-frame brightening (the PR #121 "+6 over both neighbours"
+  test).
+- **flicker**: non-flash frames where one of 48 tiles (8x6 samples each) has its mean or
+  deviation spike or dip by at least `--tile-jump` (12) against BOTH neighbours. Camera turns
+  change tiles monotonically and do not count; a flickering texture does.
+
+`flash_stats {"reset":true}` is called at the start and end of every window, so each row of
+summary.md has a `flashes` and a `flicker` column (heading rows sum their visits; the in-game row
+is everything since the monitor started, camera turns included). The "Flash / flicker monitor"
+section has the totals, the largest jumps, dropped probes and the measured CPU/GPU cost per
+present. The first flash arms one frame dump into
+`<run>/debug/flash-monitor-<session>/first-flash/` (read it with tools/oot/framedump/); the dump
+stalls the window it lands in for a few seconds, so `--no-flash-capture` when fps matters more.
+`--no-flash` runs without the debug server; a binary without `flash_monitor` (before
+feat/harness-flash-detect) leaves the columns at `-` and logs a failed `flash-monitor` step.
+
 ## gdb stub and SVC trace (opt-in)
 
     python3 -I tools/oot/harness/run.py --headless --gdb                          # stub + in-game probes
@@ -84,7 +110,8 @@ before and after and records any change in `run.json` (`live_files_changed`).
 `mangohud.csv` (+ mangoapp's own summary), `pcie.txt`, `eden_log.txt`, `gamescope.txt`,
 `harness.log`, `run.json` (steps, phase windows, clock offsets), `summary.json`, `summary.md`
 (per-phase and per-heading: MangoHud fps median/p5/p95, frametime p95/p99, guest fps,
-native_dispatches, native_marked_KB, fence_copy_MB, pool collected vs applied, PCIe rx p95, SM %).
+native_dispatches, native_marked_KB, fence_copy_MB, pool collected vs applied, PCIe rx p95, SM %,
+flashes, flicker), `debug/` (the debug server's dump dir: the first-flash frame dump).
 
 Rules it enforces: one emulator instance (refuses if `bin/lichii` is running; `--wait-idle N`
 waits), MemAvailable ≥ 40 GiB, Python niced.
