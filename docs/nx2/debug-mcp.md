@@ -103,6 +103,60 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
 
 ## Safety
 
+### Automatic white-flash capture
+
+`capture_on_flash` arms a Vulkan-only diagnostic and returns immediately:
+
+```json
+{"threshold_white_fraction":0.8,"min_luma":0.95,"max_captures":1,"timeout_s":120,"buffers":true,"sampled":false}
+```
+
+Both thresholds are fractions in [0, 1]. The detector blits the composed present source to a
+64×36 RGBA8 image with nearest sampling and counts samples whose Rec.709 luma reaches
+`min_luma`. This is a spatial estimate, not an exact count of full-resolution white pixels.
+It samples actual composed frames before optional frame generation; generated frames are not tested.
+
+Eight reusable GPU readback slots hold 9 KiB each. The render thread only reads a completed
+slot, never waits for a probe, and skips a sample if all slots are busy. There is no full-resolution
+readback, forced submission, or disk write per checked frame. Resources are allocated on first arm.
+Disarmed sessions cost one atomic flag check.
+
+A full frame dump cannot recover draws that were already submitted before detection. When a
+completed probe crosses the threshold, the existing frame dumper captures the next frame after
+that observation. GPU readback latency means this may be several frames after the white frame,
+not immediately after it. Results identify `trigger_frame`, `capture_frame`, `frame_delay`,
+`trigger_white_fraction`, and `capture_white_fraction`. These frame numbers are detector-local
+present ordinals. A missing measurement is null with an error, never a zero implying a dark frame.
+The capture includes bound buffers when `buffers` is true and texture inputs when `sampled` is true.
+On test/oot-local the `buffers` option is accepted but ignored: that tree lacks d03eb2a806,
+which adds buffer records to frame dumps.
+
+Poll `status {"fps_window_ms":0}` and inspect `flash`; this does not capture anything.
+Each report is also saved as `flash-status.json` under the server-chosen directory.
+Once `captures[].complete` is true, the normal manifest and image files are ready.
+Check `error` too. The adapter registers these directories for `capture_image`.
+`disarm` stops probing and returns the results. Already-requested dumps finish, but a
+capture-frame measurement not yet obtained is marked unavailable. Arming expires after
+`timeout_s`, defaults to one capture, and allows at most 10 captures and 600 seconds.
+
+The report measures CPU submission/analysis time and GPU blit/copy time using timestamp queries.
+`cpu_mean_ms`, `cpu_max_ms`, `gpu_mean_ms`, `gpu_max_ms`, sample counts and dropped samples
+are exposed. GPU values are null when timestamps are unsupported. Allocation and full-dump
+costs are excluded. GPU timestamps begin after the source-image barrier, so they do not measure
+all scheduling effects of adding that barrier. A live armed/disarmed comparison is still needed
+to validate the approximately 0.2 ms per-frame budget on the owner's GPU. The cloud machine has
+no Vulkan device; a CPU-only luma microbenchmark is not proof of that total budget.
+
+Example CLI:
+
+```sh
+$PY -I C:/lx/src/tools/nx2/debug_mcp.py --call '{"method":"capture_on_flash","params":{"threshold_white_fraction":0.8,"min_luma":0.95,"buffers":true}}'
+$PY -I C:/lx/src/tools/nx2/debug_mcp.py --call '{"method":"status","params":{"fps_window_ms":0}}'
+$PY -I C:/lx/src/tools/nx2/debug_mcp.py --call '{"method":"disarm"}'
+```
+
+### Server boundaries
+
 - **Loopback only.** `ParseEndpoint` accepts `127.0.0.1`, `::1` and `localhost` and refuses
   every other host, `0.0.0.0` included. The server is reachable only from the PC itself, where
   the agent already has a shell.

@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/present/frame_gen.h"
 #endif
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
+#include "video_core/renderer_vulkan/vk_flash_detector.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -114,6 +115,7 @@ private:
     std::optional<TurboMode> turbo_mode;
 
     Frame applet_frame;
+    std::unique_ptr<FlashDetector> flash_detector;
 };
 
 } // namespace Vulkan

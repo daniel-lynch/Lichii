@@ -120,6 +120,8 @@ add_library(video_core STATIC
     nx2_fast_draw.h
     nx2_debug_control.cpp
     nx2_debug_control.h
+    nx2_flash_trigger.cpp
+    nx2_flash_trigger.h
     nx2_profile.h
     pending_maps.h
     present.h
@@ -197,6 +199,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_fence_manager.cpp
     renderer_vulkan/vk_fence_manager.h
     renderer_vulkan/vk_frame_dump.cpp
+    renderer_vulkan/vk_flash_detector.cpp
+    renderer_vulkan/vk_flash_detector.h
     renderer_vulkan/vk_frame_dump.h
     renderer_vulkan/vk_graphics_pipeline.cpp
     renderer_vulkan/vk_graphics_pipeline.h

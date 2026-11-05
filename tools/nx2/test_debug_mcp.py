@@ -45,6 +45,12 @@ class FakeEmulator:
                 return {"result": {"directory": self.capture_dir, "count": count,
                                    "frames": frames}}
             return {"result": {"directory": self.capture_dir, "entries_total": 1}}
+        if method == "capture_on_flash":
+            return {"result": {"directory": self.capture_dir, "armed": True, "captures": []}}
+        if method == "disarm":
+            return {"result": {"armed": False, "captures": [
+                {"directory": self.capture_dir, "trigger_white_fraction": 0.95,
+                 "capture_white_fraction": 0.1, "complete": True}]}}
         return {"error": f"unknown method \"{method}\""}
 
     def serve(self):
@@ -96,7 +102,7 @@ class AdapterTest(unittest.TestCase):
         self.assertIsNone(self.adapter.handle({"method": "notifications/initialized"}))
         names = [tool["name"] for tool in self.adapter.handle({"id": 2, "method": "tools/list"})
                  ["result"]["tools"]]
-        self.assertEqual(names, ["status", "screenshot", "log_tail", "log_filter", "capture_frame",
+        self.assertEqual(names, ["capture_on_flash", "disarm", "status", "screenshot", "log_tail", "log_filter", "capture_frame",
                                  "capture_image", "reject_shaders"])
         self.assertEqual(self.adapter.handle({"id": 3, "method": "bogus"})["error"]["code"], -32601)
 
@@ -105,6 +111,16 @@ class AdapterTest(unittest.TestCase):
         self.assertFalse(result["isError"])
         self.assertEqual(json.loads(result["content"][0]["text"])["title"], "Test")
         self.assertEqual(self.fake.requests[-1]["params"], {"fps_window_ms": 0})
+
+    def test_flash_arms_without_waiting_and_reports_triggered_captures(self):
+        params = {"threshold_white_fraction": 0.8, "min_luma": 0.95, "buffers": True}
+        result = self.call("capture_on_flash", params)
+        self.assertTrue(json.loads(result["content"][0]["text"])["armed"])
+        self.assertEqual(self.fake.requests[-1]["params"], params)
+        report = json.loads(self.call("disarm")["content"][0]["text"])
+        self.assertEqual(report["captures"][0]["trigger_white_fraction"], 0.95)
+        self.assertFalse(self.call("capture_image", {
+            "directory": self.capture_dir, "name": "0001_present"})["isError"])
 
     def test_screenshot_becomes_image_content(self):
         result = self.call("screenshot")
