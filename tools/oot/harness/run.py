@@ -19,6 +19,15 @@ the private runtime kit's rsp_probe.py (delta / pcs / count-frames) into the run
 gdbkit.py. The stub listens on 0.0.0.0:<port> (all interfaces, debugger.cpp:146), with no
 authentication, for as long as the run is up: anyone who can reach the port can read and write
 guest memory. Firewall the port or keep such runs off untrusted networks.
+Flash/flicker (on by default; --no-flash turns it off): the run starts the emulator's debug server
+on 127.0.0.1:<--debug-port> (loopback only) with its dump dir in <run>/debug/, and once in game arms
+the Vulkan flash monitor (flash_monitor): every present is downsampled to 64x36 on the GPU and read
+back, and each frame is tested for a one-frame centre brightening of >= --flash-jump luma over both
+neighbours ("flashes") and for 8x6-sample tiles whose mean or deviation spikes by >= --tile-jump
+over both neighbours ("flicker" frames). The counters are read and reset at the start and end of
+each measurement window (flash_stats), so the summary has a flashes and a flicker column per
+window. The first detected flash arms one frame capture into <run>/debug/flash-monitor-*/first-flash/.
+
 --svc-trace FIRST:LAST sets EDEN_NX2_SVC_TRACE for the run and parses the log into svc-trace.md
 with the kit's svc_trace_parse.py (thread names from the stub when --gdb is on).
 """
@@ -40,6 +49,7 @@ sys.dont_write_bytecode = True  # keep __pycache__ out of the worktree
 sys.path.insert(0, str(HERE))  # -I drops the script dir; these are the harness's own modules
 
 import analyze  # noqa: E402
+import debugsrv  # noqa: E402
 import gdbkit  # noqa: E402
 import pad as padmod  # noqa: E402
 import portable as prof  # noqa: E402
@@ -208,6 +218,7 @@ class Run:
         self.emu_pid = None
         self.user = None
         self.n_shot = 0
+        self.dbg = None  # debugsrv.DebugClient while the flash monitor runs
         self.info = {"stamp": self.stamp, "binary": str(a.binary), "game": str(a.game),
                      "profile": str(a.profile), "headless": a.headless}
         self.kit = gdbkit.kit_tools(a.kit)
@@ -295,6 +306,8 @@ class Run:
             why = f"MemAvailable {mem:.1f} GiB < {self.a.min_mem_gib} GiB"
         elif not Path(self.a.binary).exists():
             why = f"binary not found: {self.a.binary}"
+        elif not self.a.no_flash and not debugsrv.port_free(self.a.debug_port):
+            why = f"debug server port {self.a.debug_port} is already bound; pick --debug-port"
         elif self.a.gdb and not port_free(self.a.gdb_port):
             why = f"gdb port {self.a.gdb_port} is already bound (another stub?); pick --gdb-port"
         if why:
@@ -318,6 +331,9 @@ class Run:
         env = dict(os.environ)
         run_env = dict(DEF_ENV)
         run_env.update({k: v for k, v in os.environ.items() if k.startswith("EDEN_NX2_")})
+        if not a.no_flash:
+            run_env["EDEN_NX2_DEBUG_SERVER"] = f"127.0.0.1:{a.debug_port}"
+            run_env["EDEN_NX2_DEBUG_DIR"] = str(self.dir / "debug")
         for kv in a.env:
             k, _, v = kv.partition("=")
             if v == "":
@@ -528,7 +544,67 @@ class Run:
         self.step("mangohud-log-" + ("start" if on else "stop"), "ok" if r.returncode == 0 else "fail",
                   (r.stderr or r.stdout).strip()[:200])
 
+    # -- flash / flicker monitor (debug server)
+    def flash_start(self):
+        a = self.a
+        if a.no_flash:
+            return
+        info = self.info["flash"] = {"port": a.debug_port, "flash_jump": a.flash_jump, "tile_jump": a.tile_jump,
+                                     "capture_first": not a.no_flash_capture}
+        client = debugsrv.DebugClient(a.debug_port)
+        err = None
+        for _ in range(20):  # the server starts once the game has loaded; it is up by now, but be patient
+            try:
+                info["start"] = client.call("flash_monitor", {"enable": True, "flash_jump": a.flash_jump,
+                                                              "tile_jump": a.tile_jump,
+                                                              "capture_first": not a.no_flash_capture})
+                self.dbg, err = client, None
+                break
+            except debugsrv.DebugError as e:
+                err = str(e)
+                if "unknown method" in err:
+                    break
+                time.sleep(1)
+        info["error"] = err
+        self.step("flash-monitor", "ok" if self.dbg else "fail",
+                  f"127.0.0.1:{a.debug_port}, flash_jump {a.flash_jump}, tile_jump {a.tile_jump}" if self.dbg else err)
+
+    def flash_read(self, reset=True):
+        if not self.dbg:
+            return None
+        try:
+            return self.dbg.call("flash_stats", {"reset": reset})
+        except debugsrv.DebugError as e:
+            self.say(f"flash_stats failed: {e}")
+            return None
+
+    def flash_stop(self):
+        """Final totals; waits (bounded) for the first-flash capture to finish writing."""
+        if not self.dbg:
+            return
+        info = self.info["flash"]
+        end = time.time() + self.a.flash_capture_wait
+        final = self.flash_read(reset=False)
+        while (final and (final.get("first_flash_capture") or {}).get("complete") is False
+               and time.time() < end and Path(f"/proc/{self.emu_pid}").exists()):
+            time.sleep(1)
+            final = self.flash_read(reset=False) or final
+        try:
+            final = self.dbg.call("flash_monitor", {"enable": False}) or final
+        except debugsrv.DebugError as e:
+            self.say(f"flash_monitor disable failed: {e}")
+        info["final"] = final
+        self.dbg.close()
+        self.dbg = None
+        t = (final or {}).get("total", {})
+        cap = (final or {}).get("first_flash_capture")
+        self.step("flash-monitor-stop", "ok",
+                  f"{t.get('flashes')} flashes, {t.get('flicker_frames')} flicker frames over {t.get('frames')} probes; "
+                  f"cpu {(final or {}).get('cpu_mean_ms')} ms gpu {(final or {}).get('gpu_mean_ms')} ms per frame"
+                  + (f"; first flash dump {cap.get('directory')} complete={cap.get('complete')}" if cap else ""))
+
     def phase(self, name, seconds, kind="phase", action=None, **extra):
+        self.flash_read(reset=True)  # discard what happened before the window (turns, screenshots)
         start = time.time()
         if action:
             action()
@@ -539,6 +615,9 @@ class Run:
             self.sync_clock()
             time.sleep(min(1.0, max(0.0, end_at - time.time())))
         ph = {"name": name, "kind": kind, "start": start, "end": time.time()}
+        fl = self.flash_read(reset=True)
+        if fl:
+            ph["flash"] = fl.get("window")
         ph.update(extra)
         self.phases.append(ph)
         return ph
@@ -585,6 +664,7 @@ class Run:
         self.mangohud(False)
         self.phases.insert(0, {"name": "in-game", "kind": "phase",
                                "start": self.phases[first]["start"], "end": self.phases[-1]["end"]})
+        self.flash_stop()
 
     def rotation_probe(self):
         """Calibration: turn the camera in small right-stick steps with a screenshot after each, so
@@ -705,6 +785,16 @@ def build_parser():
     ap.add_argument("--min-mem-gib", type=float, default=40)
     ap.add_argument("--keep-cores", action="store_true", help="allow core dumps of the emulator")
     ap.add_argument("--keep-poll-shots", action="store_true")
+    f = ap.add_argument_group("flash / flicker monitor (debug server; on by default)")
+    f.add_argument("--no-flash", action="store_true", help="do not start the debug server or the flash monitor")
+    f.add_argument("--debug-port", type=int, default=6545, help="debug server port (127.0.0.1 only)")
+    f.add_argument("--flash-jump", type=float, default=6.0,
+                   help="flash: centre mean luma (0-255) above BOTH neighbouring frames by at least this")
+    f.add_argument("--tile-jump", type=float, default=12.0,
+                   help="flicker: a tile's mean or deviation spikes over BOTH neighbours by at least this")
+    f.add_argument("--no-flash-capture", action="store_true", help="do not dump a frame on the first flash")
+    f.add_argument("--flash-capture-wait", type=float, default=60,
+                   help="seconds to wait at the end for the first-flash dump to finish writing")
     g = ap.add_argument_group("gdb stub / SVC trace (opt-in; the measurement scripts are a private kit outside this repo)")
     g.add_argument("--gdb", action="store_true",
                    help="enable the gdb stub in the profile's qt-config.ini, continue the guest at boot, and run "
@@ -753,6 +843,7 @@ def main():
         if a.probe_steps:
             run.rotation_probe()
         else:
+            run.flash_start()
             run.measure()
     except Abort as e:
         result, failed = "failed", str(e)
@@ -761,6 +852,8 @@ def main():
             run.shot("last-state")
         if run.mh_start and not a.no_mangohud:
             run.mangohud(False)
+        if run.dbg and run.emu_pid and Path(f"/proc/{run.emu_pid}").exists():
+            run.flash_stop()
     finally:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)

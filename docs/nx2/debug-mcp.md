@@ -103,6 +103,105 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
 
 ## Safety
 
+### Automatic white-flash capture
+
+`capture_on_flash` arms a Vulkan-only diagnostic and returns immediately:
+
+```json
+{"threshold_white_fraction":0.8,"min_luma":0.95,"max_captures":1,"timeout_s":120,"buffers":true,"sampled":false}
+```
+
+Both thresholds are fractions in [0, 1]. The detector blits the composed present source to a
+64×36 RGBA8 image with nearest sampling and counts samples whose Rec.709 luma reaches
+`min_luma`. This is a spatial estimate, not an exact count of full-resolution white pixels.
+It samples actual composed frames before optional frame generation; generated frames are not tested.
+
+Eight reusable GPU readback slots hold 9 KiB each. The render thread only reads a completed
+slot, never waits for a probe, and skips a sample if all slots are busy. There is no full-resolution
+readback, forced submission, or disk write per checked frame. Resources are allocated on first arm.
+Disarmed sessions cost one atomic flag check.
+
+A full frame dump cannot recover draws that were already submitted before detection. When a
+completed probe crosses the threshold, the existing frame dumper captures the next frame after
+that observation. GPU readback latency means this may be several frames after the white frame,
+not immediately after it. Results identify `trigger_frame`, `capture_frame`, `frame_delay`,
+`trigger_white_fraction`, and `capture_white_fraction`. These frame numbers are detector-local
+present ordinals. A missing measurement is null with an error, never a zero implying a dark frame.
+The capture includes bound buffers when `buffers` is true and texture inputs when `sampled` is true.
+On test/oot-local the `buffers` option is accepted but ignored: that tree lacks d03eb2a806,
+which adds buffer records to frame dumps.
+
+Poll `status {"fps_window_ms":0}` and inspect `flash`; this does not capture anything.
+Each report is also saved as `flash-status.json` under the server-chosen directory.
+Once `captures[].complete` is true, the normal manifest and image files are ready.
+Check `error` too. The adapter registers these directories for `capture_image`.
+`disarm` stops probing and returns the results. Already-requested dumps finish, but a
+capture-frame measurement not yet obtained is marked unavailable. Arming expires after
+`timeout_s`, defaults to one capture, and allows at most 10 captures and 600 seconds.
+
+The report measures CPU submission/analysis time and GPU blit/copy time using timestamp queries.
+`cpu_mean_ms`, `cpu_max_ms`, `gpu_mean_ms`, `gpu_max_ms`, sample counts and dropped samples
+are exposed. GPU values are null when timestamps are unsupported. Allocation and full-dump
+costs are excluded. GPU timestamps begin after the source-image barrier, so they do not measure
+all scheduling effects of adding that barrier. A live armed/disarmed comparison is still needed
+to validate the approximately 0.2 ms per-frame budget on the owner's GPU. The cloud machine has
+no Vulkan device; a CPU-only luma microbenchmark is not proof of that total budget.
+
+Example CLI:
+
+```sh
+$PY -I C:/lx/src/tools/nx2/debug_mcp.py --call '{"method":"capture_on_flash","params":{"threshold_white_fraction":0.8,"min_luma":0.95,"buffers":true}}'
+$PY -I C:/lx/src/tools/nx2/debug_mcp.py --call '{"method":"status","params":{"fps_window_ms":0}}'
+$PY -I C:/lx/src/tools/nx2/debug_mcp.py --call '{"method":"disarm"}'
+```
+
+### Continuous flash and flicker statistics
+
+`flash_monitor` reuses the same 64x36 probe to measure every present instead of waiting for one
+white frame, so a run can count single-frame flashes and texture flicker that screenshots miss:
+
+```json
+{"enable":true,"flash_jump":6,"tile_jump":12,"capture_first":true,"sampled":false}
+```
+
+`src/video_core/nx2_flicker_meter.cpp` turns each readback into the Rec.709 mean luma (0..255) of
+the central half (32x18 samples) and the mean and standard deviation of 48 tiles (8x6 samples
+each). With three consecutive distinct presents a, b, c, frame b is:
+
+- a **flash** when `min(centre(b) - centre(a), centre(b) - centre(c)) >= flash_jump` (default 6,
+  the "+6 luminance over both neighbours" criterion from PR #121): a one-frame brightening.
+- a **flicker** frame when it is not a flash and at least one tile's mean or deviation is above
+  both neighbours, or below both, by `tile_jump` (default 12): a one-frame spike or dip in part
+  of the image, which is what camera-dependent texture flicker looks like. A camera turn moves
+  tile values monotonically and is not counted.
+
+An exact repeat of the previous probe (the same guest frame presented twice) is skipped, so a
+flash shown for two presents still has distinct neighbours. A dropped probe (all eight readback
+slots busy) restarts the three-frame window and counts as a gap. Frame numbers are
+detector-local present ordinals. Probes complete out of slot order, so each present reads the
+completed slots sorted by frame.
+
+`flash_stats {"reset":false}` returns `window` (since the last reset) and `total` (since
+`flash_monitor` started) counters: `frames`, `judged`, `duplicates`, `gaps`, `flashes`,
+`flicker_frames`, `flicker_tiles`, `max_jump`, `max_tile_jump`, `last_flash_frame`,
+`last_flicker_frame`, `centre_luma_mean`; plus `dropped_samples`, `first_flash_capture` and the
+probe cost (`cpu_mean_ms`, `cpu_max_ms`, `gpu_mean_ms`, `gpu_max_ms`, as for `capture_on_flash`).
+`reset:true` returns the window and starts a new one; the OoT harness
+(`tools/oot/harness/run.py`) does that at the start and end of every measurement window.
+With `capture_first` the first flash requests one frame dump of the next present after the
+verdict (at least one frame plus the readback latency after the flash) into
+`<dump dir>/flash-monitor-<session>/first-flash/`. `flash_monitor {"enable":false}` stops it.
+
+Cost: one 64x36 nearest blit and a 9 KiB copy per present (GPU), and on the CPU a 2304-sample
+pass per completed probe; the measured numbers are in `flash_stats`. Off unless started:
+`FlashEnabled()` is one relaxed atomic load per present, the same flag as `capture_on_flash`.
+The monitor and the white-fraction trigger can run at the same time and share the probes.
+Measured on the RTX host (OoT harness runs 20261105-180556 and -181234, about 9000 presents
+each): CPU 0.011-0.012 ms mean per present (max 0.14 ms), GPU blit+copy 0.010-0.011 ms mean
+(max 0.42 ms), no dropped probes.
+
+### Server boundaries
+
 - **Loopback only.** `ParseEndpoint` accepts `127.0.0.1`, `::1` and `localhost` and refuses
   every other host, `0.0.0.0` included. The server is reachable only from the PC itself, where
   the agent already has a shell.

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -22,6 +23,7 @@
 #include "core/frontend/framebuffer_layout.h"
 #include "video_core/gpu.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_flash_trigger.h"
 #include "video_core/renderer_base.h"
 
 namespace Core::Nx2Debug {
@@ -50,6 +52,7 @@ struct ToolState {
     std::string log_filter{Settings::values.log_filter.GetValue()};
     u64 captures{};
     u64 screenshots{};
+    u64 flash_arms{};
     std::atomic<bool> stopping{};
 };
 
@@ -96,6 +99,148 @@ void AppendPng(void* context, void* data, int size) {
     png.insert(png.end(), bytes, bytes + size);
 }
 
+json FlashReport(const VideoCore::Nx2Debug::FlashStatus& flash) {
+    json captures = json::array();
+    for (const auto& capture : flash.captures) {
+        captures.push_back({
+            {"directory", capture.directory.generic_string()},
+            {"trigger_frame", capture.trigger_frame},
+            {"capture_frame", capture.capture_frame},
+            {"frame_delay", capture.capture_frame - capture.trigger_frame},
+            {"trigger_white_fraction", capture.trigger_white_fraction},
+            {"capture_white_fraction", capture.capture_white_fraction
+                                           ? json(*capture.capture_white_fraction) : json{}},
+            {"complete", capture.complete}, {"error", capture.error}});
+    }
+    json report = {
+        {"armed", flash.armed}, {"reason", flash.reason},
+        {"directory", flash.config.directory.generic_string()},
+        {"threshold_white_fraction", flash.config.threshold}, {"min_luma", flash.config.min_luma},
+        {"samples", flash.samples}, {"dropped_samples", flash.dropped},
+        {"cpu_checks", flash.cpu_checks}, {"gpu_checks", flash.gpu_checks},
+        {"cpu_mean_ms", flash.cpu_checks ? flash.cpu_total_ms / flash.cpu_checks : 0.0},
+        {"cpu_max_ms", flash.cpu_max_ms},
+        {"gpu_mean_ms", flash.gpu_checks ? json(flash.gpu_total_ms / flash.gpu_checks) : json{}},
+        {"gpu_max_ms", flash.gpu_checks ? json(flash.gpu_max_ms) : json{}},
+        {"captures", std::move(captures)},
+        {"sample_grid", {64, 36}},
+        {"timing_note", "CPU probe submission/analysis and GPU blit/copy timestamps; excludes one-time allocation and full dumps"}};
+    if (!flash.config.directory.empty()) {
+        std::ofstream file{flash.config.directory / "flash-status.json"};
+        file << report.dump(2);
+    }
+    return report;
+}
+
+json CaptureOnFlash(ToolState& state, const json& params) {
+    if (!IsVulkan()) {
+        throw std::runtime_error{"flash detection needs the Vulkan renderer"};
+    }
+    const auto fraction = [&](const char* name) {
+        const auto& value = params.at(name);
+        if (!value.is_number()) {
+            throw std::runtime_error{fmt::format("{} must be a number in [0, 1]", name)};
+        }
+        const double number = value.get<double>();
+        if (!std::isfinite(number) || number < 0 || number > 1) {
+            throw std::runtime_error{fmt::format("{} must be in [0, 1]", name)};
+        }
+        return number;
+    };
+    const double threshold = fraction("threshold_white_fraction");
+    const double min_luma = fraction("min_luma");
+    const auto limit = [&](const char* name, u32 fallback, u32 maximum) {
+        if (!params.contains(name)) {
+            return fallback;
+        }
+        const auto& value = params.at(name);
+        if (!value.is_number_integer() || value < 1 || value > maximum) {
+            throw std::runtime_error{fmt::format("{} must be an integer in 1..{}", name, maximum)};
+        }
+        return value.get<u32>();
+    };
+    const u32 max_captures = limit("max_captures", 1, 10);
+    const u32 timeout = limit("timeout_s", 120, 600);
+    const auto directory = state.dump_directory /
+                           fmt::format("flash-{}-{:03}", state.session, ++state.flash_arms);
+    std::filesystem::create_directories(directory);
+    return FlashReport(VideoCore::Nx2Debug::ArmFlash({
+        .directory = directory, .threshold = threshold, .min_luma = min_luma,
+        .max_captures = max_captures,
+        .deadline = std::chrono::steady_clock::now() + std::chrono::seconds{timeout},
+        .buffers = params.value("buffers", false), .sampled = params.value("sampled", false)}));
+}
+
+json Disarm(ToolState&, const json&) {
+    return FlashReport(VideoCore::Nx2Debug::DisarmFlash());
+}
+
+json OptionalFrame(const std::optional<u64>& frame) {
+    return frame ? json(*frame) : json{};
+}
+
+json CountersReport(const VideoCore::Nx2Debug::FlickerCounters& c) {
+    return {{"frames", c.frames}, {"judged", c.judged}, {"duplicates", c.duplicates},
+            {"gaps", c.gaps}, {"flashes", c.flashes}, {"flicker_frames", c.flicker_frames},
+            {"flicker_tiles", c.flicker_tiles}, {"max_jump", c.max_jump},
+            {"max_tile_jump", c.max_tile_jump},
+            {"last_flash_frame", OptionalFrame(c.last_flash_frame)},
+            {"last_flicker_frame", OptionalFrame(c.last_flicker_frame)},
+            {"centre_luma_mean", c.frames ? json(c.luma_sum / static_cast<double>(c.frames)) : json{}}};
+}
+
+json MonitorReport(const VideoCore::Nx2Debug::MonitorStatus& m) {
+    json capture{};
+    if (m.capture) {
+        capture = {{"directory", m.capture->directory.generic_string()},
+                   {"trigger_frame", m.capture->trigger_frame},
+                   {"capture_frame", m.capture->capture_frame},
+                   {"flash_jump", m.capture->flash_jump},
+                   {"complete", m.capture->complete}, {"error", m.capture->error}};
+    }
+    return {{"enabled", m.enabled},
+            {"flash_jump", m.config.thresholds.flash_jump},
+            {"tile_jump", m.config.thresholds.tile_jump},
+            {"capture_first", m.config.capture_first},
+            {"window", CountersReport(m.window)},
+            {"total", CountersReport(m.total)},
+            {"first_flash_capture", std::move(capture)},
+            {"dropped_samples", m.dropped},
+            {"cpu_mean_ms", m.cpu_checks ? m.cpu_total_ms / static_cast<double>(m.cpu_checks) : 0.0},
+            {"cpu_max_ms", m.cpu_max_ms},
+            {"gpu_mean_ms", m.gpu_checks ? json(m.gpu_total_ms / static_cast<double>(m.gpu_checks)) : json{}},
+            {"gpu_max_ms", m.gpu_checks ? json(m.gpu_max_ms) : json{}},
+            {"sample_grid", {VideoCore::Nx2Debug::ProbeWidth, VideoCore::Nx2Debug::ProbeHeight}},
+            {"tiles", {VideoCore::Nx2Debug::TileColumns, VideoCore::Nx2Debug::TileRows}}};
+}
+
+json FlashMonitor(ToolState& state, const json& params) {
+    if (!params.value("enable", true)) {
+        return MonitorReport(VideoCore::Nx2Debug::StopMonitor());
+    }
+    if (!IsVulkan()) {
+        throw std::runtime_error{"flash monitoring needs the Vulkan renderer"};
+    }
+    const auto positive = [&](const char* name, double fallback) {
+        const double value = params.value(name, fallback);
+        if (!std::isfinite(value) || value <= 0 || value > 255) {
+            throw std::runtime_error{fmt::format("{} must be in (0, 255] luma", name)};
+        }
+        return value;
+    };
+    VideoCore::Nx2Debug::MonitorConfig config{
+        .directory = state.dump_directory / fmt::format("flash-monitor-{}", state.session),
+        .thresholds = {.flash_jump = positive("flash_jump", 6.0),
+                       .tile_jump = positive("tile_jump", 12.0)},
+        .capture_first = params.value("capture_first", true),
+        .sampled = params.value("sampled", false)};
+    return MonitorReport(VideoCore::Nx2Debug::StartMonitor(std::move(config)));
+}
+
+json FlashStats(ToolState&, const json& params) {
+    return MonitorReport(VideoCore::Nx2Debug::ReadMonitor(params.value("reset", false)));
+}
+
 json Status(ToolState& state, const json& params) {
     const auto window = std::chrono::milliseconds{Param<int>(params, "fps_window_ms", 500, 0, 5000)};
     const u64 before = g_nx2_present_count.load(std::memory_order_relaxed);
@@ -123,6 +268,7 @@ json Status(ToolState& state, const json& params) {
         {"dump_dir", state.dump_directory.generic_string()},
         {"log_filter", state.log_filter},
         {"rejected", HexList(VideoCore::Nx2Debug::RejectedHashes())},
+        {"flash", FlashReport(VideoCore::Nx2Debug::ReadFlashStatus())},
     };
 }
 
@@ -334,6 +480,10 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"log_filter", handler(LogFilter)},
         {"capture_frame", handler(CaptureFrame)},
         {"reject_shaders", handler(RejectShaders)},
+        {"capture_on_flash", handler(CaptureOnFlash)},
+        {"disarm", handler(Disarm)},
+        {"flash_monitor", handler(FlashMonitor)},
+        {"flash_stats", handler(FlashStats)},
     };
 }
 

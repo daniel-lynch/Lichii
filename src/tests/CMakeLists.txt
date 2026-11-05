@@ -7,6 +7,8 @@
 add_executable(tests
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp
+    video_core/flash_trigger.cpp
+    video_core/flicker_meter.cpp
     video_core/gpu_timestamp.cpp
     video_core/parallel_record.cpp
     video_core/parallel_record_vulkan.cpp
