@@ -195,6 +195,18 @@ def analyze(rundir):
     if presents:
         summary["vi2_present_windows"] = [{"log_t": t, "frame_us": a, "max_us": b} for t, a, b in presents[-20:]]
     (rundir / "summary.json").write_text(json.dumps(summary, indent=2))
+    # host contention: MangoHud's system-wide CPU load (the emulator alone is ~27-30 % on a 24-thread
+    # box; builds in flight push it far higher and invalidate the fps numbers) + the preflight record
+    hl = run.get("host_load_start") or {}
+    host = {"load1_start": hl.get("load1"), "build_procs_start": hl.get("build_procs")}
+    try:
+        mrow = next(iter(csv.DictReader(open(rundir / "mangohud_summary.csv"))))
+        host["cpu_load_avg"] = float(mrow.get("CPU Load", "nan"))
+        host["cpu_load_peak"] = float(mrow.get("Peak CPU Load", "nan"))
+    except (OSError, StopIteration, ValueError):
+        pass
+    host["tainted"] = bool((host.get("cpu_load_avg") or 0) > 40 or (host.get("build_procs_start") or 0) > 0)
+    summary["host"] = host
     (rundir / "summary.md").write_text(render_md(summary))
     return summary
 
@@ -216,7 +228,11 @@ def render_md(s):
          f"- result: **{s['result']}**" + (f" (failed at `{s['failed_step']}`)" if s.get("failed_step") else ""),
          f"- binary: `{s['binary']}`",
          f"- env: " + (", ".join(f"`{k}={v}`" for k, v in sorted(s["env"].items())) or "-"),
-         f"- shutdown: {s.get('shutdown')}", ""]
+         f"- shutdown: {s.get('shutdown')}",
+         "- host: " + (lambda h: (f"system CPU load avg {h.get('cpu_load_avg')} % / peak {h.get('cpu_load_peak')} %, "
+                                 f"load1 {h.get('load1_start')} with {h.get('build_procs_start')} build procs at start"
+                                 + (" — **TAINTED by host contention; do not compare fps**" if h.get('tainted') else "")))(s.get("host") or {}),
+         ""]
     cols = ["window", "s", "fps med", "fps p5", "fps p95", "ft p95 ms", "ft p99 ms", "guest fps",
             "disp/f", "marked KB/f", "fence MB/f", "pool coll KB/f", "pool appl KB/f", "rx MB/s p95", "sm %"]
     L += ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
