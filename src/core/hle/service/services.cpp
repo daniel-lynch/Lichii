@@ -68,6 +68,7 @@
 #include "core/hle/service/tma/tma.h"
 #include "core/hle/service/usb/usb.h"
 #include "core/hle/service/vi/vi.h"
+#include "core/hle/service/nx2_gsv_server.h"
 
 namespace Service {
 
@@ -97,6 +98,10 @@ Services::Services(std::shared_ptr<SM::ServiceManager>& sm, Core::System& system
     })
         kernel.RunOnHostCoreProcess(std::string(e.first), [&system, f = e.second] { f(system); }).detach();
     kernel.RunOnHostCoreProcess("vi",         [&, token] { VI::LoopProcess(system, token); }).detach();
+    // Switch 2 graphics system sessions (vi2 presents wait for GPU fences and vblanks there).
+    if (Nx2GsvHostThreadEnabled()) {
+        kernel.RunOnHostCoreProcess("nx2:gsv", [&system] { RunNx2GsvServer(system); }).detach();
+    }
     // Avoid cold clones of lambdas -- succintly
     for (auto const& e : std::vector<std::pair<std::string_view, void (*)(Core::System&)>>{
         {"sm",         &SM::LoopProcess},
