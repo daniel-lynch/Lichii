@@ -90,6 +90,22 @@ SHOT_BACKENDS = {"gamescope": GamescopeShots}
 
 
 # ------------------------------------------------------------------ helpers
+def host_load():
+    """1-minute load average and the number of compiler/JVM processes: a run with builds in
+    flight is not comparable (2026-11-05: FAST_DRAW runs at 57-97 % system CPU load were invalid)."""
+    try:
+        load1 = float(open("/proc/loadavg").read().split()[0])
+    except (OSError, ValueError):
+        load1 = -1.0
+    out = subprocess.run(["pgrep", "-c", "-x", "ninja|cc1plus|c\\+\\+|cc1|clang|java|ld|ld.lld|mold"],
+                         capture_output=True, text=True).stdout.strip()
+    try:
+        builders = int(out)
+    except ValueError:
+        builders = -1
+    return load1, builders
+
+
 def emu_pids():
     out = subprocess.run(["pgrep", "-f", EMU_PATTERN], capture_output=True, text=True).stdout.split()
     # The harness's own ancestors (a `bash -c ... --binary .../bin/lichii` wrapper) match the
@@ -251,10 +267,19 @@ class Run:
             while others and time.time() < end:
                 time.sleep(5)
                 others = emu_pids()
+        load1, builders = host_load()
+        if self.a.wait_idle and (load1 > self.a.max_load or builders > 0):
+            self.say(f"host busy (load {load1:.1f}, {builders} build procs); waiting up to {self.a.wait_idle}s")
+            end = time.time() + self.a.wait_idle
+            while (load1 > self.a.max_load or builders > 0) and time.time() < end:
+                time.sleep(15)
+                load1, builders = host_load()
         why = None
         mem = mem_available_gib()
         if others:
             why = f"another emulator instance is running: {others}"
+        elif self.a.max_load >= 0 and (load1 > self.a.max_load or builders > 0):
+            why = f"host busy: load {load1:.1f} > {self.a.max_load} or {builders} build procs (use --max-load -1 to override)"
         elif mem < self.a.min_mem_gib:
             why = f"MemAvailable {mem:.1f} GiB < {self.a.min_mem_gib} GiB"
         elif not Path(self.a.binary).exists():
@@ -265,6 +290,7 @@ class Run:
             self.say("refusing to start: " + why)
             shutil.rmtree(self.dir, ignore_errors=True)
             sys.exit(3)
+        self.info["host_load_start"] = {"load1": load1, "build_procs": builders}
 
     def launch(self):
         a = self.a
@@ -664,6 +690,7 @@ def build_parser():
     ap.add_argument("--settle", type=float, default=4, help="seconds after the HUD appears before measuring")
     ap.add_argument("--shutdown-timeout", type=float, default=60)
     ap.add_argument("--wait-idle", type=float, default=0, help="wait up to N s for another instance to exit")
+    ap.add_argument("--max-load", type=float, default=10.0, help="refuse (or, with --wait-idle, wait) while the 1-minute load average exceeds this or any compiler/JVM runs; -1 disables")
     ap.add_argument("--min-mem-gib", type=float, default=40)
     ap.add_argument("--keep-cores", action="store_true", help="allow core dumps of the emulator")
     ap.add_argument("--keep-poll-shots", action="store_true")
