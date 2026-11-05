@@ -674,6 +674,15 @@ TEST_CASE("Ocarina F2IP rounding fields are rejected or follow F2I's rounding",
             }
         }
     }
+    // Ocarina uses only rounding fields 0 and 3 (F2I's nearest-even and truncate); 1 and 2 are
+    // unverified for F2IP, with either Ra.
+    for (const u32 a : {0x2c2d7243U, 0xff2d7243U}) {
+        for (const u32 rounding : {1U, 2U}) {
+            const Instruction changed{{a, 0x00000015, 0x000004ffU | (rounding << 14), 0x000fc400}};
+            CAPTURE(a, rounding);
+            CHECK_FALSE(LowerToMaxwell(std::array{changed, Exit}));
+        }
+    }
 }
 
 TEST_CASE("Ocarina uniform multiply adds an immediate rather than reading a register",
@@ -1259,6 +1268,16 @@ TEST_CASE("Ocarina uniform immediate add carries through any UP and preserves th
         const auto lowered_out = LowerToMaxwell(std::array{carry_out, Exit});
         const auto lowered_in = LowerToMaxwell(std::array{carry_in, Exit});
         CAPTURE(up);
+        // A UPn guard is swapped through R253, which the carry's own swap reuses, so a guarded
+        // carry (in or out) stays rejected by the guarded_add gate.
+        for (u32 guard : {0U, 4U, 8U | 4U}) {
+            auto guarded_out = carry_out, guarded_in = carry_in;
+            guarded_out.words[0] = (guarded_out.words[0] & ~0xf000U) | (guard << 12);
+            guarded_in.words[0] = (guarded_in.words[0] & ~0xf000U) | (guard << 12);
+            CAPTURE(guard);
+            CHECK_FALSE(LowerToMaxwell(std::array{guarded_out, Exit}));
+            CHECK_FALSE(LowerToMaxwell(std::array{guarded_in, Exit}));
+        }
         INFO(lowered_out.error);
         INFO(lowered_in.error);
         REQUIRE(lowered_out);
