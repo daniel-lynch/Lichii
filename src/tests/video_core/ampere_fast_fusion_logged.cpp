@@ -4,8 +4,11 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <limits>
+#include <span>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <catch2/catch_test_macros.hpp>
 
@@ -627,6 +630,61 @@ TEST_CASE("Ocarina F2IP packs two rounded unorm bytes", "[video_core][ampere][oo
     CHECK_FALSE(LowerToMaxwell(std::array{modified, Exit}));
 }
 
+TEST_CASE("Ocarina F2IP rounding fields are rejected or follow F2I's rounding",
+          "[video_core][ampere][oot][f2ip_rounding]") {
+    // F2IP.U8.F32 R41, R40, R39, RZ with bits 78-79 as F2I's field: 0 nearest-even, 1 floor,
+    // 2 ceil, 3 truncate (the lowering hands the field to Maxwell F2I unchanged).
+    for (u32 rounding = 0; rounding < 4; ++rounding) {
+        CAPTURE(rounding);
+        Instruction convert{{0x28297243, 0x27, 0x000004ffU | (rounding << 14), 0x000fc400}};
+        const auto lowered = LowerToMaxwell(std::array{convert, Exit});
+        if (!lowered) {
+            CHECK(lowered.error == "native packed float-to-byte mode");
+            continue;
+        }
+        HalfIR translation{lowered.instructions};
+        const auto byte = [rounding](f32 input) {
+            if (std::isnan(input))
+                return 0U;
+            const f32 clamped = std::clamp(input, 0.0f, 255.0f);
+            return u32(rounding == 0 ? std::nearbyintf(clamped)
+                       : rounding == 1 ? std::floor(clamped)
+                       : rounding == 2 ? std::ceil(clamped)
+                                       : std::trunc(clamped));
+        };
+        const std::array inputs{-std::numeric_limits<f32>::infinity(), -1.0f, -0.25f, 0.0f, 0.25f,
+                                0.5f, 0.75f, 1.5f, 127.5f, 128.5f, 254.25f, 254.75f, 255.0f, 300.0f,
+                                std::numeric_limits<f32>::infinity(),
+                                std::numeric_limits<f32>::quiet_NaN()};
+        for (const f32 a : inputs) {
+            for (const f32 b : inputs) {
+                CAPTURE(a, b);
+                translation.values.clear();
+                translation.registers.fill(0xdeadbeef);
+                translation.registers[40] = std::bit_cast<u32>(a);
+                translation.registers[39] = std::bit_cast<u32>(b);
+                for (const auto& inst : translation.block.Instructions()) {
+                    if (inst.GetOpcode() == IR::Opcode::SetRegister)
+                        translation.registers.at(static_cast<size_t>(inst.Arg(0).Reg())) =
+                            u32(translation.Value(inst.Arg(1)));
+                    else
+                        translation.values.emplace(&inst, translation.Evaluate(inst));
+                }
+                CHECK(translation.registers[41] == (byte(b) | (byte(a) << 8)));
+            }
+        }
+    }
+    // Ocarina uses only rounding fields 0 and 3 (F2I's nearest-even and truncate); 1 and 2 are
+    // unverified for F2IP, with either Ra.
+    for (const u32 a : {0x2c2d7243U, 0xff2d7243U}) {
+        for (const u32 rounding : {1U, 2U}) {
+            const Instruction changed{{a, 0x00000015, 0x000004ffU | (rounding << 14), 0x000fc400}};
+            CAPTURE(a, rounding);
+            CHECK_FALSE(LowerToMaxwell(std::array{changed, Exit}));
+        }
+    }
+}
+
 TEST_CASE("Ocarina uniform multiply adds an immediate rather than reading a register",
           "[video_core][ampere][oot]") {
     const Instruction multiply{{0x040474a4, 0x00003c00, 0x0f8e0206, 0x000fc600}};
@@ -1210,6 +1268,16 @@ TEST_CASE("Ocarina uniform immediate add carries through any UP and preserves th
         const auto lowered_out = LowerToMaxwell(std::array{carry_out, Exit});
         const auto lowered_in = LowerToMaxwell(std::array{carry_in, Exit});
         CAPTURE(up);
+        // A UPn guard is swapped through R253, which the carry's own swap reuses, so a guarded
+        // carry (in or out) stays rejected by the guarded_add gate.
+        for (u32 guard : {0U, 4U, 8U | 4U}) {
+            auto guarded_out = carry_out, guarded_in = carry_in;
+            guarded_out.words[0] = (guarded_out.words[0] & ~0xf000U) | (guard << 12);
+            guarded_in.words[0] = (guarded_in.words[0] & ~0xf000U) | (guard << 12);
+            CAPTURE(guard);
+            CHECK_FALSE(LowerToMaxwell(std::array{guarded_out, Exit}));
+            CHECK_FALSE(LowerToMaxwell(std::array{guarded_in, Exit}));
+        }
         INFO(lowered_out.error);
         INFO(lowered_in.error);
         REQUIRE(lowered_out);
@@ -1240,6 +1308,232 @@ TEST_CASE("Ocarina uniform immediate add carries through any UP and preserves th
             }
         }
     }
+}
+
+namespace {
+// Guest register of URn in the lowering (UR0-UR21 in R216-R237, UR22-UR27 in R240-R245).
+u32 UniformTarget(u32 reg) {
+    return reg == 63 ? 255U : reg < 22 ? 216 + reg : 218 + reg;
+}
+
+// UPn as the Ampere program sees it: R239 bit 6-n, UPT for 7, bit 3 of the field negates.
+bool UniformPredicateValue(u32 r239, u32 field) {
+    const u32 n = field & 7;
+    return (n == 7 ? true : ((r239 >> (6 - n)) & 1) != 0) != ((field & 8) != 0);
+}
+
+// The UIADD3 forms below (no negations): URd = URa + b + URc (+ the .X carry-ins); the first
+// output UP is set when the 64-bit sum reaches 2^32, the second when it reaches 2^33. A false
+// UP guard leaves URd and every UP alone.
+struct UniformAddReference {
+    u32 dest;
+    u32 r239;
+};
+
+UniformAddReference ExpectedUniformAdd(const Instruction& insn, const LoggedMachine& before) {
+    const u32 r239 = before.registers[0][239];
+    const u32 dest = UniformTarget(insn.Bits(16, 8));
+    if (!UniformPredicateValue(r239, insn.Bits(12, 4)))
+        return {before.Read(0, dest), r239};
+    const u32 a = before.Read(0, UniformTarget(insn.Bits(24, 8)));
+    const u32 b = (insn.Bits(0, 12) == 0x890) ? insn.words[1] : before.Read(0, UniformTarget(insn.Bits(32, 8)));
+    const u32 c = before.Read(0, UniformTarget(insn.Bits(64, 8)));
+    u64 sum = u64{a} + b + c;
+    if (insn.Bits(74, 1))
+        sum += u64{UniformPredicateValue(r239, insn.Bits(87, 4))} +
+               u64{UniformPredicateValue(r239, insn.Bits(77, 4))};
+    u32 packed = r239;
+    for (u32 i = 0; i < 2; ++i) {
+        const u32 output = insn.Bits(81 + i * 3, 3);
+        if (output == 7)
+            continue;
+        const u32 mask = 1U << (6 - output);
+        packed = (packed & ~mask) | (sum >= (u64{i + 1} << 32) ? mask : 0U);
+    }
+    return {static_cast<u32>(sum), packed};
+}
+
+Instruction WithUniformGuard(Instruction insn, u32 field) {
+    insn.words[0] = (insn.words[0] & ~0xf000U) | (field << 12);
+    return insn;
+}
+
+struct UniformCarryForm {
+    const char* name;
+    Instruction instruction;
+};
+
+// The UIADD3 carry encodings #144 opened up (any UP for the carry out and carry in), and the
+// captured register forms, each taken unguarded and then under every @UPn / @!UPn guard.
+std::array<UniformCarryForm, 7> UniformCarryForms() {
+    // UIADD3 UR12, UR12, 0x10 with the carry out in UP4, from Ocarina of Time (#144's own case).
+    constexpr Instruction immediate_out{{0x0c0c7890, 0x00000010, 0x0ff9e03f, 0x000fc400}};
+    auto immediate_in = immediate_out; // UIADD3.X UR12, UR12, 0x10, URZ, UP4, as #144's test builds it
+    immediate_in.words[2] = (immediate_in.words[2] & ~(0xfU << 23)) | (7U << 17) | (1U << 10) | (4U << 23);
+    auto immediate_up0 = immediate_out; // carry out in UP0
+    immediate_up0.words[2] = (immediate_up0.words[2] & ~(7U << 17));
+    return {{
+        {"UIADD3 UR12, UP4, UR12, 0x10", immediate_out},
+        {"UIADD3 UR12, UP0, UR12, 0x10", immediate_up0},
+        {"UIADD3.X UR12, UR12, 0x10, URZ, UP4", immediate_in},
+        {"captured UIADD3 UR9, UP2, UR9, UR6", CapturedCarry},
+        {"captured UIADD3 two carries", CapturedTwoCarries},
+        {"captured UIADD3.X", CapturedExtendedCarry},
+        {"captured UIADD3.X two carries", CapturedExtendedTwoCarries},
+    }};
+}
+
+struct UniformCarryOutcome {
+    bool lowered;
+    std::string_view error;
+    u32 mismatches;
+};
+
+// Lowers the form and, if it lowers, runs it on the LoggedMachine from distinctive registers
+// (every register, R239 and the scratch R250-R254 included) under both guest predicate patterns
+// and both R239 patterns, comparing every guest register, R239 and P0-P6 to the Ampere result.
+UniformCarryOutcome CheckUniformCarry(const Instruction& insn) {
+    const auto lowered = LowerToMaxwell(std::array{insn, Exit});
+    if (!lowered)
+        return {false, lowered.error, 0};
+    const u32 dest = UniformTarget(insn.Bits(16, 8));
+    const u32 a_reg = UniformTarget(insn.Bits(24, 8));
+    const u32 b_reg = insn.Bits(0, 12) == 0x890 ? 255U : UniformTarget(insn.Bits(32, 8));
+    constexpr std::array values{0U, 1U, 0x7fffffffU, 0xfffffff0U, 0xffffffffU};
+    u32 mismatches = 0;
+    for (const bool flip : {false, true}) {
+        for (u32 a : values) {
+            for (u32 b : values) {
+                if (b_reg == 255 && b != values[0])
+                    continue;
+                for (u32 packed : {0x12340015U, 0x1234006aU}) {
+                    LoggedMachine machine;
+                    if (flip)
+                        for (u32 i = 0; i < 7; ++i)
+                            machine.predicates[i] = !machine.predicates[i];
+                    machine.registers[0][a_reg] = a;
+                    if (b_reg != 255)
+                        machine.registers[0][b_reg] = b;
+                    machine.registers[0][239] = packed;
+                    const LoggedMachine before = machine;
+                    const auto expected = ExpectedUniformAdd(insn, before);
+                    machine.Run(lowered.instructions);
+                    CAPTURE(a, b, packed, flip);
+                    for (u32 reg = 0; reg < 246; ++reg) {
+                        const u32 want = reg == dest ? expected.dest
+                                       : reg == 239  ? expected.r239
+                                                     : before.registers[0][reg];
+                        CAPTURE(reg, want, machine.registers[0][reg]);
+                        if (machine.registers[0][reg] != want) {
+                            ++mismatches;
+                            CHECK(machine.registers[0][reg] == want);
+                        }
+                    }
+                    for (u32 p = 0; p < 7; ++p) {
+                        CAPTURE(p, before.predicates[p], machine.predicates[p]);
+                        if (machine.predicates[p] != before.predicates[p]) {
+                            ++mismatches;
+                            CHECK(machine.predicates[p] == before.predicates[p]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return {true, {}, mismatches};
+}
+} // namespace
+
+TEST_CASE("Guarded uniform IADD3 carries are either rejected or executed exactly",
+          "[video_core][ampere][fast_fusion_logged][iadd3_carry_guard]") {
+    for (const auto& form : UniformCarryForms()) {
+        CAPTURE(form.name);
+        // Unguarded: #144 lowers these; they must match the Ampere result.
+        const auto unguarded = CheckUniformCarry(form.instruction);
+        INFO(unguarded.error);
+        CHECK(unguarded.lowered);
+        CHECK(unguarded.mismatches == 0);
+        // Guarded: the guard swap saves the guest P(6-g) in R253, and the carry's own P(6-n)
+        // save also lands in R253. Accepting the form is only safe if the lowered sequence keeps
+        // the guest predicates, R239 and URd exactly as the guarded Ampere instruction would.
+        for (u32 field = 0; field < 16; ++field) {
+            if (field == 7)
+                continue;
+            CAPTURE(field);
+            const auto guarded = CheckUniformCarry(WithUniformGuard(form.instruction, field));
+            if (!guarded.lowered) {
+                CHECK(guarded.error == "native uniform arithmetic predication");
+                continue;
+            }
+            CHECK(guarded.mismatches == 0);
+        }
+    }
+    // Control: the guarded UIADD3 without a carry is lowered (the guard is swapped in through
+    // R253) and runs exactly for a true and a false guard.
+    auto no_carry = UniformCarryForms()[0].instruction;
+    no_carry.words[2] |= 7U << 17;
+    for (u32 field = 0; field < 16; ++field) {
+        if (field == 7 || field == 15) // @!UPT has no R239 slot.
+            continue;
+        CAPTURE(field);
+        const auto guarded = CheckUniformCarry(WithUniformGuard(no_carry, field));
+        INFO(guarded.error);
+        CHECK(guarded.lowered);
+        CHECK(guarded.mismatches == 0);
+    }
+}
+
+// Prints the per-step register trace of one guarded form (run with "[.iadd3_carry_trace]").
+TEST_CASE("Guarded uniform IADD3 carry trace", "[.iadd3_carry_trace]") {
+    std::printf("%-40s %-6s %-9s %s\n", "form", "guard", "result", "detail");
+    u32 rejected = 0, executed = 0, wrong = 0;
+    for (const auto& form : UniformCarryForms()) {
+        for (u32 field = 0; field < 16; ++field) {
+            if (field == 7)
+                continue;
+            const Instruction insn = WithUniformGuard(form.instruction, field);
+            const auto lowered = LowerToMaxwell(std::array{insn, Exit});
+            if (!lowered) {
+                ++rejected;
+                std::printf("%-40s %s%-5u rejected  %.*s\n", form.name, field & 8 ? "!UP" : "UP",
+                            field & 7, int(lowered.error.size()), lowered.error.data());
+                continue;
+            }
+            ++executed;
+            LoggedMachine machine;
+            machine.registers[0][239] = 0x12340015U;
+            const LoggedMachine before = machine;
+            const auto expected = ExpectedUniformAdd(insn, before);
+            const u32 dest = UniformTarget(insn.Bits(16, 8));
+            std::printf("%-40s %s%-5u lowered   %zu words: [%08x %08x %08x %08x]\n", form.name,
+                        field & 8 ? "!UP" : "UP", field & 7, lowered.instructions.size(), insn.words[0],
+                        insn.words[1], insn.words[2], insn.words[3]);
+            const auto dump = [&](const char* label) {
+                std::printf("    %-22s R%u=%08x R239=%08x R250=%08x R251=%08x R252=%08x R253=%08x "
+                            "R254=%08x P0-6=",
+                            label, dest, machine.registers[0][dest], machine.registers[0][239],
+                            machine.registers[0][250], machine.registers[0][251], machine.registers[0][252],
+                            machine.registers[0][253], machine.registers[0][254]);
+                for (u32 p = 0; p < 7; ++p)
+                    std::printf("%u", u32{machine.predicates[p]});
+                std::printf("\n");
+            };
+            dump("initial");
+            for (size_t i = 0; i < lowered.instructions.size(); ++i) {
+                machine.Run(std::span(lowered.instructions).subspan(i, 1));
+                char label[32];
+                std::snprintf(label, sizeof(label), "%016llx", static_cast<unsigned long long>(lowered.instructions[i]));
+                dump(label);
+            }
+            bool ok = machine.registers[0][dest] == expected.dest && machine.registers[0][239] == expected.r239;
+            for (u32 p = 0; p < 7; ++p)
+                ok = ok && machine.predicates[p] == before.predicates[p];
+            wrong += ok ? 0 : 1;
+            std::printf("    expected R%u=%08x R239=%08x P0-6 unchanged -> %s\n", dest, expected.dest,
+                        expected.r239, ok ? "MATCH" : "MISMATCH");
+        }
+    }
+    std::printf("guarded carry forms: %u rejected, %u lowered, %u lowered wrong\n", rejected, executed, wrong);
 }
 
 TEST_CASE(
