@@ -122,7 +122,15 @@ def emu_pids():
                 pid = int(f.read().rsplit(")", 1)[1].split()[1])
         except (OSError, ValueError, IndexError):
             break
-    return [int(p) for p in out if int(p) not in mine]
+    # Only processes whose executable is an emulator: other harnesses waiting in --wait-idle carry
+    # "--binary .../bin/lichii" in their command line too, and counting them made every waiting
+    # harness wait for the others until the timeout.
+    def is_emulator(pid):
+        try:
+            return re.search(EMU_PATTERN, os.readlink(f"/proc/{pid}/exe")) is not None
+        except OSError:
+            return False
+    return [int(p) for p in out if int(p) not in mine and is_emulator(int(p))]
 
 
 def descendants(pid):
