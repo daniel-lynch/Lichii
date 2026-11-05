@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <tuple>
@@ -26,6 +27,24 @@
 namespace Core::Timing {
 
 constexpr s64 MAX_SLICE_LENGTH = 10000;
+
+namespace {
+// Off switches for the two HostTiming changes ported from Orchid (6e14af2079, e0a549c6db), read
+// once. EDEN_NX2_TIMING_WAKE_ALL=1 wakes the thread for every scheduled event again;
+// EDEN_NX2_TIMER_SLACK=0 keeps the kernel's default timer slack.
+bool EnvFlag(const char* name, bool fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    return *value != '0';
+}
+
+bool WakeOnlyForEarliest() {
+    static const bool enabled = !EnvFlag("EDEN_NX2_TIMING_WAKE_ALL", false);
+    return enabled;
+}
+} // Anonymous namespace
 
 constexpr u32 CPU_CLOCK_BASE_MHZ = 1020;
 constexpr u32 CPU_CLOCK_BOOST_MHZ = 1734;
@@ -81,7 +100,9 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
 #ifdef __linux__
             // This thread sleeps until the next event (vsync, guest timeouts, pollers) with timed
             // waits, which Linux lets run late by the thread's timer slack, 50 us by default.
-            prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);
+            if (EnvFlag("EDEN_NX2_TIMER_SLACK", true)) {
+                prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);
+            }
 #endif
             Common::SetCurrentThreadToPerformanceCores();
             on_thread_init();
@@ -171,7 +192,7 @@ void CoreTiming::ScheduleEvent(std::chrono::nanoseconds ns_into_future,
 
     // The timing thread sleeps until the earliest event: wake it only when that changed (each
     // wake is a futex call; kernel timeouts schedule an event for every timed wait).
-    if (earliest) {
+    if (earliest || !WakeOnlyForEarliest()) {
         event.Set();
     }
 }
@@ -192,7 +213,7 @@ void CoreTiming::ScheduleLoopingEvent(std::chrono::nanoseconds start_time,
         earliest = event_queue.top().fifo_order == fifo_order;
     }
 
-    if (earliest) {
+    if (earliest || !WakeOnlyForEarliest()) {
         event.Set();
     }
 }
