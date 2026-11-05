@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <tuple>
@@ -14,6 +15,12 @@
 #ifdef _WIN32
 #include "common/windows/timer_resolution.h"
 #endif
+
+#if defined(__linux__) || defined(__ANDROID__)
+#include <sys/prctl.h>
+#endif
+
+#include "common/logging.h"
 
 #include "common/settings.h"
 #include "core/core_timing.h"
@@ -37,6 +44,40 @@ constexpr u32 CpuClockTargetMhz(Settings::CpuClock clock) {
         return CPU_CLOCK_BASE_MHZ;
     }
 }
+
+namespace {
+
+/// Every guest timeout (svcSleepThread, timed WaitSynchronization/WaitForAddress, the kernel's
+/// hardware timer) fires from the HostTiming thread's timed wait, so that wait's overshoot is added
+/// to each one. Linux lets an ordinary thread's timers fire up to its timer slack late, 50 us by
+/// default: measured on the dev box, a 1 ms or 100 us guest sleep resumed 55-60 us late with the
+/// default slack and 5-10 us late with 1 us of slack. EDEN_NX2_TIMER_SLACK_US=<n> sets the slack
+/// in microseconds; 0 leaves the kernel default. Unset: 1 us, except on Android (battery).
+void SetTimerThreadSlack() {
+#if defined(__linux__) || defined(__ANDROID__)
+    long long slack_us = -1;
+    if (const char* text = std::getenv("EDEN_NX2_TIMER_SLACK_US")) {
+        slack_us = std::strtoll(text, nullptr, 10);
+    }
+    if (slack_us < 0) {
+#ifdef __ANDROID__
+        slack_us = 0;
+#else
+        slack_us = 1;
+#endif
+    }
+    if (slack_us == 0) {
+        return;
+    }
+    if (prctl(PR_SET_TIMERSLACK, static_cast<unsigned long>(slack_us) * 1000UL, 0, 0, 0) != 0) {
+        LOG_WARNING(Core_Timing, "Could not set the timer thread's timer slack to {} us", slack_us);
+        return;
+    }
+    LOG_INFO(Core_Timing, "Timer thread timer slack: {} us", slack_us);
+#endif
+}
+
+} // Anonymous namespace
 
 std::shared_ptr<EventType> CreateEvent(std::string name, TimedCallback&& callback) {
     return std::make_shared<EventType>(std::move(callback), std::move(name));
@@ -75,6 +116,7 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
             Common::SetCurrentThreadName("HostTiming");
             Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
             Common::SetCurrentThreadToPerformanceCores();
+            SetTimerThreadSlack();
             on_thread_init();
             has_started = true;
 
