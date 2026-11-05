@@ -122,6 +122,8 @@ add_library(video_core STATIC
     nx2_debug_control.h
     nx2_flash_trigger.cpp
     nx2_flash_trigger.h
+    nx2_flicker_meter.cpp
+    nx2_flicker_meter.h
     nx2_profile.h
     pending_maps.h
     present.h

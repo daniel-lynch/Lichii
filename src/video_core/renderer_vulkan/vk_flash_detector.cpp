@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <algorithm>
 #include <chrono>
+#include <span>
+#include <tuple>
 #include <stdexcept>
 #include "video_core/nx2_flash_trigger.h"
 #include "video_core/renderer_vulkan/present/util.h"
@@ -60,18 +62,28 @@ FlashDetector::~FlashDetector() {
 
 void FlashDetector::Present(VkImage source, VkFormat format, u32 width, u32 height) {
     using namespace VideoCore::Nx2Debug;
+    static_assert(Width == ProbeWidth && Height == ProbeHeight);
     ++frame;
     const auto begin = std::chrono::steady_clock::now();
     const auto config = GetFlashConfig();
-    if (!config) {
+    const auto monitor = MonitorGeneration();
+    if (!config && !monitor) {
         return;
     }
     scheduler.GetMasterSemaphore().Refresh();
+    // Completed probes in present order: the flicker monitor compares neighbouring frames.
+    std::array<u32, std::tuple_size_v<decltype(samples)>> ready{};
+    size_t ready_count = 0;
     for (u32 i = 0; i < samples.size(); ++i) {
-        auto& sample = samples[i];
-        if (!sample.pending || !scheduler.IsFree(sample.tick)) {
-            continue;
+        if (samples[i].pending && scheduler.IsFree(samples[i].tick)) {
+            ready[ready_count++] = i;
         }
+    }
+    std::sort(ready.begin(), ready.begin() + ready_count,
+              [this](u32 a, u32 b) { return samples[a].frame < samples[b].frame; });
+    for (size_t r = 0; r < ready_count; ++r) {
+        const u32 i = ready[r];
+        auto& sample = samples[i];
         std::optional<double> gpu_ms;
         if (queries) {
             std::array<u64, 2> stamps{};
@@ -85,16 +97,23 @@ void FlashDetector::Present(VkImage source, VkFormat format, u32 width, u32 heig
         }
         sample.buffer.Invalidate();
         const auto data = sample.buffer.Mapped();
-        ObserveFlash(sample.generation, sample.frame, frame,
-                     WhiteFraction({reinterpret_cast<const u8*>(data.data()), Width * Height * 4},
-                                   sample.min_luma));
-        NoteFlashCost(sample.generation, -1, gpu_ms, false);
+        const std::span<const u8> rgba{reinterpret_cast<const u8*>(data.data()), Width * Height * 4};
+        if (sample.generation) {
+            ObserveFlash(sample.generation, sample.frame, frame, WhiteFraction(rgba, sample.min_luma));
+            NoteFlashCost(sample.generation, -1, gpu_ms, false);
+        }
+        if (sample.monitor) {
+            ObserveMonitor(sample.monitor, sample.frame, frame, rgba);
+            NoteMonitorCost(sample.monitor, -1, gpu_ms, false);
+        }
         sample.pending = false;
     }
     if (checked_format != format) {
         if (!(device.GetPhysical().GetFormatProperties(format).optimalTilingFeatures &
               VK_FORMAT_FEATURE_BLIT_SRC_BIT)) {
-            FailFlash(config->generation, "present format does not support blit sampling");
+            if (config) {
+                FailFlash(config->generation, "present format does not support blit sampling");
+            }
             return;
         }
         checked_format = format;
@@ -103,9 +122,10 @@ void FlashDetector::Present(VkImage source, VkFormat format, u32 width, u32 heig
     const bool dropped = slot == samples.end();
     if (!dropped) {
         const u32 query = static_cast<u32>(slot - samples.begin()) * 2;
-        slot->generation = config->generation;
+        slot->generation = config ? config->generation : 0;
+        slot->monitor = monitor.value_or(0);
         slot->frame = frame;
-        slot->min_luma = config->min_luma;
+        slot->min_luma = config ? config->min_luma : 1.0;
         slot->tick = scheduler.CurrentTick();
         slot->pending = true;
         const VkImage image = *slot->image;
@@ -151,11 +171,16 @@ void FlashDetector::Present(VkImage source, VkFormat format, u32 width, u32 heig
             }
         });
     }
-    if (dropped) {
-        DropFlashSample(config->generation, frame);
+    const double cpu_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+    if (config) {
+        if (dropped) {
+            DropFlashSample(config->generation, frame);
+        }
+        NoteFlashCost(config->generation, cpu_ms, std::nullopt, dropped);
     }
-    NoteFlashCost(config->generation,
-                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(),
-                  std::nullopt, dropped);
+    if (monitor) {
+        NoteMonitorCost(*monitor, cpu_ms, std::nullopt, dropped);
+    }
 }
 } // namespace Vulkan

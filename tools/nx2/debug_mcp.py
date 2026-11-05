@@ -50,6 +50,31 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "flash_monitor",
+        "description": "Starts (enable true) or stops continuous flash/flicker statistics on the "
+                       "64x36 present probe: a flash is a one-frame centre brightening of at least "
+                       "flash_jump luma (0-255) over both neighbours; flicker is a non-flash frame "
+                       "whose 8x6-sample tiles spike by tile_jump. capture_first dumps one frame "
+                       "after the first flash. Read the counters with flash_stats.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "enable": {"type": "boolean", "default": True},
+                "flash_jump": {"type": "number", "exclusiveMinimum": 0, "maximum": 255, "default": 6},
+                "tile_jump": {"type": "number", "exclusiveMinimum": 0, "maximum": 255, "default": 12},
+                "capture_first": {"type": "boolean", "default": True},
+                "sampled": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "flash_stats",
+        "description": "Flash monitor counters: window (since the last reset) and total: frames, "
+                       "flashes, flicker_frames, max_jump, last_flash_frame, plus probe cost. "
+                       "reset true starts a new window.",
+        "inputSchema": {"type": "object", "properties": {"reset": {"type": "boolean", "default": False}}},
+    },
+    {
         "name": "status",
         "description": "Game title, program id, build, renderer, paused state, presented frame "
                        "count and fps (measured over fps_window_ms), dump directory, live log "

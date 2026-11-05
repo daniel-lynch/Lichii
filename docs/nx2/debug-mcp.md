@@ -155,6 +155,48 @@ $PY -I C:/lx/src/tools/nx2/debug_mcp.py --call '{"method":"status","params":{"fp
 $PY -I C:/lx/src/tools/nx2/debug_mcp.py --call '{"method":"disarm"}'
 ```
 
+### Continuous flash and flicker statistics
+
+`flash_monitor` reuses the same 64x36 probe to measure every present instead of waiting for one
+white frame, so a run can count single-frame flashes and texture flicker that screenshots miss:
+
+```json
+{"enable":true,"flash_jump":6,"tile_jump":12,"capture_first":true,"sampled":false}
+```
+
+`src/video_core/nx2_flicker_meter.cpp` turns each readback into the Rec.709 mean luma (0..255) of
+the central half (32x18 samples) and the mean and standard deviation of 48 tiles (8x6 samples
+each). With three consecutive distinct presents a, b, c, frame b is:
+
+- a **flash** when `min(centre(b) - centre(a), centre(b) - centre(c)) >= flash_jump` (default 6,
+  the "+6 luminance over both neighbours" criterion from PR #121): a one-frame brightening.
+- a **flicker** frame when it is not a flash and at least one tile's mean or deviation is above
+  both neighbours, or below both, by `tile_jump` (default 12): a one-frame spike or dip in part
+  of the image, which is what camera-dependent texture flicker looks like. A camera turn moves
+  tile values monotonically and is not counted.
+
+An exact repeat of the previous probe (the same guest frame presented twice) is skipped, so a
+flash shown for two presents still has distinct neighbours. A dropped probe (all eight readback
+slots busy) restarts the three-frame window and counts as a gap. Frame numbers are
+detector-local present ordinals. Probes complete out of slot order, so each present reads the
+completed slots sorted by frame.
+
+`flash_stats {"reset":false}` returns `window` (since the last reset) and `total` (since
+`flash_monitor` started) counters: `frames`, `judged`, `duplicates`, `gaps`, `flashes`,
+`flicker_frames`, `flicker_tiles`, `max_jump`, `max_tile_jump`, `last_flash_frame`,
+`last_flicker_frame`, `centre_luma_mean`; plus `dropped_samples`, `first_flash_capture` and the
+probe cost (`cpu_mean_ms`, `cpu_max_ms`, `gpu_mean_ms`, `gpu_max_ms`, as for `capture_on_flash`).
+`reset:true` returns the window and starts a new one; the OoT harness
+(`tools/oot/harness/run.py`) does that at the start and end of every measurement window.
+With `capture_first` the first flash requests one frame dump of the next present after the
+verdict (at least one frame plus the readback latency after the flash) into
+`<dump dir>/flash-monitor-<session>/first-flash/`. `flash_monitor {"enable":false}` stops it.
+
+Cost: one 64x36 nearest blit and a 9 KiB copy per present (GPU), and on the CPU a 2304-sample
+pass per completed probe; the measured numbers are in `flash_stats`. Off unless started:
+`FlashEnabled()` is one relaxed atomic load per present, the same flag as `capture_on_flash`.
+The monitor and the white-fraction trigger can run at the same time and share the probes.
+
 ### Server boundaries
 
 - **Loopback only.** `ParseEndpoint` accepts `127.0.0.1`, `::1` and `localhost` and refuses

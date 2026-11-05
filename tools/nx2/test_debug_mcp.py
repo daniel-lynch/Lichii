@@ -102,7 +102,7 @@ class AdapterTest(unittest.TestCase):
         self.assertIsNone(self.adapter.handle({"method": "notifications/initialized"}))
         names = [tool["name"] for tool in self.adapter.handle({"id": 2, "method": "tools/list"})
                  ["result"]["tools"]]
-        self.assertEqual(names, ["capture_on_flash", "disarm", "status", "screenshot", "log_tail", "log_filter", "capture_frame",
+        self.assertEqual(names, ["capture_on_flash", "disarm", "flash_monitor", "flash_stats", "status", "screenshot", "log_tail", "log_filter", "capture_frame",
                                  "capture_image", "reject_shaders"])
         self.assertEqual(self.adapter.handle({"id": 3, "method": "bogus"})["error"]["code"], -32601)
 

@@ -21,7 +21,8 @@ private:
         vk::Image image;
         vk::Buffer buffer;
         u64 tick{};
-        u64 generation{};
+        u64 generation{}; ///< white-fraction trigger generation, 0 when it was not armed
+        u64 monitor{};    ///< flicker monitor generation, 0 when it was off
         u64 frame{};
         double min_luma{};
         bool pending{};
