@@ -741,13 +741,14 @@ void PipelineCache::OpenTranslationCache(const std::filesystem::path& filename) 
     translation_cache_verify = verify != nullptr && verify[0] == '1';
     // Device values the translation and MakeRuntimeInfo read besides the profile and host info.
     const std::string device_id =
-        fmt::format("{}|{}|{}|{}|{}|{}|{}|dyncbuf{}|indirect{}", CACHE_VERSION,
+        fmt::format("{}|{}|{}|{}|{}|{}|{}|dyncbuf{}|indirect{}|ssbobounds{}", CACHE_VERSION,
                     device.GetModelName(),
                     static_cast<u32>(device.GetDriverID()), device.GetDriverVersion(),
                     device.GetMaxComputeSharedMemorySize(), device.IsGeometryShaderSupported(),
                     device.IsExtMeshShaderSupported(),
                     Shader::Optimization::NativeDynamicCbufPointers() ? 1 : 0,
-                    IndirectPointersMode());
+                    IndirectPointersMode(),
+                    Shader::Optimization::NativeStorageBoundsCheck() ? 1 : 0);
     translation_config = TC::MakeConfigDigest(
         profile, host_info, Common::CityHash64(device_id.data(), device_id.size()));
     translation_cache.Open(filename, translation_config);
