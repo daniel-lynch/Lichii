@@ -119,6 +119,37 @@ template <class Runtime, class DeviceMemory>
         slot.tick = runtime.CurrentTick();
         return true;
     }
+    // A buffer whose device pages are one host run (always so within one 4 KiB page) is compared
+    // with the slot's bytes straight in guest memory, without the scratch copy. Changed bytes are
+    // copied once into the slot and the stream copy is made from the slot, so the two never
+    // differ (as the scratch snapshot guaranteed). Test memories have no GetSpan.
+    // Lichii: after #1586's direct-bind streak above, and keeping its miss count as the scratch
+    // path below does; the profile counters of the original commit are left out.
+    if constexpr (requires { device_memory.GetSpan(device_addr, size); }) {
+        const u8* const guest = device_memory.GetSpan(device_addr, size);
+        if (guest != nullptr) {
+            const bool same = slot.size == size && std::memcmp(slot.bytes.data(), guest, size) == 0;
+            if (same) {
+                slot.misses = 0;
+                if (slot.tick == runtime.CurrentTick()) {
+                    runtime.RebindStreamUniform(slot.ref, size);
+                    return true;
+                }
+            } else {
+                std::memcpy(slot.bytes.data(), guest, size);
+                slot.size = size;
+                if (++slot.misses >= Reuse::MissStreak) {
+                    slot.misses = 0;
+                    slot.direct = Reuse::DirectBinds;
+                }
+            }
+            const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+            std::memcpy(span.data(), slot.bytes.data(), size);
+            slot.ref = runtime.LastStreamUniformRef();
+            slot.tick = runtime.CurrentTick();
+            return true;
+        }
+    }
     u8* const scratch = reuse.scratch.data();
     device_memory.ReadBlockUnsafe(device_addr, scratch, size);
 
