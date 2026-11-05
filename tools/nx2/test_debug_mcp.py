@@ -97,7 +97,8 @@ class AdapterTest(unittest.TestCase):
         names = [tool["name"] for tool in self.adapter.handle({"id": 2, "method": "tools/list"})
                  ["result"]["tools"]]
         self.assertEqual(names, ["status", "screenshot", "log_tail", "log_filter", "capture_frame",
-                                 "capture_image", "reject_shaders"])
+                                 "capture_image", "reject_shaders", "coverage_start",
+                             "coverage_reset", "coverage_stop", "coverage_snapshot"])
         self.assertEqual(self.adapter.handle({"id": 3, "method": "bogus"})["error"]["code"], -32601)
 
     def test_status_is_forwarded(self):

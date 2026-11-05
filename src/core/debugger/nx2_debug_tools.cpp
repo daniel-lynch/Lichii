@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <charconv>
 #include <chrono>
 #include <cstdlib>
@@ -16,6 +17,7 @@
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/stb.h"
+#include "core/arm/exec_coverage.h"
 #include "core/core.h"
 #include "core/debugger/nx2_debug_server.h"
 #include "core/debugger/nx2_debug_tools.h"
@@ -323,6 +325,89 @@ json RejectShaders(ToolState&, const json& params) {
     return result;
 }
 
+std::shared_ptr<ExecCoverage::Map> CoverageMap() {
+    if (!ExecCoverage::Enabled()) {
+        throw std::runtime_error{"execution coverage is off: start Lichii with EDEN_NX2_COVERAGE=1"};
+    }
+    auto map = ExecCoverage::Current();
+    if (!map) {
+        throw std::runtime_error{"no application main module has been loaded yet"};
+    }
+    return map;
+}
+
+json CoverageState(const ExecCoverage::Map& map) {
+    return {
+        {"module", "main"},
+        {"base", fmt::format("{:#x}", map.Base())},
+        {"size", map.Size()},
+        {"granule", ExecCoverage::Map::Granule},
+        {"stopped", map.Frozen()},
+        {"compiled_blocks", map.CompiledBlocks()},
+    };
+}
+
+/// Clears the map and resumes recording (recording runs from boot; this starts a window).
+json CoverageStart(ToolState&, const json&) {
+    const auto map = CoverageMap();
+    map->Clear();
+    return CoverageState(*map);
+}
+
+json CoverageReset(ToolState& state, const json& params) {
+    return CoverageStart(state, params);
+}
+
+/// Freezes the map: later snapshots return it as of now, and the JIT stops writing.
+json CoverageStop(ToolState&, const json&) {
+    const auto map = CoverageMap();
+    map->Freeze();
+    return CoverageState(*map);
+}
+
+/// encoding "ranges" (default): flat [offset, length, ...] in bytes from the module base, merged,
+/// each hit block widened to its compiled extent unless "extents" is false. encoding "bitmap":
+/// the raw bits as base64 (bit i of byte b = offset (b * 8 + i) * granule).
+json CoverageSnapshot(ToolState&, const json& params) {
+    const auto map = CoverageMap();
+    const std::string encoding = params.value("encoding", std::string{"ranges"});
+    json result = CoverageState(*map);
+    result["encoding"] = encoding;
+    if (encoding == "bitmap") {
+        const std::vector<u8> bits = map->Bits();
+        size_t hit = 0;
+        for (const u8 byte : bits) {
+            hit += static_cast<size_t>(std::popcount(byte));
+        }
+        result["hit_blocks"] = hit;
+        result["bitmap_base64"] = Base64(bits);
+        return result;
+    }
+    if (encoding != "ranges") {
+        throw std::runtime_error{fmt::format("unknown encoding \"{}\": want ranges or bitmap", encoding)};
+    }
+    const bool extents = params.value("extents", true);
+    const auto starts = map->Ranges(false);
+    size_t hit = 0;
+    for (const auto& range : starts) {
+        hit += range.length / ExecCoverage::Map::Granule;
+    }
+    const auto ranges = extents ? map->Ranges(true) : starts;
+    json flat = json::array();
+    u64 bytes = 0;
+    for (const auto& range : ranges) {
+        flat.push_back(range.offset);
+        flat.push_back(range.length);
+        bytes += range.length;
+    }
+    result["hit_blocks"] = hit;
+    result["extents"] = extents;
+    result["range_count"] = ranges.size();
+    result["covered_bytes"] = bytes;
+    result["ranges"] = std::move(flat);
+    return result;
+}
+
 Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
     const auto handler = [&state](json (*tool)(ToolState&, const json&)) -> Handler {
         return [state, tool](const json& params) { return tool(*state, params); };
@@ -334,6 +419,10 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"log_filter", handler(LogFilter)},
         {"capture_frame", handler(CaptureFrame)},
         {"reject_shaders", handler(RejectShaders)},
+        {"coverage_start", handler(CoverageStart)},
+        {"coverage_snapshot", handler(CoverageSnapshot)},
+        {"coverage_reset", handler(CoverageReset)},
+        {"coverage_stop", handler(CoverageStop)},
     };
 }
 

@@ -4,7 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
+#include <mutex>
+#include <vector>
 #include <cstdlib>
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
@@ -17,6 +20,7 @@
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
 #include "dynarmic/interface/A64/config.h"
+#include "core/arm/exec_coverage.h"
 
 namespace Core {
 
@@ -298,8 +302,46 @@ void DynarmicCallbacks64::ReturnException(u64 pc, Dynarmic::HaltReason hr) {
     m_parent.m_jit->HaltExecution(hr);
 }
 
+namespace {
+
+/// Hands the JIT the coverage map of the application's main (Core::ExecCoverage), and keeps every
+/// map it handed bytes from alive for as long as this JIT's code can run.
+class CoverageHook final : public Dynarmic::A64::BlockCoverage {
+public:
+    std::uint8_t* OnBlockCompiled(std::uint64_t start_pc, std::uint64_t end_pc,
+                                  std::uint8_t& mask) override {
+        auto map = ExecCoverage::Current();
+        if (!map) {
+            return nullptr;
+        }
+        std::uint8_t* const byte = map->OnBlockCompiled(start_pc, end_pc, mask);
+        if (byte != nullptr && map != held) {
+            std::scoped_lock lock{mutex};
+            if (std::find(kept.begin(), kept.end(), map) == kept.end()) {
+                kept.push_back(map);
+            }
+            held = std::move(map);
+        }
+        return byte;
+    }
+
+private:
+    std::mutex mutex;
+    std::shared_ptr<ExecCoverage::Map> held;
+    std::vector<std::shared_ptr<ExecCoverage::Map>> kept;
+};
+
+} // Anonymous namespace
+
 void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_space_bits) {
     Dynarmic::A64::UserConfig config;
+
+    if (ExecCoverage::Enabled() && m_cb->m_process != nullptr && m_cb->m_process->IsApplication()) {
+        if (!m_coverage) {
+            m_coverage = std::make_unique<CoverageHook>();
+        }
+        config.block_coverage = m_coverage.get();
+    }
 
     // Callbacks
     config.callbacks = std::addressof(*m_cb);

@@ -132,6 +132,7 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
 | `log_tail`, `log_filter` | Relaunch with a new filter, owner sends the log | Read new lines since the last call, change the filter live | 1 |
 | `capture_frame` | Relaunch with `EDEN_NX2_FRAME_DUMP`, owner touches `capture.now`, agent copies the dump | Capture the next frame now, sampled inputs optional, get the manifest summary back; `capture_image` returns any pass PNG | 1 |
 | `reject_shaders` | Rebuild the env, relaunch, replay to the spot, once per bisection step | Reject or restore hashes live; bisection becomes a loop of reject, screenshot | 1 |
+| `coverage_start`, `coverage_snapshot`, `coverage_reset`, `coverage_stop` | Not possible | With `EDEN_NX2_COVERAGE=1`, which code of the game's `main` ran since the last reset; `tools/nx2/coverage_diff.py` diffs two snapshots into Ghidra addresses (docs/nx2/exec-coverage.md) | 1 |
 | `pause`, `resume`, `step_frames` | Not possible | Freeze on the broken frame, capture it, step one present | 2 |
 | `input` (buttons, sticks, timed sequences) | Owner plays to the spot | Agent walks to the spot itself and replays a repro | 2 |
 | `shaders` (inventory) | Shader dump and offline sweep | List loaded programs: key, hash, stage, address, lowered or rejected with the error | 2 |
