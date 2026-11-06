@@ -1722,12 +1722,11 @@ bool Maxwell3D::FrontDmaReadQueued(VideoCommon::GpuSplit& split, FrontState& fs,
         }
         memory_manager.ReadBlockUnsafe(source, fast.data(), read_bytes);
     }
-    // EDEN_NX2_DMA_READ_CHECK=1: also drain, read again and log reads that differ.
-    static const bool check = std::getenv("EDEN_NX2_DMA_READ_CHECK") != nullptr;
-    if (check) [[unlikely]] {
-        static u64 checks{};
-        static u64 differences{};
-        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+    // The words the drained path returns: everything queued has run, the buffer cache is flushed
+    // and (unless EDEN_NX2_QUERY_DMA_FLUSH=0) the reports pending in the range have landed, as
+    // #215 waits for them. Returns whether the range held reports pending host results.
+    const auto drained_read = [&](std::vector<u32>& exact) {
+        split.Drain(VideoCommon::DrainSite::MacroDmaCheck);
         if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
             split.Run(
                 [memory = &memory_manager, source, read_bytes] {
@@ -1735,8 +1734,58 @@ bool Maxwell3D::FrontDmaReadQueued(VideoCommon::GpuSplit& split, FrontState& fs,
                 },
                 VideoCommon::DrainSite::MacroDmaFlush);
         }
-        std::vector<u32> exact(words);
+        bool pending{};
+        split.Run(
+            [this, source, read_bytes, &pending] {
+                pending = VideoCommon::QueryDma::HasPendingQueries(memory_manager, *rasterizer,
+                                                                   source, read_bytes);
+                if (VideoCommon::QueryDma::FlushUnderSplit()) {
+                    VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source,
+                                                        read_bytes);
+                }
+            },
+            VideoCommon::DrainSite::MacroDmaFlush);
+        exact.resize(words);
         memory_manager.ReadBlockUnsafe(source, exact.data(), read_bytes);
+        return pending;
+    };
+    // EDEN_NX2_QUERY_DMA_TRACE=1: count the early reads whose words differ from what the drained
+    // path would return (a stale report count shows here), keeping the early words.
+    if (VideoCommon::QueryDma::TraceEnabled()) [[unlikely]] {
+        static u64 reads{};
+        static u64 pending_reads{};
+        static u64 stale{};
+        std::vector<u32> exact;
+        const bool pending = drained_read(exact);
+        ++reads;
+        pending_reads += pending ? 1 : 0;
+        if (exact != fast) {
+            ++stale;
+            if (stale <= 200) {
+                std::array<u32, 4> early_words{};
+                std::array<u32, 4> exact_words{};
+                const size_t shown = (std::min<size_t>)(words, early_words.size());
+                std::copy_n(fast.begin(), shown, early_words.begin());
+                std::copy_n(exact.begin(), shown, exact_words.begin());
+                LOG_INFO(HW_GPU,
+                         "Query DMA early read stale: macro={:#x} method={:#x} gpu={:#x} "
+                         "words={} pending={} early={:08x} drained={:08x} ({} of {} so far)",
+                         macro, method, source, words, pending, fmt::join(early_words, ","),
+                         fmt::join(exact_words, ","), stale, reads);
+            }
+        }
+        if ((reads & 0x3ff) == 0) {
+            LOG_INFO(HW_GPU, "Query DMA early reads: {} reads, {} with pending reports, {} stale",
+                     reads, pending_reads, stale);
+        }
+    }
+    // EDEN_NX2_DMA_READ_CHECK=1: also take the drained read and use it, logging reads that differ.
+    static const bool check = std::getenv("EDEN_NX2_DMA_READ_CHECK") != nullptr;
+    if (check) [[unlikely]] {
+        static u64 checks{};
+        static u64 differences{};
+        std::vector<u32> exact;
+        drained_read(exact);
         ++checks;
         if (exact != fast) {
             if (differences++ < 16) {
@@ -1796,8 +1845,20 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         }
     };
     VideoCommon::Nx2Profile::CountDmaRead(macro);
-    if (!Tegra::Nx2CmdPageDiag::g_enabled &&
+    // #243: reads of report memory take the words without waiting for the back when they can be
+    // known (FrontDmaReadQueued); the rest wait below. EDEN_NX2_DMA_READ_EARLY=0 sends every read
+    // the way below, as before #243. EDEN_NX2_MACRO_DMA_DRAIN, EDEN_NX2_CMDPAGE_DIAG and the mesh
+    // count trace measure that path, so they keep every read on it.
+    static const bool early = [] {
+        const char* value = std::getenv("EDEN_NX2_DMA_READ_EARLY");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (early && !full_drain && !trace && !Tegra::Nx2CmdPageDiag::g_enabled &&
         FrontDmaReadQueued(split, fs, macro, method, source, words)) {
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes,
+                                         read_bytes);
+        }
         return;
     }
     if (full_drain) {
