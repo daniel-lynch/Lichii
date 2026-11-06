@@ -39,11 +39,10 @@ Repeat `--source TITLE_ID=PATH` for more archives, or use the extractor's existi
 loaded application's program ID; this prevents accidental cross-title population.
 
 Optionally add `--shader-recipe-cache /absolute/path/to/vulkan_translations.TAG.fork-vN.bin`
-to the CLI command. That input must be a format-8 cache with the **same translator,
+to the CLI command. That input must be a format-9 cache with the **same translator,
 GPU and settings configuration**. It is opened read-only, including when its tail
-is incomplete. It can be the destination cache. Format-7 caches only stored hashes,
-so their emission inputs cannot be reconstructed; they are explicitly rejected as
-recipe inputs. Run gameplay with this build to collect format-8 recipes first.
+is incomplete. It can be the destination cache. Format-8 and earlier inputs are
+rejected because their records or keys are incompatible. Run gameplay with this build to collect format-9 recipes first.
 The shared command parser exposes the options, but archive production is an
 **eden-cli** feature, not a GUI precompile operation.
 
@@ -119,11 +118,11 @@ A8B8G8R8_UNORM, noninteger, direct storage pointer true, indirect false, viewpor
 and no HLE replacement. Copied class replay came from `feat/shader-aot-translate`
 commits `5207f8e148`, `101ce5d055`, `0457b9b2e2`.
 
-Format 8 persists optional full `RuntimeInfo` and incoming `Bindings` with each
+Format 9 persists optional full `RuntimeInfo` and incoming `Bindings` with each
 variant. Both synchronous and deferred gameplay graphics emission record recipes.
 Selection counts distinct stored modules per `(stage, runtime digest, bindings)`;
 it does not claim to measure draw frequency. Ties choose the lowest digest pair.
-The normal entry-dependent variant key remains unchanged. A stage absent from the
+Vertex-B and fragment recipes without legacy varyings canonicalize unused generic input types/stores and input topology before emission and keying. A stage absent from the
 recipe input uses its default. Compute recipes are currently unnecessary because
 archive compute is unsupported.
 
@@ -133,8 +132,7 @@ early Z, alpha test, point-size override, transform feedback or dual-source blen
 Other fields are value-initialized. Geometry uses triangle input topology; other
 stages keep the value-initialized topology. These are speculative variants, not a
 promise to cover the game's pipeline state. Emission performs the same legacy-to-
-generic conversion as the renderer. First draw still checks query replay and the
-normal variant key, falling back on mismatch.
+generic conversion as the renderer. First draw checks query replay, translates live metadata, and requires an exact canonical variant key. A miss emits from the live IR. Stage-level recipes are marked as fallback modules; their misses confer no metadata trust.
 
 The producer uses `TranslationCache::Store` and `Shader::TranslatorIdentity()` via
 the normal Vulkan configuration digest. New producer sources are included in that
@@ -192,3 +190,100 @@ with `EDEN_NX2_TRANSLATION_CACHE_VERIFY=1`. Record entry/variant hits, replay mi
 and verification differences. Open questions are the real first-use coverage of
 these recipes, scalar recipes for the unsupported stages, programs with more than
 256 bank-1 bytes, and a total memory budget covering the cache and IR.
+
+
+## Runtime safety revision (round 3)
+
+Format 9 records offline provenance, module ownership, stage-level fallback recipe
+provenance, and persistent metadata rejections. Reproduce the product with this
+build: format-8 products and recipe inputs are incompatible. The source identity
+also changes, so do not rename an old product to the new cache filename.
+
+Offline metadata never constructs a runtime program. Every offline stage is
+translated from the live environment before `MakeRuntimeInfo`, previous-stage
+interfaces, layer emulation, or deferred emission. Compare all serialized
+`ProgramMeta` fields against that live result and drop a differing entry and all
+its modules, including after reopening. This permits continuing with live IR
+before any pipeline layout consumes the rejected metadata. Other cached programs
+whose retranslation differs after metadata consumption fail the pipeline closed.
+This ports the invariant from sibling AOT `f7cdac9675`.
+
+Exact module hits still save SPIR-V emission, but currently pay live translation
+cost to establish trustworthy metadata. Eliminating that cost needs an independently
+validated runtime recipe probe; it must not restore the original speculative path.
+Entries with no modules are rejected and counted on load (including interrupted
+producer appends). Runtime entry IDs are distinct from speculative offline IDs.
+
+The shared canonicalizer ports AOT2 `6a2225485d`. Producer resume, producer emission,
+synchronous runtime emission and deferred emission all use the same canonical
+runtime info. Verification also compares full and canonical SPIR-V/bindings. It
+retains loaded and passthrough generic input state, and excludes geometry and
+legacy-varying programs from canonicalization.
+
+Per-stage logs distinguish offline variant hits, retranslated variant misses and
+metadata rejection; each outcome logs its first 20 occurrences per stage. Aggregate
+counts and entry-only rejections are reported with `LogStatistics`.
+
+Performance inspection found that entries and variants were already indexed in
+unordered maps at load. Lookup is expected O(1) in total file entries, followed by
+query replay only for the same stage key; runtime does not search emission recipes.
+The bad run logged 0.040 ms per hit. Later intervals show only 1–24 ms worker
+SPIR-V work versus hundreds of ms combined worker emission/driver build. Those
+measurements do not establish the cause of the 5-second driver build. Retest with
+correct metadata before attributing the regression to cache lookup.
+
+The load now streams framed records instead of allocating a second entire-file
+buffer. Append/flush uses a separate writer mutex and no longer blocks lookup on
+file I/O. Deferred workers now actually look up exact variants when preceding
+stages resolve their incoming bindings; reuse also requires agreement with live
+metadata already consumed by the pipeline layout. Compressed modules remain eagerly resident; lazy module loading and a
+total memory budget are still needed. Writer calls still wait for other writers.
+
+Coordinator: reproduce using the portable profile and exact producer arguments
+recorded in `~/Downloads/OOT/offline-translate/produce-run-2/time-v.txt` (run from
+the portable profile directory), with the rebuilt binary and a fresh product:
+
+```sh
+cd /home/dlynch/Downloads/OOT/offline-translate/profile-offline
+flock /home/dlynch/Downloads/OOT/harness-runs/.emulator.lock \
+  nice -n 10 /home/dlynch/dev/Lichii-offline/build-offline/bin/eden-cli \
+  -c /home/dlynch/Downloads/OOT/offline-translate/profile-offline/user/config/sdl-offline.ini \
+  --precompile-shaders \
+  --shader-archive-index /home/dlynch/Downloads/OOT/offline-translate/index-v2/offline-0400486024DEC000.json \
+  --shader-workers 4 \
+  -g '/home/dlynch/Downloads/OOT/The Legend of Zelda Ocarina of TIme [04004860224DEC000].nup'
+```
+
+Preserve a copy of the new product before gameplay changes it. Run producer again
+to check resume. For each gameplay comparison, use equivalent isolated portable
+profiles and reset their shader/driver caches to the intended starting state:
+new product, empty-cache control, then new product with verification. The harness
+takes the lock itself. From the repository, the product validation command is:
+
+```sh
+python3 -I tools/oot/harness/run.py \
+  --binary /home/dlynch/dev/Lichii-offline/build-offline/bin/lichii \
+  --profile /home/dlynch/Downloads/OOT/offline-translate/profile-offline \
+  --headless --duration 300 \
+  --env EDEN_NX2_GFX_STORAGE_SIZE_LIKE_COMPUTE=0 \
+  --env EDEN_NX2_UNIFORM_BANK_REUPLOAD=0
+```
+
+For verification add `--env EDEN_NX2_TRANSLATION_CACHE_VERIFY=1`; use the cold
+profile for the empty-cache control. Compare actual scene screenshots (HUD-only
+white frames can pass the harness's hearts detector), boot identity/digest,
+per-stage outcomes, verification differences, time to gameplay, GPU-thread build
+cost, worker emission and driver cost, and held-draw time. No gameplay result is
+claimed for this revision until these coordinator runs complete.
+
+
+Round-3 synthetic test result: `bin/tests '[translation_cache],[video_core]'`
+completed with 413 cases: 410 passed, the two known `nx2_video_render.cpp`
+assertions at lines 151 and 210 failed, and one Vulkan test was skipped. There
+were 62,836,859 assertions, with only the two known failures. Log:
+`/tmp/offline-tests3-final.log`. All new cache tests passed. Both the initial and
+final incremental locked builds of `lichii`, `eden-cli` and `tests` passed. Build
+logs: `/tmp/offline-build3.log` and `/tmp/offline-build3-final.log`. No emulator or eden-cli execution
+was performed for validation; no user Eden configuration or cache was accessed.
+The six incremental patches/messages (06–11) and the executable commit plan are
+in `/tmp/offline-translation-commits/commit-plan3.sh`. No commit was attempted.

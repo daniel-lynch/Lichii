@@ -554,3 +554,145 @@ TEST_CASE("Class replay rejects unrepresentable recipes and malformed shifts",
     REQUIRE_FALSE(ReplayQueries(std::span{&invalid, 1}, env));
     REQUIRE(env.reads == 0);
 }
+
+TEST_CASE("Offline variant misses cannot restore guessed pipeline metadata",
+          "[translation_cache][video_core]") {
+    FakeEnvironment env;
+    Store store;
+    store.Open({}, {});
+    Shader::IR::Program live;
+    live.stage = Shader::Stage::VertexB;
+    live.info.stores.Set(Shader::IR::Attribute::Generic0X, true);
+    auto guessed = ProgramMeta::From(live);
+    guessed.info.stores.Set(Shader::IR::Attribute::Generic0X, false);
+    const auto entry = store.Insert({91, 1}, {}, guessed, true);
+    const auto recipe = DefaultEmissionRecipe(live.stage);
+    const auto key = MakeVariantKey(entry->id, DigestRuntimeInfo(recipe.runtime), recipe.bindings);
+    store.InsertVariant(*entry, key, {.spirv = {0x07230203, 0x10000, 0, 1, 0}});
+    REQUIRE(store.FindEntry({91, 1}, env));
+    REQUIRE_FALSE(entry->CanReuseMetadata());
+    auto other = recipe.runtime;
+    other.convert_depth_mode = !other.convert_depth_mode;
+    REQUIRE_FALSE(store.FindVariant(MakeVariantKey(entry->id, DigestRuntimeInfo(other), recipe.bindings)));
+    // The pipeline retains its live program before MakeRuntimeInfo or previous_stage use.
+    REQUIRE_FALSE(store.ValidateOfflineEntry(*entry, live));
+    REQUIRE(live.info.stores[Shader::IR::Attribute::Generic0X]);
+    REQUIRE_FALSE(store.FindEntry({91, 1}, env));
+    REQUIRE_FALSE(store.FindVariant(key));
+    const auto demand = store.Insert({91, 1}, {}, ProgramMeta::From(live));
+    REQUIRE(demand->id != entry->id);
+    REQUIRE(demand->CanReuseMetadata());
+    REQUIRE(store.FindEntry({91, 1}, env)->id == demand->id);
+}
+
+TEST_CASE("Offline entry-only records are rejected after load and truncated append",
+          "[translation_cache][video_core]") {
+    const auto path = std::filesystem::temp_directory_path() / "lichii_offline_entry_only_test.bin";
+    std::filesystem::remove(path);
+    Digest config{91, 2};
+    FakeEnvironment env;
+    {
+        Store store;
+        store.Open(path, config);
+        REQUIRE(store.Persistent());
+        const auto offline = store.Insert({1, 2}, {}, {}, true);
+        REQUIRE_FALSE(store.FindEntry({1, 2}, env));
+        REQUIRE(offline);
+        REQUIRE(store.Insert({3, 4}, {}, {}));
+    }
+    {
+        std::ofstream tail(path, std::ios::binary | std::ios::app);
+        tail.write("STCR", 4);
+    }
+    {
+        Store store;
+        store.Open(path, config);
+        REQUIRE_FALSE(store.FindEntry({1, 2}, env));
+        REQUIRE(store.FindEntry({3, 4}, env));
+        REQUIRE(store.offline_entry_only_rejected.load() == 1);
+    }
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("Offline matching modules and persistent metadata rejection round trip",
+          "[translation_cache][video_core]") {
+    const auto path = std::filesystem::temp_directory_path() / "lichii_offline_drop_test.bin";
+    std::filesystem::remove(path);
+    Digest config{91, 3};
+    FakeEnvironment env;
+    Shader::IR::Program live;
+    live.stage = Shader::Stage::Fragment;
+    Digest variant_key{};
+    {
+        Store store;
+        store.Open(path, config);
+        const auto entry = store.Insert({1, 2}, {}, ProgramMeta::From(live), true);
+        auto recipe = DefaultEmissionRecipe(live.stage);
+        variant_key = MakeVariantKey(entry->id, DigestRuntimeInfo(recipe.runtime), recipe.bindings);
+        store.InsertVariant(*entry, variant_key,
+                            {.spirv = {0x07230203, 0x10000, 0, 1, 0}, .fallback_recipe = true}, &recipe);
+    }
+    {
+        Store store;
+        store.Open(path, config);
+        const auto entry = store.FindEntry({1, 2}, env);
+        REQUIRE(entry);
+        REQUIRE(entry->offline);
+        REQUIRE(store.offline_entry_only_rejected.load() == 0);
+        REQUIRE(store.ValidateOfflineEntry(*entry, live));
+        const auto variant = store.FindVariant(variant_key);
+        REQUIRE(variant);
+        REQUIRE(variant->fallback_recipe);
+        live.output_vertices = 19; // Scalar metadata matters as well as Shader::Info.
+        REQUIRE_FALSE(store.ValidateOfflineEntry(*entry, live));
+    }
+    {
+        Store store;
+        store.Open(path, config);
+        REQUIRE_FALSE(store.FindEntry({1, 2}, env));
+        REQUIRE_FALSE(store.FindVariant(variant_key));
+    }
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("Canonical vertex and fragment keys ignore only unused runtime inputs",
+          "[translation_cache][video_core]") {
+    for (const auto stage : {Shader::Stage::VertexB, Shader::Stage::Fragment}) {
+        Shader::IR::Program program;
+        program.stage = stage;
+        program.info.loads.Set(Shader::IR::Attribute::Generic0X, true);
+        program.info.passthrough.Set(Shader::IR::Attribute::Generic0X + 8, true);
+        auto a = DefaultEmissionRecipe(stage).runtime;
+        auto b = a;
+        b.generic_input_types[1] = Shader::AttributeType::SignedInt;
+        b.previous_stage_stores.Set(Shader::IR::Attribute::Generic0X + 4, false);
+        b.input_topology = Shader::InputTopology::Triangles;
+        const auto digest = [&](const auto& runtime) {
+            return DigestRuntimeInfo(CanonicalRuntimeInfo(runtime, program.info, program.stage));
+        };
+        REQUIRE(DigestRuntimeInfo(a) != DigestRuntimeInfo(b));
+        REQUIRE(digest(a) == digest(b));
+        SECTION("loaded input type remains significant") {
+            b.generic_input_types[0] = Shader::AttributeType::SignedInt;
+            REQUIRE(digest(a) != digest(b));
+        }
+        SECTION("loaded input stores remain significant") {
+            b.previous_stage_stores.Set(Shader::IR::Attribute::Generic0X, false);
+            REQUIRE(digest(a) != digest(b));
+        }
+        SECTION("passthrough stores remain significant") {
+            b.previous_stage_stores.Set(Shader::IR::Attribute::Generic0X + 8, false);
+            REQUIRE(digest(a) != digest(b));
+        }
+        SECTION("geometry is unchanged") {
+            program.stage = Shader::Stage::Geometry;
+            REQUIRE(digest(a) != digest(b));
+            REQUIRE(digest(b) == DigestRuntimeInfo(b));
+        }
+        SECTION("legacy varying programs are unchanged") {
+            program.info.loads.Set(Shader::IR::Attribute::ColorFrontDiffuseR, true);
+            REQUIRE(digest(a) != digest(b));
+            REQUIRE(digest(b) == DigestRuntimeInfo(b));
+        }
+    }
+}
