@@ -56,7 +56,7 @@ fi
 # the pool index, and a directory of static scene manifests the emulator loads and unites.
 # OOT_AOT_MANIFEST=<file or dir> overrides the manifest set; OOT_AOT_WORKERS=N sets the
 # translation threads (unset = the emulator's default, 2).
-if [ "${OOT_AOT:-0}" = "1" ]; then
+if [ "${OOT_AOT:-1}" = "1" ]; then  # default ON since dev 18832d80a5 (AOT merged; -36% frame-blocking cold)
   AOT_INDEX="$OOT/aot/index/oot-aot-index.bin"
   if [ -f "$AOT_INDEX" ]; then
     export EDEN_NX2_AOT_TRANSLATE=1 EDEN_NX2_AOT_INDEX="$AOT_INDEX" EDEN_NX2_AOT_SEED=1
