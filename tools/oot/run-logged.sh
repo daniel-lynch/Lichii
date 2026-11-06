@@ -10,8 +10,12 @@ export EDEN_NX2_SHADER_DUMP="$OOT/shaders"
 # 35.6 -> 39.4 fps with both off; vegetation unchanged). Default them off for this game;
 # OOT_UPSTREAM_DEFAULTS=1 restores upstream behaviour for comparison.
 if [ "${OOT_UPSTREAM_DEFAULTS:-0}" != "1" ]; then
-  export EDEN_NX2_GFX_STORAGE_SIZE_LIKE_COMPUTE=0 EDEN_NX2_UNIFORM_BANK_REUPLOAD=0 EDEN_NX2_NATIVE_PREFLUSH=1  # preflush: +3.4 fps median, interleaved A/B 2026-11-06
+  export EDEN_NX2_GFX_STORAGE_SIZE_LIKE_COMPUTE=0 EDEN_NX2_UNIFORM_BANK_REUPLOAD=0 EDEN_NX2_NATIVE_PREFLUSH="${OOT_PREFLUSH:-1}"  # preflush: +3.4 fps median, interleaved A/B 2026-11-06
 fi
+# Pipeline eviction: upstream destroys graphics pipelines unused for 9000 frames (~2.5 min at 60),
+# so re-entering an area rebuilds them on the GPU thread (upstream issue #293 — stutter).
+# Off for this game; OOT_EVICT=1 restores upstream behaviour.
+if [ "${OOT_EVICT:-0}" != "1" ]; then export EDEN_NX2_PIPELINE_EVICT=0; fi
 # OOT_GPU=fast|accurate pins the per-game GPU Mode and reactive flushing before boot
 # (fast = GPU Mode Fast + reactive flushing off; accurate = Accurate + flushing on).
 # OOT_FLUSH=0|1 overrides the flushing half. Unset = leave the config alone.
@@ -68,6 +72,25 @@ if [ "${OOT_AOT:-1}" = "1" ]; then  # default ON since dev 18832d80a5 (AOT merge
     echo "OOT_AOT: no pool index at $AOT_INDEX, AOT left off. Build it once per game version with" >&2
     echo "  mkdir -p $OOT/aot/index && nice -n 10 python3 -I ~/dev/Lichii-aot2/tools/oot/container/aot_index.py <OoT .nup> $OOT/extract/zsdic $AOT_INDEX" >&2
     echo "  (then the manifests: see $OOT/aot/README.md)" >&2
+  fi
+fi
+
+# OOT_PRODUCT: offline shader product (a translation cache written by eden-cli --precompile-shaders).
+# Every vulkan_translations.*.bin under $OOT/offline-translate/product-live/ is copied (reflink when
+# the filesystem allows, else a real copy) into the live shader cache dir if a file of that name is
+# not there yet; the runtime uses the one whose translator tag matches this build and logs the tags
+# it ignores. OOT_PRODUCT=0 skips the step.
+if [ "${OOT_PRODUCT:-1}" = "1" ]; then
+  PRODUCT_DIR="$OOT/offline-translate/product-live"
+  LIVE_SHADER_DIR="$HOME/.cache/eden/shader/0400486024dec000"
+  if [ -d "$PRODUCT_DIR" ] && [ -d "$LIVE_SHADER_DIR" ]; then
+    for f in "$PRODUCT_DIR"/vulkan_translations.*.bin; do
+      [ -f "$f" ] || continue
+      b=$(basename "$f")
+      if [ ! -e "$LIVE_SHADER_DIR/$b" ]; then
+        cp --reflink=auto "$f" "$LIVE_SHADER_DIR/$b" && echo "offline shader product installed: $b" >&2
+      fi
+    done
   fi
 fi
 # MangoHud: overlay + CSV of fps/frametime, starts 5 s after launch, runs until exit.

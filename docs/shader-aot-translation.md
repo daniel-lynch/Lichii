@@ -9,8 +9,10 @@ showed, and where the proposal was changed.
 
 Everything is behind the per-game setting **Graphics > Advanced > Translate shaders ahead of
 first use** (`use_shader_aot_translation`, default **off**). `EDEN_NX2_AOT_TRANSLATE=1` also
-turns it on. With the setting off, translation, recording and replay behave exactly as before.
-The cache file format version did change (5 → 6), so existing files are rebuilt once.
+turns it on. The setting remains off by default. Offline products are a separate CLI mode and can
+reuse replay-validated entries and defer missing variants without enabling AOT seeding.
+Both paths now use the Format 10 writer, shared runtime-info canonicalization and
+class-replay hooks; older formats are rebuilt.
 
 ## What the switch does
 
@@ -545,3 +547,36 @@ Runs on the fixed binary, before these two follow-ups, in the step-2 configurati
 Open assumption: returning to an earlier scene (A → B → A) relies on the game reading A's
 GameBancParam again when it re-enters A. No trace has shown a return yet; the tour run made a
 single change. If the game does not read it again, B's rows stay selected until the next entry.
+
+
+### Unified with dev's offline translation (pass 13)
+
+Runtime AOT recipe choice has one source of truth: `RecipeHistogram`, protected by
+`PipelineCache::recipe_mutex` and queried through `BestRecipe`. It loads the
+configuration-bound `vulkan_translations.<tag>.recipes.fork-vN.bin` histogram,
+records each eligible live pipeline observation once, and saves changed snapshots
+atomically every 30 seconds and at shutdown. Class-first selection, stage fallback,
+persisted-count decay and promotion of newly dominant recipes are retained. There
+is no second runtime recipe map. Fresh seeds and queued class re-emissions both use
+this same `BestRecipe` path and share the atomic 32-slot pending reservation.
+
+The offline producer remains separate: `eden-cli --shader-recipe-cache` imports
+emission recipes embedded in the Format 10 translation cache, not the histogram
+file. Runtime and AOT variant writes continue to attach those emission recipes for
+offline import; these records are not another runtime observation tally. Producer
+selection and import limits are unchanged.
+
+Runtime lookup, worker emission, fresh AOT seeds, class re-emission and the offline
+producer use `TranslationCache::CanonicalRuntimeInfo`. A selected stage-fallback
+recipe is canonicalized for the target program before its variant key is formed.
+All AOT variants go through the same Format 10 `Store::InsertVariant` path as live
+variants, including its lazy disk loading and budgeted resident payloads. Persistent
+drop records, fresh-program verification, class-replay hooks and compile-time
+configuration field coverage remain the shared translation-cache implementation.
+
+Scene selection, session tokens, the sharcb (BAHS) pool index and candidate
+acknowledgement/return/bounded retry are retained. `Core::System::Load` calls
+`ShaderAotScene::BeginSession` before application creation can build RomFS or post
+scene hints (the session-start function is named `BeginSession` in this branch).
+Shutdown also retains dev's cheat-engine reset immediately after requesting stop,
+before timing resumes or services are destroyed.

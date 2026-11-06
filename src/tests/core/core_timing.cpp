@@ -4,12 +4,14 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <chrono>
 #include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -143,4 +145,51 @@ TEST_CASE("CoreTiming[BasicOrderNoPausing]", "[core]") {
     printf("HostTimer No Pausing Scheduling Time: %.3f %.6f\n", micro, mili);
     printf("HostTimer No Pausing Timer Time: %.3f %.6f\n", timer_time / 1000.f,
            timer_time / 1000000.f);
+}
+
+// The cheat engine's shutdown relies on this: a looping event (its frame callback reads services
+// owned by System) is unscheduled with Wait, and only then are those services torn down. Wait must
+// return only after a callback already running on the timer thread has finished, and no callback
+// may start afterwards, or it touches a destroyed object (the shutdown SIGSEGV in
+// ServiceManager::GetService from DmntCheatVm::Execute).
+TEST_CASE("CoreTiming[UnscheduleWaitsForLoopingCallback]", "[core]") {
+    ScopeInit guard;
+    auto& core_timing = guard.core_timing;
+    core_timing.SyncPause(true);
+    core_timing.SyncPause(false);
+
+    std::atomic_bool service_alive{true};
+    std::atomic_bool in_callback{false};
+    std::atomic_bool touched_dead_service{false};
+    std::atomic<u32> calls{0};
+    const auto event = Core::Timing::CreateEvent(
+        "LoopingServiceReader",
+        [&](s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
+            in_callback = true;
+            ++calls;
+            // Long enough that the unschedule below lands while this is still running.
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+            if (!service_alive) {
+                touched_dead_service = true;
+            }
+            in_callback = false;
+            return std::nullopt;
+        });
+    core_timing.ScheduleLoopingEvent(std::chrono::microseconds{100}, std::chrono::microseconds{100},
+                                     event);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (!in_callback && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    REQUIRE(in_callback);
+
+    core_timing.UnscheduleEvent(event, Core::Timing::UnscheduleEventType::Wait);
+    REQUIRE_FALSE(in_callback);
+    const u32 calls_at_unschedule = calls;
+    service_alive = false; // The service is torn down only after the unschedule returned.
+
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    REQUIRE(calls == calls_at_unschedule);
+    REQUIRE_FALSE(touched_dead_service);
 }

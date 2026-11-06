@@ -186,6 +186,13 @@ struct System::Impl {
         : kernel{system}, fs_controller{system}, hid_core{kernel}, cpu_manager{system},
           reporter{system}, applet_manager{system}, frontend_applets{system}, profile_manager{} {}
 
+    ~Impl() {
+        // Members go in reverse declaration order: service_manager before cheat_engine, and
+        // core_timing (whose timer thread runs the cheat event) last. Stop the engine first for a
+        // System destroyed without ShutdownMainProcess.
+        cheat_engine.reset();
+    }
+
     u64 program_id;
 
     void Initialize(System& system) {
@@ -514,6 +521,13 @@ struct System::Impl {
             gpu_core->NotifyShutdown();
 
         stop_event.request_stop();
+        // Stop the cheat engine before anything it touches goes away. Its looping CoreTiming event
+        // reads HID through the service manager and guest memory through the process, and
+        // SyncPause(false) below restarts the timer thread for the rest of the teardown: with the
+        // reset left after service_manager.reset(), the event ran on a destroyed ServiceManager
+        // and the process died with SIGSEGV at shutdown. reset() unschedules the event and waits
+        // out a callback in flight.
+        cheat_engine.reset();
         core_timing.SyncPause(false);
         Network::CancelPendingSocketOperations();
         kernel.SuspendEmulation(true);
@@ -522,7 +536,6 @@ struct System::Impl {
         services.reset();
         service_manager.reset();
         fs_controller.Reset();
-        cheat_engine.reset();
         core_timing.ClearPendingEvents();
         app_loader.reset();
         audio_core.reset();

@@ -78,6 +78,11 @@ public:
     ~CheatEngine();
 
     void Initialize();
+    /// Stops the engine: no frame callback runs after this returns. Unschedules the CoreTiming
+    /// event and waits out a callback already in flight on the timer thread. Idempotent; the
+    /// destructor calls it. Call it before tearing down anything the VM touches (the service
+    /// manager and HID, the application process and its memory).
+    void Shutdown();
     void SetMainMemoryParameters(VAddr main_region_begin, u64 main_region_size);
 
     void Reload(std::vector<CheatEntry> reload_cheats);
@@ -90,6 +95,7 @@ private:
 
     std::vector<CheatEntry> cheats;
     std::atomic_bool is_pending_reload{false};
+    std::atomic_bool is_running{false};
 
     std::shared_ptr<Core::Timing::EventType> event;
     Core::Timing::CoreTiming& core_timing;

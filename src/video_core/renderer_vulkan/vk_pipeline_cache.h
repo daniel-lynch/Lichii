@@ -127,6 +127,10 @@ struct ComputePipelineCacheEntry {
 
 class PipelineCache : public VideoCommon::ShaderCache {
 public:
+    bool PrecompileArchiveShaders(const std::filesystem::path& input, u64 title_id, u32 workers,
+                                  const std::filesystem::path& recipes, u32 recipe_count,
+                                  u32 recipe_limit, const std::filesystem::path& report,
+                                  std::string_view baseline);
     explicit PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, const Device& device,
                            Scheduler& scheduler, DescriptorPool& descriptor_pool,
                            GuestDescriptorQueue& guest_descriptor_queue,
@@ -213,6 +217,7 @@ private:
     bool translation_cache_verify{};
     std::atomic<u64> translation_cache_verified{};
     std::atomic<u64> translation_cache_mismatches{};
+    std::atomic<u64> translation_cache_canonical_differences{};
     std::chrono::steady_clock::time_point translation_cache_logged{};
     void OpenTranslationCache(const std::filesystem::path& filename);
     [[nodiscard]] bool IsTranslationCacheable(const Shader::Environment& env) const;

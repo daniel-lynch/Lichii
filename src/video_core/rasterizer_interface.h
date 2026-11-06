@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <span>
@@ -257,6 +258,10 @@ public:
     /// Initialize disk cached resources for the game being emulated
     virtual void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                    const DiskResourceLoadCallback& callback) {}
+
+    virtual bool PrecompileArchiveShaders(const std::filesystem::path&, u64, u32,
+                                         const std::filesystem::path&, u32, u32,
+                                         const std::filesystem::path&, std::string_view) { return false; }
 
     virtual void InitializeChannel(Tegra::Control::ChannelState& channel) {}
 
