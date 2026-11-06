@@ -47,6 +47,22 @@ TEST_CASE("An empty constant section never dereferences its offset", "[video_cor
     REQUIRE(parsed.programs[0].constants_offset == UINT32_MAX);
 }
 
+TEST_CASE("A graphics row with more than 256 bank-1 bytes is skipped, not fatal", "[video_core][translation_cache]") {
+    auto input = Index();
+    auto row = input["programs"][0];
+    row["container"] = "large.bin";
+    row["constants_offset"] = 0;
+    row["constants_size"] = MaxBank1Bytes + 4;
+    input["programs"].push_back(row);
+    const auto parsed = ParseInput(input.dump(), {});
+    REQUIRE(parsed.programs.size() == 2);
+    REQUIRE(parsed.programs[0].skip_reason.empty());
+    REQUIRE(parsed.programs[1].skip_reason == "bank1_too_large");
+    // Out-of-range sections are still malformed whatever their size.
+    input["programs"][1]["constants_offset"] = 400;
+    REQUIRE_THROWS(ParseInput(input.dump(), {}));
+}
+
 TEST_CASE("Offline program index prioritizes tiers stably", "[video_core][translation_cache]") {
     auto input = Index();
     auto row = input["programs"][0];

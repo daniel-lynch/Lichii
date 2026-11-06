@@ -10,6 +10,10 @@
 
 namespace VideoCommon::OfflineShaders {
 constexpr u64 MaxProgramBytes = 16 * 1024 * 1024;
+/// The index is JSON text, not an allocation: a whole title's library can exceed 16 MiB.
+constexpr u64 MaxIndexBytes = 64 * 1024 * 1024;
+/// Largest bank-1 constant section the archive environment can read exactly.
+constexpr u32 MaxBank1Bytes = 256;
 struct Program {
     std::filesystem::path container;
     std::filesystem::path control;
@@ -22,6 +26,9 @@ struct Program {
     Shader::Stage stage{};
     u32 tier{};
     std::vector<u32> bank1_words;
+    /// Nonempty when the row is valid JSON but cannot be produced (e.g. bank1_too_large): the
+    /// worker counts it under this reason instead of failing the whole index.
+    std::string skip_reason;
 };
 struct Input {
     u64 title_id{};

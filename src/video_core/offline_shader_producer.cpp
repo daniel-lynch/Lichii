@@ -6,6 +6,7 @@
 #include <charconv>
 #include <chrono>
 #include <fstream>
+#include <fmt/format.h>
 #include "common/polyfill_thread.h"
 #include <nlohmann/json.hpp>
 #include "common/logging.h"
@@ -60,6 +61,7 @@ u32 Word(std::span<const u8> bytes, size_t offset) {
 }
 std::string Reason(std::string_view message) {
     for (const auto reason : {"missing_constant", "unsupported_stage", "base_dependent",
+                              "bank1_too_large",
                               "unsupported_lowering", "invalid_range", "input_io",
                               "fingerprint_mismatch", "constants_mismatch"}) {
         if (message.find(reason) != std::string_view::npos) return reason;
@@ -69,7 +71,7 @@ std::string Reason(std::string_view message) {
 } // namespace
 
 Input ParseInput(std::string_view text, const std::filesystem::path& directory) {
-    if (text.size() > MaxProgramBytes) throw std::runtime_error("Input index exceeds 16 MiB");
+    if (text.size() > MaxIndexBytes) throw std::runtime_error("index too large");
     const auto json = Json::parse(text);
     if (Unsigned(json.at("schema_version")) != 1) throw std::runtime_error("Unknown input version");
     Input result{.title_id = Hex(json.at("title_id"))};
@@ -91,13 +93,18 @@ Input ParseInput(std::string_view text, const std::filesystem::path& directory) 
             program.offset > UINT64_MAX - program.size ||
             program.control_offset > UINT64_MAX - 0x58)
             throw std::runtime_error("invalid_range");
-        if ((program.stage == Shader::Stage::VertexB || program.stage == Shader::Stage::Fragment ||
-             program.stage == Shader::Stage::Geometry) &&
-            (program.constants_size > 256 ||
-             (program.constants_size != 0 && (program.constants_offset > program.size ||
-              program.constants_size > program.size - program.constants_offset))))
+        const bool graphics = program.stage == Shader::Stage::VertexB ||
+                              program.stage == Shader::Stage::Fragment ||
+                              program.stage == Shader::Stage::Geometry;
+        if (graphics && program.constants_size != 0 &&
+            (program.constants_offset > program.size ||
+             program.constants_size > program.size - program.constants_offset))
             throw std::runtime_error("invalid_range");
-        if (row.contains("bank1_words")) {
+        // A well-formed row whose constant section exceeds what the environment can read exactly
+        // is skipped and counted by the worker; it must not reject the rest of the index.
+        if (graphics && program.constants_size > MaxBank1Bytes)
+            program.skip_reason = "bank1_too_large";
+        if (row.contains("bank1_words") && program.skip_reason.empty()) {
             const auto& words = row.at("bank1_words");
             if (!words.is_array() || words.size() > 64 || words.size() * 4 != program.constants_size)
                 throw std::runtime_error("constants_mismatch");
@@ -116,7 +123,17 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
             TranslationCache::Store& store) {
     namespace TC = TranslationCache;
     const auto begin = std::chrono::steady_clock::now();
-    const auto bytes = Read(input, 0, std::filesystem::file_size(input));
+    const auto index_size = std::filesystem::file_size(input);
+    if (index_size > MaxIndexBytes)
+        throw std::runtime_error(fmt::format("index too large: {} bytes exceeds the {} MiB limit",
+                                             index_size, MaxIndexBytes >> 20));
+    std::vector<u8> bytes(index_size);
+    {
+        std::ifstream file(input, std::ios::binary);
+        if (!file || !file.read(reinterpret_cast<char*>(bytes.data()),
+                                static_cast<std::streamsize>(bytes.size())))
+            throw std::runtime_error("input_io: cannot read the index");
+    }
     const auto parsed = ParseInput({reinterpret_cast<const char*>(bytes.data()), bytes.size()},
                                    input.parent_path());
     if (parsed.title_id != title_id) throw std::runtime_error("Archive title ID differs from game");
@@ -141,6 +158,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
             try {
                 if (row.stage != Shader::Stage::VertexB && row.stage != Shader::Stage::Fragment &&
                     row.stage != Shader::Stage::Geometry) throw std::runtime_error("unsupported_stage");
+                if (!row.skip_reason.empty()) throw std::runtime_error(row.skip_reason);
                 const auto program_bytes = Read(row.container, row.offset, row.size);
                 const auto control = Read(row.control, row.control_offset, 0x58);
                 u64 fingerprint = 0xcbf29ce484222325ULL;
