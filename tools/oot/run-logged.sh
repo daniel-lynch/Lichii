@@ -5,7 +5,9 @@ set -u
 OOT="$HOME/Downloads/OOT"
 BIN="${BIN:-$HOME/dev/Lichii/build-test/bin/lichii}"  # the dev play binary (build-test is built from the dev worktree); BIN=… overrides
 STAMP=$(date +%Y%m%d-%H%M%S)
-export EDEN_NX2_SHADER_DUMP="$OOT/shaders"
+# Shader dump: off for play (the 2026-11-06 field session wrote 1,342 dump files from the GPU thread);
+# OOT_SHADER_DUMP=1 turns it back on for analysis runs.
+if [ "${OOT_SHADER_DUMP:-0}" = "1" ]; then export EDEN_NX2_SHADER_DUMP="$OOT/shaders"; fi
 # OoT fps: upstream #150's two unswitched commits cost ~10 % here (harness A/B 2026-11-05:
 # 35.6 -> 39.4 fps with both off; vegetation unchanged). Default them off for this game;
 # OOT_UPSTREAM_DEFAULTS=1 restores upstream behaviour for comparison.
@@ -107,6 +109,9 @@ fi
 # sampler (gpu_stats) aborts the process inside libMangoHud.so on this host since 2026-11-06
 # (NVIDIA::get_samples_and_copy -> free(): invalid pointer), so it is off; OOT_MANGOHUD_GPU_STATS=1
 # turns it back on once MangoHud is fixed.
+# NVIDIA driver shader cache: large and never cleaned up, so pipelines compiled once stay warm
+# across sessions (the driver cache is where the 0.7-0.9 s runtime builds end up). OOT_GL_CACHE=0 leaves the driver defaults.
+if [ "${OOT_GL_CACHE:-1}" = "1" ]; then export __GL_SHADER_DISK_CACHE_SIZE=8589934592 __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1; fi
 export MANGOHUD="${OOT_MANGOHUD:-1}"
 MH_CFG="fps,frametime,cpu_stats,output_folder=$OOT/logs,autostart_log=5,log_duration=0,log_interval=100"
 [ "${OOT_MANGOHUD_GPU_STATS:-0}" = "1" ] && MH_CFG="$MH_CFG,gpu_stats"
