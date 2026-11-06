@@ -226,8 +226,21 @@ TEST_CASE("Compute rows parse with bank-1 checks", "[video_core][translation_cac
     index["programs"][0]["constants_size"] = Offline::MaxBank1Bytes + 4;
     index["programs"][0]["constants_offset"] = 0;
     REQUIRE(Offline::ParseInput(index.dump(), {}).programs.at(0).skip_reason == "bank1_too_large");
-    index["programs"][0]["constants_offset"] = 400;
+    // A compute section past the extracted bytes is kept (reads of it fail per program).
+    index["programs"][0]["constants_size"] = 20;
+    index["programs"][0]["constants_offset"] = 512;
+    REQUIRE(Offline::ParseInput(index.dump(), {}).programs.at(0).skip_reason.empty());
+    index["programs"][0]["stage"] = "vertex";
     REQUIRE_THROWS(Offline::ParseInput(index.dump(), {}));
+}
+
+TEST_CASE("Archive compute constants past the extracted bytes are absent, not fatal",
+          "[video_core][archive_environment]") {
+    SyntheticCompute source;
+    source.bytes.resize(0x100);
+    auto env = source.Make();
+    REQUIRE(env.Analyze().has_value());
+    REQUIRE_THROWS_WITH(env.ReadCbufValue(1, 0), ContainsSubstring("missing_constant"));
 }
 
 TEST_CASE("Recorded storage-pointer answers override the archive guesses",

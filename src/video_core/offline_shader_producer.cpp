@@ -159,9 +159,13 @@ Input ParseInput(std::string_view text, const std::filesystem::path& directory) 
                               program.stage == Shader::Stage::Fragment ||
                               program.stage == Shader::Stage::Geometry ||
                               program.stage == Shader::Stage::Compute;
-        if (graphics && program.constants_size != 0 &&
+        const bool constants_outside = program.constants_size != 0 &&
             (program.constants_offset > program.size ||
-             program.constants_size > program.size - program.constants_offset))
+             program.constants_size > program.size - program.constants_offset);
+        // The extractor keeps compute allocations at their code: a compute row's bank-1 section
+        // can lie past the extracted bytes. Such a program is still produced; any bank-1 read
+        // then fails as missing_constant.
+        if (graphics && constants_outside && program.stage != Shader::Stage::Compute)
             throw std::runtime_error("invalid_range");
         // A well-formed row whose constant section exceeds what the environment can read exactly
         // is skipped and counted by the worker; it must not reject the rest of the index.

@@ -170,8 +170,7 @@ ArchiveEnvironment::ArchiveEnvironment(ComputeProgram, std::span<const u8> progr
     const u32 constant_offset = Word(control, 0x40);
     if (code_size < sizeof(Instruction) || code_size > program.size() ||
         code_size % sizeof(Instruction) != 0 || constant_size > 0x100 ||
-        (constant_size && (constant_offset < code_size || constant_offset > program.size() ||
-                          constant_size > program.size() - constant_offset))) {
+        (constant_size && constant_offset < code_size)) {
         throw Shader::RuntimeError("Archive environment: invalid_range");
     }
     stage = Shader::Stage::Compute;
@@ -182,7 +181,9 @@ ArchiveEnvironment::ArchiveEnvironment(ComputeProgram, std::span<const u8> progr
     workgroup_size = state.workgroup_size;
     shared_memory_size = state.shared_memory_size;
     local_memory_size = state.local_memory_size;
-    if (constant_size) {
+    // A section past the extracted bytes stays absent: bank-1 reads fail as missing_constant.
+    if (constant_size && constant_offset <= program.size() &&
+        constant_size <= program.size() - constant_offset) {
         const auto section = program.subspan(constant_offset, constant_size);
         constants.assign(section.begin(), section.end());
     }
