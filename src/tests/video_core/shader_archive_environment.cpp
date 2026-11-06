@@ -208,6 +208,18 @@ TEST_CASE("Offline producer resumes complete modules and repairs interrupted app
         REQUIRE(second.translated == 0);
         REQUIRE(second.resumed == 2);
         REQUIRE(std::filesystem::file_size(path) == size);
+        {
+            Offline::SignalGuard signals;
+            std::raise(SIGTERM);
+            const auto cancelled = Offline::Run(input, 0x0400000000000000ULL, 2, path,
+                                                 profile, {}, config, store);
+            REQUIRE(cancelled.cancelled);
+            REQUIRE(cancelled.translated == 0);
+            REQUIRE(cancelled.resumed == 0);
+            REQUIRE(cancelled.modules == 0);
+            REQUIRE(std::filesystem::file_size(path) == size);
+        }
+        Offline::SignalGuard reset;
         std::ifstream file(path, std::ios::binary);
         complete.assign(std::istreambuf_iterator<char>(file), {});
         REQUIRE(complete.size() > 36);

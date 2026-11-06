@@ -18,6 +18,11 @@
 
 namespace VideoCommon::OfflineShaders {
 namespace {
+static_assert(std::atomic<int>::is_always_lock_free);
+std::atomic<int> stop_signal{};
+void StopProduction(int signal) {
+    stop_signal.store(signal, std::memory_order_relaxed);
+}
 using Json = nlohmann::json;
 u64 Unsigned(const Json& value) {
     if (!value.is_number_unsigned()) throw std::runtime_error("Expected unsigned integer");
@@ -69,6 +74,19 @@ std::string Reason(std::string_view message) {
     return "lowering_or_emission_rejected";
 }
 } // namespace
+
+SignalGuard::SignalGuard() {
+    stop_signal.store(0, std::memory_order_relaxed);
+    previous_int = std::signal(SIGINT, StopProduction);
+    previous_term = std::signal(SIGTERM, StopProduction);
+}
+SignalGuard::~SignalGuard() {
+    std::signal(SIGINT, previous_int);
+    std::signal(SIGTERM, previous_term);
+}
+int StopSignal() {
+    return stop_signal.load(std::memory_order_relaxed);
+}
 
 Input ParseInput(std::string_view text, const std::filesystem::path& directory) {
     if (text.size() > MaxIndexBytes) throw std::runtime_error("index too large");
@@ -151,7 +169,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
     std::array<std::mutex, 64> stage_locks;
     std::atomic<size_t> next{};
     auto work = [&] {
-        while (true) {
+        while (!StopSignal()) {
             const size_t index = next.fetch_add(1);
             if (index >= parsed.programs.size()) break;
             const auto& row = parsed.programs[index];
@@ -175,6 +193,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                 if (!hash) throw std::runtime_error("unsupported_lowering");
                 const auto key = TC::MakeStageKey(env, *hash, static_cast<u32>(row.stage) + 1, config);
                 std::scoped_lock stage_lock(stage_locks[key.lo % stage_locks.size()]);
+                if (StopSignal()) break;
                 auto recipe = recipes[static_cast<size_t>(row.stage)];
                 TC::RecordingEnvironment resume(env, true);
                 if (const auto entry = store.FindEntry(key, resume)) {
@@ -220,6 +239,10 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
     {
         std::vector<std::jthread> threads;
         for (u32 i = 0; i < workers; ++i) threads.emplace_back(work);
+    }
+    summary.cancelled = StopSignal() != 0;
+    if (summary.cancelled) {
+        LOG_INFO(Render_Vulkan, "Offline translation: stopped at record boundary signal={}", StopSignal());
     }
     u64 skipped{};
     for (const auto& [reason, count] : summary.skipped) {

@@ -159,3 +159,21 @@ TEST_CASE("Equal recipe frequencies choose the lowest stable digest", "[video_co
     }
     std::filesystem::remove(path);
 }
+
+TEST_CASE("Offline production signals request cancellation without terminating",
+          "[video_core][translation_cache]") {
+    {
+        SignalGuard signals;
+        REQUIRE(StopSignal() == 0);
+        std::raise(SIGTERM);
+        REQUIRE(StopSignal() == SIGTERM);
+    }
+    {
+        SignalGuard signals;
+        REQUIRE(StopSignal() == 0);
+        std::raise(SIGINT);
+        REQUIRE(StopSignal() == SIGINT);
+    }
+    // Leave the producer ready for other tests in this process.
+    SignalGuard reset;
+}

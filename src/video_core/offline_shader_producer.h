@@ -3,6 +3,7 @@
 #pragma once
 
 #include <filesystem>
+#include <csignal>
 #include <map>
 #include <string>
 #include <string_view>
@@ -34,8 +35,22 @@ struct Input {
     u64 title_id{};
     std::vector<Program> programs;
 };
+// Instantiated after SDL initialization so its quit-event handler cannot swallow production signals.
+class SignalGuard {
+public:
+    SignalGuard();
+    ~SignalGuard();
+    SignalGuard(const SignalGuard&) = delete;
+    SignalGuard& operator=(const SignalGuard&) = delete;
+private:
+    using Handler = void (*)(int);
+    Handler previous_int;
+    Handler previous_term;
+};
+[[nodiscard]] int StopSignal();
 struct Summary {
     u64 seen{}, translated{}, resumed{}, modules{};
+    bool cancelled{};
     std::map<std::string, u64> skipped;
 };
 [[nodiscard]] Input ParseInput(std::string_view json, const std::filesystem::path& directory);

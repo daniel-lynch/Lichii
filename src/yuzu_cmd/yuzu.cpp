@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/offline_shader_producer.h"
 #include <algorithm>
 #include <atomic>
 #include <iterator>
@@ -256,6 +257,7 @@ struct SdlState {
     bool network_initialized{};
     // --precompile-shaders: SDL_AppInit returns straight to SDL_AppQuit.
     bool precompile_exit{};
+    int precompile_signal{};
 };
 
 // How long a precompile run lets the guest run before stopping it (see SDL_AppInit).
@@ -666,6 +668,9 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         }
     }
 
+    std::optional<VideoCommon::OfflineShaders::SignalGuard> production_signals;
+    if (lp.precompile_shaders) production_signals.emplace();
+
     // Core is loaded, start the GPU (makes the GPU contexts current to this thread)
     state->system.GPU().Start();
     state->system.GetCpuManager().OnGpuReady();
@@ -705,6 +710,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         void(state->system.Run());
         std::this_thread::sleep_for(kPrecompileSettle);
         state->precompile_exit = true;
+        state->precompile_signal = VideoCommon::OfflineShaders::StopSignal();
         return archive_ok ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
     }
 
@@ -842,7 +848,8 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
         return;
     }
     if (state->precompile_exit) {
-        const int code = result == SDL_APP_SUCCESS ? 0 : 1;
+        const int code = state->precompile_signal ? 128 + state->precompile_signal
+                                                  : result == SDL_APP_SUCCESS ? 0 : 1;
         std::thread([code] {
             std::this_thread::sleep_for(kPrecompileShutdownLimit);
             LOG_CRITICAL(Frontend, "Precompile: shutdown still running after {} s, exiting {}",
@@ -864,9 +871,14 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
         LOG_INFO(Frontend, "Precompile: shutdown complete");
     }
     const bool network_initialized = state->network_initialized;
+    const int production_signal = state->precompile_signal;
     delete state;
     if (network_initialized) {
         Network::Shutdown();
+    }
+    if (production_signal) {
+        SDL_Quit();
+        std::exit(128 + production_signal);
     }
     if (restart_requested) {
         // SDL3 maps SDL_APP_SUCCESS to exit code 0; quit SDL ourselves to return the restart code.
