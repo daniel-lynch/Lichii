@@ -171,6 +171,26 @@ u64 RecipeHistogram::ClassKey(Shader::Stage stage, const std::bitset<512>* loads
     return key;
 }
 
+std::vector<RecipeHistogram::Recipe>::iterator RecipeHistogram::Victim(std::vector<Recipe>& list) {
+    // A full class makes room for a new recipe: first the weakest recipe this session has not
+    // seen (it only came from the file, so earlier sessions' recipes cannot hold the slots
+    // forever), else a recipe seen once this session (as weak as the newcomer).
+    const auto weakest = [&](auto&& eligible) {
+        auto best = list.end();
+        for (auto it = list.begin(); it != list.end(); ++it) {
+            if (eligible(*it) && (best == list.end() || it->count < best->count)) {
+                best = it;
+            }
+        }
+        return best;
+    };
+    if (const auto unseen = weakest([](const Recipe& recipe) { return !recipe.seen; });
+        unseen != list.end()) {
+        return unseen;
+    }
+    return weakest([](const Recipe& recipe) { return recipe.count <= 1; });
+}
+
 u64 RecipeHistogram::MaxFileBytes() {
     using Info = Shader::RuntimeInfo;
     constexpr u64 runtime_info =
@@ -217,6 +237,8 @@ bool RecipeHistogram::Record(Shader::Stage stage, const std::bitset<512>& loads,
         } else if (list.size() < MaxPerClass) {
             list.push_back({runtime_info, binding_in, digest, 1, true});
             first = first || (list.size() == 1 && class_key == own_class);
+        } else if (const auto victim = Victim(list); victim != list.end()) {
+            *victim = Recipe{runtime_info, binding_in, digest, 1, true};
         }
     }
     return first;

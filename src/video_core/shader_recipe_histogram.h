@@ -48,7 +48,8 @@ public:
     [[nodiscard]] static u64 ClassKey(Shader::Stage stage, const std::bitset<512>* loads);
 
     /// A run-time stage was emitted with this recipe. Returns whether its class (by loads) got
-    /// its first recipe.
+    /// its first recipe. A full class replaces its weakest recipe not seen this session (from
+    /// the file), else a recipe seen only once, so a new dominant recipe always gets in.
     bool Record(Shader::Stage stage, const std::bitset<512>& loads,
                 const Shader::RuntimeInfo& runtime_info,
                 const Shader::Backend::Bindings& binding_in);
@@ -87,6 +88,7 @@ private:
         std::bitset<512> loads{};
         std::vector<Recipe> recipes;
     };
+    static std::vector<Recipe>::iterator Victim(std::vector<Recipe>& list);
     std::unordered_map<u64, Class> classes;
     u64 revision{};
 };
