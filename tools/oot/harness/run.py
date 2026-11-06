@@ -808,7 +808,9 @@ class Run:
                     res["crash_signal"] = signal.Signals(hits[-1]["sig"]).name
             except (subprocess.TimeoutExpired, ValueError, KeyError, OSError):
                 pass
-        csvs = sorted(p for p in self.dir.glob("*.csv") if not p.name.endswith("_summary.csv"))
+        csvs = sorted(p for p in self.dir.glob("*.csv")
+                      if not p.name.endswith("_summary.csv")
+                      and p.name not in ("delta.csv", "pcs.csv", "mangohud.csv"))  # --gdb artefacts
         if csvs:
             csvs[-1].rename(self.dir / "mangohud.csv")
             for s in self.dir.glob("*_summary.csv"):
