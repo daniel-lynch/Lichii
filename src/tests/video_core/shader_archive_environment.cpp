@@ -267,8 +267,8 @@ TEST_CASE("Offline producer resumes complete modules and repairs interrupted app
         store.Open(directory / "multi.bin", config);
         const auto first = Offline::Run(input, 0x0400000000000000ULL, 2, recipes_path,
                                         profile, {}, config, store, 1);
-        REQUIRE(first.modules == 2);
-        REQUIRE(first.translated == 2);
+        REQUIRE(first.modules == 1);
+        REQUIRE(first.translated == 1);
         REQUIRE(first.module_bytes >= first.modules * 20);
         REQUIRE(first.skipped.empty());
         const auto size = std::filesystem::file_size(directory / "multi.bin");
@@ -278,6 +278,77 @@ TEST_CASE("Offline producer resumes complete modules and repairs interrupted app
         REQUIRE(second.translated == 0);
         REQUIRE(second.resumed == 2);
         REQUIRE(std::filesystem::file_size(directory / "multi.bin") == size);
+    }
+    {
+        Store store;
+        store.Open({}, config);
+        const auto result = Offline::Run(input, 0x0400000000000000ULL, 2, {},
+            profile, {}, config, store, DefaultRecipeCount, DefaultRecipeLimit, {}, RecipeBaseline::Never);
+        REQUIRE(result.modules == 0);
+        REQUIRE(result.entries == 1);
+        REQUIRE(result.multiplicity.at(0) == 1);
+        REQUIRE(result.skipped.empty());
+    }
+    {
+        const auto class_path = directory / "class-recipes.bin";
+        {
+            Store recipes;
+            recipes.Open(class_path, source_config);
+            const auto entry = recipes.Insert({77, 88}, {}, {.stage = Shader::Stage::VertexB});
+            auto recipe = DefaultEmissionRecipe(Shader::Stage::VertexB);
+            recipe.bindings.texture = 5;
+            REQUIRE(recipes.InsertVariant(*entry, {79, 80},
+                {.spirv = {0x07230203, 0x10000, 0, 1, 0}}, &recipe));
+        }
+        Store store;
+        store.Open({}, config);
+        const auto result = Offline::Run(input, 0x0400000000000000ULL, 2, class_path,
+            profile, {}, config, store);
+        REQUIRE(result.modules == 2);
+        REQUIRE(result.sources[0].modules == 0);
+        REQUIRE(result.sources[1].modules == 1);
+        REQUIRE(result.sources[2].modules == 1);
+        REQUIRE(result.module_bytes == result.sources[1].module_bytes + result.sources[2].module_bytes);
+    }
+    for (const auto policy : {RecipeBaseline::Auto, RecipeBaseline::Always, RecipeBaseline::Never}) {
+        const auto suffix = std::to_string(static_cast<int>(policy));
+        Store store;
+        const auto product = directory / ("policy-" + suffix + ".bin");
+        const auto report = directory / ("report-" + suffix + ".json");
+        store.Open(product, config);
+        const auto result = Offline::Run(input, 0x0400000000000000ULL, 2, recipes_path,
+            profile, {}, config, store, DefaultRecipeCount, DefaultRecipeLimit, report, policy);
+        const u64 expected = policy == RecipeBaseline::Always ? 3 : 2;
+        REQUIRE(result.modules == expected);
+        REQUIRE(result.entries == 1);
+        REQUIRE(result.multiplicity.at(expected) == 1);
+        REQUIRE(result.sources[0].modules == 2);
+        REQUIRE(result.sources[1].modules == 0);
+        REQUIRE(result.sources[2].modules == expected - 2);
+        REQUIRE(result.import_invalid_recipes == 1);
+        std::ifstream file(report);
+        const auto json = nlohmann::json::parse(file);
+        REQUIRE(json["modules"] == expected);
+        REQUIRE(json["entries"] == 1);
+        REQUIRE(json["module_bytes"] == result.module_bytes);
+        REQUIRE(json["sources"]["exact_stage"]["module_bytes"] == result.sources[0].module_bytes);
+        REQUIRE(json["sources"]["baseline"]["modules"] == expected - 2);
+        REQUIRE(json["product_entry_multiplicity"][std::to_string(expected)] == 1);
+        REQUIRE(json["import"]["invalid_recipes"] == 1);
+        REQUIRE(json["import"]["entries"] == result.import_entries);
+        REQUIRE(json["import"]["bytes"] == result.import_bytes);
+        REQUIRE(json["skips"].empty());
+        store.Close();
+        store.Open(product, config);
+        const auto resumed = Offline::Run(input, 0x0400000000000000ULL, 2, recipes_path,
+            profile, {}, config, store, DefaultRecipeCount, DefaultRecipeLimit, report, policy);
+        REQUIRE(resumed.modules == 0);
+        REQUIRE(resumed.multiplicity.at(expected) == 1);
+        const auto trimmed_selection = Offline::Run(input, 0x0400000000000000ULL, 2, recipes_path,
+            profile, {}, config, store, 1, DefaultRecipeLimit, report, RecipeBaseline::Never);
+        REQUIRE(trimmed_selection.modules == 0);
+        REQUIRE(trimmed_selection.product_modules == expected);
+        REQUIRE(trimmed_selection.multiplicity.at(expected) == 1);
     }
     std::filesystem::remove_all(directory);
 }

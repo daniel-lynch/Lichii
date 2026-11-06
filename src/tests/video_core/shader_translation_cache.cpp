@@ -291,6 +291,8 @@ TEST_CASE("Translation cache persists entries and variants", "[video_core][trans
         REQUIRE(found->spirv == variant.spirv);
         REQUIRE(found->binding_out.texture == 3);
         REQUIRE(found->info.stores_frag_depth);
+        REQUIRE(InfoEqual(found->info, variant.info));
+        REQUIRE(store.HasVariant(variant_key));
         REQUIRE_FALSE(store.FindVariant(MakeVariantKey(entry->id, runtime, {})));
 
         // The environment answers a query differently: no entry.
@@ -1065,7 +1067,7 @@ TEST_CASE("Recipe catalogs cap exact selection and total import size",
     REQUIRE(catalog.exact.at(key).front().count == 3);
     REQUIRE(catalog.entries == 18);
     REQUIRE(catalog.truncated_entries == 0);
-    const auto selected = catalog.Select(key, stage, {}, 2);
+    const auto selected = catalog.Select(key, stage, {}, 2, RecipeBaseline::Always);
     REQUIRE(selected.size() == 3);
     REQUIRE(selected.front().bindings.texture == 1);
     REQUIRE(selected.back().bindings.texture == 0);
@@ -1192,4 +1194,24 @@ TEST_CASE("SPIR-V emission bounds transform-feedback components to each output v
     for (const auto& component : context.output_generics[1]) {
         REQUIRE(component.num_components == 0);
     }
+}
+
+TEST_CASE("Product multiplicity counts unique modules and excludes dropped entries",
+          "[video_core][translation_cache]") {
+    Store store;
+    store.Open({}, {11, 22});
+    const auto a = store.Insert({1, 2}, {}, {.stage = Shader::Stage::Fragment});
+    const auto b = store.Insert({3, 4}, {}, {.stage = Shader::Stage::Fragment});
+    REQUIRE(store.VariantMultiplicity().at(0) == 2);
+    const Variant variant{.spirv = {0x07230203, 1, 2, 3, 4}};
+    REQUIRE(store.InsertVariant(*a, {5, 6}, variant));
+    REQUIRE(store.InsertVariant(*a, {5, 6}, variant));
+    REQUIRE(store.InsertVariant(*a, {7, 8}, variant));
+    REQUIRE(store.VariantMultiplicity().at(2) == 1);
+    REQUIRE(store.VariantMultiplicity().at(0) == 1);
+    store.DropEntry(*a);
+    REQUIRE_FALSE(store.HasVariant({5, 6}));
+    const auto histogram = store.VariantMultiplicity();
+    REQUIRE(histogram.size() == 1);
+    REQUIRE(histogram.at(0) == 1);
 }

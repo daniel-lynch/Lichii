@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include "video_core/offline_shader_producer.h"
+#include "core/launch_params.h"
 
 namespace {
 using namespace VideoCommon::TranslationCache;
@@ -216,7 +217,7 @@ TEST_CASE("Recipe catalogs retain exact variants and rank runtime recipes by cla
     const auto catalog = Store::ReadRecipeCatalog(path, {100, 200});
     REQUIRE(catalog.source_config == source_config);
     REQUIRE(std::filesystem::file_size(path) == size + 7);
-    const auto exact = catalog.Select({3, 1}, meta.stage, meta.info, 1);
+    const auto exact = catalog.Select({3, 1}, meta.stage, meta.info, 1, RecipeBaseline::Always);
     REQUIRE(exact.size() == 2);
     REQUIRE(exact[0].bindings.texture == 3);
     REQUIRE(exact[1].bindings.texture == 0);
@@ -230,4 +231,76 @@ TEST_CASE("Recipe catalogs retain exact variants and rank runtime recipes by cla
     REQUIRE(classified[0].bindings.texture == 4);
     REQUIRE(classified[1].bindings.texture == 0);
     std::filesystem::remove(path);
+}
+
+TEST_CASE("Recipe policy defaults to two observations and attributes canonical duplicates",
+          "[video_core][translation_cache]") {
+    REQUIRE(Core::LaunchParams{}.shader_recipe_count == 2);
+    REQUIRE(Core::LaunchParams{}.shader_recipe_baseline == "auto");
+    REQUIRE(DefaultRecipeCount == 2);
+    const auto stage = Shader::Stage::VertexB;
+    const Digest key{17, 18};
+    RecipeCatalog catalog;
+    auto recipe = DefaultEmissionRecipe(stage);
+    auto add = [&](auto& list, u32 binding) {
+        recipe.bindings.texture = binding;
+        list.push_back({recipe, {}, 1});
+    };
+    auto& exact = catalog.exact[key];
+    add(exact, 1);
+    add(exact, 2);
+    add(exact, 3);
+    auto& classes = catalog.classes[RecipeClass(stage, nullptr)];
+    add(classes, 4);
+    add(classes, 5);
+    add(classes, 6);
+    const auto defaults = catalog.SelectWithSources(key, stage, {});
+    REQUIRE(defaults.size() == 2);
+    REQUIRE(defaults[0].source == RecipeSource::ExactStage);
+    REQUIRE(defaults[1].recipe.bindings.texture == 2);
+    REQUIRE(catalog.Select(key, stage, {}, 2, RecipeBaseline::Always).size() == 3);
+    REQUIRE(catalog.Select(key, stage, {}, 2, RecipeBaseline::Never).size() == 2);
+    const auto fallback = catalog.SelectWithSources({99, 99}, stage, {});
+    REQUIRE(fallback.size() == 3);
+    REQUIRE(fallback[0].source == RecipeSource::Class);
+    REQUIRE(fallback[2].source == RecipeSource::Baseline);
+    REQUIRE(catalog.Select({99, 99}, stage, {}, 2, RecipeBaseline::Never).size() == 2);
+    catalog.classes.clear();
+    exact.resize(2);
+    exact[1] = exact[0];
+    // This unused input differs before canonicalization, but produces the same variant key.
+    exact[1].recipe.runtime.generic_input_types[0] = Shader::AttributeType::SignedInt;
+    const auto deduped = catalog.SelectWithSources(key, stage, {});
+    REQUIRE(deduped.size() == 1);
+    REQUIRE(deduped[0].source == RecipeSource::ExactStage);
+    exact[0].recipe = DefaultEmissionRecipe(stage);
+    exact.resize(1);
+    const auto baseline_duplicate = catalog.SelectWithSources(key, stage, {}, 2, RecipeBaseline::Always);
+    REQUIRE(baseline_duplicate.size() == 1);
+    REQUIRE(baseline_duplicate[0].source == RecipeSource::ExactStage);
+    catalog.exact.clear();
+    REQUIRE(catalog.Select(key, stage, {}).size() == 1);
+    REQUIRE(catalog.Select(key, stage, {}, 2, RecipeBaseline::Never).empty());
+}
+
+TEST_CASE("Shader report includes skips and all import limits", "[video_core][translation_cache]") {
+    Summary summary;
+    summary.seen = 7;
+    summary.cancelled = true;
+    summary.skipped["unsupported_stage"] = 4;
+    summary.import_truncated_entries = 8;
+    summary.import_skipped_records = 9;
+    const auto path = std::filesystem::temp_directory_path() / "lichii_report_test.json";
+    WriteReport(path, summary);
+    std::ifstream file(path);
+    const auto report = nlohmann::json::parse(file);
+    REQUIRE(report["seen"] == 7);
+    REQUIRE(report["cancelled"] == true);
+    REQUIRE(report["skips"]["unsupported_stage"] == 4);
+    REQUIRE(report["import"]["truncated_entries"] == 8);
+    REQUIRE(report["import"]["skipped_records"] == 9);
+    REQUIRE(report["sources"]["class"]["modules"] == 0);
+    file.close();
+    std::filesystem::remove(path);
+    REQUIRE_THROWS(WriteReport(path / "missing-parent.json", summary));
 }
