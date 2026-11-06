@@ -868,8 +868,8 @@ void PipelineCache::OpenTranslationCache(const std::filesystem::path& filename) 
     }
     const char* emit_env = std::getenv("EDEN_NX2_AOT_EMIT");
     aot_emit_variants = aot_translation && !(emit_env != nullptr && emit_env[0] == '0');
-    // AOT jobs queued for the previous file must not store into this one.
-    ++aot_generation;
+    // AOT jobs queued for the previous file must not store into this one: Open changes the
+    // store's generation, which every AOT publication checks under the store mutex.
     translation_cache.Open(filename, translation_config);
     translation_cache.count_mismatches = aot_translation;
     translation_cache_logged = std::chrono::steady_clock::now();
@@ -982,7 +982,7 @@ void PipelineCache::EmitWaitingSeeds(std::vector<WaitingSeed> seeds) {
         for (const WaitingSeed& seed : seeds) {
             const auto begin = std::chrono::steady_clock::now();
             try {
-                if (seed.generation == aot_generation.load()) {
+                if (seed.generation == translation_cache.Generation()) {
                     // The same translation as the seed's (the guessed words are kept by the
                     // environment), checked against the entry before its module is stored.
                     ShaderPools pools;
@@ -1106,7 +1106,7 @@ bool PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
         }
     }
     aot_workers->QueueWork([this, owned = std::move(owned), stage_key, unique_hash, job_bytes,
-                            tier_index, generation = aot_generation.load()] {
+                            tier_index, generation = translation_cache.Generation()] {
         const auto translate_begin = std::chrono::steady_clock::now();
         bool stored = false;
         try {
@@ -1122,9 +1122,9 @@ bool PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
             std::shared_ptr<const TC::Entry> entry;
             if (program.info.requires_layer_emulation || broken) {
                 ++aot_failed;
-            } else if (generation == aot_generation.load() &&
-                       (entry = translation_cache.Insert(stage_key, recording.TakeQueries(),
-                                                         TC::ProgramMeta::From(program)))) {
+            } else if ((entry = translation_cache.Insert(stage_key, recording.TakeQueries(),
+                                                         TC::ProgramMeta::From(program),
+                                                         generation))) {
                 stored = true;
                 ++aot_completed;
                 ++aot_stored_by_tier[tier_index];

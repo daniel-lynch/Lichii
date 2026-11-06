@@ -906,6 +906,7 @@ void Store::Close() {
     entries.clear();
     variants.clear();
     enabled = false;
+    ++generation;
 }
 
 void Store::Open(const std::filesystem::path& path, const Digest& config) {
@@ -1101,7 +1102,8 @@ std::optional<Variant> Store::FindVariant(const Digest& variant_key) {
 }
 
 std::shared_ptr<const Entry> Store::Insert(const Digest& stage_key, std::vector<Query> queries,
-                                           const ProgramMeta& meta) {
+                                           const ProgramMeta& meta,
+                                           std::optional<u64> expected_generation) {
     Entry entry{.stage_key = stage_key, .queries = std::move(queries), .meta = meta};
     std::vector<u8> record;
     {
@@ -1112,7 +1114,7 @@ std::shared_ptr<const Entry> Store::Insert(const Digest& stage_key, std::vector<
         WriteMeta(record, entry.meta);
     }
     std::scoped_lock lock{mutex};
-    if (!enabled) {
+    if (!enabled || (expected_generation && *expected_generation != generation.load())) {
         return nullptr;
     }
     const size_t before = entries.contains(stage_key) ? entries[stage_key].size() : 0;
@@ -1123,7 +1125,7 @@ std::shared_ptr<const Entry> Store::Insert(const Digest& stage_key, std::vector<
     return shared;
 }
 
-void Store::InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant) {
+bool Store::InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant) {
     auto stored = std::make_shared<StoredVariant>();
     stored->binding_out = variant.binding_out;
     stored->info = variant.info;
@@ -1142,11 +1144,22 @@ void Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
     }
     std::scoped_lock lock{mutex};
     if (!enabled) {
-        return;
+        return false;
+    }
+    // Only for an entry of this store: one held across a reopen (or never inserted) names a
+    // program of another configuration.
+    const auto list = entries.find(entry.stage_key);
+    if (list == entries.end() ||
+        std::ranges::none_of(list->second, [&](const auto& stored_entry) {
+            return stored_entry.get() == &entry;
+        })) {
+        ++rejected_variants;
+        return false;
     }
     if (variants.try_emplace(variant_key, std::move(stored)).second) {
         Append(record);
     }
+    return true;
 }
 
 void Store::Append(const std::vector<u8>& record) {

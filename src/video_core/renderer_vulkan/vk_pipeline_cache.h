@@ -254,7 +254,6 @@ private:
     static constexpr u64 MaxAotEntries = 4096;
     std::atomic<u64> aot_pending{};
     std::atomic<u64> aot_reserved{}; ///< Admitted jobs plus stored entries, against MaxAotEntries
-    std::atomic<u64> aot_generation{}; ///< Bumped when the translation cache is reopened
     [[nodiscard]] bool AotHasRoom() const noexcept {
         return aot_translation && aot_pending.load() < MaxAotPending &&
                aot_reserved.load() < MaxAotEntries;

@@ -251,10 +251,19 @@ public:
     /// The variant, decompressed.
     [[nodiscard]] std::optional<Variant> FindVariant(const Digest& variant_key);
 
-    /// Adds an entry (when new) and a variant, and appends both to the file.
+    /// Adds an entry (when new) and appends it to the file. With `expected_generation`, nothing
+    /// is added unless the store is still the one opened then (checked under the store mutex).
     std::shared_ptr<const Entry> Insert(const Digest& stage_key, std::vector<Query> queries,
-                                        const ProgramMeta& meta);
-    void InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant);
+                                        const ProgramMeta& meta,
+                                        std::optional<u64> expected_generation = std::nullopt);
+    /// Adds a variant of `entry`, which must be an entry of this store (one from before a
+    /// reopen is refused); returns whether it was taken.
+    bool InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant);
+    /// Changes whenever the store is closed (and so on every Open).
+    [[nodiscard]] u64 Generation() const noexcept {
+        return generation.load();
+    }
+    std::atomic<u64> rejected_variants{};
 
     void LogStatistics(std::string_view when);
 
@@ -284,6 +293,7 @@ private:
 
     std::mutex mutex;
     bool enabled{};
+    std::atomic<u64> generation{};
     std::unordered_map<Digest, std::vector<std::shared_ptr<const Entry>>, DigestHash> entries;
     std::unordered_map<Digest, std::shared_ptr<const StoredVariant>, DigestHash> variants;
     std::filesystem::path filename;
