@@ -1438,6 +1438,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             // Keep an offline entry only for an exact module lookup after live translation.
             if (cached_entries[index] && cached_entries[index]->offline &&
                 !translation_cache.ValidateOfflineEntry(*cached_entries[index], programs[index])) {
+                translation_cache.LogOfflineOutcome(programs[index].stage, key.unique_hashes[index],
+                                                    TC::OfflineOutcome::MetaMismatch);
                 cached_entries[index].reset();
             }
             from_cache[index] = false;
@@ -1533,6 +1535,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 TC::MakeVariantKey(entry->id, TC::DigestRuntimeInfo(runtime_info), binding);
             variant = translation_cache.FindVariant(variant_key);
         }
+        if (entry && entry->offline) {
+            translation_cache.LogOfflineOutcome(program.stage, key.unique_hashes[index],
+                variant ? TC::OfflineOutcome::VariantHit : TC::OfflineOutcome::VariantMiss);
+        }
         // #184 native async pipelines: the SPIR-V of a stage the translation cache does not
         // supply is emitted on the worker that builds the pipeline. Not while verifying the
         // translation cache, which compares on this thread.
@@ -1611,7 +1617,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if (use_translation_cache && !is_emulated_stage) {
             const auto ns = static_cast<u64>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(stage_time[index]).count());
-            if (variant && !translation_cache_verify && from_cache[index]) {
+            if (variant && !translation_cache_verify &&
+                (from_cache[index] || (entry && entry->offline))) {
                 ++translation_cache.stage_hits;
                 translation_cache.hit_ns += ns;
             } else {

@@ -1323,9 +1323,29 @@ bool Store::ValidateOfflineEntry(const Entry& entry, const Shader::IR::Program& 
     return false;
 }
 
+void Store::LogOfflineOutcome(Shader::Stage stage, u64 hash, OfflineOutcome outcome) {
+    const auto index = static_cast<size_t>(outcome);
+    const auto count = ++offline_outcomes[static_cast<size_t>(stage)][index];
+    constexpr std::array names{"entry hit + variant hit", "entry hit + variant miss (retranslated)",
+                               "meta mismatch dropped"};
+    if (count <= 20) {
+        LOG_INFO(Render_Vulkan, "Translation cache offline: stage={} shader={:016x} {} count={}{}",
+                 static_cast<u32>(stage), hash, names[index], count,
+                 count == 20 ? " (further stage outcomes suppressed)" : "");
+    }
+}
+
 void Store::LogStatistics(std::string_view when) {
     LOG_INFO(Render_Vulkan, "Translation cache ({}): offline entry-only records rejected={}",
              when, offline_entry_only_rejected.load());
+    for (size_t stage = 0; stage < offline_outcomes.size(); ++stage) {
+        const auto& counts = offline_outcomes[stage];
+        if (counts[0] + counts[1] + counts[2] != 0) {
+            LOG_INFO(Render_Vulkan, "Translation cache offline ({}): stage={} variant_hit={} "
+                     "variant_miss={} meta_mismatch_dropped={}", when, stage,
+                     counts[0].load(), counts[1].load(), counts[2].load());
+        }
+    }
     const u64 hits = stage_hits.load();
     const u64 misses = stage_misses.load();
     if (hits + misses == 0) {

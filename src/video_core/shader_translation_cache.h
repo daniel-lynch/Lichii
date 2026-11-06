@@ -224,6 +224,8 @@ struct EmissionRecipe {
 
 [[nodiscard]] EmissionRecipe DefaultEmissionRecipe(Shader::Stage stage);
 
+enum class OfflineOutcome { VariantHit, VariantMiss, MetaMismatch };
+
 class Store {
 public:
     Store() = default;
@@ -258,9 +260,11 @@ public:
     /// Reject speculative metadata before any pipeline state is derived from it.
     [[nodiscard]] bool ValidateOfflineEntry(const Entry& entry, const Shader::IR::Program& live);
 
+    void LogOfflineOutcome(Shader::Stage stage, u64 hash, OfflineOutcome outcome);
     void LogStatistics(std::string_view when);
 
     // Statistics
+    std::array<std::array<std::atomic<u64>, 3>, Shader::MaxStageTypes> offline_outcomes{};
     std::atomic<u64> offline_entry_only_rejected{};
     std::atomic<u64> stage_hits{};
     std::atomic<u64> stage_misses{};
