@@ -448,7 +448,12 @@ void RecordingEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
 }
 
 bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env) {
-    for (const Query& query : queries) {
+    return ReplayQueriesUntilMismatch(queries, env) == queries.size();
+}
+
+size_t ReplayQueriesUntilMismatch(std::span<const Query> queries, Shader::Environment& env) {
+    for (size_t index = 0; index < queries.size(); ++index) {
+        const Query& query = queries[index];
         u32 answer{};
         switch (query.kind) {
         case QueryKind::CbufValue:
@@ -478,13 +483,13 @@ bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env) {
             break;
         }
         default:
-            return false;
+            return index;
         }
         if (answer != query.answer) {
-            return false;
+            return index;
         }
     }
-    return true;
+    return queries.size();
 }
 
 Digest MakeStageKey(Shader::Environment& env, u64 unique_hash, u32 slot, const Digest& config) {
@@ -892,15 +897,25 @@ std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::E
         }
         candidates = it->second;
     }
+    size_t furthest = 0;
+    std::optional<QueryKind> furthest_kind;
     for (const auto& candidate : candidates) {
         try {
-            if (ReplayQueries(candidate->queries, env)) {
+            const size_t matched = ReplayQueriesUntilMismatch(candidate->queries, env);
+            if (matched == candidate->queries.size()) {
                 return candidate;
+            }
+            if (!furthest_kind || matched > furthest) {
+                furthest = matched;
+                furthest_kind = candidate->queries[matched].kind;
             }
         } catch (const Shader::Exception&) {
             // An environment read from the pipeline cache only answers the queries its own
             // translation made; a question outside them means this entry does not apply.
         }
+    }
+    if (count_mismatches && furthest_kind) {
+        ++first_mismatch[static_cast<size_t>(*furthest_kind) % first_mismatch.size()];
     }
     return nullptr;
 }

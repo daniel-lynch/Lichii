@@ -126,6 +126,10 @@ private:
 /// Asks the live environment the recorded queries in order; true when every answer matches.
 /// Stops at the first mismatch, so it never makes a query the translation would not make.
 [[nodiscard]] bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env);
+/// ReplayQueries that also says where it stopped: the index of the first query answered
+/// differently (queries.size() when all matched).
+[[nodiscard]] size_t ReplayQueriesUntilMismatch(std::span<const Query> queries,
+                                                Shader::Environment& env);
 
 /// Key of a stage: its hash and the environment values the translator reads besides queries.
 [[nodiscard]] Digest MakeStageKey(Shader::Environment& env, u64 unique_hash, u32 slot,
@@ -213,6 +217,12 @@ public:
     void InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant);
 
     void LogStatistics(std::string_view when);
+
+    /// With count_mismatches set (use_shader_aot_translation), FindEntry misses on a known
+    /// stage key are counted by the kind of the first query answered differently, taken from the
+    /// candidate whose replay got furthest.
+    bool count_mismatches{};
+    std::array<std::atomic<u64>, 8> first_mismatch{};
 
     // Statistics
     std::atomic<u64> stage_hits{};
