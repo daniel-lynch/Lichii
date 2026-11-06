@@ -54,7 +54,8 @@ standalone translator executable. Do not run it in the implementation sandbox.
 
 ## Input schema
 
-UTF-8 JSON, version 1, maximum 16 MiB and 100,000 rows. Paths are relative to the
+UTF-8 JSON, version 1, maximum 64 MiB (`MaxIndexBytes`; larger fails with "index too
+large") and 100,000 rows. The extractor writes it compact. Paths are relative to the
 index directory unless absolute. Nested/compressed members are materialized by
 Python into owned allocation files; offsets never refer into compressed bytes.
 For direct uncompressed allocations, container and control may name the same file.
@@ -84,7 +85,9 @@ is FNV-1a-64 over the first `min(256, size)` bytes. `constants_offset` is relati
 to the program; it and `constants_size` must match control words at 0x40 and 0x3c.
 The reader consumes 0x58 control bytes. Optional `bank1_words` must cover the entire
 constant section and match its little-endian bytes exactly. `tier` defaults to 0;
-lower tiers are admitted first, with stable ordering within a tier. Stage names
+lower tiers are admitted first, with stable ordering within a tier. A vertex, fragment or
+geometry row whose constant section exceeds 256 bytes is parsed and then skipped as
+`bank1_too_large`; it does not fail the index. Stage names
 are `vertex`, `tess-control`, `tess-eval`, `geometry`, `fragment`, `compute`,
 `vertex-a`, `task`, `mesh`. Unknown stage strings or malformed index rows fail the
 index; unsupported known stages are counted without reading their allocations.

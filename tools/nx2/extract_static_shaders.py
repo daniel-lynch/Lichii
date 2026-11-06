@@ -121,9 +121,11 @@ def write_offline_inputs(result, output):
                "stage": program["stage"], "fingerprint": f"{fingerprint:016x}"}
         titles.setdefault(program["title_id"], []).append(row)
     for title, rows in titles.items():
+        # Compact: a whole title's index is read in one piece by the producer, and the
+        # indented form of a large library (OoT: 18.3 MB) is a quarter whitespace.
         (output / f"offline-{title}.json").write_text(json.dumps(
-            {"schema_version": 1, "title_id": title, "programs": rows}, indent=2) + "\n",
-            encoding="utf-8")
+            {"schema_version": 1, "title_id": title, "programs": rows},
+            separators=(",", ":")) + "\n", encoding="utf-8")
 
 
 def main():
