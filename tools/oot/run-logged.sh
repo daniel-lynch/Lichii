@@ -94,8 +94,14 @@ if [ "${OOT_PRODUCT:-1}" = "1" ]; then
   fi
 fi
 # MangoHud: overlay + CSV of fps/frametime, starts 5 s after launch, runs until exit.
-export MANGOHUD=1
-export MANGOHUD_CONFIG="fps,frametime,gpu_stats,cpu_stats,output_folder=$OOT/logs,autostart_log=5,log_duration=0,log_interval=100"
+# MangoHud: OOT_MANGOHUD=0 disables the overlay and the frametime log entirely. The NVIDIA GPU
+# sampler (gpu_stats) aborts the process inside libMangoHud.so on this host since 2026-11-06
+# (NVIDIA::get_samples_and_copy -> free(): invalid pointer), so it is off; OOT_MANGOHUD_GPU_STATS=1
+# turns it back on once MangoHud is fixed.
+export MANGOHUD="${OOT_MANGOHUD:-1}"
+MH_CFG="fps,frametime,cpu_stats,output_folder=$OOT/logs,autostart_log=5,log_duration=0,log_interval=100"
+[ "${OOT_MANGOHUD_GPU_STATS:-0}" = "1" ] && MH_CFG="$MH_CFG,gpu_stats"
+export MANGOHUD_CONFIG="$MH_CFG"
 # PCIe + GPU load sampler (1 s) for the whole session, saved beside the logs.
 nvidia-smi dmon -s tu -d 1 > "$OOT/logs/pcie-$STAMP.txt" 2>/dev/null &
 SAMPLER=$!
