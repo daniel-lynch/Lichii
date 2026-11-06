@@ -1301,11 +1301,13 @@ void PipelineCache::LogStageOutcomes(std::string_view when) {
 }
 
 PipelineCache::~PipelineCache() {
+    background_pipelines.Stop();
+    workers.WaitForRequests();
+    // After the pipeline workers: their jobs record recipes, which can queue AOT re-emission.
+    // AOT jobs queue only AOT jobs, and WaitForRequests covers work queued while it waits.
     if (aot_workers) {
         aot_workers->WaitForRequests();
     }
-    background_pipelines.Stop();
-    workers.WaitForRequests();
     serialization_thread.WaitForRequests();
     translation_cache.LogStatistics("run time");
     LogStageOutcomes("run time");
