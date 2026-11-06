@@ -944,20 +944,36 @@ void PipelineCache::ParkSeed(const std::shared_ptr<VideoCommon::ReplayEnvironmen
                              const std::shared_ptr<const VideoCommon::TranslationCache::Entry>& entry,
                              Shader::Stage stage, const Shader::Info& info, u64 bytes,
                              u64 generation) {
+    // The environment stays owned until the class's recipe is seen (EmitWaitingSeeds releases
+    // the bytes).
+    const auto account_bytes = [this](u64 count) {
+        const u64 in_flight = aot_bytes.fetch_add(count) + count;
+        for (u64 peak = aot_bytes_peak.load();
+             in_flight > peak && !aot_bytes_peak.compare_exchange_weak(peak, in_flight);) {
+        }
+    };
     static constexpr size_t MaxWaiting = 2048;
-    std::scoped_lock lock{recipe_mutex};
-    if (waiting_count >= MaxWaiting) {
-        ++aot_waiting_dropped;
-        return;
+    const u64 class_key = RecipeClass(stage, &info);
+    {
+        std::scoped_lock lock{recipe_mutex};
+        // The class's first recipe may have been recorded since this seed chose a stage-level
+        // one: that recording drained the waiting list already, so emit now instead of parking.
+        const auto known = recipes.find(class_key);
+        if (known == recipes.end() || known->second.empty()) {
+            if (waiting_count >= MaxWaiting) {
+                ++aot_waiting_dropped;
+                return;
+            }
+            waiting_seeds[class_key].push_back({env, entry, bytes, generation});
+            ++waiting_count;
+            ++aot_parked;
+            account_bytes(bytes);
+            return;
+        }
     }
-    waiting_seeds[RecipeClass(stage, &info)].push_back({env, entry, bytes, generation});
-    ++waiting_count;
     ++aot_parked;
-    // The environment stays owned until the class's recipe is seen.
-    const u64 in_flight = aot_bytes.fetch_add(bytes) + bytes;
-    for (u64 peak = aot_bytes_peak.load();
-         in_flight > peak && !aot_bytes_peak.compare_exchange_weak(peak, in_flight);) {
-    }
+    account_bytes(bytes);
+    EmitWaitingSeeds({WaitingSeed{env, entry, bytes, generation}});
 }
 
 void PipelineCache::EmitWaitingSeeds(std::vector<WaitingSeed> seeds) {
