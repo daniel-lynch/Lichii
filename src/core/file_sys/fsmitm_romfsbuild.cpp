@@ -6,6 +6,8 @@
 #include <string_view>
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging.h"
+#include "common/shader_aot_scene.h"
 #include "core/file_sys/fsmitm_romfsbuild.h"
 #include "core/file_sys/ips_layer.h"
 #include "core/file_sys/vfs/vfs.h"
@@ -80,6 +82,52 @@ struct RomFSBuildFileContext {
     RomFSBuildFileContext* sibling = nullptr;
     VirtualFile source;
 };
+
+namespace {
+/// A scene placement file that tells the shader AOT translation which scene the game loads
+/// whenever it is read (Common::ShaderAotScene). Everything else is the wrapped file's.
+class SceneHintFile final : public VfsFile {
+public:
+    SceneHintFile(VirtualFile file_, std::string scene_)
+        : file{std::move(file_)}, scene{std::move(scene_)} {}
+
+    std::string GetName() const override {
+        return file->GetName();
+    }
+    std::size_t GetSize() const override {
+        return file->GetSize();
+    }
+    bool Resize(std::size_t new_size) override {
+        return file->Resize(new_size);
+    }
+    VirtualDir GetContainingDirectory() const override {
+        return file->GetContainingDirectory();
+    }
+    bool IsWritable() const override {
+        return file->IsWritable();
+    }
+    bool IsReadable() const override {
+        return file->IsReadable();
+    }
+    std::size_t Read(u8* data, std::size_t length, std::size_t offset) const override {
+        Common::ShaderAotScene::Post(scene);
+        return file->Read(data, length, offset);
+    }
+    std::size_t Write(const u8* data, std::size_t length, std::size_t offset) override {
+        return file->Write(data, length, offset);
+    }
+    bool Rename(std::string_view name) override {
+        return file->Rename(name);
+    }
+    std::string GetFullPath() const override {
+        return file->GetFullPath();
+    }
+
+private:
+    VirtualFile file;
+    std::string scene;
+};
+} // Anonymous namespace
 
 static u32 romfs_calc_path_hash(u32 parent, std::string_view path, u32 start,
                                 std::size_t path_len) {
@@ -234,6 +282,23 @@ std::vector<std::pair<u64, VirtualFile>> RomFSBuildContext::Build() {
               [](const auto& a, const auto& b) { return a->path < b->path; });
     std::sort(directories.begin(), directories.end(),
               [](const auto& a, const auto& b) { return a->path < b->path; });
+
+    // Shader AOT translation: the scene placement files say which scene the game loads.
+    if (Common::ShaderAotScene::Wanted()) {
+        size_t hooked = 0;
+        for (const auto& file : files) {
+            if (std::string scene = Common::ShaderAotScene::SceneOfPath(file->path);
+                !scene.empty() && file->source != nullptr) {
+                file->source = std::make_shared<SceneHintFile>(std::move(file->source),
+                                                               std::move(scene));
+                ++hooked;
+            }
+        }
+        if (hooked != 0) {
+            Common::ShaderAotScene::SetHookedFiles(hooked);
+            LOG_INFO(Loader, "Shader AOT: {} scene placement files report their reads", hooked);
+        }
+    }
 
     // Determine file offsets.
     u32 entry_offset = 0;

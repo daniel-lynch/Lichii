@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <filesystem>
@@ -17,6 +18,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/shader_aot_scene.h"
 
 namespace Tegra {
 class MemoryManager;
@@ -34,8 +36,14 @@ namespace VideoCommon {
 /// With EDEN_NX2_AOT_MANIFEST=<manifest-<Scene>.json, or a directory of them> (static scene
 /// manifests built from the game's files, kept outside the repository), the programs a scene's
 /// materials use are offered first, main material pass (tier 1) to tier 3, and the other
-/// siblings only when no manifest program is waiting. Every manifest in the directory is loaded
-/// and their rows are united.
+/// siblings only when no manifest program is waiting.
+///
+/// A directory that holds manifest-_global.json selects manifests per scene: the global one is
+/// always loaded, and manifest-<Scene>.json when the game reads that scene's placement files
+/// (Common::ShaderAotScene, posted by the RomFS builder). A new scene replaces the previous
+/// scene's rows; seeds already stored stay. When the scene cannot be known (no placement file was
+/// hooked, EDEN_NX2_AOT_SCENES=0, or no scene read within EDEN_NX2_AOT_SCENE_WAIT seconds, default
+/// 120), every manifest in the directory is loaded and their rows are united, as before.
 class ShaderPoolIndex {
 public:
     /// The index named by EDEN_NX2_AOT_INDEX, or null when unset or unreadable.
@@ -44,6 +52,14 @@ public:
 
     /// A native graphics program at `address` is used for the first time.
     void OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr address);
+
+    /// Per-scene manifests: picks up a scene the game started to load (cheap, for every draw).
+    void PollScene(Tegra::MemoryManager& gpu_memory) {
+        if (scene_mode && (scene_load_pending || ++scene_polls % 256 == 0 ||
+                           Common::ShaderAotScene::Generation() != scene_generation)) {
+            UpdateScene(gpu_memory);
+        }
+    }
 
     /// Candidate priority: manifest tiers 1-3, then the siblings no manifest names.
     static constexpr size_t PriorityCount = 4;
@@ -87,6 +103,8 @@ public:
         u16 constants_size;
         u8 tier{NoTier};          ///< Lowest manifest tier naming the program
         u32 manifest_bank1{~0U}; ///< Index into manifest_bank1_words
+        u8 global_tier{NoTier};   ///< The same, from the manifests kept across scenes
+        u32 global_bank1{~0U};
     };
     struct Container {
         std::vector<Program> programs;
@@ -111,6 +129,11 @@ public:
     [[nodiscard]] static bool ParseManifest(std::string_view json, std::vector<ManifestRow>& out);
     /// Marks the indexed programs a manifest names (lowest tier wins); returns the rows matched.
     size_t ApplyManifest(std::span<const ManifestRow> rows);
+    /// The tiers marked so far are kept across scenes (the global manifest).
+    void KeepTiersAsGlobal();
+    /// Replaces the previous scene's tiers with `rows` (global tiers stay); returns the rows
+    /// matched. Queued candidates are not touched (UpdateScene re-queues).
+    size_t SelectSceneRows(std::span<const ManifestRow> rows);
     /// An index over `containers` without a file or manifests, for tests.
     [[nodiscard]] static std::unique_ptr<ShaderPoolIndex> ForTesting(
         std::vector<Container> containers) {
@@ -160,6 +183,28 @@ private:
     bool PollManifest();
     std::future<LoadedManifests> manifest_load;
     bool manifest_pending{};
+    std::unordered_multimap<u64, Program*> programs_by_key; ///< (fingerprint, offset) key
+
+    /// Per-scene manifests (a directory with manifest-_global.json).
+    void UpdateScene(Tegra::MemoryManager& gpu_memory);
+    void ApplyScene(Tegra::MemoryManager& gpu_memory, LoadedManifests loaded);
+    bool scene_mode{};
+    std::filesystem::path manifest_dir;
+    u64 scene_generation{};   ///< Generation of the last scene hint taken
+    u64 scene_polls{};
+    std::string scene_name;   ///< Scene whose rows are applied ("" none, "*" the union)
+    std::string scene_loading;
+    bool scene_load_pending{};
+    std::future<LoadedManifests> scene_load;
+    std::shared_ptr<std::atomic<bool>> scene_load_done;
+    std::chrono::steady_clock::time_point scene_deadline{};
+    size_t global_bank1_count{};
+    /// Pools recognised so far: (container, pool address), to offer a new scene's programs.
+    std::vector<std::pair<u32, GPUVAddr>> recognised_pools;
+    /// Addresses taken from the queue (seeded or skipped), not offered again.
+    std::unordered_set<GPUVAddr> taken;
+    u64 scenes_applied{};
+    u64 scenes_without_manifest{};
     std::vector<GPUVAddr> deferred_first_uses;
     std::vector<std::vector<u32>> manifest_bank1_words;
     size_t manifest_files{};

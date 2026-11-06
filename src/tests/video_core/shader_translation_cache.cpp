@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <catch2/catch_test_macros.hpp>
+#include "common/shader_aot_scene.h"
 #include "video_core/shader_pool_index.h"
 #include "shader_recompiler/translator_identity.h"
 #include "video_core/shader_translation_cache.h"
@@ -494,6 +495,56 @@ TEST_CASE("AOT scene manifest marks indexed programs by tier and keeps the bank-
     REQUIRE_FALSE(ShaderPoolIndex::ParseManifest("{\"programs\": [{\"fingerprint\": \"zz\"}]}",
                                                  rows));
     REQUIRE_FALSE(ShaderPoolIndex::ParseManifest("not json", rows));
+}
+
+TEST_CASE("AOT scene manifests replace the previous scene's tiers and keep the global ones",
+          "[video_core][translation_cache]") {
+    using VideoCommon::ShaderPoolIndex;
+    using Row = ShaderPoolIndex::ManifestRow;
+    std::vector<ShaderPoolIndex::Container> containers(1);
+    containers[0].programs.push_back({0x000, 0x100, 0, 0x10, ~0U, 0});
+    containers[0].programs.push_back({0x100, 0x100, 4, 0x11, 0xc0, 8});
+    containers[0].programs.push_back({0x200, 0x100, 0, 0x12, ~0U, 0});
+    auto index = ShaderPoolIndex::ForTesting(std::move(containers));
+    const auto& programs = index->Containers()[0].programs;
+    // The global manifest: program 0 at tier 2.
+    const std::vector<Row> global{Row{0x10, 0x000, 0x100, 0, 2}};
+    REQUIRE(index->ApplyManifest(global) == 1);
+    index->KeepTiersAsGlobal();
+    // Scene A: programs 0 (tier 1, lower than the global tier) and 1 (with bank-1 words).
+    const std::vector<Row> scene_a{Row{0x10, 0x000, 0x100, 0, 1},
+                                   Row{0x11, 0x100, 0x100, 4, 3, 0xc0, {5, 6}}};
+    REQUIRE(index->SelectSceneRows(scene_a) == 2);
+    REQUIRE(programs[0].tier == 1);
+    REQUIRE(programs[1].tier == 3);
+    REQUIRE(programs[1].manifest_bank1 == 0);
+    REQUIRE(programs[2].tier == ShaderPoolIndex::NoTier);
+    // Scene B names program 2 only: A's tiers go, the global tier comes back.
+    const std::vector<Row> scene_b{Row{0x12, 0x200, 0x100, 0, 1}, Row{0x99, 0x300, 0x80, 0, 1}};
+    REQUIRE(index->SelectSceneRows(scene_b) == 1);
+    REQUIRE(programs[0].tier == 2);
+    REQUIRE(programs[1].tier == ShaderPoolIndex::NoTier);
+    REQUIRE(programs[1].manifest_bank1 == ~0U);
+    REQUIRE(programs[2].tier == 1);
+    // Back to A: the same tiers and a fresh bank-1 slot.
+    REQUIRE(index->SelectSceneRows(scene_a) == 2);
+    REQUIRE(programs[1].tier == 3);
+    REQUIRE(programs[1].manifest_bank1 == 0);
+    REQUIRE(programs[2].tier == ShaderPoolIndex::NoTier);
+}
+
+TEST_CASE("AOT scene names come from the placement files only",
+          "[video_core][translation_cache]") {
+    using Common::ShaderAotScene::SceneOfPath;
+    REQUIRE(SceneOfPath("/Banc/KokiriForest/KokiriForest_Child_Static.bcett.byml.zs") ==
+            "KokiriForest_Child");
+    REQUIRE(SceneOfPath("Banc/HyruleField/HyruleField_Adult_Dynamic.bcett.byml.zs") ==
+            "HyruleField_Adult");
+    REQUIRE(SceneOfPath("/Banc/GameBancParam/KokiriForest_Child.game__banc__GameBancParam.bgyml")
+                .empty());
+    REQUIRE(SceneOfPath("/Banc/A/B/C_Static.bcett.byml.zs").empty());
+    REQUIRE(SceneOfPath("/Banc/KokiriForest/_Static.bcett.byml.zs").empty());
+    REQUIRE(SceneOfPath("/Pack/Banc/X/Y_Static.bcett.byml.zs").empty());
 }
 
 namespace {

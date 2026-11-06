@@ -122,6 +122,9 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     // Scene-manifest programs of recognised pools are fed to the AOT workers as fast as they take
     // them, not only when a new program is used: a loading screen or a stretch of known draws
     // would otherwise leave the workers idle while the scene's programs wait.
+    if (pool_index) {
+        pool_index->PollScene(*gpu_memory);
+    }
     if (seed_enabled && pool_index && pool_index->HasManifestCandidates() && seed_has_room &&
         seed_has_room()) {
         const auto seed_begin = std::chrono::steady_clock::now();
