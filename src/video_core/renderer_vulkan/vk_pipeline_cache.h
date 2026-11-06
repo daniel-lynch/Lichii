@@ -212,7 +212,18 @@ private:
     /// too, and each run-time graphics stage is counted by why it was or was not taken from the
     /// cache.
     bool aot_translation{};
-    enum class StageOutcome : u8 { Hit, Uncacheable, NewKey, ReplayFailed, VariantMiss, Count };
+    enum class StageOutcome : u8 {
+        Hit,
+        Uncacheable,
+        NewKey,
+        ReplayFailed,
+        VariantMiss,
+        VariantDeferred,
+        Count
+    };
+    std::atomic<u64> replay_translations{};
+    std::atomic<u64> replay_translation_ns{};
+    std::atomic<u64> replay_translation_mismatches{};
     struct OutcomeCounter {
         std::atomic<u64> stages{};
         std::atomic<u64> ns{};
@@ -224,6 +235,27 @@ private:
     std::atomic<u64> boot_mesh_pipelines{};
     void CountStageOutcome(StageOutcome outcome, Shader::Stage stage, u64 ns);
     void LogStageOutcomes(std::string_view when);
+
+    /// Ahead-of-time translation of recognised pool programs (ShaderCache::seed_stage): the
+    /// GPU thread builds the environment and an owned copy of it; a worker translates the copy,
+    /// which answers no queries, and stores programs that needed none as ordinary entries.
+    void SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_hash, size_t slot);
+    static constexpr u64 MaxAotPending = 32;
+    static constexpr u64 MaxAotEntries = 4096;
+    std::atomic<u64> aot_pending{};
+    std::atomic<u64> aot_candidates{};
+    std::atomic<u64> aot_skipped_known{};
+    std::atomic<u64> aot_skipped_uncacheable{};
+    std::atomic<u64> aot_skipped_full{};
+    std::atomic<u64> aot_completed{};
+    std::atomic<u64> aot_failed{};
+    std::array<std::atomic<u64>, 8> aot_needs_query{}; ///< By TranslationCache::QueryKind
+    std::atomic<u64> aot_capture_ns{};
+    std::atomic<u64> aot_translate_ns{};
+    std::atomic<u64> aot_entry_hits{};
+    std::mutex aot_mutex;
+    std::unordered_set<VideoCommon::TranslationCache::Digest, VideoCommon::TranslationCache::DigestHash>
+        aot_keys; ///< Stage keys of entries the workers stored, not yet used by a draw
 
     std::filesystem::path pipeline_cache_filename;
 
@@ -246,6 +278,8 @@ private:
 
     Common::ThreadWorker workers;
     Common::ThreadWorker serialization_thread;
+    /// Declared after the translation cache: destroyed (and joined) before it.
+    Common::ThreadWorker aot_workers;
     DynamicFeatures dynamic_features;
 };
 

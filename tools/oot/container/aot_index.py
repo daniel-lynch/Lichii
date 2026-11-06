@@ -12,6 +12,7 @@ per program: u32 pool offset, u32 size, u8 stage slot (bnsh.STAGES index), u64 F
 first min(size, 256) bytes.
 """
 import fnmatch, os, struct, sys
+sys.dont_write_bytecode = True  # keep __pycache__ out of the worktree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nup_tool, unzs, sarc, bnsh
 
