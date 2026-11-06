@@ -39,9 +39,9 @@ namespace VideoCommon {
 /// siblings only when no manifest program is waiting.
 ///
 /// A directory that holds manifest-_global.json selects manifests per scene: the global one is
-/// always loaded, and manifest-<Scene>.json when the game reads that scene's placement files
-/// (Common::ShaderAotScene, posted by the RomFS builder). A new scene replaces the previous
-/// scene's rows; seeds already stored stay. When the scene cannot be known (no placement file was
+/// always loaded, and manifest-<Scene>.json when the game enters that scene (Common::ShaderAotScene,
+/// posted by the RomFS builder from the scene's file reads). A new scene replaces the previous
+/// scene's rows; seeds already stored stay. When the scene cannot be known (no scene file was
 /// hooked, EDEN_NX2_AOT_SCENES=0, or no scene read within EDEN_NX2_AOT_SCENE_WAIT seconds, default
 /// 120), every manifest in the directory is loaded and their rows are united, as before.
 class ShaderPoolIndex {

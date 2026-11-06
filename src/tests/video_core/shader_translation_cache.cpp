@@ -533,18 +533,44 @@ TEST_CASE("AOT scene manifests replace the previous scene's tiers and keep the g
     REQUIRE(programs[2].tier == ShaderPoolIndex::NoTier);
 }
 
-TEST_CASE("AOT scene names come from the placement files only",
+TEST_CASE("AOT scene hints: placement reads count before the first entry only",
+          "[video_core][translation_cache]") {
+    namespace Scene = Common::ShaderAotScene;
+    u64 generation{};
+    const u64 start = Scene::Generation();
+    Scene::Post("TestTitle_Child", false); // boot: the save's scene is loaded behind the title
+    REQUIRE(Scene::Current(generation) == "TestTitle_Child");
+    REQUIRE(generation == start + 1);
+    Scene::Post("TestTitle_Child", true); // entering it changes nothing
+    REQUIRE(Scene::Generation() == start + 1);
+    const u64 prefetches = Scene::Prefetches();
+    Scene::Post("TestField_Child", false); // a neighbour prefetched after the entry
+    REQUIRE(Scene::Current(generation) == "TestTitle_Child");
+    REQUIRE(Scene::Prefetches() == prefetches + 1);
+    Scene::Post("TestField_Child", true);
+    REQUIRE(Scene::Current(generation) == "TestField_Child");
+    REQUIRE(generation == start + 2);
+}
+
+TEST_CASE("AOT scene names come from the placement and parameter files only",
           "[video_core][translation_cache]") {
     using Common::ShaderAotScene::SceneOfPath;
-    REQUIRE(SceneOfPath("/Banc/KokiriForest/KokiriForest_Child_Static.bcett.byml.zs") ==
-            "KokiriForest_Child");
-    REQUIRE(SceneOfPath("Banc/HyruleField/HyruleField_Adult_Dynamic.bcett.byml.zs") ==
+    const auto placement = SceneOfPath("/Banc/KokiriForest/KokiriForest_Child_Static.bcett.byml.zs");
+    REQUIRE(placement.has_value());
+    REQUIRE(placement->scene == "KokiriForest_Child");
+    REQUIRE_FALSE(placement->entered);
+    REQUIRE(SceneOfPath("Banc/HyruleField/HyruleField_Adult_Dynamic.bcett.byml.zs")->scene ==
             "HyruleField_Adult");
-    REQUIRE(SceneOfPath("/Banc/GameBancParam/KokiriForest_Child.game__banc__GameBancParam.bgyml")
-                .empty());
-    REQUIRE(SceneOfPath("/Banc/A/B/C_Static.bcett.byml.zs").empty());
-    REQUIRE(SceneOfPath("/Banc/KokiriForest/_Static.bcett.byml.zs").empty());
-    REQUIRE(SceneOfPath("/Pack/Banc/X/Y_Static.bcett.byml.zs").empty());
+    const auto param =
+        SceneOfPath("/Banc/GameBancParam/KokiriForest_Child.game__banc__GameBancParam.bgyml");
+    REQUIRE(param.has_value());
+    REQUIRE(param->scene == "KokiriForest_Child");
+    REQUIRE(param->entered);
+    REQUIRE_FALSE(SceneOfPath("/Banc/GameBancParam/X_Static.bcett.byml.zs").has_value());
+    REQUIRE_FALSE(SceneOfPath("/Banc/BancBasedResource/StartPos.byml.zs").has_value());
+    REQUIRE_FALSE(SceneOfPath("/Banc/A/B/C_Static.bcett.byml.zs").has_value());
+    REQUIRE_FALSE(SceneOfPath("/Banc/KokiriForest/_Static.bcett.byml.zs").has_value());
+    REQUIRE_FALSE(SceneOfPath("/Pack/Banc/X/Y_Static.bcett.byml.zs").has_value());
 }
 
 namespace {

@@ -14,6 +14,8 @@ std::mutex mutex;
 std::string current;
 std::atomic<u64> generation{};
 std::atomic<size_t> hooked_files{};
+std::atomic<u64> prefetches{};
+bool entered_any{};
 
 bool EnvIs(const char* name, char value) {
     const char* text = std::getenv(name);
@@ -38,13 +40,27 @@ size_t HookedFiles() {
     return hooked_files.load(std::memory_order_acquire);
 }
 
-void Post(std::string_view scene) {
+void Post(std::string_view scene, bool entered) {
     std::scoped_lock lock{mutex};
-    if (scene.empty() || current == scene) {
+    if (scene.empty()) {
+        return;
+    }
+    if (!entered && entered_any) {
+        if (current != scene) {
+            prefetches.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    entered_any = entered_any || entered;
+    if (current == scene) {
         return;
     }
     current = scene;
     generation.fetch_add(1, std::memory_order_release);
+}
+
+u64 Prefetches() {
+    return prefetches.load(std::memory_order_relaxed);
 }
 
 u64 Generation() {
@@ -57,29 +73,43 @@ std::string Current(u64& generation_out) {
     return current;
 }
 
-std::string SceneOfPath(std::string_view path) {
-    // /Banc/<Dir>/<Scene>_Static.bcett.byml.zs or _Dynamic: exactly two levels under Banc.
+std::optional<SceneFile> SceneOfPath(std::string_view path) {
+    // /Banc/<Dir>/<Scene>_Static.bcett.byml.zs or _Dynamic, and
+    // /Banc/GameBancParam/<Scene>.game__banc__GameBancParam.bgyml: two levels under Banc.
     if (path.starts_with('/')) {
         path.remove_prefix(1);
     }
     if (!path.starts_with("Banc/")) {
-        return {};
+        return std::nullopt;
     }
     path.remove_prefix(5);
     const size_t slash = path.find('/');
     if (slash == std::string_view::npos || slash == 0) {
-        return {};
+        return std::nullopt;
     }
-    std::string_view name = path.substr(slash + 1);
+    const std::string_view dir = path.substr(0, slash);
+    const std::string_view name = path.substr(slash + 1);
     if (name.find('/') != std::string_view::npos) {
-        return {};
+        return std::nullopt;
     }
-    for (const std::string_view suffix : {"_Static.bcett.byml.zs", "_Dynamic.bcett.byml.zs"}) {
+    const auto strip = [&](std::string_view suffix) -> std::optional<std::string> {
         if (name.size() > suffix.size() && name.ends_with(suffix)) {
             return std::string{name.substr(0, name.size() - suffix.size())};
         }
+        return std::nullopt;
+    };
+    if (dir == "GameBancParam") {
+        if (auto scene = strip(".game__banc__GameBancParam.bgyml")) {
+            return SceneFile{std::move(*scene), true};
+        }
+        return std::nullopt;
     }
-    return {};
+    for (const std::string_view suffix : {"_Static.bcett.byml.zs", "_Dynamic.bcett.byml.zs"}) {
+        if (auto scene = strip(suffix)) {
+            return SceneFile{std::move(*scene), false};
+        }
+    }
+    return std::nullopt;
 }
 
 } // namespace Common::ShaderAotScene

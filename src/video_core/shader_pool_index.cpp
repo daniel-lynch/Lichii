@@ -292,13 +292,14 @@ void ShaderPoolIndex::StartManifestLoad() {
             scene_deadline = std::chrono::steady_clock::now() +
                              std::chrono::seconds{(std::max)(seconds, 0L)};
             LOG_INFO(HW_GPU,
-                     "AOT manifest: per-scene selection ({} placement files hooked); the global "
-                     "manifest now, a scene's when it is read, all of them after {} s without one",
+                     "AOT manifest: per-scene selection ({} scene files hooked); the global "
+                     "manifest now, a scene's when the game enters it, all of them after {} s "
+                     "without one",
                      hooked, seconds);
         } else {
             LOG_INFO(HW_GPU, "AOT manifest: the scene cannot be known ({}); every manifest is "
                              "loaded",
-                     hooked == 0 ? "no placement file hooked" : "EDEN_NX2_AOT_SCENES=0");
+                     hooked == 0 ? "no scene file hooked" : "EDEN_NX2_AOT_SCENES=0");
         }
     }
     // Parsed on its own thread (a directory may hold a manifest per scene); recognition waits
@@ -754,13 +755,15 @@ void ShaderPoolIndex::ApplyScene(Tegra::MemoryManager& gpu_memory, LoadedManifes
     LOG_INFO(HW_GPU,
              "AOT scene {} (was {}): {} files, {} rows of tiers 1-3, {} matched indexed "
              "programs; read in {:.1f} ms on a loader thread, applied in {:.1f} ms; queue: {} "
-             "dropped, {} offered from {} recognised pools; process memory {}",
+             "dropped, {} offered from {} recognised pools; {} prefetch reads ignored so far; "
+             "process memory {}",
              scene_name, previous.empty() ? std::string{"none"} : previous, loaded.files,
              loaded.rows.size(), matched,
              std::chrono::duration<double, std::milli>(loaded.time).count(),
              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
                  .count(),
-             dropped, offered, recognised_pools.size(), MemoryNote());
+             dropped, offered, recognised_pools.size(), Common::ShaderAotScene::Prefetches(),
+             MemoryNote());
 }
 
 } // namespace VideoCommon

@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <string_view>
@@ -88,8 +91,10 @@ namespace {
 /// whenever it is read (Common::ShaderAotScene). Everything else is the wrapped file's.
 class SceneHintFile final : public VfsFile {
 public:
-    SceneHintFile(VirtualFile file_, std::string scene_)
-        : file{std::move(file_)}, scene{std::move(scene_)} {}
+    SceneHintFile(VirtualFile file_, std::string scene_, bool entered_, std::string path_,
+                  bool trace_)
+        : file{std::move(file_)}, scene{std::move(scene_)}, entered{entered_},
+          path{std::move(path_)}, trace{trace_} {}
 
     std::string GetName() const override {
         return file->GetName();
@@ -110,7 +115,18 @@ public:
         return file->IsReadable();
     }
     std::size_t Read(u8* data, std::size_t length, std::size_t offset) const override {
-        Common::ShaderAotScene::Post(scene);
+        if (trace) {
+            // EDEN_NX2_AOT_SCENE_TRACE=1: when the game reads which Banc file (a read after a
+            // second's pause starts a new line).
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_read.exchange(now) > std::chrono::seconds{1}) {
+                LOG_INFO(Loader, "Shader AOT: Banc read {} at {:#x} ({:#x} bytes of {:#x})", path,
+                         offset, length, file->GetSize());
+            }
+        }
+        if (!scene.empty()) {
+            Common::ShaderAotScene::Post(scene, entered);
+        }
         return file->Read(data, length, offset);
     }
     std::size_t Write(const u8* data, std::size_t length, std::size_t offset) override {
@@ -126,6 +142,10 @@ public:
 private:
     VirtualFile file;
     std::string scene;
+    bool entered;
+    std::string path;
+    bool trace;
+    mutable std::atomic<std::chrono::steady_clock::time_point> last_read{};
 };
 } // Anonymous namespace
 
@@ -285,18 +305,24 @@ std::vector<std::pair<u64, VirtualFile>> RomFSBuildContext::Build() {
 
     // Shader AOT translation: the scene placement files say which scene the game loads.
     if (Common::ShaderAotScene::Wanted()) {
+        const char* trace_env = std::getenv("EDEN_NX2_AOT_SCENE_TRACE");
+        const bool trace = trace_env != nullptr && trace_env[0] == '1';
         size_t hooked = 0;
         for (const auto& file : files) {
-            if (std::string scene = Common::ShaderAotScene::SceneOfPath(file->path);
-                !scene.empty() && file->source != nullptr) {
-                file->source = std::make_shared<SceneHintFile>(std::move(file->source),
-                                                               std::move(scene));
-                ++hooked;
+            auto scene = Common::ShaderAotScene::SceneOfPath(file->path);
+            if (file->source != nullptr &&
+                (scene.has_value() || (trace && file->path.starts_with("/Banc/")))) {
+                hooked += scene.has_value() ? 1 : 0;
+                file->source = std::make_shared<SceneHintFile>(
+                    std::move(file->source), scene ? std::move(scene->scene) : std::string{},
+                    scene && scene->entered, file->path, trace);
             }
         }
         if (hooked != 0) {
             Common::ShaderAotScene::SetHookedFiles(hooked);
-            LOG_INFO(Loader, "Shader AOT: {} scene placement files report their reads", hooked);
+            LOG_INFO(Loader, "Shader AOT: {} scene files (placement and parameters) report their "
+                             "reads",
+                     hooked);
         }
     }
 
