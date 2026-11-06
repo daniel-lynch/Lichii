@@ -281,6 +281,16 @@ void WriteMeta(std::vector<u8>& out, const ProgramMeta& meta) {
     writer.Put(meta.shared_memory_size);
     writer.Put(meta.is_geometry_passthrough);
     WriteInfo(out, meta.info);
+    // Task and mesh entries (only stored with use_shader_aot_translation) carry the mesh sizes
+    // and line maps the emitter and the next stage's runtime info read.
+    if (meta.stage == Shader::Stage::Task || meta.stage == Shader::Stage::Mesh) {
+        writer.Put(meta.mesh.payload_words);
+        writer.Put(meta.mesh.max_vertices);
+        writer.Put(meta.mesh.max_primitives);
+        writer.Put(meta.mesh.topology);
+        writer.PutVector(meta.mesh.vertex_lines);
+        writer.PutVector(meta.mesh.primitive_lines);
+    }
 }
 
 bool ReadMeta(std::span<const u8>& in, ProgramMeta& meta) {
@@ -289,7 +299,12 @@ bool ReadMeta(std::span<const u8>& in, ProgramMeta& meta) {
            reader.Get(meta.output_topology) && reader.Get(meta.output_vertices) &&
            reader.Get(meta.invocations) && reader.Get(meta.local_memory_size) &&
            reader.Get(meta.shared_memory_size) && reader.Get(meta.is_geometry_passthrough) &&
-           ReadInfo(in, meta.info);
+           ReadInfo(in, meta.info) &&
+           ((meta.stage != Shader::Stage::Task && meta.stage != Shader::Stage::Mesh) ||
+            (reader.Get(meta.mesh.payload_words) && reader.Get(meta.mesh.max_vertices) &&
+             reader.Get(meta.mesh.max_primitives) && reader.Get(meta.mesh.topology) &&
+             reader.GetVector(meta.mesh.vertex_lines, meta.mesh.vertex_lines.capacity()) &&
+             reader.GetVector(meta.mesh.primitive_lines, meta.mesh.primitive_lines.capacity())));
 }
 
 Digest EntryId(const Digest& stage_key, std::span<const Query> queries) {
@@ -573,6 +588,7 @@ ProgramMeta ProgramMeta::From(const Shader::IR::Program& program) {
         .shared_memory_size = program.shared_memory_size,
         .is_geometry_passthrough = program.is_geometry_passthrough,
         .info = program.info,
+        .mesh = program.mesh,
     };
 }
 
@@ -587,6 +603,7 @@ Shader::IR::Program ProgramMeta::ToProgram() const {
     program.local_memory_size = local_memory_size;
     program.shared_memory_size = shared_memory_size;
     program.is_geometry_passthrough = is_geometry_passthrough;
+    program.mesh = mesh;
     return program;
 }
 
@@ -871,6 +888,11 @@ std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::E
         }
     }
     return nullptr;
+}
+
+bool Store::HasStageKey(const Digest& stage_key) {
+    std::scoped_lock lock{mutex};
+    return entries.contains(stage_key);
 }
 
 std::optional<Variant> Store::FindVariant(const Digest& variant_key) {

@@ -304,3 +304,48 @@ TEST_CASE("Translation cache persists entries and variants", "[video_core][trans
     }
     std::filesystem::remove(path);
 }
+
+TEST_CASE("Translation cache persists the mesh info of task and mesh entries",
+          "[video_core][translation_cache]") {
+    const auto path = TempPath("lichii_translation_cache_mesh_test.bin");
+    std::filesystem::remove(path);
+    const Digest config{0x31, 0x32};
+    FakeEnvironment env;
+    const Digest stage_key = MakeStageKey(env, 0x77, 3, config);
+
+    ProgramMeta meta{};
+    meta.stage = Shader::Stage::Mesh;
+    meta.workgroup_size = {32, 1, 1};
+    meta.info = SampleInfo();
+    meta.info.is_mesh = true;
+    meta.mesh.payload_words = 64;
+    meta.mesh.max_vertices = 64;
+    meta.mesh.max_primitives = 126;
+    meta.mesh.topology = 4;
+    for (u32 i = 0; i < 20; ++i) {
+        meta.mesh.vertex_lines.push_back(100 + i);
+    }
+    meta.mesh.primitive_lines.push_back(7);
+    {
+        Store store;
+        store.Open(path, config);
+        RecordingEnvironment recording{env};
+        Translate(recording);
+        REQUIRE(store.Insert(stage_key, recording.TakeQueries(), meta));
+    }
+    {
+        Store store;
+        store.Open(path, config);
+        const auto entry = store.FindEntry(stage_key, env);
+        REQUIRE(entry);
+        REQUIRE(entry->meta.info.is_mesh);
+        const auto program = entry->meta.ToProgram();
+        REQUIRE(program.mesh.payload_words == 64);
+        REQUIRE(program.mesh.max_vertices == 64);
+        REQUIRE(program.mesh.max_primitives == 126);
+        REQUIRE(program.mesh.topology == 4);
+        REQUIRE(std::ranges::equal(program.mesh.vertex_lines, meta.mesh.vertex_lines));
+        REQUIRE(std::ranges::equal(program.mesh.primitive_lines, meta.mesh.primitive_lines));
+    }
+    std::filesystem::remove(path);
+}

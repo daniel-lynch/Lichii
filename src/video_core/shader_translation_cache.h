@@ -147,6 +147,7 @@ struct ProgramMeta {
     u32 shared_memory_size{};
     bool is_geometry_passthrough{};
     Shader::Info info;
+    Shader::MeshInfo mesh;
 
     [[nodiscard]] static ProgramMeta From(const Shader::IR::Program& program);
     /// A program with these fields and no IR blocks.
@@ -198,6 +199,8 @@ public:
     /// The entry of a stage whose recorded queries the environment answers the same way.
     [[nodiscard]] std::shared_ptr<const Entry> FindEntry(const Digest& stage_key,
                                                          Shader::Environment& env);
+    /// True when entries exist for the stage key (whether or not the environment matches them).
+    [[nodiscard]] bool HasStageKey(const Digest& stage_key);
     /// The variant, decompressed.
     [[nodiscard]] std::optional<Variant> FindVariant(const Digest& variant_key);
 
