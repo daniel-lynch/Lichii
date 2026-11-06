@@ -276,6 +276,11 @@ private:
     std::array<std::atomic<u64>, 4> aot_stored_by_tier{}; ///< Tiers 1-3, then no manifest tier
     std::array<std::atomic<u64>, 4> aot_hits_by_tier{};
     std::atomic<u64> aot_late{};
+    /// (unique hash, slot) of admitted seeds -> their stage key, until the program's first draw.
+    std::unordered_map<u64, VideoCommon::TranslationCache::Digest> aot_seeded_programs;
+    std::atomic<u64> aot_miss_key_differs{};
+    std::atomic<u64> aot_miss_replay_failed{};
+    std::atomic<u64> aot_miss_not_stored{};
 
     /// Seeded variants: a seeded entry also gets the SPIR-V module of the emission recipe
     /// (runtime info and bindings in) most often seen at run time for stages of its class (stage
@@ -312,6 +317,8 @@ private:
     std::atomic<u64> aot_emitted_at_draw{};     ///< Seeded stages emitted at their first draw
     std::atomic<u64> worker_variant_hits{};     ///< Deferred stages whose module the worker found
     std::atomic<u64> worker_variant_info_differs{};
+    std::atomic<u64> canonical_verified{};
+    std::atomic<u64> canonical_mismatches{};
     std::atomic<u64> aot_bytes{};
     std::atomic<u64> aot_bytes_peak{};
 

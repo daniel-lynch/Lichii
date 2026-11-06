@@ -150,6 +150,7 @@ private:
     void LoadManifests();
     std::vector<std::vector<u32>> manifest_bank1_words;
     size_t manifest_files{};
+    bool offer_others{true}; ///< Offer siblings no manifest names (EDEN_NX2_AOT_OTHERS=1)
     size_t manifest_rows{};
     size_t manifest_rows_matched{};
     size_t manifest_bytes{};

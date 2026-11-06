@@ -227,11 +227,17 @@ void ShaderPoolIndex::LoadManifests() {
         manifest_bytes += words.capacity() * sizeof(u32) + sizeof(words);
     }
     manifest_time = std::chrono::steady_clock::now() - begin;
+    // With a manifest, the siblings it does not name are not offered (run 20261106-020645:
+    // 39 of 1418 such seeds were drawn, against 236 of 792 manifest seeds, for 64 % of the
+    // worker time). EDEN_NX2_AOT_OTHERS=1 offers them after the manifest programs.
+    const char* others = std::getenv("EDEN_NX2_AOT_OTHERS");
+    offer_others = manifest_files == 0 || (others != nullptr && others[0] == '1');
     LOG_INFO(HW_GPU,
              "AOT manifest: {} files, {} rows of tiers 1-3, {} matched indexed programs, {} with "
-             "bank-1 words ({} bytes); loaded in {:.1f} ms",
+             "bank-1 words ({} bytes); loaded in {:.1f} ms; other siblings {}",
              manifest_files, manifest_rows, manifest_rows_matched, manifest_bank1_words.size(),
-             manifest_bytes, std::chrono::duration<double, std::milli>(manifest_time).count());
+             manifest_bytes, std::chrono::duration<double, std::milli>(manifest_time).count(),
+             offer_others ? "offered after them" : "not offered");
 }
 
 std::unique_ptr<ShaderPoolIndex> ShaderPoolIndex::Open() {
@@ -474,7 +480,7 @@ void ShaderPoolIndex::OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr addr
                 if (stage != 0 && stage != 4) {
                     continue;
                 }
-                if (queued_tier.contains(where)) {
+                if (queued_tier.contains(where) || (program->tier == NoTier && !offer_others)) {
                     continue;
                 }
                 // A full queue gives way to a manifest program: the newest other sibling goes.
