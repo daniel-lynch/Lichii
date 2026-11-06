@@ -5,6 +5,7 @@
 
 #include <bitset>
 #include <filesystem>
+#include <iosfwd>
 #include <optional>
 #include <span>
 #include <string>
@@ -30,6 +31,10 @@ class RecipeHistogram {
 public:
     static constexpr size_t MaxPerClass = 8;
     static constexpr size_t MaxClasses = 4096;
+    /// Recipes whose runtime info maps more legacy varyings are not kept (a format bound).
+    static constexpr size_t MaxLegacyMappings = 64;
+    /// The largest file the format allows: every class full of the largest recipes.
+    [[nodiscard]] static u64 MaxFileBytes();
 
     struct Recipe {
         Shader::RuntimeInfo runtime_info;
@@ -67,8 +72,12 @@ public:
 
     /// The file contents for this translation configuration.
     [[nodiscard]] std::vector<u8> Serialize(const TranslationCache::Digest& config) const;
-    /// Replaces the histogram with a file's contents; counts from earlier sessions weigh half.
-    /// On failure the histogram is left empty and `why` says what was wrong.
+    /// Replaces the histogram with `size` bytes of a file read from `in` (nothing is allocated
+    /// for the whole file); counts from earlier sessions weigh half. A size above MaxFileBytes,
+    /// a repeated class or a repeated recipe in a class is refused. On failure the histogram is
+    /// left empty and `why` says what was wrong.
+    bool Load(std::istream& in, u64 size, const TranslationCache::Digest& config,
+              std::string& why);
     bool Load(std::span<const u8> data, const TranslationCache::Digest& config, std::string& why);
 
 private:

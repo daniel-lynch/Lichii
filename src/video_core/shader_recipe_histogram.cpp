@@ -8,7 +8,9 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <istream>
 #include <random>
+#include <sstream>
 #include <system_error>
 #include <type_traits>
 
@@ -50,15 +52,15 @@ public:
 
 class Reader {
 public:
-    explicit Reader(std::span<const u8> data_) : data{data_} {}
+    Reader(std::istream& in_, u64 size) : in{in_}, remaining{size} {}
     template <typename T>
     bool Get(T& value) {
         static_assert(std::is_trivially_copyable_v<T>);
-        if (offset + sizeof(T) > data.size()) {
+        if (sizeof(T) > remaining ||
+            !in.read(reinterpret_cast<char*>(&value), static_cast<std::streamsize>(sizeof(T)))) {
             return false;
         }
-        std::memcpy(&value, data.data() + offset, sizeof(T));
-        offset += sizeof(T);
+        remaining -= sizeof(T);
         return true;
     }
     template <size_t N>
@@ -73,12 +75,12 @@ public:
         return true;
     }
     [[nodiscard]] bool AtEnd() const noexcept {
-        return offset == data.size();
+        return remaining == 0;
     }
 
 private:
-    std::span<const u8> data;
-    size_t offset{};
+    std::istream& in;
+    u64 remaining;
 };
 
 void PutRuntimeInfo(Writer& out, const Shader::RuntimeInfo& info) {
@@ -115,7 +117,8 @@ void PutRuntimeInfo(Writer& out, const Shader::RuntimeInfo& info) {
 bool GetRuntimeInfo(Reader& in, Shader::RuntimeInfo& info) {
     u32 primitive_generics{}, legacy{};
     if (!in.Get(info.generic_input_types) || !in.GetBits(info.previous_stage_stores.mask) ||
-        !in.Get(primitive_generics) || !in.Get(legacy) || legacy > 512) {
+        !in.Get(primitive_generics) || !in.Get(legacy) ||
+        legacy > RecipeHistogram::MaxLegacyMappings) {
         return false;
     }
     info.per_primitive_generics = std::bitset<32>{primitive_generics};
@@ -168,9 +171,28 @@ u64 RecipeHistogram::ClassKey(Shader::Stage stage, const std::bitset<512>* loads
     return key;
 }
 
+u64 RecipeHistogram::MaxFileBytes() {
+    using Info = Shader::RuntimeInfo;
+    constexpr u64 runtime_info =
+        sizeof(Info::generic_input_types) + 512 / 8 + sizeof(u32) + sizeof(u32) +
+        MaxLegacyMappings * 2 * sizeof(Shader::IR::Attribute) + 2 * sizeof(bool) +
+        sizeof(Info::tess_primitive) + sizeof(Info::tess_spacing) + sizeof(bool) +
+        sizeof(Info::input_topology) + sizeof(bool) + sizeof(float) + sizeof(bool) +
+        sizeof(Shader::CompareFunction) + sizeof(float) + 2 * sizeof(bool) + sizeof(u32) +
+        sizeof(Info::xfb_varyings) + sizeof(Info::color_output_types) + sizeof(bool);
+    constexpr u64 recipe = sizeof(u64) + runtime_info + sizeof(Shader::Backend::Bindings);
+    constexpr u64 entry = sizeof(Shader::Stage) + sizeof(u8) + 512 / 8 + sizeof(u32) +
+                          MaxPerClass * recipe;
+    return sizeof(Magic) + sizeof(FormatVersion) + sizeof(TC::Digest) + sizeof(u32) +
+           MaxClasses * entry;
+}
+
 bool RecipeHistogram::Record(Shader::Stage stage, const std::bitset<512>& loads,
                              const Shader::RuntimeInfo& runtime_info,
                              const Shader::Backend::Bindings& binding_in) {
+    if (runtime_info.previous_stage_legacy_stores_mapping.size() > MaxLegacyMappings) {
+        return false;
+    }
     const TC::Digest digest = RecipeDigest(runtime_info, binding_in);
     const u64 own_class = ClassKey(stage, &loads);
     bool first = false;
@@ -262,13 +284,22 @@ std::vector<u8> RecipeHistogram::Serialize(const TC::Digest& config) const {
 }
 
 bool RecipeHistogram::Load(std::span<const u8> data, const TC::Digest& config, std::string& why) {
+    std::istringstream stream{std::string{reinterpret_cast<const char*>(data.data()), data.size()}};
+    return Load(stream, data.size(), config, why);
+}
+
+bool RecipeHistogram::Load(std::istream& stream, u64 size, const TC::Digest& config,
+                           std::string& why) {
     Clear();
-    Reader in{data};
     const auto refuse = [&](const char* reason) {
         Clear();
         why = reason;
         return false;
     };
+    if (size > MaxFileBytes()) {
+        return refuse("larger than the format allows");
+    }
+    Reader in{stream, size};
     std::array<char, 8> magic{};
     u32 version{}, count{};
     TC::Digest file_config{};
@@ -285,7 +316,7 @@ bool RecipeHistogram::Load(std::span<const u8> data, const TC::Digest& config, s
         Class entry{};
         u8 by_loads{};
         u32 recipes{};
-        if (!in.Get(entry.stage) || !in.Get(by_loads) ||
+        if (!in.Get(entry.stage) || !in.Get(by_loads) || by_loads > 1 ||
             (by_loads != 0 && !in.GetBits(entry.loads)) || !in.Get(recipes) ||
             recipes > MaxPerClass) {
             return refuse("truncated");
@@ -299,14 +330,16 @@ bool RecipeHistogram::Load(std::span<const u8> data, const TC::Digest& config, s
             }
             recipe.count = (recipe.count + 1) / 2;
             recipe.digest = RecipeDigest(recipe.runtime_info, recipe.binding_in);
+            if (std::ranges::find(entry.recipes, recipe.digest, &Recipe::digest) !=
+                entry.recipes.end()) {
+                return refuse("a recipe repeated in its class");
+            }
             entry.recipes.push_back(std::move(recipe));
         }
         const u64 key = ClassKey(entry.stage, entry.by_loads ? &entry.loads : nullptr);
-        auto& slot = classes[key];
-        slot.stage = entry.stage;
-        slot.by_loads = entry.by_loads;
-        slot.loads = entry.loads;
-        slot.recipes.insert(slot.recipes.end(), entry.recipes.begin(), entry.recipes.end());
+        if (!classes.emplace(key, std::move(entry)).second) {
+            return refuse("a class repeated");
+        }
     }
     if (!in.AtEnd()) {
         return refuse("trailing bytes");

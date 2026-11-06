@@ -9,6 +9,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <catch2/catch_test_macros.hpp>
@@ -907,4 +908,53 @@ TEST_CASE("AOT recipe file: atomic replacement through a unique temporary file",
     REQUIRE_FALSE(VideoCommon::WriteFileAtomically(dir / "missing" / "recipes.bin", first, why));
     REQUIRE_FALSE(why.empty());
     std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("AOT recipe file: oversized, repeated classes and repeated recipes are refused",
+          "[video_core][translation_cache]") {
+    using VideoCommon::RecipeHistogram;
+    const VideoCommon::TranslationCache::Digest config{3, 4};
+    std::bitset<512> loads;
+    loads.set(7);
+    RecipeHistogram histogram;
+    histogram.Record(Shader::Stage::Fragment, loads, RecipeInfo(1), RecipeBindings(1));
+    std::vector<u8> data = histogram.Serialize(config);
+    std::string why;
+    RecipeHistogram loaded;
+    REQUIRE(loaded.Load(data, config, why));
+    REQUIRE(loaded.Classes() == 2); // the class and its stage
+
+    // A size above the format's maximum is refused before anything is read.
+    std::istringstream empty{std::string{}};
+    REQUIRE_FALSE(loaded.Load(empty, RecipeHistogram::MaxFileBytes() + 1, config, why));
+    REQUIRE(why == "larger than the format allows");
+    REQUIRE(loaded.Classes() == 0);
+
+    // The class count is at offset 28 (magic, version, configuration digest): claim both
+    // classes twice by appending the class records again.
+    std::vector<u8> doubled = data;
+    doubled.insert(doubled.end(), data.begin() + 32, data.end());
+    const u32 four = 4;
+    std::memcpy(doubled.data() + 28, &four, sizeof(four));
+    REQUIRE_FALSE(loaded.Load(doubled, config, why));
+    REQUIRE(why == "a class repeated");
+
+    // One class whose two recipes are the same. The file holds two classes (the program's and
+    // its stage's), one recipe each, of the same size; take the first and repeat its recipe.
+    const size_t header = 32; // magic, version, configuration digest, class count
+    const size_t stage_size = sizeof(Shader::Stage);
+    const size_t heads = 2 * (stage_size + 1 + 4) + 64;
+    const size_t recipe_size = (data.size() - header - heads) / 2;
+    const bool first_has_loads = data[header + stage_size] != 0;
+    const size_t count_at = header + stage_size + 1 + (first_has_loads ? 64 : 0);
+    const size_t recipe_begin = count_at + 4;
+    std::vector<u8> repeated(data.begin(),
+                             data.begin() + static_cast<std::ptrdiff_t>(recipe_begin + recipe_size));
+    repeated.insert(repeated.end(), data.begin() + static_cast<std::ptrdiff_t>(recipe_begin),
+                    data.begin() + static_cast<std::ptrdiff_t>(recipe_begin + recipe_size));
+    const u32 two = 2, one_class = 1;
+    std::memcpy(repeated.data() + count_at, &two, sizeof(two));
+    std::memcpy(repeated.data() + 28, &one_class, sizeof(one_class));
+    REQUIRE_FALSE(loaded.Load(repeated, config, why));
+    REQUIRE(why == "a recipe repeated in its class");
 }

@@ -909,18 +909,18 @@ void PipelineCache::LoadRecipes() {
     if (recipes_filename.empty()) {
         return;
     }
-    std::ifstream file{recipes_filename, std::ios::binary | std::ios::ate};
-    if (!file.is_open()) {
-        return;
+    std::error_code error;
+    const auto size = std::filesystem::file_size(recipes_filename, error);
+    if (error) {
+        return; // No file yet, or its size cannot be known.
     }
-    std::vector<u8> data(static_cast<size_t>(file.tellg()));
-    file.seekg(0);
-    file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
-    if (!file) {
-        return;
-    }
+    std::ifstream file{recipes_filename, std::ios::binary};
     std::string why;
-    if (!recipe_histogram.Load(data, translation_config, why)) {
+    if (!file.is_open()) {
+        why = "cannot open it";
+    }
+    // Read as a stream: nothing is allocated for the whole file, and its size is checked first.
+    if (!why.empty() || !recipe_histogram.Load(file, size, translation_config, why)) {
         LOG_INFO(Render_Vulkan, "Shader AOT: recipe file {} not used ({})",
                  recipes_filename.filename().string(), why);
         return;
