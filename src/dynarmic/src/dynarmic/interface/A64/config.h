@@ -293,6 +293,13 @@ struct UserConfig {
     /// to avoid writting certain unnecessary code only needed for cycle timers.
     bool wall_clock_cntpct = false;
 
+    /// x86-64 hosts only. Exploit the host's TSO memory model: ordered 8/16/32/64-bit reads (LDAR,
+    /// LDAXR, LDAPR) are plain MOVs instead of LOCK XADD [addr], 0 (ordered writes stay XCHG, so
+    /// STLR -> LDAR keeps its store-load order), and DMB *LD / DMB *ST emit no MFENCE.
+    bool x64_tso_memory = true;
+    std::uint64_t inline_cntpct_tsc_base = 0;
+    std::uint64_t inline_cntpct_tsc_factor = 0;
+
     /// This allows accurately emulating protection fault handlers. If true, we check
     /// for exit after every data memory access by the emulated program.
     bool check_halt_on_memory_access = false;

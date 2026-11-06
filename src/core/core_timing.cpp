@@ -96,7 +96,11 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
     if (is_multicore) {
         timer_thread = std::jthread([this](std::stop_token stop_token) {
             Common::SetCurrentThreadName("HostTiming");
-            Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
+            // Upstream PR #161 raises this thread to Critical (nice -16); EDEN_NX2_JIT_TSO=0 keeps
+            // the previous VeryHigh (nice -8) for A/B tests.
+            Common::SetCurrentThreadPriority(EnvFlag("EDEN_NX2_JIT_TSO", true)
+                                                 ? Common::ThreadPriority::Critical
+                                                 : Common::ThreadPriority::VeryHigh);
 #ifdef __linux__
             // This thread sleeps until the next event (vsync, guest timeouts, pollers) with timed
             // waits, which Linux lets run late by the thread's timer slack, 50 us by default.

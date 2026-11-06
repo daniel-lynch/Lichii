@@ -38,6 +38,9 @@ struct TranslationOptions {
     /// If this is false, we treat the instruction as a NOP.
     /// If this is true, we emit an ExceptionRaised instruction.
     bool hook_hint_instructions = true;
+
+    /// x86-64 hosts: DMB *LD / DMB *ST translate to nothing (TSO already orders them).
+    bool elide_tso_barriers = false;
 };
 
 /**
