@@ -12,6 +12,8 @@
 #include <string>
 #include <string_view>
 #include <catch2/catch_test_macros.hpp>
+#include "common/logging.h"
+#include "common/fs/path_util.h"
 #include "video_core/shader_pool_index.h"
 #include "shader_recompiler/translator_identity.h"
 #include "video_core/shader_translation_cache.h"
@@ -981,4 +983,57 @@ TEST_CASE("Offline resume replays guessed handles in their original scope",
     RecordingEnvironment replay(resumed, true);
     REQUIRE(ReplayQueries(queries, replay));
     REQUIRE_THROWS(resumed.ReadCbufValue(2, 0x20));
+}
+
+TEST_CASE("Read-only translation caches retain usable records without throwing",
+          "[video_core][translation_cache]") {
+    const auto path = TempPath("lichii_readonly_translation_cache.bin");
+    const Digest config{11, 22}, key{33, 44};
+    FakeEnvironment env;
+    std::filesystem::remove(path);
+    Digest variant_key;
+    {
+        Store store;
+        store.Open(path, config);
+        const auto entry = store.Insert(key, {}, {.stage = Shader::Stage::Fragment});
+        variant_key = MakeVariantKey(entry->id, {}, {});
+        REQUIRE(store.InsertVariant(*entry, variant_key, {.spirv = {0x07230203, 1, 2}}));
+    }
+    SECTION("valid file cannot be opened for append") {}
+    SECTION("incomplete tail cannot be truncated") {
+        std::ofstream tail(path, std::ios::binary | std::ios::app);
+        tail << "broken";
+    }
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() {
+            std::error_code ec;
+            std::filesystem::permissions(path, std::filesystem::perms::owner_all, ec);
+            std::filesystem::remove(path, ec);
+            Common::Log::SetRingCapacity(0);
+        }
+    } cleanup{path};
+    std::error_code ec;
+    std::filesystem::permissions(path, std::filesystem::perms::owner_read |
+        std::filesystem::perms::group_read | std::filesystem::perms::others_read, ec);
+    if (ec || std::ofstream(path, std::ios::binary | std::ios::app).is_open())
+        SKIP("Read-only file permissions are not enforceable for this platform/user");
+    Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, path.parent_path());
+    Common::Log::Initialize();
+    Common::Log::SetGlobalFilter(Common::Log::Filter{Common::Log::Level::Info});
+    Common::Log::SetRingCapacity(64);
+    const auto size = std::filesystem::file_size(path);
+    Store store;
+    REQUIRE_NOTHROW(store.Open(path, config));
+    REQUIRE(store.Enabled());
+    REQUIRE_FALSE(store.Persistent());
+    REQUIRE(store.FindEntry(key, env));
+    REQUIRE(store.FindVariant(variant_key));
+    REQUIRE(store.Insert({55, 66}, {}, {}));
+    REQUIRE(std::filesystem::file_size(path) == size);
+    const auto lines = Common::Log::ReadRing(0);
+    REQUIRE(std::ranges::count_if(lines, [&](const auto& line) {
+        return line.text.find("persistence disabled for " + path.string()) != std::string::npos &&
+               line.text.find(std::make_error_code(std::errc::permission_denied).message()) != std::string::npos;
+    }) == 1);
 }

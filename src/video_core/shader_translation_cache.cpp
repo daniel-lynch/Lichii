@@ -6,6 +6,7 @@
 #include <tuple>
 #include <bit>
 #include <chrono>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -1170,6 +1171,8 @@ void Store::Close() {
     entries_with_modules.clear();
     offline_entry_only_rejected = 0;
     enabled = false;
+    persistence_failed = false;
+    file.clear();
     ++generation;
 }
 
@@ -1198,12 +1201,13 @@ void Store::Open(const std::filesystem::path& path, const Digest& config) {
     filename = path;
     const auto begin = std::chrono::steady_clock::now();
     const bool loaded = LoadFile(path, config);
-    if (!loaded) {
+    if (!loaded && !persistence_failed) {
         file.open(path, std::ios::binary | std::ios::trunc);
         file.write(FileMagic.data(), FileMagic.size());
         file.write(reinterpret_cast<const char*>(&FormatVersion), sizeof(FormatVersion));
         file.write(reinterpret_cast<const char*>(&config), sizeof(config));
         file.flush();
+        if (!file.good()) DisablePersistence(std::error_code(errno, std::generic_category()));
     }
     LOG_INFO(Render_Vulkan,
              "Translation cache: {} stage entries and {} modules read from {} in {:.1f} ms",
@@ -1309,11 +1313,15 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
         std::error_code ec;
         std::filesystem::resize_file(path, offset, ec);
         if (ec) {
-            throw std::runtime_error("Translation cache: cannot repair incomplete tail");
+            DisablePersistence(ec);
+            return false;
         }
     }
     file.open(path, std::ios::binary | std::ios::app);
-    if (!file.is_open()) throw std::runtime_error("Translation cache: cannot append");
+    if (!file.is_open()) {
+        DisablePersistence(std::error_code(errno, std::generic_category()));
+        return false;
+    }
     return true;
 }
 
@@ -1492,6 +1500,16 @@ bool Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
     return true;
 }
 
+void Store::DisablePersistence(const std::error_code& error) {
+    if (!persistence_failed) {
+        LOG_ERROR(Render_Vulkan, "Translation cache: persistence disabled for {}: {}; keeping usable records in memory",
+                  Common::FS::PathToUTF8String(filename),
+                  error ? error.message() : std::make_error_code(std::errc::io_error).message());
+    }
+    persistence_failed = true;
+    if (file.is_open()) file.close();
+}
+
 void Store::Append(const std::vector<u8>& record) {
     if (!file.is_open()) {
         return;
@@ -1502,9 +1520,7 @@ void Store::Append(const std::vector<u8>& record) {
     file.write(reinterpret_cast<const char*>(record.data()), length);
     file.flush();
     if (!file.good()) {
-        LOG_ERROR(Render_Vulkan, "Translation cache: writing {} failed, keeping it in memory only",
-                  Common::FS::PathToUTF8String(filename));
-        file.close();
+        DisablePersistence(std::error_code(errno, std::generic_category()));
     }
 }
 

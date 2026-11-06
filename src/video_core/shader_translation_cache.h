@@ -13,6 +13,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -345,6 +346,7 @@ private:
 
     std::shared_ptr<const Entry> InsertLocked(Entry entry);
     void Append(const std::vector<u8>& record);
+    void DisablePersistence(const std::error_code& error);
     bool LoadFile(const std::filesystem::path& path, const Digest& config, bool writable = true);
 
     struct RecipeCount {
@@ -362,6 +364,7 @@ private:
     std::mutex writer_mutex;
     std::mutex mutex;
     bool enabled{};
+    bool persistence_failed{};
     std::atomic<u64> generation{};
     std::unordered_map<Digest, std::vector<std::shared_ptr<const Entry>>, DigestHash> entries;
     std::unordered_map<Digest, std::shared_ptr<const StoredVariant>, DigestHash> variants;
