@@ -4,11 +4,16 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
+#include <mutex>
+#include <vector>
 #include <cstdlib>
+#include <thread>
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
+#include "common/cpu_features.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
@@ -17,6 +22,7 @@
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
 #include "dynarmic/interface/A64/config.h"
+#include "core/arm/exec_coverage.h"
 
 namespace Core {
 
@@ -243,6 +249,19 @@ u64 DynarmicCallbacks64::GetTicksRemaining() {
     return std::max<s64>(m_parent.m_system.CoreTiming().downcount, 0);
 }
 
+namespace {
+// EDEN_NX2_JIT_TSO=0 turns off upstream PR #161's JIT changes for A/B tests: the inline RDTSC
+// CNTPCT_EL0, plain-MOV ordered loads and elided DMB LD/ST (UserConfig::x64_tso_memory), and the
+// Auto/Unsafe FMA and FPCR flag changes, restoring the previous emission. Read once per process.
+bool JitTsoEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_JIT_TSO");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+} // Anonymous namespace
+
 u64 DynarmicCallbacks64::GetCNTPCT() {
     const u64 ticks = m_parent.m_system.CoreTiming().GetClockTicks();
     // Guest code that waits by polling the counter (title 1's main thread reads it ~17 million
@@ -251,8 +270,15 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
     // other are such a loop: pause, which hands the core's resources to the sibling thread for a
     // moment. The guest sees the same counter. EDEN_NX2_CNTPCT_PAUSE=0 turns it off.
     static const bool pause_spins = [] {
-        const char* value = std::getenv("EDEN_NX2_CNTPCT_PAUSE");
-        return value == nullptr || value[0] != '0';
+        if (const char* value = std::getenv("EDEN_NX2_CNTPCT_PAUSE")) {
+            return value[0] != '0';
+        }
+        if (const auto physical_cores = Common::GetProcessorCount();
+            physical_cores &&
+            static_cast<unsigned int>(*physical_cores) >= std::thread::hardware_concurrency()) {
+            return false;
+        }
+        return true;
     }();
     if (pause_spins && ticks - m_last_cntpct < m_spin_ticks) {
 #if defined(_M_X64) || defined(__x86_64__)
@@ -298,8 +324,46 @@ void DynarmicCallbacks64::ReturnException(u64 pc, Dynarmic::HaltReason hr) {
     m_parent.m_jit->HaltExecution(hr);
 }
 
+namespace {
+
+/// Hands the JIT the coverage map of the application's main (Core::ExecCoverage), and keeps every
+/// map it handed bytes from alive for as long as this JIT's code can run.
+class CoverageHook final : public Dynarmic::A64::BlockCoverage {
+public:
+    std::uint8_t* OnBlockCompiled(std::uint64_t start_pc, std::uint64_t end_pc,
+                                  std::uint8_t& mask) override {
+        auto map = ExecCoverage::Current();
+        if (!map) {
+            return nullptr;
+        }
+        std::uint8_t* const byte = map->OnBlockCompiled(start_pc, end_pc, mask);
+        if (byte != nullptr && map != held) {
+            std::scoped_lock lock{mutex};
+            if (std::find(kept.begin(), kept.end(), map) == kept.end()) {
+                kept.push_back(map);
+            }
+            held = std::move(map);
+        }
+        return byte;
+    }
+
+private:
+    std::mutex mutex;
+    std::shared_ptr<ExecCoverage::Map> held;
+    std::vector<std::shared_ptr<ExecCoverage::Map>> kept;
+};
+
+} // Anonymous namespace
+
 void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_space_bits) {
     Dynarmic::A64::UserConfig config;
+
+    if (ExecCoverage::Enabled() && m_cb->m_process != nullptr && m_cb->m_process->IsApplication()) {
+        if (!m_coverage) {
+            m_coverage = std::make_unique<CoverageHook>();
+        }
+        config.block_coverage = m_coverage.get();
+    }
 
     // Callbacks
     config.callbacks = std::addressof(*m_cb);
@@ -353,6 +417,22 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     // Timing
     config.wall_clock_cntpct = m_uses_wall_clock;
     config.enable_cycle_counting = !m_uses_wall_clock;
+#if defined(ARCHITECTURE_x86_64)
+    config.x64_tso_memory = JitTsoEnabled();
+    if (JitTsoEnabled() && m_uses_wall_clock && Common::g_wall_clock.IsNative() &&
+        Settings::values.cpu_clock.GetValue() == Settings::CpuClock::Normal &&
+        !Settings::values.sync_core_speed.GetValue()) {
+        static const bool allow_inline = [] {
+            const char* value = std::getenv("EDEN_NX2_INLINE_CNTPCT");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (allow_inline) {
+            config.inline_cntpct_tsc_base = Common::g_wall_clock.base_rdtsc;
+            config.inline_cntpct_tsc_factor =
+                Common::g_wall_clock.cntpct_rdtsc_factor.load(std::memory_order_relaxed);
+        }
+    }
+#endif
 
     // Code cache size
 #if defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
@@ -420,11 +500,21 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
             config.fastmem_pointer = std::nullopt;
             config.fastmem_exclusive_access = false;
         }
+#ifdef ARCHITECTURE_x86_64
+        if (Settings::values.cpuopt_unsafe_unfuse_fma &&
+            (!JitTsoEnabled() || !Common::g_cpu_caps.fma)) {
+            config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA;
+        }
+#else
         if (Settings::values.cpuopt_unsafe_unfuse_fma) {
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA;
         }
+#endif
         if (Settings::values.cpuopt_unsafe_reduce_fp_error) {
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
+            if (JitTsoEnabled()) {
+                config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
+            }
         }
         if (Settings::values.cpuopt_unsafe_inaccurate_nan) {
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
@@ -435,11 +525,21 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         if (Settings::values.cpuopt_unsafe_ignore_global_monitor) {
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
         }
+        if (JitTsoEnabled()) {
+            config.optimizations |= Dynarmic::OptimizationFlag::CodeSpeed |
+                                    Dynarmic::OptimizationFlag::DisableVerification;
+        }
         break;
     // Safe optimisations
     case Settings::CpuAccuracy::Auto:
         config.unsafe_optimizations = true;
+#ifdef ARCHITECTURE_x86_64
+        if (!JitTsoEnabled() || !Common::g_cpu_caps.fma) {
+            config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA;
+        }
+#else
         config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA;
+#endif
         config.fastmem_address_space_bits = 64;
         config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
         break;

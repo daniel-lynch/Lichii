@@ -20,11 +20,13 @@
 #include "common/swap.h"
 #include "core/core.h"
 #include "core/arm/dynarmic/window_trace.h"
+#include "core/arm/exec_coverage.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/hle/kernel/code_set.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/hle/service/nx2_oot_time.h"
 #include "core/loader/nso.h"
 #include "core/memory.h"
 
@@ -327,7 +329,18 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         }
     }
     LOG_INFO(Loader, "Module {} loaded at {:#x} (size {:#x})", nso_file.GetName(), load_base, image_size);
+    if (name == "main" && process.GetProgramId() == Service::Nx2OotTime::ProgramId) {
+        const size_t hook = module_start + Service::Nx2OotTime::HookOffset;
+        u32 word = 0;
+        if (codeset.memory.size() >= hook + sizeof(word)) {
+            std::memcpy(&word, codeset.memory.data() + hook, sizeof(word));
+        }
+        process.SetOotDeltaAddress(word == Service::Nx2OotTime::HookInstruction
+                                       ? load_base + module_start + Service::Nx2OotTime::DeltaOffset
+                                       : 0);
+    }
     process.LoadModule(system.Kernel(), std::move(codeset), load_base);
+    Core::ExecCoverage::OnModuleLoaded(process, nso_file.GetName(), load_base, image_size);
     if (name == "main" && process.GetProgramId() == Settings::MarioKartWorldProgramId) {
         process.SetMkwDynamicFpsPatchApplied(mkw_dynamic_fps_patch_applied);
     }

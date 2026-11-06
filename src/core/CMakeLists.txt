@@ -7,6 +7,8 @@
 add_library(core STATIC
     arm/arm_interface.cpp
     arm/arm_interface.h
+    arm/exec_coverage.cpp
+    arm/exec_coverage.h
     arm/debug.cpp
     arm/debug.h
     arm/exclusive_monitor.cpp
@@ -1057,6 +1059,7 @@ add_library(core STATIC
     hle/service/nx2_gsv_server.h
     hle/service/nx2_video_input_queue.h
     hle/service/nx2_image_layout.h
+    hle/service/nx2_oot_time.h
     hle/service/nx2_present_pacer.h
     hle/service/nx2_video_ready.h
     hle/service/services.cpp

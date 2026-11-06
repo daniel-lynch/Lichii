@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
+    video_core/buffer_cache_ports.cpp
     video_core/unswizzle_workers.cpp
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp
@@ -16,6 +17,8 @@ add_executable(tests
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
     core/nx2_debug_server.cpp
+    core/exec_coverage.cpp
+    core/nx2_oot_time.cpp
     core/nx2_present_pacer.cpp
     common/dkb_cpu_trace.cpp
     common/dkb_frame_trace.cpp
@@ -60,10 +63,13 @@ add_executable(tests
     video_core/ampere_async_copy.cpp
     video_core/ampere_trap_guards.cpp
     video_core/async_draw_policy.cpp
+    video_core/query_wait.cpp
     video_core/async_shader_emission.cpp
     video_core/pipeline_build.cpp
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
+    video_core/command_writer.cpp
+    video_core/split_fence_wait.cpp
     video_core/command_snapshot_suspensions.cpp
     video_core/pending_maps.cpp
     video_core/maxwell_fast_method.cpp
@@ -157,10 +163,21 @@ target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain
 
 if (TARGET dynarmic::dynarmic)
     target_sources(tests PRIVATE core/window_trace.cpp)
+    # dynarmic_tso.cpp allocates guest memory with mmap (POSIX only).
+    if (ARCHITECTURE_x86_64 AND NOT WIN32)
+        target_sources(tests PRIVATE core/dynarmic_tso.cpp)
+    endif()
     target_link_libraries(tests PRIVATE dynarmic::dynarmic)
 endif()
 
 add_test(NAME tests COMMAND tests)
+
+# The translated-shader cache's translator identity (CMakeModules/TranslatorIdentity.cmake).
+add_test(NAME translator_identity
+         COMMAND ${CMAKE_COMMAND}
+                 -DMODULE=${PROJECT_SOURCE_DIR}/CMakeModules/TranslatorIdentity.cmake
+                 -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/translator_identity_test
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/translator_identity_test.cmake)
 
 if (WIN32 AND ARCHITECTURE_x86_64)
     add_executable(event_wait_probe ../../tools/nx2/event_wait_probe.cpp)

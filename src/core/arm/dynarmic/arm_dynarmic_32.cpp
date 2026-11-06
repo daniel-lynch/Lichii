@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_32.h"
@@ -187,6 +188,11 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
 
     // Timing
     config.wall_clock_cntpct = m_uses_wall_clock;
+    // Upstream PR #161's x86-64 TSO loads/barriers; EDEN_NX2_JIT_TSO=0 restores LOCK XADD / MFENCE.
+    config.x64_tso_memory = [] {
+        const char* value = std::getenv("EDEN_NX2_JIT_TSO");
+        return value == nullptr || value[0] != '0';
+    }();
     config.enable_cycle_counting = !m_uses_wall_clock;
 
     // Code cache size

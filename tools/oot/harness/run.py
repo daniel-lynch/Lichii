@@ -55,6 +55,9 @@ import pad as padmod  # noqa: E402
 import portable as prof  # noqa: E402
 import states  # noqa: E402
 
+sys.path.insert(0, str(HERE.parent.parent / "nx2"))
+import coverage_diff  # noqa: E402
+
 HOME = Path.home()
 DEF_BIN = HOME / "dev/Lichii/build-test/bin/lichii"
 DEF_GAME = HOME / "Downloads/OOT/The Legend of Zelda Ocarina of TIme [04004860224DEC000].nup"
@@ -225,6 +228,7 @@ class Run:
         self.log_offset = None
         self.mh_start = None
         self.gs = self.sampler = self.pad = self.shots = None
+        self.coverage = None
         self.emu_pid = None
         self.user = None
         self.n_shot = 0
@@ -388,6 +392,9 @@ class Run:
                 run_env[k] = v
         env.update(run_env)
         self.info["env"] = run_env
+        # EDEN_NX2_COVERAGE with a debug server: snapshots at title and in-game, and their diff.
+        cov_on = run_env.get("EDEN_NX2_COVERAGE", "0") not in ("", "0")
+        self.coverage = run_env.get("EDEN_NX2_DEBUG_SERVER") if cov_on else None
         env["MANGOHUD_CONFIG"] = (f"fps,frametime,no_display,control=mangohud,output_folder={self.dir},"
                                   f"log_interval={a.mangohud_interval}")
         env.pop("MANGOHUD", None)
@@ -546,6 +553,7 @@ class Run:
         time.sleep(1.5)  # title menu fades in; input before that is ignored
         self.shot("title")
         self.step("title", "ok", f"title score {f.get('title')}")
+        self.coverage_snapshot("title")
 
         for name, want, keep in (("file-select", {"load_list", "load_confirm"}, "file-select"),
                                  ("load-confirm", {"load_confirm"}, "load-confirm")):
@@ -578,6 +586,36 @@ class Run:
         time.sleep(a.settle)
         self.shot("in-game")
         self.step("in-game", "ok", f"hearts {f.get('hearts')}")
+        if self.coverage_snapshot("ingame") and (self.dir / "coverage-title.json").exists():
+            self.coverage_diff("title", "ingame")
+
+    # -- execution coverage (EDEN_NX2_COVERAGE + EDEN_NX2_DEBUG_SERVER; docs/nx2/exec-coverage.md)
+    def coverage_snapshot(self, name):
+        if not self.coverage:
+            return False
+        path = self.dir / f"coverage-{name}.json"
+        t = time.time()
+        try:
+            r = coverage_diff.take_snapshot(self.coverage, path)
+        except (SystemExit, OSError, ValueError) as e:
+            self.say(f"coverage snapshot {name} failed: {e}")
+            return False
+        self.info.setdefault("coverage", {})[name] = coverage_diff.summary(r)
+        self.say(f"coverage {name}: {r.get('hit_blocks')} blocks hit, {r.get('range_count')} ranges, "
+                 f"{r.get('covered_bytes')} bytes ({time.time() - t:.1f}s)")
+        return True
+
+    def coverage_diff(self, before, after):
+        functions = coverage_diff.Functions.load(self.a.coverage_functions) if self.a.coverage_functions else None
+        report, fresh = coverage_diff.diff_report(
+            coverage_diff.load_snapshot(self.dir / f"coverage-{before}.json"),
+            coverage_diff.load_snapshot(self.dir / f"coverage-{after}.json"), functions,
+            base_name=before, new_name=after)
+        out = self.dir / f"coverage-{before}-to-{after}.txt"
+        out.write_text(report)
+        self.info.setdefault("coverage", {})[f"{before}-to-{after}"] = {
+            "ranges": len(fresh), "bytes": sum(e - s for s, e in fresh), "report": out.name}
+        self.say(f"coverage {before} -> {after}: {len(fresh)} newly hit ranges -> {out.name}")
 
     # -- measurement
     def mangohud(self, on):
@@ -774,7 +812,9 @@ class Run:
                     res["crash_signal"] = signal.Signals(hits[-1]["sig"]).name
             except (subprocess.TimeoutExpired, ValueError, KeyError, OSError):
                 pass
-        csvs = sorted(p for p in self.dir.glob("*.csv") if not p.name.endswith("_summary.csv"))
+        csvs = sorted(p for p in self.dir.glob("*.csv")
+                      if not p.name.endswith("_summary.csv")
+                      and p.name not in ("delta.csv", "pcs.csv", "mangohud.csv"))  # --gdb artefacts
         if csvs:
             csvs[-1].rename(self.dir / "mangohud.csv")
             for s in self.dir.glob("*_summary.csv"):
@@ -834,6 +874,9 @@ def build_parser():
     ap.add_argument("--max-load", type=float, default=10.0, help="refuse (or, with --wait-idle, wait) while the 1-minute load average exceeds this or any compiler/JVM runs; -1 disables")
     ap.add_argument("--gpu-settle-mib", type=int, default=4096, help="after taking the run lock, wait (up to 90 s) until no emulator runs and GPU memory used is below this, so the previous instance's VRAM is released before vkCreateDevice")
     ap.add_argument("--min-mem-gib", type=float, default=40)
+    ap.add_argument("--coverage-functions", type=Path, metavar="TSV",
+                    help="with --env EDEN_NX2_COVERAGE=1 --env EDEN_NX2_DEBUG_SERVER=HOST:PORT: name the "
+                         "title -> in-game coverage diff from this Ghidra address<TAB>name file (read only)")
     ap.add_argument("--keep-cores", action="store_true", help="allow core dumps of the emulator")
     ap.add_argument("--keep-poll-shots", action="store_true")
     f = ap.add_argument_group("flash / flicker monitor (debug server; on by default)")

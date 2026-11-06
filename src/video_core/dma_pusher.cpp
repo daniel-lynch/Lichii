@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstdio>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -34,6 +35,17 @@ namespace Tegra {
 
 constexpr u32 MacroRegistersStart = 0xE00;
 constexpr u32 ComputeInline = 0x6D;
+
+bool DmaPusher::IsMemoryWriter(const Engines::EngineInterface& engine, Engines::EngineTypes type,
+                              u32 method) {
+    if (type == Engines::EngineTypes::KeplerCompute) {
+        return static_cast<const Engines::KeplerCompute&>(engine).MayWriteMemory(method);
+    }
+    if (type == Engines::EngineTypes::MaxwellDMA) {
+        return method >= MacroRegistersStart || engine.execution_mask[method];
+    }
+    return false;
+}
 
 DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_)
     : system{system_}
@@ -471,10 +483,9 @@ void DmaPusher::CallMethod(u32 argument) {
             ReportUnboundSubchannel();
             return;
         }
-        // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
         const auto engine_type = subchannel_type[dma_state.subchannel];
-        const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
-                            engine_type == Engines::EngineTypes::MaxwellDMA;
+        const bool writer = split.Active() &&
+                            IsMemoryWriter(*subchannel, engine_type, dma_state.method);
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
@@ -531,10 +542,9 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             ReportUnboundSubchannel();
             return;
         }
-        // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
         const auto engine_type = subchannel_type[dma_state.subchannel];
-        const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
-                            engine_type == Engines::EngineTypes::MaxwellDMA;
+        const bool writer = split.Active() &&
+                            IsMemoryWriter(*subchannel, engine_type, dma_state.method);
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();

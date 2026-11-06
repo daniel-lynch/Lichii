@@ -41,7 +41,7 @@ constexpr std::array StageNames{"vertex",  "tess-control", "tess-eval", "geometr
                                 "compute", "vertex-a",     "task",      "mesh"};
 
 Stage ParseStage(std::string_view name) {
-    for (size_t i = 0; i < 6; ++i) {
+    for (size_t i = 0; i < StageNames.size(); ++i) {
         if (name == StageNames[i])
             return static_cast<Stage>(i);
     }
@@ -189,6 +189,12 @@ public:
             sph = reader.Read<Shader::ProgramHeader>();
             if (stage == Stage::Geometry)
                 gp_passthrough_mask = reader.Read<std::array<u32, 8>>();
+            if (stage == Stage::Task || stage == Stage::Mesh) {
+                if (version < 52)
+                    throw std::runtime_error("Task/mesh environments require cache version 52");
+                mesh_registers = reader.Read<std::array<u32, 3>>();
+                mesh_primitive_header = reader.Read<Shader::ProgramHeader>();
+            }
         }
         if (reader.Remaining())
             throw std::runtime_error("Trailing bytes after environment record");
@@ -558,6 +564,7 @@ int main(int argc, char** argv) {
         std::optional<Stage> requested_stage;
         u32 version{};
         bool lower_only{};
+        bool packed_code{};
         bool capture_extent{};
         bool assume_storage_pointers{};
         bool assume_textures{};
@@ -570,9 +577,9 @@ int main(int argc, char** argv) {
                              "vertex|tess-control|tess-eval|geometry|fragment|compute|task|mesh]\n"
                              "  [--mesh-registers SHADER_A,SHADER_B,INIT (hex, task/mesh)]\n"
                              "  [--format instructions|native-header] [--environment FILE "
-                             "--cache-version 46|47|48|49|50|51|52]\n"
+                             "--cache-version 46|47|48|49|50|51|52|53]\n"
                              "  [--pipeline-key FILE] [--capture-extent] "
-                             "(--output SPV | --lower-only WORDS) [--dump-ir FILE]\n"
+                             "(--output SPV | --lower-only WORDS | --packed-code WORDS) [--dump-ir FILE]\n"
                              "  [--assume-storage-pointers] [--assume-textures]\n";
                 return 0;
             }
@@ -622,14 +629,15 @@ int main(int argc, char** argv) {
             }
             else if (arg == "--cache-version") {
                 if (value != "46" && value != "47" && value != "48" && value != "49" && value != "50" &&
-                    value != "51" && value != "52")
-                    throw std::runtime_error("Expected cache version 46 to 52");
+                    value != "51" && value != "52" && value != "53")
+                    throw std::runtime_error("Expected cache version 46 to 53");
                 version = static_cast<u32>(std::stoul(value));
-            } else if (arg == "--output" || arg == "--lower-only") {
+            } else if (arg == "--output" || arg == "--lower-only" || arg == "--packed-code") {
                 if (!output.empty())
                     throw std::runtime_error("Only one output mode is permitted");
                 output = value;
-                lower_only = arg == "--lower-only";
+                lower_only = arg != "--output";
+                packed_code = arg == "--packed-code";
             } else
                 throw std::runtime_error("Unknown option " + arg);
         }
@@ -684,21 +692,19 @@ int main(int argc, char** argv) {
                 const u32 type = header.common0.shader_type;
                 if (type < 1 || type > 5)
                     throw std::runtime_error("Invalid native graphics header stage");
-                Stage header_stage = static_cast<Stage>(type - 1);
-                // A task program is bound in the vertex slot, a mesh program in a tessellation
-                // slot (translate_program.cpp)
-                if (requested_stage == Stage::Task && header_stage == Stage::VertexB) {
-                    header_stage = Stage::Task;
-                } else if (requested_stage == Stage::Mesh &&
-                           (header_stage == Stage::TessellationControl ||
-                            header_stage == Stage::TessellationEval)) {
-                    header_stage = Stage::Mesh;
-                }
-                if ((requested_stage && *requested_stage != header_stage) ||
-                    (env.captured && env.ShaderStage() != header_stage)) {
+                const Stage header_stage = static_cast<Stage>(type - 1);
+                const Stage stage = requested_stage.value_or(
+                    env.captured ? env.ShaderStage() : header_stage);
+                // A task program is bound in the vertex slot, a mesh program in a vertex or
+                // tessellation slot (translate_program.cpp)
+                const bool mesh_envelope =
+                    (stage == Stage::Task && type == 1) ||
+                    (stage == Stage::Mesh && (type == 1 || type == 2 || type == 3));
+                if ((stage != header_stage && !mesh_envelope) ||
+                    (env.captured && env.ShaderStage() != stage)) {
                     throw std::runtime_error("Stage disagrees with native header");
                 }
-                env.SetStage(header_stage);
+                env.SetStage(stage);
                 env.SetHeader(bytes);
             } else if (!requested_stage && !env.captured && !lower_only) {
                 throw std::runtime_error(
@@ -767,7 +773,12 @@ int main(int argc, char** argv) {
             diagnostic["lowered_words"] = lowered.instructions.size();
             if (lower_only) {
                 diagnostic["phase"] = "output";
-                WriteFile(output, lowered.instructions);
+                if (packed_code) {
+                    env.SetCode(lowered);
+                    WriteFile(output, env.code);
+                } else {
+                    WriteFile(output, lowered.instructions);
+                }
                 diagnostic["status"] = "ok";
                 std::cout << diagnostic.dump() << '\n';
                 return 0;
@@ -792,7 +803,8 @@ int main(int argc, char** argv) {
         }
         if (env.ShaderStage() == Stage::Task || env.ShaderStage() == Stage::Mesh) {
             if (env.captured) {
-                throw MissingContext("Task and mesh cache records lack the mesh registers");
+                throw MissingContext(
+                    "Captured task and mesh programs require additional pipeline stage context");
             }
             if (!mesh_registers) {
                 // Triangles, 64 vertices, 126 primitives, 32 threads per stage, one payload line

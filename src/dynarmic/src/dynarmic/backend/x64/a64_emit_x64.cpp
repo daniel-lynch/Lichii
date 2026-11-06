@@ -95,6 +95,22 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
     code.mov(code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)], rbp);
     code.lea(rbp, code.ptr[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer) - 8]);
 
+    if (conf.block_coverage) {
+        // Nothing is live in host registers or flags at block entry: guest state is in A64JitState.
+        std::uint8_t mask = 0;
+        std::uint8_t* const byte = conf.block_coverage->OnBlockCompiled(
+            A64::LocationDescriptor{block.Location()}.PC(), A64::LocationDescriptor{block.EndLocation()}.PC(), mask);
+        if (byte != nullptr && mask != 0) {
+            Xbyak::Label marked;
+            code.mov(rax, reinterpret_cast<u64>(byte));
+            code.test(code.byte[rax], mask);
+            code.jnz(marked);
+            code.lock();
+            code.or_(code.byte[rax], mask);
+            code.L(marked);
+        }
+    }
+
     DEBUG_ASSERT(block.GetCondition() == IR::Cond::AL);
     typedef void (EmitX64::*EmitHandlerFn)(EmitContext& context, IR::Inst* inst);
     constexpr EmitHandlerFn opcode_handlers[] = {
@@ -559,6 +575,27 @@ void A64EmitX64::EmitA64GetCNTFRQ(A64EmitContext& ctx, IR::Inst* inst) {
 }
 
 void A64EmitX64::EmitA64GetCNTPCT(A64EmitContext& ctx, IR::Inst* inst) {
+    if (conf.wall_clock_cntpct && conf.inline_cntpct_tsc_factor != 0) {
+        const Xbyak::Reg64 rax_reg = ctx.reg_alloc.ScratchGpr(code, HostLoc::RAX);
+        const Xbyak::Reg64 rdx_reg = ctx.reg_alloc.ScratchGpr(code, HostLoc::RDX);
+        const Xbyak::Reg64 tmp = ctx.reg_alloc.ScratchGpr(code);
+        // ISB is not hooked by default, so the counter read itself must be ordered:
+        // the leading LFENCE keeps RDTSC from sampling before earlier loads complete
+        // (LDR; ISB; MRS CNTPCT_EL0), the trailing one keeps later loads from issuing
+        // before the sample (MRS CNTPCT_EL0; ISB; LDR). Same sequence as
+        // Common::X64::FencedRDTSC() on the host-call path.
+        code.lfence();
+        code.rdtsc();
+        code.lfence();
+        code.shl(rdx_reg, 32);
+        code.or_(rax_reg, rdx_reg);
+        code.mov(tmp, conf.inline_cntpct_tsc_base);
+        code.sub(rax_reg, tmp);
+        code.mov(tmp, conf.inline_cntpct_tsc_factor);
+        code.mul(tmp);
+        ctx.reg_alloc.DefineValue(code, inst, rdx_reg);
+        return;
+    }
     ctx.reg_alloc.HostCall(code, inst);
     if (!conf.wall_clock_cntpct) {
         code.UpdateTicks();

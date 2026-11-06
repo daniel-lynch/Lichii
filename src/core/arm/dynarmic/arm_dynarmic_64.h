@@ -118,6 +118,9 @@ private:
     std::optional<DynarmicCallbacks64> m_cb{};
     std::size_t m_core_index{};
 
+    // EDEN_NX2_COVERAGE: declared before m_jit so it outlives the code compiled against it.
+    std::unique_ptr<Dynarmic::A64::BlockCoverage> m_coverage{};
+
     std::optional<Dynarmic::A64::Jit> m_jit{};
 
     // SVC callback

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <limits>
 #include <cstdio>
@@ -35,6 +36,7 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/native_query_trace.h"
 #include "video_core/native_indirect_reset.h"
+#include "video_core/query_wait.h"
 #include "video_core/render_trace.h"
 #include "video_core/indirect_reset.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -2245,6 +2247,43 @@ void RasterizerVulkan::ReleaseFences(bool force) {
     fence_manager.WaitPendingFences(force);
 }
 
+void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+    if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
+        return;
+    }
+    // Below High GPU accuracy a fence runs its own callback at once, so wait for an operation
+    // queued behind the pending report writes instead. On the split's back the fence's
+    // submission may be deferred, and the fencing thread would wait for this thread to submit it.
+    // The operation owns the completion state, so it stays valid if the wait below gives up and
+    // the operation runs (or is destroyed unrun) later.
+    const auto written = std::make_shared<VideoCommon::QueryWait::Completion>();
+    fence_manager.SyncOperation([written] { written->Signal(); });
+    fence_manager.SignalFence([] {});
+    scheduler.FlushDeferred();
+    // Wait in slices, submitting deferred work between them: the fencing thread may be waiting
+    // for a submission only this thread makes (WaitSubmitted asks the back's idle hook, which
+    // does not run while the back blocks here). A lost fence, device loss or a shutdown race
+    // would otherwise hang the GPU front for good: on timeout the read goes ahead on guest
+    // memory as it is, the pre-#215 behaviour, a possibly stale count, never a hang.
+    // EDEN_NX2_QUERY_WAIT_MS=0 waits without a bound (still submitting between slices).
+    const auto timeout = VideoCommon::QueryWait::Timeout();
+    const auto start = std::chrono::steady_clock::now();
+    if (VideoCommon::QueryWait::WaitSliced(*written, timeout, VideoCommon::QueryWait::Slice,
+                                           [this] { scheduler.FlushDeferred(); })) {
+        return;
+    }
+    static std::atomic<u64> timeouts{};
+    if (const auto note = VideoCommon::QueryWait::NoteTimeout(timeouts); note.log) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+        LOG_WARNING(HW_GPU,
+                    "Query result wait timed out after {} ms (limit {} ms) at {:#x}+{:#x}; "
+                    "reading reports as they are ({} timeouts so far, logged every {})",
+                    elapsed.count(), timeout.count(), addr, size, note.count,
+                    VideoCommon::QueryWait::LogEvery);
+    }
+}
+
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
                                                 VideoCommon::CacheType which) {
     if (Settings::IsGPULevelHigh()) {
@@ -2803,10 +2842,7 @@ void RasterizerVulkan::FlushWork() {
     static constexpr bool android = false;
 #endif // __ANDROID__
     const bool native = gpu_memory->UsesNativeTiling();
-    // The 128-draw native budget is tuned for MoltenVK; desktop Vulkan takes the legacy 4096 (#161).
-    const u32 default_native_budget =
-        !device.IsMoltenVK() ? 4096U : SubmissionPolicy::DefaultNativeBudget;
-    u32 budget = default_native_budget;
+    u32 budget = SubmissionPolicy::DefaultNativeBudget;
     if (native && !android) {
         static const std::optional<u32> configured_budget = []() -> std::optional<u32> {
             if (const char* value = std::getenv("EDEN_NX2_FLUSH_DRAWS")) {
@@ -2819,7 +2855,7 @@ void RasterizerVulkan::FlushWork() {
             }
             return std::nullopt;
         }();
-        budget = configured_budget.value_or(default_native_budget);
+        budget = configured_budget.value_or(SubmissionPolicy::DefaultNativeBudget);
     }
     u32 legacy_budget = 4096;
     if (!native && !android) {

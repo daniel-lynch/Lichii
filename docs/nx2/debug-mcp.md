@@ -233,6 +233,7 @@ each): CPU 0.011-0.012 ms mean per present (max 0.14 ms), GPU blit+copy 0.010-0.
 | `log_tail`, `log_filter` | Relaunch with a new filter, owner sends the log | Read new lines since the last call, change the filter live | 1 |
 | `capture_frame` | Relaunch with `EDEN_NX2_FRAME_DUMP`, owner touches `capture.now`, agent copies the dump | Capture the next frame now, sampled textures and bound buffers optional, get the manifest summary back; `capture_image` returns any pass PNG | 1 |
 | `reject_shaders` | Rebuild the env, relaunch, replay to the spot, once per bisection step | Reject or restore hashes live; bisection becomes a loop of reject, screenshot | 1 |
+| `coverage_start`, `coverage_snapshot`, `coverage_reset`, `coverage_stop` | Not possible | With `EDEN_NX2_COVERAGE=1`, which code of the game's `main` ran since the last reset; `tools/nx2/coverage_diff.py` diffs two snapshots into Ghidra addresses (docs/nx2/exec-coverage.md) | 1 |
 | `pause`, `resume`, `step_frames` | Not possible | Freeze on the broken frame, capture it, step one present | 2 |
 | `input`, `input_sequence` (buttons, sticks, frame-timed sequences) | Owner plays to the spot | Agent walks to the spot itself and replays a repro (done) | 2 |
 | `shaders` (inventory) | Shader dump and offline sweep | List loaded programs: key, hash, stage, address, lowered or rejected with the error | 2 |

@@ -84,6 +84,20 @@ enum class InstructionCacheOperation {
     InvalidateAllToPoUInnerSharable
 };
 
+/// Execution coverage at block granularity (x64 backend only). When UserConfig::block_coverage is
+/// set, the JIT asks it about every block it compiles; a block that gets a byte back is compiled
+/// with a prologue that runs on every entry:
+///     test byte [byte], mask ; jnz done ; lock or byte [byte], mask ; done:
+/// so after the first entry it costs one load and a predicted branch, and never writes the shared
+/// cache line again. The byte must stay valid for as long as the compiled code can run.
+struct BlockCoverage {
+    virtual ~BlockCoverage() = default;
+    /// Called once per compiled block (also on recompiles) with the guest PC of its first
+    /// instruction and the PC one past its last. Returns the bitmap byte to mark and sets mask,
+    /// or returns nullptr to compile the block without the prologue.
+    virtual std::uint8_t* OnBlockCompiled(std::uint64_t start_pc, std::uint64_t end_pc, std::uint8_t& mask) = 0;
+};
+
 struct UserCallbacks {
     virtual ~UserCallbacks() = default;
 
@@ -293,6 +307,13 @@ struct UserConfig {
     /// to avoid writting certain unnecessary code only needed for cycle timers.
     bool wall_clock_cntpct = false;
 
+    /// x86-64 hosts only. Exploit the host's TSO memory model: ordered 8/16/32/64-bit reads (LDAR,
+    /// LDAXR, LDAPR) are plain MOVs instead of LOCK XADD [addr], 0 (ordered writes stay XCHG, so
+    /// STLR -> LDAR keeps its store-load order), and DMB *LD / DMB *ST emit no MFENCE.
+    bool x64_tso_memory = true;
+    std::uint64_t inline_cntpct_tsc_base = 0;
+    std::uint64_t inline_cntpct_tsc_factor = 0;
+
     /// This allows accurately emulating protection fault handlers. If true, we check
     /// for exit after every data memory access by the emulated program.
     bool check_halt_on_memory_access = false;
@@ -300,6 +321,9 @@ struct UserConfig {
     /// This option allows you to disable cycle counting. If this is set to false,
     /// AddTicks and GetTicksRemaining are never called, and no cycle counting is done.
     bool enable_cycle_counting = true;
+
+    /// Execution coverage (see BlockCoverage). Null (the default) emits nothing.
+    BlockCoverage* block_coverage = nullptr;
 
     /// Internal use only
     bool very_verbose_debugging_output = false;

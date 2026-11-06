@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <set>
+#include <string>
+#include <string_view>
 #include <catch2/catch_test_macros.hpp>
 #include "video_core/shader_pool_index.h"
+#include "shader_recompiler/translator_identity.h"
 #include "video_core/shader_translation_cache.h"
 
 namespace {
@@ -580,4 +585,96 @@ TEST_CASE("Class-level replay covers two-word handles and rejects one-to-many ma
     // The two recorded-equal handles now differ live: one recorded handle, two live ones.
     env.cbufs[(u64{2} << 32) | 0x30] = 6;
     REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) < queries.size());
+namespace {
+// Sets an environment variable for one scope and restores it afterwards.
+class ScopedEnvironmentVariable {
+public:
+    ScopedEnvironmentVariable(const char* name_, const char* value) : name{name_} {
+        if (const char* old = std::getenv(name)) {
+            previous = old;
+        }
+        Set(value);
+    }
+    ~ScopedEnvironmentVariable() {
+        Set(previous ? previous->c_str() : nullptr);
+    }
+
+private:
+    void Set(const char* value) {
+#ifdef _WIN32
+        _putenv_s(name, value ? value : "");
+#else
+        if (value) {
+            setenv(name, value, 1);
+        } else {
+            unsetenv(name);
+        }
+#endif
+    }
+
+    const char* name;
+    std::optional<std::string> previous;
+};
+} // Anonymous namespace
+
+TEST_CASE("Translation cache identifies the translator by its source",
+          "[video_core][translation_cache]") {
+    // The generated header holds a SHA-256 in lowercase hexadecimal.
+    const auto is_hex = [](std::string_view text) {
+        return std::all_of(text.begin(), text.end(),
+                           [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+    };
+    const std::string_view hash = Shader::TranslatorSourceHash();
+    REQUIRE(hash.size() == 64);
+    REQUIRE(is_hex(hash));
+    // src/shader_recompiler alone holds more than two hundred files.
+    REQUIRE(Shader::TranslatorSourceFileCount() > 200);
+    // Nothing about the running process: the same value on every call, built from the hash.
+    REQUIRE(Shader::TranslatorIdentity() == Shader::TranslatorIdentity());
+    REQUIRE(Shader::TranslatorIdentity().find(hash) != std::string::npos);
+
+    const Shader::Profile profile{};
+    const Shader::HostTranslateInfo host_info{};
+    Digest source_digest{};
+    std::string source_tag;
+    {
+        ScopedEnvironmentVariable key{"EDEN_NX2_TRANSLATION_CACHE_KEY", nullptr};
+        const CacheIdentity identity = CurrentCacheIdentity();
+        REQUIRE(identity.kind == "source");
+        REQUIRE(identity.value == Shader::TranslatorIdentity());
+        REQUIRE(identity.file_tag.size() == 16);
+        REQUIRE(is_hex(identity.file_tag));
+        REQUIRE(identity.description.find(hash.substr(0, 16)) != std::string::npos);
+        source_tag = identity.file_tag;
+        source_digest = MakeConfigDigest(profile, host_info, 0);
+        REQUIRE(MakeConfigDigest(profile, host_info, 0) == source_digest);
+        REQUIRE_FALSE(MakeConfigDigest(profile, host_info, 1) == source_digest);
+    }
+    {
+        ScopedEnvironmentVariable key{"EDEN_NX2_TRANSLATION_CACHE_KEY", "source"};
+        REQUIRE(CurrentCacheIdentity().file_tag == source_tag);
+        REQUIRE(MakeConfigDigest(profile, host_info, 0) == source_digest);
+    }
+    {
+        // An unknown value keeps the source identity and says so in the log line.
+        ScopedEnvironmentVariable key{"EDEN_NX2_TRANSLATION_CACHE_KEY", "bogus"};
+        const CacheIdentity identity = CurrentCacheIdentity();
+        REQUIRE(identity.kind == "source");
+        REQUIRE(identity.file_tag == source_tag);
+        REQUIRE(identity.description.find("not recognised") != std::string::npos);
+        REQUIRE(MakeConfigDigest(profile, host_info, 0) == source_digest);
+    }
+    {
+        // The escape hatch restores the executable identity and the old file name, and never
+        // shares a file with the source identity.
+        ScopedEnvironmentVariable key{"EDEN_NX2_TRANSLATION_CACHE_KEY", "exe"};
+        const CacheIdentity identity = CurrentCacheIdentity();
+        REQUIRE(identity.kind == "exe");
+        REQUIRE(identity.file_tag.empty());
+#if defined(__linux__) || defined(_WIN32)
+        REQUIRE_FALSE(identity.value.empty());
+        REQUIRE(identity.value.find(hash) == std::string::npos);
+        REQUIRE_FALSE(MakeConfigDigest(profile, host_info, 0) == source_digest);
+#endif
+    }
 }

@@ -25,6 +25,17 @@ inline bool TraceEnabled() {
     return enabled;
 }
 
+/// EDEN_NX2_QUERY_DMA_FLUSH=0: restores the pre-#204 gating, where macro DMA reads of reports
+/// flush the query cache only while the split GPU thread is inactive (so under the split they
+/// can read stale counts). Default on: the flush runs wherever the query cache is owned.
+inline bool FlushUnderSplit() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_QUERY_DMA_FLUSH");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 /// Whether [source, source + size) holds reports still waiting for host query results. Runs
 /// where the rasterizer's caches are owned (the back of a split GPU thread).
 inline bool HasPendingQueries(const Tegra::MemoryManager& memory,
@@ -43,10 +54,26 @@ inline bool HasPendingQueries(const Tegra::MemoryManager& memory,
     return false;
 }
 
+/// Writes the reports in [source, source + size) to guest memory, waiting for pending host
+/// results. Runs where the rasterizer's caches are owned.
+inline void FlushPending(const Tegra::MemoryManager& memory,
+                         VideoCore::RasterizerInterface& rasterizer, GPUVAddr source, size_t size) {
+    constexpr GPUVAddr page_size = 0x1000;
+    const GPUVAddr end = source + size;
+    for (GPUVAddr begin = source; begin < end;) {
+        const GPUVAddr page_end = (std::min)((begin & ~(page_size - 1)) + page_size, end);
+        if (const auto device = memory.GpuToCpuAddress(begin)) {
+            rasterizer.FlushQueryResults(*device, page_end - begin);
+        }
+        begin = page_end;
+    }
+}
+
 /// Logs a read of pending reports with the words it reads, and the same words once the next
 /// fence has popped and the results have landed.
-inline void Trace(const Tegra::MemoryManager& memory, VideoCore::RasterizerInterface& rasterizer,
-                  u32 macro, u32 method, GPUVAddr source, size_t size) {
+/// Returns the read number when it was logged (0 past the log cap).
+inline u64 Trace(const Tegra::MemoryManager& memory, VideoCore::RasterizerInterface& rasterizer,
+                 u32 macro, u32 method, GPUVAddr source, size_t size) {
     static constexpr u64 max_reads = 4000;
     static std::atomic<u64> reads{};
     const u64 read = reads.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -54,7 +81,7 @@ inline void Trace(const Tegra::MemoryManager& memory, VideoCore::RasterizerInter
         if (read % 10000 == 0) {
             LOG_INFO(HW_GPU, "Query DMA read of pending reports ({} so far)", read);
         }
-        return;
+        return 0;
     }
     std::array<u32, 4> words{};
     const size_t bytes = (std::min)(size, sizeof(words));
@@ -68,6 +95,15 @@ inline void Trace(const Tegra::MemoryManager& memory, VideoCore::RasterizerInter
         memory.ReadBlockUnsafe(source, landed.data(), bytes);
         LOG_INFO(HW_GPU, "Query DMA read #{} landed words={:08x}", read, fmt::join(landed, ","));
     });
+    return read;
+}
+
+/// Logs the words a traced read sees after the query flush step, as the macro reads them.
+inline void TracePostFlush(const Tegra::MemoryManager& memory, u64 read, GPUVAddr source,
+                           size_t size) {
+    std::array<u32, 4> words{};
+    memory.ReadBlockUnsafe(source, words.data(), (std::min)(size, sizeof(words)));
+    LOG_INFO(HW_GPU, "Query DMA read #{} post-flush words={:08x}", read, fmt::join(words, ","));
 }
 
 } // namespace VideoCommon::QueryDma

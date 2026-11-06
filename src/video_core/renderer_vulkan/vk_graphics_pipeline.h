@@ -225,6 +225,10 @@ public:
         return delta_mismatch;
     }
 
+    [[nodiscard]] bool Failed() const noexcept {
+        return build->Failed();
+    }
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };

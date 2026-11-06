@@ -245,36 +245,45 @@ template<>
 }
 
 template<std::size_t bitsize>
-const void* EmitReadMemoryMov(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr, bool ordered) {
-    if (ordered) {
+const void* EmitReadMemoryMov(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr, bool ordered, bool tso_plain_ordered) {
+    // Under x86-64 TSO an aligned 8-64-bit MOV already has acquire semantics (no later load or
+    // store passes it), and ordered writes are XCHG (a full barrier), so STLR -> LDAR stays
+    // ordered. 128-bit has no atomic plain load and keeps LOCK CMPXCHG16B.
+    if (ordered && !tso_plain_ordered) {
         if constexpr (bitsize != 128) {
             code.xor_(Xbyak::Reg32(value_idx), Xbyak::Reg32(value_idx));
-        } else {
+            const void* fastmem_location = code.getCurr();
+            switch (bitsize) {
+            case 8:
+                code.lock();
+                code.xadd(code.byte[addr], Xbyak::Reg32(value_idx).cvt8());
+                break;
+            case 16:
+                code.lock();
+                code.xadd(word[addr], Xbyak::Reg64(value_idx).cvt16());
+                break;
+            case 32:
+                code.lock();
+                code.xadd(dword[addr], Xbyak::Reg64(value_idx).cvt32());
+                break;
+            case 64:
+                code.lock();
+                code.xadd(qword[addr], Xbyak::Reg64(value_idx));
+                break;
+            default:
+                UNREACHABLE();
+            }
+            return fastmem_location;
+        }
+    }
+    if constexpr (bitsize == 128) {
+        if (ordered) {
             code.xor_(eax, eax);
             code.xor_(ebx, ebx);
             code.xor_(ecx, ecx);
             code.xor_(edx, edx);
-        }
 
-        const void* fastmem_location = code.getCurr();
-        switch (bitsize) {
-        case 8:
-            code.lock();
-            code.xadd(code.byte[addr], Xbyak::Reg32(value_idx).cvt8());
-            break;
-        case 16:
-            code.lock();
-            code.xadd(word[addr], Xbyak::Reg64(value_idx).cvt16());
-            break;
-        case 32:
-            code.lock();
-            code.xadd(dword[addr], Xbyak::Reg64(value_idx).cvt32());
-            break;
-        case 64:
-            code.lock();
-            code.xadd(qword[addr], Xbyak::Reg64(value_idx));
-            break;
-        case 128:
+            const void* fastmem_location = code.getCurr();
             code.lock();
             code.cmpxchg16b(xword[addr]);
             if (code.HasHostFeature(HostFeature::SSE41)) {
@@ -285,12 +294,11 @@ const void* EmitReadMemoryMov(BlockOfCode& code, int value_idx, const Xbyak::Reg
                 code.movq(xmm0, rdx);
                 code.punpcklqdq(Xbyak::Xmm(value_idx), xmm0);
             }
-            break;
-        default:
-            UNREACHABLE();
+            return fastmem_location;
         }
-        return fastmem_location;
-    } else {
+    }
+
+    {
         const void* fastmem_location = code.getCurr();
         switch (bitsize) {
         case 8:
