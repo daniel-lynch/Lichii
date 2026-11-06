@@ -150,7 +150,8 @@ target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain
 
 if (TARGET dynarmic::dynarmic)
     target_sources(tests PRIVATE core/window_trace.cpp)
-    if (ARCHITECTURE_x86_64)
+    # dynarmic_tso.cpp allocates guest memory with mmap (POSIX only).
+    if (ARCHITECTURE_x86_64 AND NOT WIN32)
         target_sources(tests PRIVATE core/dynarmic_tso.cpp)
     endif()
     target_link_libraries(tests PRIVATE dynarmic::dynarmic)
