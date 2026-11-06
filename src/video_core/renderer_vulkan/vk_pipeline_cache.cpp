@@ -1434,8 +1434,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 LOG_WARNING(Render_Vulkan, "0x{:016x}: Skipping shader with known issues", key.unique_hashes[index]);
                 return nullptr;
             }
-            // Archive guesses must never supply pipeline state, even while emission is deferred.
-            // Keep an offline entry only for an exact module lookup after live translation.
+            // Verification and variant misses compare reconstructed metadata before using it.
             if (cached_entries[index] && cached_entries[index]->offline &&
                 !translation_cache.ValidateOfflineEntry(*cached_entries[index], programs[index])) {
                 translation_cache.LogOfflineOutcome(programs[index].stage, key.unique_hashes[index],
@@ -1537,7 +1536,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         if (entry && entry->offline && (variant || !emit_pools || translation_cache_verify)) {
             translation_cache.LogOfflineOutcome(program.stage, key.unique_hashes[index],
-                variant ? TC::OfflineOutcome::VariantHit : TC::OfflineOutcome::VariantMiss);
+                variant ? (from_cache[index] && !translation_cache_verify ? TC::OfflineOutcome::FullHit
+                                                                        : TC::OfflineOutcome::VariantHit)
+                        : TC::OfflineOutcome::VariantMiss);
         }
         // #184 native async pipelines: the SPIR-V of a stage the translation cache does not
         // supply is emitted on the worker that builds the pipeline. Not while verifying the
@@ -1556,6 +1557,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 if (!TC::InfoEqual(fresh.info, program.info) ||
                     !std::ranges::equal(fresh.mesh.vertex_lines, program.mesh.vertex_lines) ||
                     !std::ranges::equal(fresh.mesh.primitive_lines, program.mesh.primitive_lines)) {
+                    if (entry) translation_cache.DropEntry(*entry);
+                    if (entry && entry->offline) {
+                        translation_cache.LogOfflineOutcome(program.stage, key.unique_hashes[index],
+                                                            TC::OfflineOutcome::MetaMismatch);
+                    }
                     throw Shader::LogicError("Translation cache: retranslated stage {} metadata differs", index);
                 }
                 program = std::move(fresh);

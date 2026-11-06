@@ -193,7 +193,7 @@ struct Entry {
     Digest id;
     bool offline{};
 
-    [[nodiscard]] bool CanReuseMetadata() const { return !offline; }
+    [[nodiscard]] bool CanReuseMetadata() const { return true; }
 };
 
 struct Variant {
@@ -224,7 +224,7 @@ struct EmissionRecipe {
 
 [[nodiscard]] EmissionRecipe DefaultEmissionRecipe(Shader::Stage stage);
 
-enum class OfflineOutcome { VariantHit, VariantMiss, MetaMismatch };
+enum class OfflineOutcome { VariantHit, VariantMiss, MetaMismatch, FullHit };
 
 class Store {
 public:
@@ -260,12 +260,14 @@ public:
     /// Reject speculative metadata before any pipeline state is derived from it.
     [[nodiscard]] bool ValidateOfflineEntry(const Entry& entry, const Shader::IR::Program& live);
 
+    void DropEntry(const Entry& entry);
     void LogOfflineOutcome(Shader::Stage stage, u64 hash, OfflineOutcome outcome);
     void LogStatistics(std::string_view when);
 
     // Statistics
-    std::array<std::array<std::atomic<u64>, 3>, Shader::MaxStageTypes> offline_outcomes{};
+    std::array<std::array<std::atomic<u64>, 4>, Shader::MaxStageTypes> offline_outcomes{};
     std::atomic<u64> offline_entry_only_rejected{};
+    std::atomic<u64> entry_key_misses{}, offline_replay_misses{}, offline_dropped_misses{};
     std::atomic<u64> stage_hits{};
     std::atomic<u64> stage_misses{};
     std::atomic<u64> hit_ns{};

@@ -555,7 +555,7 @@ TEST_CASE("Class replay rejects unrepresentable recipes and malformed shifts",
     REQUIRE(env.reads == 0);
 }
 
-TEST_CASE("Offline variant misses cannot restore guessed pipeline metadata",
+TEST_CASE("Offline metadata can be reused after replay and is dropped on disagreement",
           "[translation_cache][video_core]") {
     FakeEnvironment env;
     Store store;
@@ -570,11 +570,11 @@ TEST_CASE("Offline variant misses cannot restore guessed pipeline metadata",
     const auto key = MakeVariantKey(entry->id, DigestRuntimeInfo(recipe.runtime), recipe.bindings);
     store.InsertVariant(*entry, key, {.spirv = {0x07230203, 0x10000, 0, 1, 0}});
     REQUIRE(store.FindEntry({91, 1}, env));
-    REQUIRE_FALSE(entry->CanReuseMetadata());
+    REQUIRE(entry->CanReuseMetadata());
     auto other = recipe.runtime;
     other.convert_depth_mode = !other.convert_depth_mode;
     REQUIRE_FALSE(store.FindVariant(MakeVariantKey(entry->id, DigestRuntimeInfo(other), recipe.bindings)));
-    // The pipeline retains its live program before MakeRuntimeInfo or previous_stage use.
+    // A fresh translation that disagrees invalidates both metadata and modules.
     REQUIRE_FALSE(store.ValidateOfflineEntry(*entry, live));
     REQUIRE(live.info.stores[Shader::IR::Attribute::Generic0X]);
     REQUIRE_FALSE(store.FindEntry({91, 1}, env));

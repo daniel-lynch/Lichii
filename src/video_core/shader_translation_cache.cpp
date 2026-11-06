@@ -1213,9 +1213,11 @@ std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::E
         std::scoped_lock lock{mutex};
         const auto it = entries.find(stage_key);
         if (it == entries.end()) {
+            ++entry_key_misses;
             return nullptr;
         }
         for (const auto& entry : it->second) {
+            if (entry->offline && dropped_entries.contains(entry->id)) ++offline_dropped_misses;
             if (!dropped_entries.contains(entry->id) &&
                 (!entry->offline || entries_with_modules.contains(entry->id)))
                 candidates.push_back(entry);
@@ -1230,6 +1232,7 @@ std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::E
             // An environment read from the pipeline cache only answers the queries its own
             // translation made; a question outside them means this entry does not apply.
         }
+        if (candidate->offline) ++offline_replay_misses;
     }
     return nullptr;
 }
@@ -1352,6 +1355,11 @@ bool Store::ValidateOfflineEntry(const Entry& entry, const Shader::IR::Program& 
     WriteMeta(expected, entry.meta);
     WriteMeta(actual, ProgramMeta::From(live));
     if (expected == actual) return true;
+    DropEntry(entry);
+    return false;
+}
+
+void Store::DropEntry(const Entry& entry) {
     std::vector<u8> record;
     Writer writer{record};
     writer.Put(RecordDrop);
@@ -1361,14 +1369,14 @@ bool Store::ValidateOfflineEntry(const Entry& entry, const Shader::IR::Program& 
     const bool inserted = dropped_entries.insert(entry.id).second;
     lock.unlock();
     if (inserted) Append(record);
-    return false;
 }
 
 void Store::LogOfflineOutcome(Shader::Stage stage, u64 hash, OfflineOutcome outcome) {
+    if (static_cast<size_t>(stage) >= offline_outcomes.size()) return;
     const auto index = static_cast<size_t>(outcome);
     const auto count = ++offline_outcomes[static_cast<size_t>(stage)][index];
     constexpr std::array names{"entry hit + variant hit", "entry hit + variant miss (retranslated)",
-                               "meta mismatch dropped"};
+                               "meta mismatch dropped", "full hit (no translation or emission)"};
     if (count <= 20) {
         LOG_INFO(Render_Vulkan, "Translation cache offline: stage={} shader={:016x} {} count={}{}",
                  static_cast<u32>(stage), hash, names[index], count,
@@ -1377,14 +1385,16 @@ void Store::LogOfflineOutcome(Shader::Stage stage, u64 hash, OfflineOutcome outc
 }
 
 void Store::LogStatistics(std::string_view when) {
+    LOG_INFO(Render_Vulkan, "Translation cache misses ({}): stage_key={} offline_query_replay={} offline_dropped={}",
+             when, entry_key_misses.load(), offline_replay_misses.load(), offline_dropped_misses.load());
     LOG_INFO(Render_Vulkan, "Translation cache ({}): offline entry-only records rejected={}",
              when, offline_entry_only_rejected.load());
     for (size_t stage = 0; stage < offline_outcomes.size(); ++stage) {
         const auto& counts = offline_outcomes[stage];
-        if (counts[0] + counts[1] + counts[2] != 0) {
+        if (counts[0] + counts[1] + counts[2] + counts[3] != 0) {
             LOG_INFO(Render_Vulkan, "Translation cache offline ({}): stage={} variant_hit={} "
-                     "variant_miss={} meta_mismatch_dropped={}", when, stage,
-                     counts[0].load(), counts[1].load(), counts[2].load());
+                     "variant_miss={} meta_mismatch_dropped={} full_hit={} emission_only=0", when, stage,
+                     counts[0].load(), counts[1].load(), counts[2].load(), counts[3].load());
         }
     }
     const u64 hits = stage_hits.load();
