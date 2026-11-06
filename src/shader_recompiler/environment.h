@@ -123,6 +123,16 @@ public:
 
     virtual void Dump(u64 pipeline_hash, u64 shader_hash) = 0;
 
+    /// The texture pass is about to read the constant buffer words of a texture handle, and has
+    /// computed it from them. The words are consumed only through the texture queries made with
+    /// the handle. The translation cache records this to compare texture classes instead of raw
+    /// handle words; other environments ignore it.
+    virtual void BeginTextureHandle() {}
+    virtual void EndTextureHandle([[maybe_unused]] const ConstBufferAddr& cbuf,
+                                  [[maybe_unused]] u32 handle) {}
+    /// A constant buffer word the texture pass consumes by value (served from its word cache).
+    virtual void NoteExactCbufWord([[maybe_unused]] u32 index, [[maybe_unused]] u32 offset) {}
+
     [[nodiscard]] const ProgramHeader& SPH() const noexcept {
         return sph;
     }

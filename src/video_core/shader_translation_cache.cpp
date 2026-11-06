@@ -36,7 +36,9 @@ namespace {
 //    argument); before, the recording environment answered it with the base class's `true`.
 // The translator's identity (CurrentCacheIdentity) is not part of the layout: it is folded into
 // the configuration digest and named in the file name, so it needs no version of its own.
-constexpr u32 FormatVersion = 5;
+// 6 is used by the sibling AOT branch (also stores mesh metadata).
+// 7: Class-level texture replay without the sibling branch's mesh metadata layout.
+constexpr u32 FormatVersion = 7;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
@@ -329,7 +331,46 @@ Digest Hasher::Finish() const {
     return Digest{hash[0], hash[1]};
 }
 
-RecordingEnvironment::RecordingEnvironment(Shader::Environment& inner_) : inner{inner_} {
+namespace {
+u64 WordKey(u32 index, u32 offset) {
+    return (u64{index} << 32) | offset;
+}
+
+struct HandleAddress {
+    u32 index, offset, shift_left, secondary_index, secondary_offset, secondary_shift_left;
+    bool has_secondary;
+};
+
+Query PackHandleAddress(const Shader::ConstBufferAddr& cbuf, u32 handle) {
+    if (cbuf.index > 0xff || cbuf.shift_left >= 32 || cbuf.secondary_shift_left >= 32 ||
+        (cbuf.has_secondary && (cbuf.secondary_index > 0xffff || cbuf.secondary_offset > 0xffff))) {
+        throw Shader::LogicError("Translation cache: texture handle recipe out of range");
+    }
+    return Query{
+        .kind = QueryKind::TextureHandle,
+        .a = (cbuf.index & 0xff) | ((cbuf.shift_left & 0xff) << 8) |
+             ((cbuf.secondary_shift_left & 0xff) << 16) | (cbuf.has_secondary ? 1U << 24 : 0U),
+        .b = cbuf.offset,
+        .answer = handle,
+        .c = ((cbuf.secondary_index & 0xffff) << 16) | (cbuf.secondary_offset & 0xffff),
+    };
+}
+
+HandleAddress UnpackHandleAddress(const Query& query) {
+    return HandleAddress{
+        .index = query.a & 0xff,
+        .offset = query.b,
+        .shift_left = (query.a >> 8) & 0xff,
+        .secondary_index = query.c >> 16,
+        .secondary_offset = query.c & 0xffff,
+        .secondary_shift_left = (query.a >> 16) & 0xff,
+        .has_secondary = ((query.a >> 24) & 1) != 0,
+    };
+}
+} // Anonymous namespace
+
+RecordingEnvironment::RecordingEnvironment(Shader::Environment& inner_, bool class_replay_)
+    : inner{inner_}, class_replay{class_replay_} {
     sph = inner.SPH();
     gp_passthrough_mask = inner.GpPassthroughMask();
     mesh_registers = inner.MeshRegisters();
@@ -365,7 +406,47 @@ bool RecordingEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 off
     return answer;
 }
 
+void RecordingEnvironment::BeginTextureHandle() {
+    ++handle_depth;
+    inner.BeginTextureHandle();
+}
+
+void RecordingEnvironment::EndTextureHandle(const Shader::ConstBufferAddr& cbuf, u32 handle) {
+    if (handle_depth != 0) {
+        --handle_depth;
+    }
+    inner.EndTextureHandle(cbuf, handle);
+    if (class_replay) {
+        queries.push_back(PackHandleAddress(cbuf, handle));
+    }
+}
+
+void RecordingEnvironment::NoteExactCbufWord(u32 index, u32 offset) {
+    inner.NoteExactCbufWord(index, offset);
+    if (class_replay) {
+        exact_words.insert(WordKey(index, offset));
+        const u32 answer = inner.ReadCbufValue(index, offset);
+        queries.push_back({QueryKind::CbufValue, index, offset, answer});
+    }
+}
+
+std::vector<Query> RecordingEnvironment::TakeQueries() {
+    if (class_replay) {
+        // A word read only to build texture handles is covered by its TextureHandle queries;
+        // a word also consumed by value keeps its exact query.
+        std::erase_if(queries, [this](const Query& query) {
+            const u64 key = WordKey(query.a, query.b);
+            return query.kind == QueryKind::CbufValue && handle_words.contains(key) &&
+                   !exact_words.contains(key);
+        });
+    }
+    return std::move(queries);
+}
+
 u32 RecordingEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
+    if (class_replay) {
+        (handle_depth != 0 ? handle_words : exact_words).insert(WordKey(cbuf_index, cbuf_offset));
+    }
     const u32 answer = inner.ReadCbufValue(cbuf_index, cbuf_offset);
     queries.push_back({QueryKind::CbufValue, cbuf_index, cbuf_offset, answer});
     return answer;
@@ -436,20 +517,51 @@ void RecordingEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
 }
 
 bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env) {
-    for (const Query& query : queries) {
+    // Class-level replay: recorded handle -> live handle.
+    std::unordered_map<u32, u32> handles;
+    for (size_t index = 0; index < queries.size(); ++index) {
+        const Query& query = queries[index];
+        if (query.kind == QueryKind::TextureHandle) {
+            const HandleAddress cbuf = UnpackHandleAddress(query);
+            if (cbuf.shift_left >= 32 || cbuf.secondary_shift_left >= 32) {
+                return false;
+            }
+            const u32 sec_index = cbuf.has_secondary ? cbuf.secondary_index : cbuf.index;
+            const u32 sec_offset = cbuf.has_secondary ? cbuf.secondary_offset : cbuf.offset;
+            const u32 lhs_word = env.ReadCbufValue(cbuf.index, cbuf.offset);
+            const u32 rhs_word = env.ReadCbufValue(sec_index, sec_offset);
+            const u32 handle =
+                (lhs_word << cbuf.shift_left) | (rhs_word << cbuf.secondary_shift_left);
+            if (const auto [it, inserted] = handles.try_emplace(query.answer, handle);
+                !inserted && it->second != handle) {
+                // One recorded handle standing for two live ones: the texture queries cannot be
+                // told apart.
+                return false;
+            }
+            continue;
+        }
+        const bool texture_query = query.kind == QueryKind::TextureType ||
+                                   query.kind == QueryKind::TexturePixelFormat ||
+                                   query.kind == QueryKind::TexturePixelFormatInteger;
+        u32 argument = query.a;
+        if (texture_query) {
+            if (const auto it = handles.find(query.a); it != handles.end()) {
+                argument = it->second;
+            }
+        }
         u32 answer{};
         switch (query.kind) {
         case QueryKind::CbufValue:
             answer = env.ReadCbufValue(query.a, query.b);
             break;
         case QueryKind::TextureType:
-            answer = static_cast<u32>(env.ReadTextureType(query.a));
+            answer = static_cast<u32>(env.ReadTextureType(argument));
             break;
         case QueryKind::TexturePixelFormat:
-            answer = static_cast<u32>(env.ReadTexturePixelFormat(query.a));
+            answer = static_cast<u32>(env.ReadTexturePixelFormat(argument));
             break;
         case QueryKind::TexturePixelFormatInteger:
-            answer = env.IsTexturePixelFormatInteger(query.a) ? 1U : 0U;
+            answer = env.IsTexturePixelFormatInteger(argument) ? 1U : 0U;
             break;
         case QueryKind::ViewportTransformState:
             answer = env.ReadViewportTransformState();

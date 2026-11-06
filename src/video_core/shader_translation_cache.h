@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/common_types.h"
@@ -76,6 +77,7 @@ enum class QueryKind : u8 {
     CbufStorageBufferPointer,
     ReplaceConstBuffer,
     CbufIndirectStorageBufferPointer,
+    TextureHandle,
 };
 
 struct Query {
@@ -91,7 +93,10 @@ struct Query {
 /// Forwards to a live environment and records each query the translator makes with its answer.
 class RecordingEnvironment final : public Shader::Environment {
 public:
-    explicit RecordingEnvironment(Shader::Environment& inner);
+    explicit RecordingEnvironment(Shader::Environment& inner, bool class_replay = false);
+    void BeginTextureHandle() override;
+    void EndTextureHandle(const Shader::ConstBufferAddr& cbuf, u32 handle) override;
+    void NoteExactCbufWord(u32 index, u32 offset) override;
     ~RecordingEnvironment() override = default;
 
     u64 ReadInstruction(u32 address) override;
@@ -114,13 +119,15 @@ public:
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override;
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
-    [[nodiscard]] std::vector<Query> TakeQueries() {
-        return std::move(queries);
-    }
+    [[nodiscard]] std::vector<Query> TakeQueries();
 
 private:
     Shader::Environment& inner;
     std::vector<Query> queries;
+    bool class_replay{};
+    u32 handle_depth{};
+    std::unordered_set<u64> handle_words;
+    std::unordered_set<u64> exact_words;
 };
 
 /// Asks the live environment the recorded queries in order; true when every answer matches.
