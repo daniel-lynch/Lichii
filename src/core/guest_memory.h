@@ -126,7 +126,13 @@ public:
 
         if (this->TrySetSpan()) {
             if constexpr (FLAGS & GuestMemoryFlags::Safe && M::HAS_FLUSH_INVALIDATION) {
-                m_memory->FlushRegion(m_addr, this->size_bytes());
+                if constexpr (M::HAS_SPLIT_AWARE_FLUSH) {
+                    // The video memory manager queues this on the GPU split's back thread, where the
+                    // caches live, rather than the front touching back-owned state.
+                    m_memory->FlushRegionForRead(m_addr, this->size_bytes());
+                } else {
+                    m_memory->FlushRegion(m_addr, this->size_bytes());
+                }
             }
         } else {
             if (backup) {

@@ -1,3 +1,22 @@
+# OOT_PRODUCT: offline shader product (a translation cache written by eden-cli --precompile-shaders).
+# Every vulkan_translations.*.bin under $OOT/offline-translate/product-live/ is copied (reflink when
+# the filesystem allows, else a real copy) into the live shader cache dir if a file of that name is
+# not there yet; the runtime uses the one whose translator tag matches this build and logs the tags
+# it ignores. OOT_PRODUCT=0 skips the step.
+if [ "${OOT_PRODUCT:-1}" = "1" ]; then
+  PRODUCT_DIR="$OOT/offline-translate/product-live"
+  LIVE_SHADER_DIR="$HOME/.cache/eden/shader/0400486024dec000"
+  if [ -d "$PRODUCT_DIR" ] && [ -d "$LIVE_SHADER_DIR" ]; then
+    for f in "$PRODUCT_DIR"/vulkan_translations.*.bin; do
+      [ -f "$f" ] || continue
+      b=$(basename "$f")
+      if [ ! -e "$LIVE_SHADER_DIR/$b" ]; then
+        cp --reflink=auto "$f" "$LIVE_SHADER_DIR/$b" && echo "offline shader product installed: $b" >&2
+      fi
+    done
+  fi
+fi
+
 #!/bin/bash
 # Launch the locally built Lichii with the shader dump on and MangoHud frametime logging,
 # then keep this run's emulator log next to the frametime CSV.
@@ -12,6 +31,10 @@ export EDEN_NX2_SHADER_DUMP="$OOT/shaders"
 if [ "${OOT_UPSTREAM_DEFAULTS:-0}" != "1" ]; then
   export EDEN_NX2_GFX_STORAGE_SIZE_LIKE_COMPUTE=0 EDEN_NX2_UNIFORM_BANK_REUPLOAD=0 EDEN_NX2_NATIVE_PREFLUSH="${OOT_PREFLUSH:-1}"  # preflush: +3.4 fps median, interleaved A/B 2026-11-06
 fi
+# Pipeline eviction: upstream destroys graphics pipelines unused for 9000 frames (~2.5 min at 60),
+# so re-entering an area rebuilds them on the GPU thread (upstream issue #293 — stutter).
+# Off for this game; OOT_EVICT=1 restores upstream behaviour.
+if [ "${OOT_EVICT:-0}" != "1" ]; then export EDEN_NX2_PIPELINE_EVICT=0; fi
 # OOT_GPU=fast|accurate pins the per-game GPU Mode and reactive flushing before boot
 # (fast = GPU Mode Fast + reactive flushing off; accurate = Accurate + flushing on).
 # OOT_FLUSH=0|1 overrides the flushing half. Unset = leave the config alone.
