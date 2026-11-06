@@ -248,8 +248,8 @@ private:
     /// Ahead-of-time translation of recognised pool programs (ShaderCache::seed_stage): the
     /// GPU thread builds the environment and an owned copy of it; a worker translates the copy,
     /// which answers no queries, and stores programs that needed none as ordinary entries.
-    bool SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_hash, size_t slot,
-                   std::span<const u8> constants, u8 tier);
+    VideoCommon::SeedResult SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_hash,
+                                      size_t slot, std::span<const u8> constants, u8 tier);
     [[nodiscard]] static size_t AotWorkerCount();
     size_t aot_worker_count{};
     static constexpr u64 MaxAotPending = 32;

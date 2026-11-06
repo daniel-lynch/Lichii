@@ -76,8 +76,19 @@ public:
     };
     /// Up to `count` candidates, highest priority first and oldest first within a priority,
     /// skipping programs used since they were found. `manifest_only` takes manifest programs
-    /// only.
+    /// only. Each must then be acknowledged (seeded, or never seedable) or returned.
     [[nodiscard]] std::vector<Candidate> TakeCandidates(size_t count, bool manifest_only = false);
+    /// The candidate was seeded or can never be: a later scene does not offer it again.
+    void Acknowledge(const Candidate& candidate);
+    /// Candidates taken but not handled (no room now) go back to the front of their queues, in
+    /// order.
+    void ReturnCandidates(std::span<const Candidate> candidates);
+    /// Candidates waiting (for tests and statistics).
+    [[nodiscard]] size_t QueuedCandidates() const noexcept {
+        return candidates_queued;
+    }
+    /// Queues a candidate as recognition does (for tests).
+    void QueueForTesting(const Candidate& candidate);
     /// Whether a manifest program waits for translation (cheap, for every draw).
     [[nodiscard]] bool HasManifestCandidates() const noexcept {
         return manifest_queued != 0;
@@ -201,7 +212,7 @@ private:
     size_t global_bank1_count{};
     /// Pools recognised so far: (container, pool address), to offer a new scene's programs.
     std::vector<std::pair<u32, GPUVAddr>> recognised_pools;
-    /// Addresses taken from the queue (seeded or skipped), not offered again.
+    /// Addresses acknowledged (seeded, or never seedable), not offered again.
     std::unordered_set<GPUVAddr> taken;
     u64 scenes_applied{};
     u64 scenes_without_manifest{};

@@ -1022,3 +1022,24 @@ TEST_CASE("AOT recipe histogram: a full persisted class learns a new dominant re
     best = session.Best(Shader::Stage::Fragment, loads, class_match);
     REQUIRE(best->binding_in.uniform_buffer != fresh);
 }
+
+TEST_CASE("AOT candidates without room go back to the queue in order",
+          "[video_core][translation_cache]") {
+    using VideoCommon::ShaderPoolIndex;
+    auto index = ShaderPoolIndex::ForTesting({});
+    for (u32 i = 0; i < 4; ++i) {
+        index->QueueForTesting({0x1000 + i * 0x100, 0, 1, ~0U, 0, ~0U});
+    }
+    auto taken = index->TakeCandidates(4);
+    REQUIRE(taken.size() == 4);
+    REQUIRE(index->QueuedCandidates() == 0);
+    // One slot was free: the first is seeded, the other three wait for room.
+    index->Acknowledge(taken[0]);
+    index->ReturnCandidates(std::span{taken}.subspan(1));
+    REQUIRE(index->QueuedCandidates() == 3);
+    REQUIRE(index->HasManifestCandidates());
+    const auto again = index->TakeCandidates(4);
+    REQUIRE(again.size() == 3);
+    REQUIRE(again[0].address == taken[1].address);
+    REQUIRE(again[2].address == taken[3].address);
+}

@@ -296,40 +296,58 @@ void ShaderCache::SeedPoolCandidates(bool manifest_only) {
     if (seed_has_room && !seed_has_room()) {
         return;
     }
-    for (const auto& candidate : pool_index->TakeCandidates(PerCall, manifest_only)) {
+    // A candidate is acknowledged (never offered again) once it was seeded or can never be;
+    // the ones there was no room for go back to the queue, in order.
+    const auto candidates = pool_index->TakeCandidates(PerCall, manifest_only);
+    for (size_t index = 0; index < candidates.size(); ++index) {
+        const auto& candidate = candidates[index];
         if (seed_has_room && !seed_has_room()) {
-            break;
+            pool_index->ReturnCandidates(std::span{candidates}.subspan(index));
+            return;
         }
         const std::optional<VAddr> cpu_addr{gpu_memory->GpuToCpuAddress(candidate.address)};
-        if (!cpu_addr || TryGet(*cpu_addr) || IsRejected(*cpu_addr)) {
+        if (!cpu_addr) {
+            // Unmapped now: dropped, not acknowledged, so a later scene can offer it again.
+            continue;
+        }
+        if (TryGet(*cpu_addr) || IsRejected(*cpu_addr)) {
+            pool_index->Acknowledge(candidate);
             continue;
         }
         const auto program = candidate.stage == 0 ? Tegra::Engines::Maxwell3D::Regs::ShaderType::VertexB
                                                   : Tegra::Engines::Maxwell3D::Regs::ShaderType::Pixel;
+        SeedResult result = SeedResult::Rejected;
         try {
             GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, candidate.address, 0};
             const std::optional<u64> hash{env.Analyze()};
-            if (!hash) {
-                continue;
-            }
-            // Bank 1 is the program's own constant section, a part of the pool bound with it
-            // and never written: its words are exact answers, not guesses.
-            std::vector<u8> constants;
-            if (candidate.constants_offset != ~0U && candidate.constants_size != 0 &&
-                gpu_memory->IsFullyMappedRange(candidate.address + candidate.constants_offset,
-                                               candidate.constants_size)) {
-                constants.resize(candidate.constants_size);
-                gpu_memory->ReadBlockUnsafe(candidate.address + candidate.constants_offset,
-                                            constants.data(), constants.size());
-            }
-            // The pool is authoritative; the manifest's copy of the words is only checked.
-            pool_index->CheckBank1(candidate, constants);
-            if (seed_stage(env, *hash, static_cast<size_t>(program), constants, candidate.tier)) {
-                pool_index->CountSeeded(candidate);
+            if (hash) {
+                // Bank 1 is the program's own constant section, a part of the pool bound with
+                // it and never written: its words are exact answers, not guesses.
+                std::vector<u8> constants;
+                if (candidate.constants_offset != ~0U && candidate.constants_size != 0 &&
+                    gpu_memory->IsFullyMappedRange(
+                        candidate.address + candidate.constants_offset, candidate.constants_size)) {
+                    constants.resize(candidate.constants_size);
+                    gpu_memory->ReadBlockUnsafe(candidate.address + candidate.constants_offset,
+                                                constants.data(), constants.size());
+                }
+                // The pool is authoritative; the manifest's copy of the words is only checked.
+                pool_index->CheckBank1(candidate, constants);
+                result = seed_stage(env, *hash, static_cast<size_t>(program), constants,
+                                    candidate.tier);
             }
         } catch (const Shader::Exception&) {
             // Rejected or not lowerable: its first use will say so.
+            result = SeedResult::Rejected;
         }
+        if (result == SeedResult::Retry) {
+            pool_index->ReturnCandidates(std::span{candidates}.subspan(index));
+            return;
+        }
+        if (result == SeedResult::Admitted) {
+            pool_index->CountSeeded(candidate);
+        }
+        pool_index->Acknowledge(candidate);
     }
 }
 

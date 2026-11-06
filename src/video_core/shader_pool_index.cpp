@@ -448,15 +448,38 @@ std::vector<ShaderPoolIndex::Candidate> ShaderPoolIndex::TakeCandidates(size_t c
                 --manifest_queued;
             }
             queued_tier.erase(candidate.address);
-            if (scene_mode) {
-                taken.insert(candidate.address);
-            }
             if (!used.contains(candidate.address)) {
                 result.push_back(candidate);
             }
         }
     }
     return result;
+}
+
+void ShaderPoolIndex::Acknowledge(const Candidate& candidate) {
+    taken.insert(candidate.address);
+}
+
+void ShaderPoolIndex::ReturnCandidates(std::span<const Candidate> returned) {
+    for (auto it = returned.rbegin(); it != returned.rend(); ++it) {
+        const Candidate& candidate = *it;
+        if (used.contains(candidate.address) || queued_tier.contains(candidate.address) ||
+            candidates_queued >= MaxCandidatesQueued) {
+            continue;
+        }
+        const size_t priority = (std::min<size_t>)(candidate.tier, NoTier) - 1;
+        candidates_queues[priority].push_front(candidate);
+        queued_tier.emplace(candidate.address, candidate.tier);
+        ++candidates_queued;
+        manifest_queued += candidate.tier != NoTier ? 1 : 0;
+    }
+}
+
+void ShaderPoolIndex::QueueForTesting(const Candidate& candidate) {
+    candidates_queues[(std::min<size_t>)(candidate.tier, NoTier) - 1].push_back(candidate);
+    queued_tier.emplace(candidate.address, candidate.tier);
+    ++candidates_queued;
+    manifest_queued += candidate.tier != NoTier ? 1 : 0;
 }
 
 void ShaderPoolIndex::OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr address) {

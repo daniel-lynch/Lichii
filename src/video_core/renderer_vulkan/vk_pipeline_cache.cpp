@@ -1148,23 +1148,24 @@ size_t PipelineCache::AotWorkerCount() {
     return std::clamp<size_t>(count, 1, limit);
 }
 
-bool PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_hash,
+VideoCommon::SeedResult PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_hash,
                               size_t slot, std::span<const u8> constants, u8 tier) {
     namespace TC = VideoCommon::TranslationCache;
+    using VideoCommon::SeedResult;
     if (!aot_translation || !translation_cache.Enabled()) {
-        return false;
+        return SeedResult::Rejected;
     }
     const auto begin = std::chrono::steady_clock::now();
     ++aot_candidates;
     if (!IsTranslationCacheable(env)) {
         ++aot_skipped_uncacheable;
-        return false;
+        return SeedResult::Rejected;
     }
     // One pending slot, reserved atomically (the same reservation as re-emissions), released on
     // every way out until the job is queued and then when the job ends.
     if (!TryReservePending()) {
         ++aot_skipped_full;
-        return false;
+        return SeedResult::Retry;
     }
     bool queued = false;
     SCOPE_EXIT {
@@ -1176,14 +1177,14 @@ bool PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
                                                   translation_config);
     if (translation_cache.HasStageKey(stage_key)) {
         ++aot_skipped_known;
-        return false;
+        return SeedResult::Rejected;
     }
     {
         // A job for the same stage key queued or running: translating it twice stores nothing.
         std::scoped_lock lock{aot_mutex};
         if (aot_in_flight.contains(stage_key)) {
             ++aot_skipped_known;
-            return false;
+            return SeedResult::Rejected;
         }
     }
     // No recorded answers: the worker answers with the common case (guess mode) and records
@@ -1199,7 +1200,7 @@ bool PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
     if (aot_reserved.fetch_add(1) >= MaxAotEntries) {
         --aot_reserved;
         ++aot_skipped_full;
-        return false;
+        return SeedResult::Retry;
     }
     if (!aot_workers) {
         aot_worker_count = AotWorkerCount();
@@ -1316,7 +1317,7 @@ bool PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
         aot_bytes -= job_bytes;
     });
     queued = true;
-    return true;
+    return SeedResult::Admitted;
 }
 
 void PipelineCache::CountStageOutcome(StageOutcome outcome, Shader::Stage stage, u64 ns) {
