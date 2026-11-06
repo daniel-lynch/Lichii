@@ -33,7 +33,9 @@ namespace {
 // 4: StorageBufferDescriptor gained indirect_offset (upstream nx2 #150, merged at 27226d2568).
 // 5: IsCbufIndirectStorageBufferPointer is recorded and replayed (queries gained a third
 //    argument); before, the recording environment answered it with the base class's `true`.
-constexpr u32 FormatVersion = 5;
+// 6: class-level replay (use_shader_aot_translation) records texture handles by their source
+//    words (QueryKind::TextureHandle) instead of the raw handle words.
+constexpr u32 FormatVersion = 6;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
@@ -341,7 +343,42 @@ Digest Hasher::Finish() const {
     return Digest{hash[0], hash[1]};
 }
 
-RecordingEnvironment::RecordingEnvironment(Shader::Environment& inner_) : inner{inner_} {
+namespace {
+u64 WordKey(u32 index, u32 offset) {
+    return (u64{index} << 32) | offset;
+}
+
+struct HandleAddress {
+    u32 index, offset, shift_left, secondary_index, secondary_offset, secondary_shift_left;
+    bool has_secondary;
+};
+
+Query PackHandleAddress(const Shader::ConstBufferAddr& cbuf, u32 handle) {
+    return Query{
+        .kind = QueryKind::TextureHandle,
+        .a = (cbuf.index & 0xff) | ((cbuf.shift_left & 0xff) << 8) |
+             ((cbuf.secondary_shift_left & 0xff) << 16) | (cbuf.has_secondary ? 1U << 24 : 0U),
+        .b = cbuf.offset,
+        .answer = handle,
+        .c = ((cbuf.secondary_index & 0xffff) << 16) | (cbuf.secondary_offset & 0xffff),
+    };
+}
+
+HandleAddress UnpackHandleAddress(const Query& query) {
+    return HandleAddress{
+        .index = query.a & 0xff,
+        .offset = query.b,
+        .shift_left = (query.a >> 8) & 0xff,
+        .secondary_index = query.c >> 16,
+        .secondary_offset = query.c & 0xffff,
+        .secondary_shift_left = (query.a >> 16) & 0xff,
+        .has_secondary = ((query.a >> 24) & 1) != 0,
+    };
+}
+} // Anonymous namespace
+
+RecordingEnvironment::RecordingEnvironment(Shader::Environment& inner_, bool class_replay_)
+    : inner{inner_}, class_replay{class_replay_} {
     sph = inner.SPH();
     gp_passthrough_mask = inner.GpPassthroughMask();
     mesh_registers = inner.MeshRegisters();
@@ -377,7 +414,38 @@ bool RecordingEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 off
     return answer;
 }
 
+void RecordingEnvironment::BeginTextureHandle() {
+    ++handle_depth;
+}
+
+void RecordingEnvironment::EndTextureHandle(const Shader::ConstBufferAddr& cbuf, u32 handle) {
+    if (handle_depth != 0) {
+        --handle_depth;
+    }
+    if (class_replay) {
+        queries.push_back(PackHandleAddress(cbuf, handle));
+    }
+}
+
+void RecordingEnvironment::NoteExactCbufWord(u32 index, u32 offset) {
+    exact_words.insert(WordKey(index, offset));
+}
+
+std::vector<Query> RecordingEnvironment::TakeQueries() {
+    if (class_replay) {
+        // A word read only to build texture handles is covered by its TextureHandle queries;
+        // a word also consumed by value keeps its exact query.
+        std::erase_if(queries, [this](const Query& query) {
+            const u64 key = WordKey(query.a, query.b);
+            return query.kind == QueryKind::CbufValue && handle_words.contains(key) &&
+                   !exact_words.contains(key);
+        });
+    }
+    return std::move(queries);
+}
+
 u32 RecordingEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
+    (handle_depth != 0 ? handle_words : exact_words).insert(WordKey(cbuf_index, cbuf_offset));
     const u32 answer = inner.ReadCbufValue(cbuf_index, cbuf_offset);
     queries.push_back({QueryKind::CbufValue, cbuf_index, cbuf_offset, answer});
     return answer;
@@ -451,22 +519,58 @@ bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env) {
     return ReplayQueriesUntilMismatch(queries, env) == queries.size();
 }
 
-size_t ReplayQueriesUntilMismatch(std::span<const Query> queries, Shader::Environment& env) {
+size_t ReplayQueriesUntilMismatch(std::span<const Query> queries, Shader::Environment& env,
+                                  LiveAnswers* live) {
+    // Class-level replay: recorded handle -> live handle.
+    std::unordered_map<u32, u32> handles;
+    if (live) {
+        live->clear();
+    }
     for (size_t index = 0; index < queries.size(); ++index) {
         const Query& query = queries[index];
+        if (query.kind == QueryKind::TextureHandle) {
+            if (!live) {
+                return index;
+            }
+            const HandleAddress cbuf = UnpackHandleAddress(query);
+            const u32 sec_index = cbuf.has_secondary ? cbuf.secondary_index : cbuf.index;
+            const u32 sec_offset = cbuf.has_secondary ? cbuf.secondary_offset : cbuf.offset;
+            const u32 lhs_word = env.ReadCbufValue(cbuf.index, cbuf.offset);
+            const u32 rhs_word = env.ReadCbufValue(sec_index, sec_offset);
+            const u32 handle =
+                (lhs_word << cbuf.shift_left) | (rhs_word << cbuf.secondary_shift_left);
+            if (const auto [it, inserted] = handles.try_emplace(query.answer, handle);
+                !inserted && it->second != handle) {
+                // One recorded handle standing for two live ones: the texture queries cannot be
+                // told apart.
+                return index;
+            }
+            live->push_back({QueryKind::CbufValue, cbuf.index, cbuf.offset, lhs_word});
+            live->push_back({QueryKind::CbufValue, sec_index, sec_offset, rhs_word});
+            continue;
+        }
+        const bool texture_query = query.kind == QueryKind::TextureType ||
+                                   query.kind == QueryKind::TexturePixelFormat ||
+                                   query.kind == QueryKind::TexturePixelFormatInteger;
+        u32 argument = query.a;
+        if (live && texture_query) {
+            if (const auto it = handles.find(query.a); it != handles.end()) {
+                argument = it->second;
+            }
+        }
         u32 answer{};
         switch (query.kind) {
         case QueryKind::CbufValue:
             answer = env.ReadCbufValue(query.a, query.b);
             break;
         case QueryKind::TextureType:
-            answer = static_cast<u32>(env.ReadTextureType(query.a));
+            answer = static_cast<u32>(env.ReadTextureType(argument));
             break;
         case QueryKind::TexturePixelFormat:
-            answer = static_cast<u32>(env.ReadTexturePixelFormat(query.a));
+            answer = static_cast<u32>(env.ReadTexturePixelFormat(argument));
             break;
         case QueryKind::TexturePixelFormatInteger:
-            answer = env.IsTexturePixelFormatInteger(query.a) ? 1U : 0U;
+            answer = env.IsTexturePixelFormatInteger(argument) ? 1U : 0U;
             break;
         case QueryKind::ViewportTransformState:
             answer = env.ReadViewportTransformState();
@@ -487,6 +591,11 @@ size_t ReplayQueriesUntilMismatch(std::span<const Query> queries, Shader::Enviro
         }
         if (answer != query.answer) {
             return index;
+        }
+        if (live) {
+            Query live_query = query;
+            live_query.a = argument;
+            live->push_back(live_query);
         }
     }
     return queries.size();
@@ -887,7 +996,8 @@ std::shared_ptr<const Entry> Store::InsertLocked(Entry entry) {
     return shared;
 }
 
-std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::Environment& env) {
+std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::Environment& env,
+                                              LiveAnswers* live) {
     std::vector<std::shared_ptr<const Entry>> candidates;
     {
         std::scoped_lock lock{mutex};
@@ -901,7 +1011,7 @@ std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::E
     std::optional<QueryKind> furthest_kind;
     for (const auto& candidate : candidates) {
         try {
-            const size_t matched = ReplayQueriesUntilMismatch(candidate->queries, env);
+            const size_t matched = ReplayQueriesUntilMismatch(candidate->queries, env, live);
             if (matched == candidate->queries.size()) {
                 return candidate;
             }

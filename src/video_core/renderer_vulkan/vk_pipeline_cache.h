@@ -255,7 +255,7 @@ private:
     std::atomic<u64> aot_skipped_full{};
     std::atomic<u64> aot_completed{};
     std::atomic<u64> aot_failed{};
-    std::array<std::atomic<u64>, 8> aot_needs_query{}; ///< By TranslationCache::QueryKind
+    std::array<std::atomic<u64>, 16> aot_needs_query{}; ///< By TranslationCache::QueryKind
     std::atomic<u64> aot_capture_ns{};
     std::atomic<u64> aot_translate_ns{};
     std::atomic<u64> aot_entry_hits{};

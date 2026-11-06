@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -407,4 +408,126 @@ TEST_CASE("AOT pool index parses the index file and fingerprints like the tool",
     REQUIRE(containers[0].programs[1].fingerprint == 7);
     data.pop_back();
     REQUIRE_FALSE(ShaderPoolIndex::Parse(data, containers));
+}
+
+namespace {
+// What the texture pass does for one handle: Begin, the two word reads, End.
+u32 ReadHandle(Shader::Environment& env, const Shader::ConstBufferAddr& cbuf) {
+    env.BeginTextureHandle();
+    const u32 sec_index = cbuf.has_secondary ? cbuf.secondary_index : cbuf.index;
+    const u32 sec_offset = cbuf.has_secondary ? cbuf.secondary_offset : cbuf.offset;
+    const u32 handle = (env.ReadCbufValue(cbuf.index, cbuf.offset) << cbuf.shift_left) |
+                       (env.ReadCbufValue(sec_index, sec_offset) << cbuf.secondary_shift_left);
+    env.EndTextureHandle(cbuf, handle);
+    return handle;
+}
+
+Shader::ConstBufferAddr HandleAt(u32 index, u32 offset) {
+    Shader::ConstBufferAddr cbuf{};
+    cbuf.index = index;
+    cbuf.offset = offset;
+    return cbuf;
+}
+
+size_t CountKind(const std::vector<Query>& queries, QueryKind kind) {
+    return static_cast<size_t>(std::ranges::count(queries, kind, &Query::kind));
+}
+} // Anonymous namespace
+
+TEST_CASE("Class-level replay compares texture classes instead of handle words",
+          "[video_core][translation_cache]") {
+    FakeEnvironment env;
+    const u64 word = (u64{2} << 32) | 0x20;
+    env.cbufs[word] = 5; // a 2D texture
+    std::vector<Query> queries;
+    {
+        RecordingEnvironment recording{env, true};
+        const u32 handle = ReadHandle(recording, HandleAt(2, 0x20));
+        (void)recording.ReadTextureType(handle);
+        queries = recording.TakeQueries();
+    }
+    // Handle-only word: no exact query, one TextureHandle query.
+    REQUIRE(CountKind(queries, QueryKind::CbufValue) == 0);
+    REQUIRE(CountKind(queries, QueryKind::TextureHandle) == 1);
+    // A different handle of the same class matches, and the live answers carry the new words.
+    env.cbufs[word] = 6;
+    LiveAnswers live;
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) == queries.size());
+    REQUIRE(std::ranges::any_of(live, [](const Query& q) {
+        return q.kind == QueryKind::CbufValue && q.answer == 6;
+    }));
+    REQUIRE(std::ranges::any_of(live, [](const Query& q) {
+        return q.kind == QueryKind::TextureType && q.a == 6;
+    }));
+    // A handle of another class does not.
+    env.cbufs[word] = 7; // ColorArray2D in FakeEnvironment
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) < queries.size());
+    // Without live answers (the setting off), such an entry never matches.
+    env.cbufs[word] = 5;
+    REQUIRE_FALSE(ReplayQueries(queries, env));
+}
+
+TEST_CASE("Class-level replay keeps exact words exact", "[video_core][translation_cache]") {
+    FakeEnvironment env;
+    env.cbufs[(u64{1} << 32) | 0x10] = 0x40;
+    env.cbufs[(u64{2} << 32) | 0x20] = 5;
+    std::vector<Query> queries;
+    {
+        RecordingEnvironment recording{env, true};
+        // Exact-only word (a folded driver constant).
+        (void)recording.ReadCbufValue(1, 0x10);
+        // Shared word: read for a handle, then consumed by value from the pass's word cache.
+        const u32 handle = ReadHandle(recording, HandleAt(2, 0x20));
+        recording.NoteExactCbufWord(2, 0x20);
+        (void)recording.ReadTextureType(handle);
+        queries = recording.TakeQueries();
+    }
+    REQUIRE(CountKind(queries, QueryKind::CbufValue) == 3); // the exact word, both handle reads
+    LiveAnswers live;
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) == queries.size());
+    env.cbufs[(u64{1} << 32) | 0x10] = 0x44;
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) < queries.size());
+    env.cbufs[(u64{1} << 32) | 0x10] = 0x40;
+    env.cbufs[(u64{2} << 32) | 0x20] = 6; // same class, but the word is also used by value
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) < queries.size());
+}
+
+TEST_CASE("Class-level replay covers two-word handles and rejects one-to-many mappings",
+          "[video_core][translation_cache]") {
+    FakeEnvironment env;
+    Shader::ConstBufferAddr two_word = HandleAt(2, 0x20);
+    two_word.has_secondary = true;
+    two_word.secondary_index = 3;
+    two_word.secondary_offset = 0x40;
+    two_word.secondary_shift_left = 20;
+    env.cbufs[(u64{2} << 32) | 0x20] = 5;
+    env.cbufs[(u64{3} << 32) | 0x40] = 1;
+    env.cbufs[(u64{2} << 32) | 0x30] = 5;
+    std::vector<Query> queries;
+    {
+        RecordingEnvironment recording{env, true};
+        const u32 first = ReadHandle(recording, two_word);
+        (void)recording.ReadTextureType(first);
+        // A second handle recorded with the same value from other words.
+        Shader::ConstBufferAddr other = HandleAt(2, 0x30);
+        other.has_secondary = true;
+        other.secondary_index = 3;
+        other.secondary_offset = 0x40;
+        other.secondary_shift_left = 20;
+        const u32 second = ReadHandle(recording, other);
+        REQUIRE(second == first);
+        (void)recording.ReadTextureType(second);
+        queries = recording.TakeQueries();
+    }
+    REQUIRE(CountKind(queries, QueryKind::CbufValue) == 0);
+    REQUIRE(CountKind(queries, QueryKind::TextureHandle) == 2);
+    LiveAnswers live;
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) == queries.size());
+    // The secondary word is covered: changing it changes the live handle (7 << 20 here is
+    // still a 2D texture, so it matches with a new handle).
+    env.cbufs[(u64{3} << 32) | 0x40] = 2;
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) == queries.size());
+    // The two recorded-equal handles now differ live: one recorded handle, two live ones.
+    env.cbufs[(u64{2} << 32) | 0x30] = 6;
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) < queries.size());
 }

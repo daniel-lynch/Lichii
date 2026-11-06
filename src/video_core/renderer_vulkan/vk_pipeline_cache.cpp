@@ -1503,6 +1503,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     using Clock = std::chrono::steady_clock;
     const bool use_translation_cache = translation_cache.Enabled() && !uses_vertex_a;
     std::array<std::shared_ptr<const TC::Entry>, Maxwell::MaxShaderProgram> cached_entries{};
+    /// AOT translation: the live answers of each matched entry (class-level replay).
+    std::array<TC::LiveAnswers, Maxwell::MaxShaderProgram> live_answers{};
     std::array<bool, Maxwell::MaxShaderProgram> from_cache{};
     std::array<Shader::Environment*, Maxwell::MaxShaderProgram> stage_envs{};
     std::array<Clock::duration, Maxwell::MaxShaderProgram> stage_time{};
@@ -1552,7 +1554,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if (cacheable) {
             stage_key = TC::MakeStageKey(env, key.unique_hashes[index], static_cast<u32>(index),
                                          translation_config);
-            cached_entries[index] = translation_cache.FindEntry(stage_key, env);
+            cached_entries[index] = translation_cache.FindEntry(
+                stage_key, env, aot_translation ? &live_answers[index] : nullptr);
             from_cache[index] = cached_entries[index] != nullptr;
         }
         if (aot_translation && from_cache[index]) {
@@ -1575,7 +1578,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             // later use of its result.
             std::optional<TC::RecordingEnvironment> recording;
             if (cacheable) {
-                recording.emplace(env);
+                recording.emplace(env, aot_translation);
             }
             Shader::Environment& translate_env =
                 recording ? static_cast<Shader::Environment&>(*recording) : env;
@@ -1708,8 +1711,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 // GraphicsEnvironments; boot builds use FileEnvironments and never defer.
                 const auto& generic =
                     *static_cast<const VideoCommon::GenericEnvironment*>(stage_envs[index]);
+                // The live answers: with class-level replay the entry holds handle recipes,
+                // and the live words and handles are what the translation will ask about.
                 replay_envs[stage_index] = std::make_unique<VideoCommon::ReplayEnvironment>(
-                    generic, cached_entries[index]->queries);
+                    generic, live_answers[index]);
                 outcomes[index] = StageOutcome::VariantDeferred;
             }
             if (from_cache[index] && !replay_envs[stage_index]) {
