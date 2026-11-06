@@ -381,6 +381,37 @@ TEST_CASE("Translation cache records indirect storage pointer classifications",
     REQUIRE_FALSE(ReplayQueries(queries, env));
 }
 
+TEST_CASE("Translation cache refuses publications from before a reopen",
+          "[video_core][translation_cache]") {
+    const Digest config{0x41, 0x42};
+    FakeEnvironment env;
+    const Digest stage_key = MakeStageKey(env, 0x99, 1, config);
+    ProgramMeta meta{};
+    meta.stage = Shader::Stage::VertexB;
+    meta.info = SampleInfo();
+    Store store;
+    store.Open({}, config);
+    REQUIRE(store.Enabled());
+    const u64 generation = store.Generation();
+    RecordingEnvironment recording{env};
+    Translate(recording);
+    const auto queries = recording.TakeQueries();
+    const auto entry = store.Insert(stage_key, queries, meta, generation);
+    REQUIRE(entry);
+    const Variant variant{.info = SampleInfo(), .spirv = {0x07230203}};
+    REQUIRE(store.InsertVariant(*entry, Digest{1, 1}, variant));
+    // An entry that is not the store's own is refused.
+    Entry copy = *entry;
+    REQUIRE_FALSE(store.InsertVariant(copy, Digest{2, 2}, variant));
+
+    store.Open({}, config);
+    REQUIRE(store.Generation() != generation);
+    REQUIRE_FALSE(store.Insert(stage_key, queries, meta, generation));
+    REQUIRE_FALSE(store.InsertVariant(*entry, Digest{3, 3}, variant));
+    REQUIRE_FALSE(store.FindVariant(Digest{3, 3}));
+    REQUIRE(store.Insert(stage_key, queries, meta, store.Generation()));
+}
+
 TEST_CASE("AOT pool index parses the index file and fingerprints like the tool",
           "[video_core][translation_cache]") {
     using VideoCommon::ShaderPoolIndex;
