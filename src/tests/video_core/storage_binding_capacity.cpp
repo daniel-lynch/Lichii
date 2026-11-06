@@ -63,3 +63,26 @@ TEST_CASE("Storage buffer size limits cap the kind extent before narrowing",
     CHECK(StorageBufferSizeLimit(four_gib + 0x2000, 0x10a, true, false, false) == 0x10a);
     CHECK(StorageBufferSizeLimit(0, 0x10a, false, true, false) == 0);
 }
+
+TEST_CASE("Read-only table-pointer pools reach as far as a storage buffer binding",
+          "[video_core][storage_bindings]") {
+    using VideoCommon::StorageBufferSizeLimit;
+    using VideoCommon::TablePoolReach;
+    constexpr u64 kib = 1024;
+    constexpr u64 mib = 1024 * kib;
+    constexpr u64 four_gib = 1ULL << 32;
+    // EDEN_NX2_TABLE_POOL_FULL=0 keeps the old 64 MiB cap whatever the device allows.
+    CHECK(TablePoolReach(four_gib - 1, false) == 64 * mib);
+    // Otherwise the device range, at most 1 GiB, less 64 KiB.
+    CHECK(TablePoolReach(four_gib - 1, true) == 1024 * mib - 64 * kib);
+    CHECK(TablePoolReach(128 * mib, true) == 128 * mib - 64 * kib);
+    CHECK(TablePoolReach(32 * kib, true) == 0);
+    // Ocarina of Time's light probes lie about 130 MiB past their pool pointer.
+    const u64 reach = TablePoolReach(four_gib - 1, true);
+    CHECK(StorageBufferSizeLimit(200 * mib, 0, false, false, true, reach) == 200 * mib);
+    CHECK(StorageBufferSizeLimit(four_gib + 0x2000, 0, false, false, true, reach) == reach);
+    // Written pools and other pointers keep their caps.
+    CHECK(StorageBufferSizeLimit(200 * mib, 0, true, false, true, reach) == 8 * mib);
+    CHECK(StorageBufferSizeLimit(200 * mib, 0, false, true, false, reach) == 8 * mib);
+    CHECK(StorageBufferSizeLimit(200 * mib, 0x10a, false, false, false, reach) == 0x10a);
+}

@@ -3641,8 +3641,16 @@ Binding BufferCache<P>::StorageBufferBindingAt(GPUVAddr gpu_addr, GPUVAddr ssbo_
     const Binding binding = [&]() -> Binding {
         // storage_buffer_size.h: the u64 layout extent is capped before it is narrowed.
         // next_qword is 0 where the size word is not read (table reads, native pointers).
+        // EDEN_NX2_TABLE_POOL_FULL=0 keeps read-only table-pointer pools at the old 64 MiB cap.
+        static const bool table_pool_full = [] {
+            const char* value = std::getenv("EDEN_NX2_TABLE_POOL_FULL");
+            return !(value != nullptr && value[0] == '0');
+        }();
+        const u64 table_pool_reach =
+            TablePoolReach(runtime.GetMaxStorageBufferRange(), table_pool_full);
         u32 size = StorageBufferSizeLimit(gpu_memory->GetMemoryLayoutSize(gpu_addr), next_qword,
-                                          is_written, native_pointer, table_pointer);
+                                          is_written, native_pointer, table_pointer,
+                                          table_pool_reach);
         if ((native_pointer || table_pointer) && size != 0) {
             // Stop where the mapping or its device range does: the binding is one device range, and
             // a written one isn't split into separate ranges without sparse sources.

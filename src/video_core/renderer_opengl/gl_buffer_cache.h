@@ -207,6 +207,11 @@ public:
         return static_cast<u32>(device.GetShaderStorageBufferAlignment());
     }
 
+    /// Largest range a storage buffer binding may have: the minimum GL guarantees
+    u64 GetMaxStorageBufferRange() const {
+        return u64{1} << 27;
+    }
+
 private:
     static constexpr std::array PABO_LUT{
         GL_VERTEX_PROGRAM_PARAMETER_BUFFER_NV,          GL_TESS_CONTROL_PROGRAM_PARAMETER_BUFFER_NV,
