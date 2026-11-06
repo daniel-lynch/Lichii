@@ -1037,6 +1037,22 @@ void PipelineCache::EmitWaitingSeeds(std::vector<WaitingSeed> seeds) {
     PumpReadySeeds();
 }
 
+bool PipelineCache::TryReservePending() {
+    u64 pending = aot_pending.load();
+    do {
+        if (pending >= MaxAotPending) {
+            return false;
+        }
+    } while (!aot_pending.compare_exchange_weak(pending, pending + 1));
+    return true;
+}
+
+void PipelineCache::ReleasePending() {
+    aot_pending.fetch_sub(1);
+    // A slot came free: a seed waiting for one (re-emission) takes it.
+    PumpReadySeeds();
+}
+
 void PipelineCache::PumpReadySeeds() {
     // Re-emissions share the AOT workers' pending cap with new seeds: each takes a slot, and a
     // finished job queues the next one.
@@ -1047,20 +1063,25 @@ void PipelineCache::PumpReadySeeds() {
             if (ready_seeds.empty()) {
                 return;
             }
-            u64 pending = aot_pending.load();
-            do {
-                if (pending >= MaxAotPending) {
-                    return;
-                }
-            } while (!aot_pending.compare_exchange_weak(pending, pending + 1));
+            if (!TryReservePending()) {
+                return;
+            }
             seed = std::move(ready_seeds.front());
             ready_seeds.pop_front();
         }
+        bool queued = false;
+        SCOPE_EXIT {
+            if (!queued) {
+                ReleasePending();
+            }
+        };
         aot_workers->QueueWork([this, seed = std::move(seed)] {
+            SCOPE_EXIT {
+                ReleasePending();
+            };
             EmitWaitingSeed(seed);
-            --aot_pending;
-            PumpReadySeeds();
         });
+        queued = true;
     }
 }
 
@@ -1139,10 +1160,18 @@ bool PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
         ++aot_skipped_uncacheable;
         return false;
     }
-    if (aot_pending.load() >= MaxAotPending) {
+    // One pending slot, reserved atomically (the same reservation as re-emissions), released on
+    // every way out until the job is queued and then when the job ends.
+    if (!TryReservePending()) {
         ++aot_skipped_full;
         return false;
     }
+    bool queued = false;
+    SCOPE_EXIT {
+        if (!queued) {
+            ReleasePending();
+        }
+    };
     const TC::Digest stage_key = TC::MakeStageKey(env, unique_hash, static_cast<u32>(slot),
                                                   translation_config);
     if (translation_cache.HasStageKey(stage_key)) {
@@ -1172,7 +1201,6 @@ bool PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
         ++aot_skipped_full;
         return false;
     }
-    ++aot_pending;
     if (!aot_workers) {
         aot_worker_count = AotWorkerCount();
         LOG_INFO(Render_Vulkan, "Shader AOT: {} translation workers", aot_worker_count);
@@ -1195,6 +1223,9 @@ bool PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
     }
     aot_workers->QueueWork([this, owned = std::move(owned), stage_key, unique_hash, job_bytes,
                             tier_index, generation = translation_cache.Generation()] {
+        SCOPE_EXIT {
+            ReleasePending();
+        };
         const auto translate_begin = std::chrono::steady_clock::now();
         bool stored = false;
         try {
@@ -1283,9 +1314,8 @@ bool PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
             aot_in_flight.erase(stage_key);
         }
         aot_bytes -= job_bytes;
-        --aot_pending;
-        PumpReadySeeds();
     });
+    queued = true;
     return true;
 }
 

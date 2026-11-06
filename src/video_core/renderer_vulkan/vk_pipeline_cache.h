@@ -350,6 +350,10 @@ private:
     std::deque<WaitingSeed> ready_seeds;
     size_t ready_seeds_peak{};
     void PumpReadySeeds();
+    /// Takes one of the MaxAotPending slots atomically (fresh seeds and re-emissions alike).
+    [[nodiscard]] bool TryReservePending();
+    /// Gives a slot back and lets a waiting re-emission take it.
+    void ReleasePending();
     void EmitWaitingSeed(const WaitingSeed& seed);
     std::atomic<u64> aot_parked{};
     std::atomic<u64> aot_waiting_dropped{};
