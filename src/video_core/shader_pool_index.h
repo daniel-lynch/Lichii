@@ -40,6 +40,8 @@ public:
     struct Candidate {
         GPUVAddr address;
         u8 stage; ///< Container stage slot (0 vertex, 4 pixel; others are not offered)
+        u32 constants_offset;
+        u16 constants_size;
     };
     /// Up to `count` candidates, oldest first, skipping programs used since they were found.
     [[nodiscard]] std::vector<Candidate> TakeCandidates(size_t count);
@@ -53,6 +55,8 @@ public:
         u32 size;
         u8 stage;
         u64 fingerprint;
+        u32 constants_offset; ///< Bank-1 constant section from the program start, ~0 if none
+        u16 constants_size;
     };
     struct Container {
         std::vector<Program> programs;

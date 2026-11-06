@@ -13,8 +13,8 @@
 
 namespace VideoCommon {
 namespace {
-constexpr std::array<char, 8> Magic{'L', 'X', 'A', 'O', 'T', 'I', 'X', '1'};
-constexpr size_t ProgramRecordSize = 4 + 4 + 1 + 8;
+constexpr std::array<char, 8> Magic{'L', 'X', 'A', 'O', 'T', 'I', 'X', '2'};
+constexpr size_t ProgramRecordSize = 4 + 4 + 1 + 8 + 4 + 2;
 /// A pool counts as recognised when this share of its programs verifies at the expected address.
 constexpr double RecogniseShare = 0.9;
 } // Anonymous namespace
@@ -54,7 +54,8 @@ bool ShaderPoolIndex::Parse(std::span<const u8> data, std::vector<Container>& ou
         container.programs.resize(programs);
         for (Program& program : container.programs) {
             if (!get(program.offset) || !get(program.size) || !get(program.stage) ||
-                !get(program.fingerprint)) {
+                !get(program.fingerprint) || !get(program.constants_offset) ||
+                !get(program.constants_size) || program.constants_size > 0x100) {
                 return false;
             }
         }
@@ -209,7 +210,7 @@ void ShaderPoolIndex::OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr addr
             continue;
         }
         size_t verified = 0, mismatched = 0, unmapped = 0;
-        std::vector<std::pair<GPUVAddr, u8>> found;
+        std::vector<std::pair<GPUVAddr, const Program*>> found;
         for (const Program& program : container.programs) {
             const GPUVAddr where = pool + program.offset;
             const size_t length = (std::min)(size_t{program.size}, FingerprintBytes);
@@ -219,7 +220,7 @@ void ShaderPoolIndex::OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr addr
                 ++mismatched;
             } else {
                 ++verified;
-                found.emplace_back(where, program.stage);
+                found.emplace_back(where, &program);
             }
         }
         const size_t total = container.programs.size();
@@ -232,7 +233,8 @@ void ShaderPoolIndex::OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr addr
             siblings_verified += verified;
             siblings_mismatched += mismatched;
             siblings_unmapped += unmapped;
-            for (const auto& [where, stage] : found) {
+            for (const auto& [where, program] : found) {
+                const u8 stage = program->stage;
                 if (used.contains(where)) {
                     continue;
                 }
@@ -242,7 +244,8 @@ void ShaderPoolIndex::OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr addr
                     continue;
                 }
                 if (candidates_queue.size() < MaxCandidatesQueued) {
-                    candidates_queue.push_back({where, stage});
+                    candidates_queue.push_back(
+                        {where, stage, program->constants_offset, program->constants_size});
                     ++candidates_offered;
                 } else {
                     ++candidates_dropped;

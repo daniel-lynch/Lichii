@@ -209,7 +209,10 @@ protected:
     /// Set by a renderer that translates recognised programs ahead of time: called on the GPU
     /// thread with a program's environment (built as at first use), its unique hash and its
     /// pipeline slot.
-    std::function<void(GenericEnvironment& env, u64 unique_hash, size_t slot)> seed_stage;
+    /// `constants`: the program's bank-1 constant section, read from its pool (may be empty).
+    std::function<void(GenericEnvironment& env, u64 unique_hash, size_t slot,
+                       std::span<const u8> constants)>
+        seed_stage;
     /// Whether seed_stage would take another program now (checked before building one).
     std::function<bool()> seed_has_room;
 };

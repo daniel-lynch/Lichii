@@ -239,7 +239,8 @@ private:
     /// Ahead-of-time translation of recognised pool programs (ShaderCache::seed_stage): the
     /// GPU thread builds the environment and an owned copy of it; a worker translates the copy,
     /// which answers no queries, and stores programs that needed none as ordinary entries.
-    void SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_hash, size_t slot);
+    void SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_hash, size_t slot,
+                   std::span<const u8> constants);
     static constexpr u64 MaxAotPending = 32;
     static constexpr u64 MaxAotEntries = 4096;
     std::atomic<u64> aot_pending{};
@@ -259,6 +260,7 @@ private:
     std::atomic<u64> aot_capture_ns{};
     std::atomic<u64> aot_translate_ns{};
     std::atomic<u64> aot_entry_hits{};
+    std::atomic<u64> aot_with_constants{};
     std::mutex aot_mutex;
     std::unordered_set<VideoCommon::TranslationCache::Digest, VideoCommon::TranslationCache::DigestHash>
         aot_keys; ///< Stage keys of entries the workers stored, not yet used by a draw

@@ -384,7 +384,7 @@ TEST_CASE("AOT pool index parses the index file and fingerprints like the tool",
     const std::array<u8, 1> a{'a'};
     REQUIRE(ShaderPoolIndex::Fingerprint(a) == 0xaf63dc4c8601ec8cULL);
 
-    std::vector<u8> data{'L', 'X', 'A', 'O', 'T', 'I', 'X', '1'};
+    std::vector<u8> data{'L', 'X', 'A', 'O', 'T', 'I', 'X', '2'};
     const auto put = [&](auto value) {
         const auto* bytes = reinterpret_cast<const u8*>(&value);
         data.insert(data.end(), bytes, bytes + sizeof(value));
@@ -395,10 +395,14 @@ TEST_CASE("AOT pool index parses the index file and fingerprints like the tool",
     put(u32{0x380});
     put(u8{4});
     put(u64{0x1122334455667788ULL});
+    put(u32{0x300});
+    put(u16{0x40});
     put(u32{0x480});
     put(u32{0x80});
     put(u8{0});
     put(u64{7});
+    put(u32{~0U});
+    put(u16{0});
     std::vector<ShaderPoolIndex::Container> containers;
     REQUIRE(ShaderPoolIndex::Parse(data, containers));
     REQUIRE(containers.size() == 1);
@@ -406,6 +410,8 @@ TEST_CASE("AOT pool index parses the index file and fingerprints like the tool",
     REQUIRE(containers[0].programs[0].offset == 0x100);
     REQUIRE(containers[0].programs[0].stage == 4);
     REQUIRE(containers[0].programs[1].fingerprint == 7);
+    REQUIRE(containers[0].programs[0].constants_offset == 0x300);
+    REQUIRE(containers[0].programs[0].constants_size == 0x40);
     data.pop_back();
     REQUIRE_FALSE(ShaderPoolIndex::Parse(data, containers));
 }

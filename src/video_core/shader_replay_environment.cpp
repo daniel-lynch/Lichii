@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <cstring>
+
 #include "shader_recompiler/exception.h"
 #include "video_core/shader_replay_environment.h"
 
@@ -10,8 +12,8 @@ using TranslationCache::QueryKind;
 
 ReplayEnvironment::ReplayEnvironment(const GenericEnvironment& live,
                                      std::span<const TranslationCache::Query> queries,
-                                     bool guess_)
-    : GenericEnvironment(live), guess{guess_} {
+                                     bool guess_, std::span<const u8> constants_)
+    : GenericEnvironment(live), guess{guess_}, constants(constants_.begin(), constants_.end()) {
     gpu_memory = nullptr;
     for (const auto& query : queries) {
         answers.emplace(std::tuple{static_cast<u8>(query.kind), query.a, query.b, query.c},
@@ -52,6 +54,11 @@ u32 ReplayEnvironment::Answer(QueryKind kind, u32 a, u32 b, u32 c) const {
 }
 
 u32 ReplayEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
+    if (guess && cbuf_index == 1 && size_t{cbuf_offset} + sizeof(u32) <= constants.size()) {
+        u32 word;
+        std::memcpy(&word, constants.data() + cbuf_offset, sizeof(word));
+        return word;
+    }
     if (guess && handle_depth != 0 &&
         !answers.contains(std::tuple{static_cast<u8>(QueryKind::CbufValue), cbuf_index,
                                      cbuf_offset, 0U})) {

@@ -302,7 +302,17 @@ void ShaderCache::SeedPoolCandidates() {
             if (!hash) {
                 continue;
             }
-            seed_stage(env, *hash, static_cast<size_t>(program));
+            // Bank 1 is the program's own constant section, a part of the pool bound with it
+            // and never written: its words are exact answers, not guesses.
+            std::vector<u8> constants;
+            if (candidate.constants_offset != ~0U && candidate.constants_size != 0 &&
+                gpu_memory->IsFullyMappedRange(candidate.address + candidate.constants_offset,
+                                               candidate.constants_size)) {
+                constants.resize(candidate.constants_size);
+                gpu_memory->ReadBlockUnsafe(candidate.address + candidate.constants_offset,
+                                            constants.data(), constants.size());
+            }
+            seed_stage(env, *hash, static_cast<size_t>(program), constants);
         } catch (const Shader::Exception&) {
             // Rejected or not lowerable: its first use will say so.
         }

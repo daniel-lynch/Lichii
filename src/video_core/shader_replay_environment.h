@@ -22,10 +22,11 @@ public:
     /// instead of throwing (ahead-of-time translation; the draw's replay validates the guess):
     /// a distinct made-up word inside a texture handle, a 2D float texture, a direct storage
     /// pointer, no indirect pointer table, the viewport transform on and no HLE replacement.
-    /// A constant buffer word consumed by value cannot be guessed and still throws.
+    /// A bank-1 word is answered from `constants` (the program's constant section); another
+    /// constant buffer word consumed by value cannot be guessed and still throws.
     explicit ReplayEnvironment(const GenericEnvironment& live,
                                std::span<const TranslationCache::Query> queries,
-                               bool guess = false);
+                               bool guess = false, std::span<const u8> constants = {});
     ~ReplayEnvironment() override;
 
     u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
@@ -59,6 +60,8 @@ private:
     bool guess{};
     u32 handle_depth{};
     std::map<std::pair<u32, u32>, u32> guessed_words;
+    /// Guess mode: the bank-1 constant section, answered exactly.
+    std::vector<u8> constants;
 };
 
 } // namespace VideoCommon

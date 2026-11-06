@@ -532,8 +532,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {},
                            Common::ThreadPlacement::Background) {
-    seed_stage = [this](VideoCommon::GenericEnvironment& env, u64 unique_hash, size_t slot) {
-        SeedStage(env, unique_hash, slot);
+    seed_stage = [this](VideoCommon::GenericEnvironment& env, u64 unique_hash, size_t slot,
+                        std::span<const u8> constants) {
+        SeedStage(env, unique_hash, slot, constants);
     };
     seed_has_room = [this] { return AotHasRoom(); };
     const auto& float_control{device.FloatControlProperties()};
@@ -856,7 +857,7 @@ bool PipelineCache::IsTranslationCacheable(const Shader::Environment& env) const
 }
 
 void PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_hash,
-                              size_t slot) {
+                              size_t slot, std::span<const u8> constants) {
     namespace TC = VideoCommon::TranslationCache;
     if (!aot_translation || !translation_cache.Enabled()) {
         return;
@@ -881,7 +882,8 @@ void PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
     // what it answered; the draw's class-level replay keeps the entry only if the live
     // environment agrees. A word consumed by value cannot be guessed and aborts the job.
     auto owned = std::make_shared<VideoCommon::ReplayEnvironment>(
-        env, std::span<const TC::Query>{}, true);
+        env, std::span<const TC::Query>{}, true, constants);
+    aot_with_constants += constants.empty() ? 0 : 1;
     aot_capture_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                            std::chrono::steady_clock::now() - begin)
                                            .count());
@@ -975,7 +977,8 @@ void PipelineCache::LogStageOutcomes(std::string_view when) {
     LOG_INFO(Render_Vulkan,
              "Shader AOT ({}): {} candidates, {} stored with guessed answers, {} needed an exact "
              "word (by kind:{}), {} failed; skipped {} known, {} uncacheable, {} over budget; {} "
-             "pending; {} stored entries used by a draw; GPU thread {:.1f} ms, worker {:.1f} ms",
+             "pending; {} stored entries used by a draw; {} candidates had their bank-1 "
+             "constants; GPU thread {:.1f} ms, worker {:.1f} ms",
              when, aot_candidates.load(), aot_completed.load(),
              [&] {
                  u64 total = 0;
@@ -986,7 +989,8 @@ void PipelineCache::LogStageOutcomes(std::string_view when) {
              }(),
              needs.empty() ? " none" : needs, aot_failed.load(), aot_skipped_known.load(),
              aot_skipped_uncacheable.load(), aot_skipped_full.load(), aot_pending.load(),
-             aot_entry_hits.load(), static_cast<double>(aot_capture_ns.load()) / 1e6,
+             aot_entry_hits.load(), aot_with_constants.load(),
+             static_cast<double>(aot_capture_ns.load()) / 1e6,
              static_cast<double>(aot_translate_ns.load()) / 1e6);
     std::string mismatches;
     for (size_t kind = 0; kind < translation_cache.first_mismatch.size(); ++kind) {
