@@ -41,6 +41,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache_prebuild.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/shader_cache.h"
+#include "video_core/shader_recipe_histogram.h"
 #include "video_core/shader_translation_cache.h"
 
 namespace Core {
@@ -294,26 +295,10 @@ private:
     /// and loaded varyings), so its first draw neither translates nor emits. A wrong guess is
     /// never used: the variant key holds the runtime info and the bindings. Off with
     /// EDEN_NX2_AOT_EMIT=0.
-    struct EmissionRecipe {
-        Shader::RuntimeInfo runtime_info;
-        Shader::Backend::Bindings binding_in{};
-        VideoCommon::TranslationCache::Digest digest{};
-        u64 count{};
-        bool seen{}; ///< Recorded this session (false: only from the recipe file)
-    };
+    using EmissionRecipe = VideoCommon::RecipeHistogram::Recipe;
     bool aot_emit_variants{};
     std::mutex recipe_mutex;
-    /// Class key -> recipes seen (a few per class; key 0 of a stage holds the stage's recipes).
-    std::unordered_map<u64, std::vector<EmissionRecipe>> recipes;
-    [[nodiscard]] static u64 RecipeClass(Shader::Stage stage, const Shader::Info* info);
-    [[nodiscard]] static u64 RecipeClassOf(Shader::Stage stage, const std::bitset<512>* loads);
-    /// What each class key stands for (stage, loaded varyings or none), to write it out.
-    struct RecipeClassId {
-        Shader::Stage stage;
-        bool by_loads;
-        std::bitset<512> loads;
-    };
-    std::unordered_map<u64, RecipeClassId> recipe_class_ids; ///< Under recipe_mutex
+    VideoCommon::RecipeHistogram recipe_histogram; ///< Under recipe_mutex
     /// The recipe histogram is kept next to the translation file
     /// (vulkan_translations.<tag>.recipes.fork-vN.bin), so a later session guesses from the
     /// start. Loaded when the translation file is opened, written every 30 s when it changed

@@ -14,6 +14,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "common/shader_aot_scene.h"
 #include "video_core/shader_pool_index.h"
+#include "video_core/shader_recipe_histogram.h"
 #include "shader_recompiler/translator_identity.h"
 #include "video_core/shader_translation_cache.h"
 
@@ -787,4 +788,67 @@ TEST_CASE("Translation cache identifies the translator by its source",
         REQUIRE_FALSE(MakeConfigDigest(profile, host_info, 0) == source_digest);
 #endif
     }
+}
+
+namespace {
+// A recipe distinguished by its uniform-buffer binding base (made-up values).
+Shader::RuntimeInfo RecipeInfo(u32 variant) {
+    Shader::RuntimeInfo info{};
+    info.generic_input_types[0] = Shader::AttributeType::Float;
+    info.previous_stage_stores.mask.set(variant % 512);
+    info.y_negate = (variant & 1) != 0;
+    info.alpha_test_func = Shader::CompareFunction::Greater;
+    info.xfb_count = 1;
+    info.xfb_varyings[0].components = 4;
+    return info;
+}
+Shader::Backend::Bindings RecipeBindings(u32 variant) {
+    Shader::Backend::Bindings bindings{};
+    bindings.uniform_buffer = variant;
+    return bindings;
+}
+} // Anonymous namespace
+
+TEST_CASE("AOT recipe histogram picks the class's most common recipe and round-trips",
+          "[video_core][translation_cache]") {
+    using VideoCommon::RecipeHistogram;
+    const VideoCommon::TranslationCache::Digest config{1, 2};
+    std::bitset<512> loads_a, loads_b;
+    loads_a.set(40);
+    loads_b.set(41);
+    RecipeHistogram histogram;
+    REQUIRE(histogram.Record(Shader::Stage::Fragment, loads_a, RecipeInfo(1), RecipeBindings(1)));
+    REQUIRE_FALSE(
+        histogram.Record(Shader::Stage::Fragment, loads_a, RecipeInfo(2), RecipeBindings(2)));
+    histogram.Record(Shader::Stage::Fragment, loads_a, RecipeInfo(2), RecipeBindings(2));
+    histogram.Record(Shader::Stage::Fragment, loads_a, RecipeInfo(2), RecipeBindings(2));
+    bool class_match = false;
+    auto best = histogram.Best(Shader::Stage::Fragment, loads_a, class_match);
+    REQUIRE(best.has_value());
+    REQUIRE(class_match);
+    REQUIRE(best->binding_in.uniform_buffer == 2);
+    // Another class of the stage falls back to the stage's recipes.
+    best = histogram.Best(Shader::Stage::Fragment, loads_b, class_match);
+    REQUIRE(best.has_value());
+    REQUIRE_FALSE(class_match);
+
+    const std::vector<u8> data = histogram.Serialize(config);
+    RecipeHistogram loaded;
+    std::string why;
+    REQUIRE(loaded.Load(data, config, why));
+    REQUIRE(loaded.Classes() == histogram.Classes());
+    REQUIRE(loaded.Recipes() == histogram.Recipes());
+    best = loaded.Best(Shader::Stage::Fragment, loads_a, class_match);
+    REQUIRE(best.has_value());
+    REQUIRE_FALSE(best->seen);
+    REQUIRE(best->runtime_info.alpha_test_func == Shader::CompareFunction::Greater);
+    REQUIRE(best->runtime_info.xfb_count == 1);
+    REQUIRE(best->binding_in.uniform_buffer == 2);
+    REQUIRE(best->count == 2); // 3 halved, rounded up
+
+    REQUIRE_FALSE(loaded.Load(data, VideoCommon::TranslationCache::Digest{9, 9}, why));
+    REQUIRE(loaded.Classes() == 0);
+    std::vector<u8> truncated(data.begin(), data.end() - 3);
+    REQUIRE_FALSE(loaded.Load(truncated, config, why));
+    REQUIRE(loaded.Classes() == 0);
 }

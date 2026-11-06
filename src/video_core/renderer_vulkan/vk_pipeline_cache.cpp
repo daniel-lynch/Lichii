@@ -900,153 +900,9 @@ bool PipelineCache::IsTranslationCacheable(const Shader::Environment& env) const
     return env.CanCacheTranslation();
 }
 
-u64 PipelineCache::RecipeClass(Shader::Stage stage, const Shader::Info* info) {
-    return RecipeClassOf(stage, info != nullptr ? &info->loads.mask : nullptr);
-}
-
-u64 PipelineCache::RecipeClassOf(Shader::Stage stage, const std::bitset<512>* loads) {
-    u64 key = (static_cast<u64>(stage) + 1) * 0x9e3779b97f4a7c15ULL;
-    if (loads != nullptr) {
-        key ^= std::hash<std::bitset<512>>{}(*loads) * 0xff51afd7ed558ccdULL + 1;
-    }
-    return key;
-}
-
-namespace {
-constexpr std::array<char, 8> RecipeMagic{'L', 'X', 'R', 'E', 'C', 'I', 'P', '1'};
-constexpr u32 RecipeFormatVersion = 1;
-
-class RecipeWriter {
-public:
-    template <typename T>
-    void Put(const T& value) {
-        static_assert(std::is_trivially_copyable_v<T>);
-        const auto* bytes = reinterpret_cast<const u8*>(&value);
-        data.insert(data.end(), bytes, bytes + sizeof(T));
-    }
-    template <size_t N>
-    void PutBits(const std::bitset<N>& bits) {
-        std::array<u8, N / 8> bytes{};
-        for (size_t i = 0; i < N; ++i) {
-            bytes[i / 8] |= static_cast<u8>(bits[i] ? 1U << (i % 8) : 0U);
-        }
-        Put(bytes);
-    }
-    std::vector<u8> data;
-};
-
-class RecipeReader {
-public:
-    explicit RecipeReader(std::span<const u8> data_) : data{data_} {}
-    template <typename T>
-    bool Get(T& value) {
-        static_assert(std::is_trivially_copyable_v<T>);
-        if (offset + sizeof(T) > data.size()) {
-            return false;
-        }
-        std::memcpy(&value, data.data() + offset, sizeof(T));
-        offset += sizeof(T);
-        return true;
-    }
-    template <size_t N>
-    bool GetBits(std::bitset<N>& bits) {
-        std::array<u8, N / 8> bytes{};
-        if (!Get(bytes)) {
-            return false;
-        }
-        for (size_t i = 0; i < N; ++i) {
-            bits[i] = (bytes[i / 8] >> (i % 8)) & 1;
-        }
-        return true;
-    }
-    [[nodiscard]] bool AtEnd() const noexcept {
-        return offset == data.size();
-    }
-
-private:
-    std::span<const u8> data;
-    size_t offset{};
-};
-
-void PutRuntimeInfo(RecipeWriter& out, const Shader::RuntimeInfo& info) {
-    out.Put(info.generic_input_types);
-    out.PutBits(info.previous_stage_stores.mask);
-    out.Put(static_cast<u32>(info.per_primitive_generics.to_ulong()));
-    out.Put(static_cast<u32>(info.previous_stage_legacy_stores_mapping.size()));
-    for (const auto& [from, to] : info.previous_stage_legacy_stores_mapping) {
-        out.Put(from);
-        out.Put(to);
-    }
-    out.Put(info.convert_depth_mode);
-    out.Put(info.force_early_z);
-    out.Put(info.tess_primitive);
-    out.Put(info.tess_spacing);
-    out.Put(info.tess_clockwise);
-    out.Put(info.input_topology);
-    out.Put(info.fixed_state_point_size.has_value());
-    out.Put(info.fixed_state_point_size.value_or(0.0f));
-    out.Put(info.alpha_test_func.has_value());
-    out.Put(info.alpha_test_func.value_or(Shader::CompareFunction{}));
-    out.Put(info.alpha_test_reference);
-    out.Put(info.y_negate);
-    out.Put(info.glasm_use_storage_buffers);
-    const u32 xfb = std::min<u32>(info.xfb_count, static_cast<u32>(info.xfb_varyings.size()));
-    out.Put(xfb);
-    for (u32 i = 0; i < xfb; ++i) {
-        out.Put(info.xfb_varyings[i]);
-    }
-    out.Put(info.color_output_types);
-    out.Put(info.dual_source_blend);
-}
-
-bool GetRuntimeInfo(RecipeReader& in, Shader::RuntimeInfo& info) {
-    u32 primitive_generics{}, legacy{};
-    if (!in.Get(info.generic_input_types) || !in.GetBits(info.previous_stage_stores.mask) ||
-        !in.Get(primitive_generics) || !in.Get(legacy) || legacy > 512) {
-        return false;
-    }
-    info.per_primitive_generics = std::bitset<32>{primitive_generics};
-    for (u32 i = 0; i < legacy; ++i) {
-        Shader::IR::Attribute from{}, to{};
-        if (!in.Get(from) || !in.Get(to)) {
-            return false;
-        }
-        info.previous_stage_legacy_stores_mapping.emplace(from, to);
-    }
-    bool has_point_size{}, has_alpha_test{};
-    float point_size{};
-    Shader::CompareFunction alpha_test{};
-    u32 xfb{};
-    if (!in.Get(info.convert_depth_mode) || !in.Get(info.force_early_z) ||
-        !in.Get(info.tess_primitive) || !in.Get(info.tess_spacing) ||
-        !in.Get(info.tess_clockwise) || !in.Get(info.input_topology) ||
-        !in.Get(has_point_size) || !in.Get(point_size) || !in.Get(has_alpha_test) ||
-        !in.Get(alpha_test) || !in.Get(info.alpha_test_reference) || !in.Get(info.y_negate) ||
-        !in.Get(info.glasm_use_storage_buffers) || !in.Get(xfb) ||
-        xfb > info.xfb_varyings.size()) {
-        return false;
-    }
-    if (has_point_size) {
-        info.fixed_state_point_size = point_size;
-    }
-    if (has_alpha_test) {
-        info.alpha_test_func = alpha_test;
-    }
-    info.xfb_count = xfb;
-    for (u32 i = 0; i < xfb; ++i) {
-        if (!in.Get(info.xfb_varyings[i])) {
-            return false;
-        }
-    }
-    return in.Get(info.color_output_types) && in.Get(info.dual_source_blend);
-}
-} // Anonymous namespace
-
 void PipelineCache::LoadRecipes() {
-    namespace TC = VideoCommon::TranslationCache;
     std::scoped_lock lock{recipe_mutex};
-    recipes.clear();
-    recipe_class_ids.clear();
+    recipe_histogram.Clear();
     recipes_loaded = 0;
     recipe_classes_loaded = 0;
     recipes_dirty = false;
@@ -1063,64 +919,20 @@ void PipelineCache::LoadRecipes() {
     if (!file) {
         return;
     }
-    RecipeReader in{data};
-    std::array<char, 8> magic{};
-    u32 version{}, classes{};
-    TC::Digest config{};
-    const auto refuse = [&](const char* why) {
-        recipes.clear();
-        recipe_class_ids.clear();
-        recipes_loaded = 0;
-        recipe_classes_loaded = 0;
+    std::string why;
+    if (!recipe_histogram.Load(data, translation_config, why)) {
         LOG_INFO(Render_Vulkan, "Shader AOT: recipe file {} not used ({})",
                  recipes_filename.filename().string(), why);
-    };
-    if (!in.Get(magic) || magic != RecipeMagic || !in.Get(version) ||
-        version != RecipeFormatVersion) {
-        return refuse("another format");
+        return;
     }
-    if (!in.Get(config) || !(config == translation_config)) {
-        return refuse("another translation configuration");
-    }
-    if (!in.Get(classes) || classes > 4096) {
-        return refuse("truncated");
-    }
-    for (u32 c = 0; c < classes; ++c) {
-        RecipeClassId id{};
-        u8 by_loads{};
-        u32 count{};
-        if (!in.Get(id.stage) || !in.Get(by_loads) ||
-            (by_loads != 0 && !in.GetBits(id.loads)) || !in.Get(count) || count > 8) {
-            return refuse("truncated");
-        }
-        id.by_loads = by_loads != 0;
-        const u64 key = RecipeClassOf(id.stage, id.by_loads ? &id.loads : nullptr);
-        auto& list = recipes[key];
-        recipe_class_ids.insert_or_assign(key, id);
-        for (u32 r = 0; r < count; ++r) {
-            EmissionRecipe recipe{};
-            if (!in.Get(recipe.count) || !GetRuntimeInfo(in, recipe.runtime_info) ||
-                !in.Get(recipe.binding_in)) {
-                return refuse("truncated");
-            }
-            // Older sessions weigh half, so the histogram follows the game as it changes.
-            recipe.count = (recipe.count + 1) / 2;
-            recipe.digest = TC::MakeVariantKey(
-                TC::Digest{}, TC::DigestRuntimeInfo(recipe.runtime_info), recipe.binding_in);
-            list.push_back(std::move(recipe));
-            ++recipes_loaded;
-        }
-        ++recipe_classes_loaded;
-    }
-    if (!in.AtEnd()) {
-        return refuse("trailing bytes");
-    }
+    recipes_loaded = recipe_histogram.Recipes();
+    recipe_classes_loaded = recipe_histogram.Classes();
     LOG_INFO(Render_Vulkan, "Shader AOT: {} emission recipes of {} classes from {}",
              recipes_loaded, recipe_classes_loaded, recipes_filename.filename().string());
 }
 
 void PipelineCache::SaveRecipes() {
-    RecipeWriter out;
+    std::vector<u8> data;
     size_t classes = 0, written = 0;
     {
         std::scoped_lock lock{recipe_mutex};
@@ -1128,41 +940,17 @@ void PipelineCache::SaveRecipes() {
             return;
         }
         recipes_dirty = false;
-        out.Put(RecipeMagic);
-        out.Put(RecipeFormatVersion);
-        out.Put(translation_config);
-        u32 count = 0;
-        for (const auto& [key, list] : recipes) {
-            count += !list.empty() && recipe_class_ids.contains(key) ? 1 : 0;
-        }
-        out.Put(count);
-        for (const auto& [key, list] : recipes) {
-            const auto id = recipe_class_ids.find(key);
-            if (list.empty() || id == recipe_class_ids.end()) {
-                continue;
-            }
-            out.Put(id->second.stage);
-            out.Put(static_cast<u8>(id->second.by_loads ? 1 : 0));
-            if (id->second.by_loads) {
-                out.PutBits(id->second.loads);
-            }
-            out.Put(static_cast<u32>(list.size()));
-            for (const EmissionRecipe& recipe : list) {
-                out.Put(recipe.count);
-                PutRuntimeInfo(out, recipe.runtime_info);
-                out.Put(recipe.binding_in);
-                ++written;
-            }
-            ++classes;
-        }
+        data = recipe_histogram.Serialize(translation_config);
+        classes = recipe_histogram.Classes();
+        written = recipe_histogram.Recipes();
     }
     // Written next to the file and renamed over it, so a crash leaves the previous histogram.
     auto temporary = recipes_filename;
     temporary += ".tmp";
     {
         std::ofstream file{temporary, std::ios::binary | std::ios::trunc};
-        file.write(reinterpret_cast<const char*>(out.data.data()),
-                   static_cast<std::streamsize>(out.data.size()));
+        file.write(reinterpret_cast<const char*>(data.data()),
+                   static_cast<std::streamsize>(data.size()));
         if (!file) {
             LOG_WARNING(Render_Vulkan, "Shader AOT: cannot write {}", temporary.string());
             return;
@@ -1182,46 +970,22 @@ void PipelineCache::SaveRecipes() {
 void PipelineCache::RecordRecipe(Shader::Stage stage, const Shader::Info& info,
                                  const Shader::RuntimeInfo& runtime_info,
                                  const Shader::Backend::Bindings& binding_in) {
-    namespace TC = VideoCommon::TranslationCache;
     if (!aot_emit_variants || info.loads.Legacy() || info.stores.Legacy()) {
         return;
     }
-    const TC::Digest digest =
-        TC::MakeVariantKey(TC::Digest{}, TC::DigestRuntimeInfo(runtime_info), binding_in);
-    static constexpr size_t MaxPerClass = 8;
-    static constexpr size_t MaxClasses = 4096;
     std::vector<WaitingSeed> ready;
     {
         std::scoped_lock lock{recipe_mutex};
-        const u64 own_class = RecipeClass(stage, &info);
-        for (const u64 class_key : {own_class, RecipeClass(stage, nullptr)}) {
-            if (!recipes.contains(class_key) && recipes.size() >= MaxClasses) {
-                continue;
-            }
-            auto& list = recipes[class_key];
-            if (!recipe_class_ids.contains(class_key)) {
-                const bool by_loads = class_key == own_class;
-                recipe_class_ids.emplace(
-                    class_key, RecipeClassId{stage, by_loads,
-                                             by_loads ? info.loads.mask : std::bitset<512>{}});
-            }
-            recipes_dirty = true;
-            const auto it = std::ranges::find(list, digest, &EmissionRecipe::digest);
-            if (it != list.end()) {
-                ++it->count;
-                it->seen = true;
-            } else if (list.size() < MaxPerClass) {
-                list.push_back({runtime_info, binding_in, digest, 1, true});
-                // The class's first recipe: seeds of the class emitted with a stage-level
-                // guess get a module for it now, usually before their own first draw.
-                if (list.size() == 1 && class_key == own_class) {
-                    if (const auto waiting = waiting_seeds.find(class_key);
-                        waiting != waiting_seeds.end()) {
-                        ready = std::move(waiting->second);
-                        waiting_count -= ready.size();
-                        waiting_seeds.erase(waiting);
-                    }
-                }
+        recipes_dirty = true;
+        // The class's first recipe: seeds of the class emitted with a stage-level guess get a
+        // module for it now, usually before their own first draw.
+        if (recipe_histogram.Record(stage, info.loads.mask, runtime_info, binding_in)) {
+            const u64 class_key = VideoCommon::RecipeHistogram::ClassKey(stage, &info.loads.mask);
+            if (const auto waiting = waiting_seeds.find(class_key);
+                waiting != waiting_seeds.end()) {
+                ready = std::move(waiting->second);
+                waiting_count -= ready.size();
+                waiting_seeds.erase(waiting);
             }
         }
     }
@@ -1243,13 +1007,12 @@ void PipelineCache::ParkSeed(const std::shared_ptr<VideoCommon::ReplayEnvironmen
         }
     };
     static constexpr size_t MaxWaiting = 2048;
-    const u64 class_key = RecipeClass(stage, &info);
+    const u64 class_key = VideoCommon::RecipeHistogram::ClassKey(stage, &info.loads.mask);
     {
         std::scoped_lock lock{recipe_mutex};
         // The class's first recipe may have been recorded since this seed chose a stage-level
         // one: that recording drained the waiting list already, so emit now instead of parking.
-        const auto known = recipes.find(class_key);
-        if (known == recipes.end() || known->second.empty()) {
+        if (!recipe_histogram.HasRecipes(class_key)) {
             if (waiting_count >= MaxWaiting) {
                 ++aot_waiting_dropped;
                 return;
@@ -1349,19 +1112,11 @@ std::optional<PipelineCache::EmissionRecipe> PipelineCache::BestRecipe(Shader::S
                                                                       const Shader::Info& info,
                                                                       bool& class_match) {
     std::scoped_lock lock{recipe_mutex};
-    for (const bool by_class : {true, false}) {
-        const auto it = recipes.find(RecipeClass(stage, by_class ? &info : nullptr));
-        if (it == recipes.end() || it->second.empty()) {
-            continue;
-        }
-        class_match = by_class;
-        const EmissionRecipe& best = *std::ranges::max_element(it->second, {}, &EmissionRecipe::count);
-        if (!best.seen) {
-            ++aot_variants_from_file;
-        }
-        return best;
+    auto best = recipe_histogram.Best(stage, info.loads.mask, class_match);
+    if (best && !best->seen) {
+        ++aot_variants_from_file;
     }
-    return std::nullopt;
+    return best;
 }
 
 size_t PipelineCache::AotWorkerCount() {
