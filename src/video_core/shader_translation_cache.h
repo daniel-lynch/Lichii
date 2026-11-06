@@ -210,6 +210,13 @@ void WriteInfo(std::vector<u8>& out, const Shader::Info& info);
 /// write yet; the cache is then off rather than handing pipelines an incomplete info.
 [[nodiscard]] bool LayoutIsCovered();
 
+struct EmissionRecipe {
+    Shader::RuntimeInfo runtime{};
+    Shader::Backend::Bindings bindings{};
+};
+
+[[nodiscard]] EmissionRecipe DefaultEmissionRecipe(Shader::Stage stage);
+
 class Store {
 public:
     Store() = default;
@@ -219,6 +226,7 @@ public:
     /// differs. An empty path keeps the cache in memory only.
     void Open(const std::filesystem::path& path, const Digest& config);
     void Close();
+    [[nodiscard]] bool Persistent();
 
     [[nodiscard]] bool Enabled() const noexcept {
         return enabled;
@@ -233,7 +241,12 @@ public:
     /// Adds an entry (when new) and a variant, and appends both to the file.
     std::shared_ptr<const Entry> Insert(const Digest& stage_key, std::vector<Query> queries,
                                         const ProgramMeta& meta);
-    void InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant);
+    void InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant,
+                       const EmissionRecipe* recipe = nullptr);
+
+    /// Reads recipes without modifying the source cache, including an incomplete tail.
+    [[nodiscard]] static std::array<EmissionRecipe, Shader::MaxStageTypes> ReadRecipes(
+        const std::filesystem::path& path, const Digest& config);
 
     void LogStatistics(std::string_view when);
 
@@ -253,7 +266,15 @@ private:
 
     std::shared_ptr<const Entry> InsertLocked(Entry entry);
     void Append(const std::vector<u8>& record);
-    bool LoadFile(const std::filesystem::path& path, const Digest& config);
+    bool LoadFile(const std::filesystem::path& path, const Digest& config, bool writable = true);
+
+    struct RecipeCount {
+        EmissionRecipe recipe;
+        Shader::Stage stage;
+        u64 count{};
+    };
+    void CountRecipe(Shader::Stage stage, const EmissionRecipe& recipe);
+    std::unordered_map<Digest, RecipeCount, DigestHash> recipes;
 
     std::mutex mutex;
     bool enabled{};

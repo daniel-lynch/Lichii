@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <stdexcept>
+#include <tuple>
 #include <bit>
 #include <chrono>
 #include <cstdlib>
@@ -38,7 +40,8 @@ namespace {
 // the configuration digest and named in the file name, so it needs no version of its own.
 // 6 is used by the sibling AOT branch (also stores mesh metadata).
 // 7: Class-level texture replay without the sibling branch's mesh metadata layout.
-constexpr u32 FormatVersion = 7;
+// 8: Variants optionally carry their emission recipe for archive producers.
+constexpr u32 FormatVersion = 8;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
@@ -689,6 +692,102 @@ Digest MakeConfigDigest(const Shader::Profile& profile, const Shader::HostTransl
     return hasher.Finish();
 }
 
+EmissionRecipe DefaultEmissionRecipe(Shader::Stage stage) {
+    EmissionRecipe recipe;
+    recipe.runtime.previous_stage_stores.mask.set();
+    if (stage == Shader::Stage::Geometry) {
+        recipe.runtime.input_topology = Shader::InputTopology::Triangles;
+    }
+    return recipe;
+}
+
+namespace {
+#define RECIPE_FIELDS(X) \
+    X(generic_input_types) X(previous_stage_stores.mask) X(per_primitive_generics) \
+    X(convert_depth_mode) X(force_early_z) X(tess_primitive) X(tess_spacing) \
+    X(tess_clockwise) X(input_topology) X(alpha_test_reference) X(y_negate) \
+    X(glasm_use_storage_buffers) X(xfb_count) X(color_output_types) X(dual_source_blend)
+
+void WriteRecipe(Writer& writer, const EmissionRecipe& recipe) {
+    writer.Put(recipe.bindings);
+    const auto& info = recipe.runtime;
+#define WRITE_RECIPE(field) writer.Put(info.field);
+    RECIPE_FIELDS(WRITE_RECIPE)
+#undef WRITE_RECIPE
+    writer.Put(info.fixed_state_point_size.has_value());
+    writer.Put(info.fixed_state_point_size.value_or(0));
+    writer.Put(info.alpha_test_func.has_value());
+    writer.Put(info.alpha_test_func.value_or(Shader::CompareFunction{}));
+    writer.Put(static_cast<u32>(info.previous_stage_legacy_stores_mapping.size()));
+    for (const auto& [from, to] : info.previous_stage_legacy_stores_mapping) {
+        writer.Put(from);
+        writer.Put(to);
+    }
+    for (u32 i = 0; i < info.xfb_count; ++i) {
+        writer.Put(info.xfb_varyings[i]);
+    }
+}
+
+bool ReadRecipe(Reader& reader, EmissionRecipe& recipe) {
+    if (!reader.Get(recipe.bindings)) return false;
+    auto& info = recipe.runtime;
+#define READ_RECIPE(field) if (!reader.Get(info.field)) return false;
+    RECIPE_FIELDS(READ_RECIPE)
+#undef READ_RECIPE
+    bool has_point{}, has_alpha{};
+    float point{};
+    Shader::CompareFunction alpha{};
+    u32 count{};
+    if (!reader.Get(has_point) || !reader.Get(point) || !reader.Get(has_alpha) ||
+        !reader.Get(alpha) || !reader.Get(count) || count > 512 ||
+        info.xfb_count > info.xfb_varyings.size()) return false;
+    if (has_point) info.fixed_state_point_size = point;
+    if (has_alpha) info.alpha_test_func = alpha;
+    for (u32 i = 0; i < count; ++i) {
+        Shader::IR::Attribute from{}, to{};
+        if (!reader.Get(from) || !reader.Get(to)) return false;
+        info.previous_stage_legacy_stores_mapping.emplace(from, to);
+    }
+    for (u32 i = 0; i < info.xfb_count; ++i) {
+        if (!reader.Get(info.xfb_varyings[i])) return false;
+    }
+    return true;
+}
+#undef RECIPE_FIELDS
+} // namespace
+
+void Store::CountRecipe(Shader::Stage stage, const EmissionRecipe& recipe) {
+    const auto key = MakeVariantKey({static_cast<u64>(stage), 0},
+                                    DigestRuntimeInfo(recipe.runtime), recipe.bindings);
+    auto [it, inserted] = recipes.try_emplace(key, RecipeCount{recipe, stage, 0});
+    ++it->second.count;
+}
+
+std::array<EmissionRecipe, Shader::MaxStageTypes> Store::ReadRecipes(
+    const std::filesystem::path& path, const Digest& config) {
+    Store source;
+    if (!source.LoadFile(path, config, false)) {
+        throw std::runtime_error("Recipe cache is missing or has an incompatible configuration");
+    }
+    std::array<EmissionRecipe, Shader::MaxStageTypes> result;
+    std::array<u64, Shader::MaxStageTypes> counts{};
+    std::array<Digest, Shader::MaxStageTypes> keys{};
+    for (size_t i = 0; i < result.size(); ++i) {
+        result[i] = DefaultEmissionRecipe(static_cast<Shader::Stage>(i));
+    }
+    for (const auto& [key, value] : source.recipes) {
+        const auto stage = static_cast<size_t>(value.stage);
+        if (stage >= result.size()) continue;
+        if (value.count > counts[stage] || (value.count == counts[stage] &&
+            std::tie(key.lo, key.hi) < std::tie(keys[stage].lo, keys[stage].hi))) {
+            counts[stage] = value.count;
+            keys[stage] = key;
+            result[stage] = value.recipe;
+        }
+    }
+    return result;
+}
+
 Digest DigestRuntimeInfo(const Shader::RuntimeInfo& info) {
     Hasher hasher;
     hasher.Add(info.generic_input_types);
@@ -874,6 +973,11 @@ Store::~Store() {
     Close();
 }
 
+bool Store::Persistent() {
+    std::scoped_lock lock{mutex};
+    return file.is_open() && file.good();
+}
+
 void Store::Close() {
     std::scoped_lock lock{mutex};
     if (file.is_open()) {
@@ -882,6 +986,7 @@ void Store::Close() {
     }
     entries.clear();
     variants.clear();
+    recipes.clear();
     enabled = false;
 }
 
@@ -923,7 +1028,7 @@ void Store::Open(const std::filesystem::path& path, const Digest& config) {
                  .count());
 }
 
-bool Store::LoadFile(const std::filesystem::path& path, const Digest& config) {
+bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bool writable) {
     loaded_entries = 0;
     loaded_variants = 0;
     std::ifstream in{path, std::ios::binary | std::ios::ate};
@@ -973,8 +1078,17 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config) {
             auto stored = std::make_shared<StoredVariant>();
             ok = reader.Get(key) && reader.Get(stored->binding_out) &&
                  ReadInfo(record, stored->info) && reader.Get(stored->spirv_words) &&
-                 reader.GetBytes(stored->compressed_spirv) && record.empty();
+                 reader.GetBytes(stored->compressed_spirv);
+            bool has_recipe{};
+            Shader::Stage stage{};
+            EmissionRecipe recipe;
+            ok = ok && reader.Get(has_recipe);
+            if (ok && has_recipe) {
+                ok = reader.Get(stage) && ReadRecipe(reader, recipe);
+            }
+            ok = ok && record.empty();
             if (ok) {
+                if (has_recipe && !variants.contains(key)) CountRecipe(stage, recipe);
                 variants.insert_or_assign(key, std::move(stored));
                 ++loaded_variants;
             }
@@ -986,6 +1100,7 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config) {
         }
         offset += 8 + length;
     }
+    if (!writable) return true;
     if (offset != size) {
         // A record cut short (the emulator stopped while writing) or damaged: keep what precedes.
         LOG_WARNING(Render_Vulkan, "Translation cache: dropping {} bytes after offset {}",
@@ -993,11 +1108,12 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config) {
         std::error_code ec;
         std::filesystem::resize_file(path, offset, ec);
         if (ec) {
-            return false;
+            throw std::runtime_error("Translation cache: cannot repair incomplete tail");
         }
     }
     file.open(path, std::ios::binary | std::ios::app);
-    return file.is_open();
+    if (!file.is_open()) throw std::runtime_error("Translation cache: cannot append");
+    return true;
 }
 
 std::shared_ptr<const Entry> Store::InsertLocked(Entry entry) {
@@ -1084,7 +1200,11 @@ std::shared_ptr<const Entry> Store::Insert(const Digest& stage_key, std::vector<
     return shared;
 }
 
-void Store::InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant) {
+void Store::InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant,
+                          const EmissionRecipe* recipe) {
+    if (recipe && recipe->runtime.xfb_count > recipe->runtime.xfb_varyings.size()) {
+        throw std::runtime_error("Translation cache: invalid recipe");
+    }
     auto stored = std::make_shared<StoredVariant>();
     stored->binding_out = variant.binding_out;
     stored->info = variant.info;
@@ -1100,12 +1220,18 @@ void Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
         WriteInfo(record, stored->info);
         writer.Put(stored->spirv_words);
         writer.PutBytes(stored->compressed_spirv.data(), stored->compressed_spirv.size());
+        writer.Put(recipe != nullptr);
+        if (recipe) {
+            writer.Put(entry.meta.stage);
+            WriteRecipe(writer, *recipe);
+        }
     }
     std::scoped_lock lock{mutex};
     if (!enabled) {
         return;
     }
     if (variants.try_emplace(variant_key, std::move(stored)).second) {
+        if (recipe) CountRecipe(entry.meta.stage, *recipe);
         Append(record);
     }
 }
