@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <chrono>
 #include <cstddef>
 #include <deque>
@@ -40,6 +41,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache_prebuild.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/shader_cache.h"
+#include "video_core/shader_recipe_histogram.h"
 #include "video_core/shader_translation_cache.h"
 
 namespace Core {
@@ -253,8 +255,8 @@ private:
     /// Ahead-of-time translation of recognised pool programs (ShaderCache::seed_stage): the
     /// GPU thread builds the environment and an owned copy of it; a worker translates the copy,
     /// which answers no queries, and stores programs that needed none as ordinary entries.
-    bool SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_hash, size_t slot,
-                   std::span<const u8> constants, u8 tier);
+    VideoCommon::SeedResult SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_hash,
+                                      size_t slot, std::span<const u8> constants, u8 tier);
     [[nodiscard]] static size_t AotWorkerCount();
     size_t aot_worker_count{};
     static constexpr u64 MaxAotPending = 32;
@@ -300,16 +302,24 @@ private:
     /// and loaded varyings), so its first draw neither translates nor emits. A wrong guess is
     /// never used: the variant key holds the runtime info and the bindings. Off with
     /// EDEN_NX2_AOT_EMIT=0.
-    struct EmissionRecipe {
-        Shader::RuntimeInfo runtime_info;
-        Shader::Backend::Bindings binding_in{};
-        VideoCommon::TranslationCache::Digest digest{};
-        u64 count{};
-    };
+    using EmissionRecipe = VideoCommon::RecipeHistogram::Recipe;
     bool aot_emit_variants{};
     std::mutex recipe_mutex;
-    /// Class key -> recipes seen (a few per class; key 0 of a stage holds the stage's recipes).
-    std::unordered_map<u64, std::vector<EmissionRecipe>> recipes;
+    VideoCommon::RecipeHistogram recipe_histogram; ///< Under recipe_mutex
+    /// The recipe histogram is kept next to the translation file
+    /// (vulkan_translations.<tag>.recipes.fork-vN.bin), so a later session guesses from the
+    /// start. Loaded when the translation file is opened, written every 30 s when it changed
+    /// and at shutdown.
+    std::filesystem::path recipes_filename;
+    /// The histogram revision last written (or loaded), under recipe_mutex. A save that fails
+    /// leaves it behind, so the next save retries; a successful one records only the revision
+    /// of its snapshot.
+    u64 recipes_saved_revision{};
+    size_t recipes_loaded{};
+    size_t recipe_classes_loaded{};
+    void LoadRecipes();
+    void SaveRecipes();
+    std::atomic<u64> aot_variants_from_file{}; ///< Seeds emitted with a recipe not seen yet
     /// A plain vertex-B + fragment pipeline's stage was emitted (or taken from the cache) with
     /// this runtime info and these bindings in.
     void RecordRecipe(Shader::Stage stage, const Shader::Info& info,
@@ -343,6 +353,15 @@ private:
                   const std::shared_ptr<const VideoCommon::TranslationCache::Entry>& entry,
                   Shader::Stage stage, const Shader::Info& info, u64 bytes, u64 generation);
     void EmitWaitingSeeds(std::vector<WaitingSeed> seeds);
+    /// Seeds whose class's recipe was seen, waiting for a pending slot (under recipe_mutex).
+    std::deque<WaitingSeed> ready_seeds;
+    size_t ready_seeds_peak{};
+    void PumpReadySeeds();
+    /// Takes one of the MaxAotPending slots atomically (fresh seeds and re-emissions alike).
+    [[nodiscard]] bool TryReservePending();
+    /// Gives a slot back and lets a waiting re-emission take it.
+    void ReleasePending();
+    void EmitWaitingSeed(const WaitingSeed& seed);
     std::atomic<u64> aot_parked{};
     std::atomic<u64> aot_waiting_dropped{};
     std::atomic<u64> aot_late_variants{};

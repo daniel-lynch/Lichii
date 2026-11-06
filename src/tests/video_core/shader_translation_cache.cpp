@@ -9,12 +9,15 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <catch2/catch_test_macros.hpp>
+#include "common/shader_aot_scene.h"
 #include "common/logging.h"
 #include "common/fs/path_util.h"
 #include "video_core/shader_pool_index.h"
+#include "video_core/shader_recipe_histogram.h"
 #include "shader_recompiler/translator_identity.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "video_core/shader_translation_cache.h"
@@ -519,6 +522,109 @@ TEST_CASE("AOT scene manifest marks indexed programs by tier and keeps the bank-
     REQUIRE_FALSE(ShaderPoolIndex::ParseManifest("not json", rows));
 }
 
+TEST_CASE("AOT scene manifests replace the previous scene's tiers and keep the global ones",
+          "[video_core][translation_cache]") {
+    using VideoCommon::ShaderPoolIndex;
+    using Row = ShaderPoolIndex::ManifestRow;
+    std::vector<ShaderPoolIndex::Container> containers(1);
+    containers[0].programs.push_back({0x000, 0x100, 0, 0x10, ~0U, 0});
+    containers[0].programs.push_back({0x100, 0x100, 4, 0x11, 0xc0, 8});
+    containers[0].programs.push_back({0x200, 0x100, 0, 0x12, ~0U, 0});
+    auto index = ShaderPoolIndex::ForTesting(std::move(containers));
+    const auto& programs = index->Containers()[0].programs;
+    // The global manifest: program 0 at tier 2.
+    const std::vector<Row> global{Row{0x10, 0x000, 0x100, 0, 2}};
+    REQUIRE(index->ApplyManifest(global) == 1);
+    index->KeepTiersAsGlobal();
+    // Scene A: programs 0 (tier 1, lower than the global tier) and 1 (with bank-1 words).
+    const std::vector<Row> scene_a{Row{0x10, 0x000, 0x100, 0, 1},
+                                   Row{0x11, 0x100, 0x100, 4, 3, 0xc0, {5, 6}}};
+    REQUIRE(index->SelectSceneRows(scene_a) == 2);
+    REQUIRE(programs[0].tier == 1);
+    REQUIRE(programs[1].tier == 3);
+    REQUIRE(programs[1].manifest_bank1 == 0);
+    REQUIRE(programs[2].tier == ShaderPoolIndex::NoTier);
+    // Scene B names program 2 only: A's tiers go, the global tier comes back.
+    const std::vector<Row> scene_b{Row{0x12, 0x200, 0x100, 0, 1}, Row{0x99, 0x300, 0x80, 0, 1}};
+    REQUIRE(index->SelectSceneRows(scene_b) == 1);
+    REQUIRE(programs[0].tier == 2);
+    REQUIRE(programs[1].tier == ShaderPoolIndex::NoTier);
+    REQUIRE(programs[1].manifest_bank1 == ~0U);
+    REQUIRE(programs[2].tier == 1);
+    // Back to A: the same tiers and a fresh bank-1 slot.
+    REQUIRE(index->SelectSceneRows(scene_a) == 2);
+    REQUIRE(programs[1].tier == 3);
+    REQUIRE(programs[1].manifest_bank1 == 0);
+    REQUIRE(programs[2].tier == ShaderPoolIndex::NoTier);
+}
+
+TEST_CASE("AOT scene hints: placement reads count before the first entry only",
+          "[video_core][translation_cache]") {
+    namespace Scene = Common::ShaderAotScene;
+    const u64 session = Scene::BeginSession();
+    u64 generation{};
+    const u64 start = Scene::Generation();
+    Scene::Post("TestTitle_Child", false, session); // boot: the save's scene behind the title
+    REQUIRE(Scene::Current(generation) == "TestTitle_Child");
+    REQUIRE(generation == start + 1);
+    Scene::Post("TestTitle_Child", true, session); // entering it changes nothing
+    REQUIRE(Scene::Generation() == start + 1);
+    const u64 prefetches = Scene::Prefetches();
+    Scene::Post("TestField_Child", false, session); // a neighbour prefetched after the entry
+    REQUIRE(Scene::Current(generation) == "TestTitle_Child");
+    REQUIRE(Scene::Prefetches() == prefetches + 1);
+    Scene::Post("TestField_Child", true, session);
+    REQUIRE(Scene::Current(generation) == "TestField_Child");
+    REQUIRE(generation == start + 2);
+}
+
+TEST_CASE("AOT scene hints belong to one emulation session",
+          "[video_core][translation_cache]") {
+    namespace Scene = Common::ShaderAotScene;
+    u64 generation{};
+    const u64 first = Scene::BeginSession();
+    Scene::SetHookedFiles(240, first);
+    Scene::Post("TestA_Child", false, first);
+    Scene::Post("TestA_Child", true, first);
+    REQUIRE(Scene::HookedFiles() == 240);
+    // The next game: nothing of the first session is left, the zero-hook case included.
+    const u64 before = Scene::Generation();
+    const u64 second = Scene::BeginSession();
+    REQUIRE(second != first);
+    REQUIRE(Scene::Generation() != before);
+    REQUIRE(Scene::HookedFiles() == 0);
+    REQUIRE(Scene::Current(generation).empty());
+    // A wrapper of the first session (its RomFS outlived the boundary) posts nothing.
+    Scene::Post("TestB_Child", true, first);
+    Scene::SetHookedFiles(240, first);
+    REQUIRE(Scene::Current(generation).empty());
+    REQUIRE(Scene::HookedFiles() == 0);
+    // Boot placement reads name the scene again, since nothing has been entered yet.
+    Scene::Post("TestB_Child", false, second);
+    REQUIRE(Scene::Current(generation) == "TestB_Child");
+}
+
+TEST_CASE("AOT scene names come from the placement and parameter files only",
+          "[video_core][translation_cache]") {
+    using Common::ShaderAotScene::SceneOfPath;
+    const auto placement = SceneOfPath("/Banc/KokiriForest/KokiriForest_Child_Static.bcett.byml.zs");
+    REQUIRE(placement.has_value());
+    REQUIRE(placement->scene == "KokiriForest_Child");
+    REQUIRE_FALSE(placement->entered);
+    REQUIRE(SceneOfPath("Banc/HyruleField/HyruleField_Adult_Dynamic.bcett.byml.zs")->scene ==
+            "HyruleField_Adult");
+    const auto param =
+        SceneOfPath("/Banc/GameBancParam/KokiriForest_Child.game__banc__GameBancParam.bgyml");
+    REQUIRE(param.has_value());
+    REQUIRE(param->scene == "KokiriForest_Child");
+    REQUIRE(param->entered);
+    REQUIRE_FALSE(SceneOfPath("/Banc/GameBancParam/X_Static.bcett.byml.zs").has_value());
+    REQUIRE_FALSE(SceneOfPath("/Banc/BancBasedResource/StartPos.byml.zs").has_value());
+    REQUIRE_FALSE(SceneOfPath("/Banc/A/B/C_Static.bcett.byml.zs").has_value());
+    REQUIRE_FALSE(SceneOfPath("/Banc/KokiriForest/_Static.bcett.byml.zs").has_value());
+    REQUIRE_FALSE(SceneOfPath("/Pack/Banc/X/Y_Static.bcett.byml.zs").has_value());
+}
+
 namespace {
 // What the texture pass does for one handle: Begin, the two word reads, End.
 u32 ReadHandle(Shader::Environment& env, const Shader::ConstBufferAddr& cbuf) {
@@ -735,6 +841,288 @@ TEST_CASE("Translation cache identifies the translator by its source",
     }
 }
 
+namespace {
+// A recipe distinguished by its uniform-buffer binding base (made-up values).
+Shader::RuntimeInfo RecipeInfo(u32 variant) {
+    Shader::RuntimeInfo info{};
+    info.generic_input_types[0] = Shader::AttributeType::Float;
+    info.previous_stage_stores.mask.set(variant % 512);
+    info.y_negate = (variant & 1) != 0;
+    info.alpha_test_func = Shader::CompareFunction::Greater;
+    info.xfb_count = 1;
+    info.xfb_varyings[0].components = 4;
+    return info;
+}
+Shader::Backend::Bindings RecipeBindings(u32 variant) {
+    Shader::Backend::Bindings bindings{};
+    bindings.uniform_buffer = variant;
+    return bindings;
+}
+} // Anonymous namespace
+
+TEST_CASE("AOT recipe histogram picks the class's most common recipe and round-trips",
+          "[video_core][translation_cache]") {
+    using VideoCommon::RecipeHistogram;
+    const VideoCommon::TranslationCache::Digest config{1, 2};
+    std::bitset<512> loads_a, loads_b;
+    loads_a.set(40);
+    loads_b.set(41);
+    RecipeHistogram histogram;
+    REQUIRE(histogram.Record(Shader::Stage::Fragment, loads_a, RecipeInfo(1), RecipeBindings(1)));
+    REQUIRE_FALSE(
+        histogram.Record(Shader::Stage::Fragment, loads_a, RecipeInfo(2), RecipeBindings(2)));
+    histogram.Record(Shader::Stage::Fragment, loads_a, RecipeInfo(2), RecipeBindings(2));
+    histogram.Record(Shader::Stage::Fragment, loads_a, RecipeInfo(2), RecipeBindings(2));
+    bool class_match = false;
+    auto best = histogram.Best(Shader::Stage::Fragment, loads_a, class_match);
+    REQUIRE(best.has_value());
+    REQUIRE(class_match);
+    REQUIRE(best->binding_in.uniform_buffer == 2);
+    // Another class of the stage falls back to the stage's recipes.
+    best = histogram.Best(Shader::Stage::Fragment, loads_b, class_match);
+    REQUIRE(best.has_value());
+    REQUIRE_FALSE(class_match);
+
+    const std::vector<u8> data = histogram.Serialize(config);
+    RecipeHistogram loaded;
+    std::string why;
+    REQUIRE(loaded.Load(data, config, why));
+    REQUIRE(loaded.Classes() == histogram.Classes());
+    REQUIRE(loaded.Recipes() == histogram.Recipes());
+    best = loaded.Best(Shader::Stage::Fragment, loads_a, class_match);
+    REQUIRE(best.has_value());
+    REQUIRE_FALSE(best->seen);
+    REQUIRE(best->runtime_info.alpha_test_func == Shader::CompareFunction::Greater);
+    REQUIRE(best->runtime_info.xfb_count == 1);
+    REQUIRE(best->binding_in.uniform_buffer == 2);
+    REQUIRE(best->count == 2); // 3 halved, rounded up
+
+    REQUIRE_FALSE(loaded.Load(data, VideoCommon::TranslationCache::Digest{9, 9}, why));
+    REQUIRE(loaded.Classes() == 0);
+    std::vector<u8> truncated(data.begin(), data.end() - 3);
+    REQUIRE_FALSE(loaded.Load(truncated, config, why));
+    REQUIRE(loaded.Classes() == 0);
+}
+
+TEST_CASE("AOT recipe file: atomic replacement through a unique temporary file",
+          "[video_core][translation_cache]") {
+    const auto dir = TempPath("eden-aot-recipe-write");
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto path = dir / "recipes.bin";
+    std::string why;
+    const std::vector<u8> first{1, 2, 3}, second{4, 5, 6, 7};
+    REQUIRE(VideoCommon::WriteFileAtomically(path, first, why));
+    // A stale temporary of another writer under the old fixed name is neither used nor touched.
+    {
+        std::ofstream stale{dir / "recipes.bin.tmp", std::ios::binary};
+        stale << "other writer";
+    }
+    REQUIRE(VideoCommon::WriteFileAtomically(path, second, why));
+    std::ifstream in{path, std::ios::binary};
+    const std::vector<u8> read{std::istreambuf_iterator<char>{in}, {}};
+    REQUIRE(read == second);
+    size_t files = 0;
+    for ([[maybe_unused]] const auto& item : std::filesystem::directory_iterator(dir)) {
+        ++files;
+    }
+    REQUIRE(files == 2); // the file and the stale temporary, no temporary of ours left
+    // A missing directory fails without leaving anything behind.
+    REQUIRE_FALSE(VideoCommon::WriteFileAtomically(dir / "missing" / "recipes.bin", first, why));
+    REQUIRE_FALSE(why.empty());
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("AOT recipe file: oversized, repeated classes and repeated recipes are refused",
+          "[video_core][translation_cache]") {
+    using VideoCommon::RecipeHistogram;
+    const VideoCommon::TranslationCache::Digest config{3, 4};
+    std::bitset<512> loads;
+    loads.set(7);
+    RecipeHistogram histogram;
+    histogram.Record(Shader::Stage::Fragment, loads, RecipeInfo(1), RecipeBindings(1));
+    std::vector<u8> data = histogram.Serialize(config);
+    std::string why;
+    RecipeHistogram loaded;
+    REQUIRE(loaded.Load(data, config, why));
+    REQUIRE(loaded.Classes() == 2); // the class and its stage
+
+    // A size above the format's maximum is refused before anything is read.
+    std::istringstream empty{std::string{}};
+    REQUIRE_FALSE(loaded.Load(empty, RecipeHistogram::MaxFileBytes() + 1, config, why));
+    REQUIRE(why == "larger than the format allows");
+    REQUIRE(loaded.Classes() == 0);
+
+    // The class count is at offset 28 (magic, version, configuration digest): claim both
+    // classes twice by appending the class records again.
+    std::vector<u8> doubled = data;
+    doubled.insert(doubled.end(), data.begin() + 32, data.end());
+    const u32 four = 4;
+    std::memcpy(doubled.data() + 28, &four, sizeof(four));
+    REQUIRE_FALSE(loaded.Load(doubled, config, why));
+    REQUIRE(why == "a class repeated");
+
+    // One class whose two recipes are the same. The file holds two classes (the program's and
+    // its stage's), one recipe each, of the same size; take the first and repeat its recipe.
+    const size_t header = 32; // magic, version, configuration digest, class count
+    const size_t stage_size = sizeof(Shader::Stage);
+    const size_t heads = 2 * (stage_size + 1 + 4) + 64;
+    const size_t recipe_size = (data.size() - header - heads) / 2;
+    const bool first_has_loads = data[header + stage_size] != 0;
+    const size_t count_at = header + stage_size + 1 + (first_has_loads ? 64 : 0);
+    const size_t recipe_begin = count_at + 4;
+    std::vector<u8> repeated(data.begin(),
+                             data.begin() + static_cast<std::ptrdiff_t>(recipe_begin + recipe_size));
+    repeated.insert(repeated.end(), data.begin() + static_cast<std::ptrdiff_t>(recipe_begin),
+                    data.begin() + static_cast<std::ptrdiff_t>(recipe_begin + recipe_size));
+    const u32 two = 2, one_class = 1;
+    std::memcpy(repeated.data() + count_at, &two, sizeof(two));
+    std::memcpy(repeated.data() + 28, &one_class, sizeof(one_class));
+    REQUIRE_FALSE(loaded.Load(repeated, config, why));
+    REQUIRE(why == "a recipe repeated in its class");
+}
+
+TEST_CASE("AOT recipe histogram revisions tell a pending save",
+          "[video_core][translation_cache]") {
+    using VideoCommon::RecipeHistogram;
+    std::bitset<512> loads;
+    loads.set(9);
+    RecipeHistogram histogram;
+    const u64 empty = histogram.Revision();
+    histogram.Record(Shader::Stage::VertexB, loads, RecipeInfo(1), RecipeBindings(1));
+    const u64 snapshot = histogram.Revision();
+    REQUIRE(snapshot != empty);
+    // A recording made while the snapshot is written leaves a newer revision pending.
+    histogram.Record(Shader::Stage::VertexB, loads, RecipeInfo(1), RecipeBindings(1));
+    REQUIRE(histogram.Revision() > snapshot);
+    // A failed write (here: into a missing directory) reports it, so the caller keeps the
+    // revision pending.
+    std::string why;
+    REQUIRE_FALSE(VideoCommon::WriteFileAtomically(
+        TempPath("eden-aot-missing-dir") / "x" / "recipes.bin",
+        histogram.Serialize(VideoCommon::TranslationCache::Digest{}), why));
+}
+
+TEST_CASE("AOT recipe histogram: a full persisted class learns a new dominant recipe",
+          "[video_core][translation_cache]") {
+    using VideoCommon::RecipeHistogram;
+    const VideoCommon::TranslationCache::Digest config{5, 6};
+    std::bitset<512> loads;
+    loads.set(11);
+    RecipeHistogram earlier;
+    for (u32 variant = 0; variant < RecipeHistogram::MaxPerClass; ++variant) {
+        for (int i = 0; i < 4; ++i) {
+            earlier.Record(Shader::Stage::Fragment, loads, RecipeInfo(variant),
+                           RecipeBindings(variant));
+        }
+    }
+    RecipeHistogram histogram;
+    std::string why;
+    REQUIRE(histogram.Load(earlier.Serialize(config), config, why));
+    REQUIRE(histogram.Recipes() == 2 * RecipeHistogram::MaxPerClass); // class and stage, full
+    // A recipe the earlier sessions never saw, now the common one.
+    const u32 fresh = 100;
+    bool class_match = false;
+    for (int i = 0; i < 3; ++i) {
+        histogram.Record(Shader::Stage::Fragment, loads, RecipeInfo(fresh), RecipeBindings(fresh));
+    }
+    REQUIRE(histogram.Recipes() == 2 * RecipeHistogram::MaxPerClass);
+    auto best = histogram.Best(Shader::Stage::Fragment, loads, class_match);
+    REQUIRE(best.has_value());
+    REQUIRE(class_match);
+    REQUIRE(best->binding_in.uniform_buffer == fresh); // 3 against the halved 2
+    REQUIRE(best->seen);
+
+    // In-session: a full class of recipes seen twice keeps them against a one-off.
+    RecipeHistogram session;
+    for (u32 variant = 0; variant < RecipeHistogram::MaxPerClass; ++variant) {
+        session.Record(Shader::Stage::Fragment, loads, RecipeInfo(variant),
+                       RecipeBindings(variant));
+        session.Record(Shader::Stage::Fragment, loads, RecipeInfo(variant),
+                       RecipeBindings(variant));
+    }
+    session.Record(Shader::Stage::Fragment, loads, RecipeInfo(fresh), RecipeBindings(fresh));
+    best = session.Best(Shader::Stage::Fragment, loads, class_match);
+    REQUIRE(best->binding_in.uniform_buffer != fresh);
+}
+
+TEST_CASE("AOT candidates without room go back to the queue in order",
+          "[video_core][translation_cache]") {
+    using VideoCommon::ShaderPoolIndex;
+    auto index = ShaderPoolIndex::ForTesting({});
+    for (u32 i = 0; i < 4; ++i) {
+        index->QueueForTesting({0x1000 + i * 0x100, 0, 1, ~0U, 0, ~0U});
+    }
+    auto taken = index->TakeCandidates(4);
+    REQUIRE(taken.size() == 4);
+    REQUIRE(index->QueuedCandidates() == 0);
+    // One slot was free: the first is seeded, the other three wait for room.
+    index->Acknowledge(taken[0]);
+    index->ReturnCandidates(std::span{taken}.subspan(1));
+    REQUIRE(index->QueuedCandidates() == 3);
+    REQUIRE(index->HasManifestCandidates());
+    const auto again = index->TakeCandidates(4);
+    REQUIRE(again.size() == 3);
+    REQUIRE(again[0].address == taken[1].address);
+    REQUIRE(again[2].address == taken[3].address);
+}
+
+TEST_CASE("AOT recipe histogram: a ninth recipe overtakes eight residents seen more than once",
+          "[video_core][translation_cache]") {
+    using VideoCommon::RecipeHistogram;
+    std::bitset<512> loads;
+    loads.set(13);
+    RecipeHistogram histogram;
+    for (u32 variant = 0; variant < RecipeHistogram::MaxPerClass; ++variant) {
+        for (int i = 0; i < 2; ++i) {
+            histogram.Record(Shader::Stage::Fragment, loads, RecipeInfo(variant),
+                             RecipeBindings(variant));
+        }
+    }
+    const u32 fresh = 200;
+    bool class_match = false;
+    // Twice: tallied aside (2 is not above the residents' 2), still not chosen.
+    for (int i = 0; i < 2; ++i) {
+        histogram.Record(Shader::Stage::Fragment, loads, RecipeInfo(fresh), RecipeBindings(fresh));
+    }
+    REQUIRE(histogram.Best(Shader::Stage::Fragment, loads, class_match)->binding_in.uniform_buffer !=
+            fresh);
+    // The third observation promotes it over the weakest resident; it is now the best.
+    histogram.Record(Shader::Stage::Fragment, loads, RecipeInfo(fresh), RecipeBindings(fresh));
+    REQUIRE(histogram.Recipes() == 2 * RecipeHistogram::MaxPerClass);
+    const auto best = histogram.Best(Shader::Stage::Fragment, loads, class_match);
+    REQUIRE(class_match);
+    REQUIRE(best->binding_in.uniform_buffer == fresh);
+    REQUIRE(best->count == 3);
+}
+
+TEST_CASE("AOT candidates at unmapped addresses are retried a bounded number of times",
+          "[video_core][translation_cache]") {
+    using VideoCommon::ShaderPoolIndex;
+    auto index = ShaderPoolIndex::ForTesting({});
+    const ShaderPoolIndex::Candidate candidate{0x2000, 4, 1, ~0U, 0, ~0U};
+    index->QueueForTesting(candidate);
+    auto now = std::chrono::steady_clock::now();
+    for (u32 attempt = 1; attempt <= ShaderPoolIndex::MaxRetries; ++attempt) {
+        auto taken = index->TakeCandidates(4);
+        REQUIRE(taken.size() == 1);
+        index->Defer(taken[0]); // unmapped when taken
+        now = std::chrono::steady_clock::now();
+        REQUIRE(index->QueuedCandidates() == 0);
+        REQUIRE(index->DeferredCandidates() == 1);
+        index->RequeueDeferred(now); // not yet: it waits for its retry time
+        REQUIRE(index->QueuedCandidates() == 0);
+        index->RequeueDeferred(now + ShaderPoolIndex::RetryInterval * attempt);
+        REQUIRE(index->QueuedCandidates() == 1);
+        REQUIRE(index->DeferredCandidates() == 0);
+    }
+    // One retry too many: dropped (a scene change can still offer it).
+    auto taken = index->TakeCandidates(4);
+    index->Defer(taken[0]);
+    REQUIRE(index->DeferredCandidates() == 0);
+    index->RequeueDeferred(now + std::chrono::hours{1});
+    REQUIRE(index->QueuedCandidates() == 0);
+}
 
 
 TEST_CASE("Class-level replay compares texture classes instead of handle words",

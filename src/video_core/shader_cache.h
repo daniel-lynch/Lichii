@@ -44,6 +44,13 @@ struct ShaderInfo {
     std::shared_ptr<const LoweredNativeCode> lowered_native;
 };
 
+/// What a renderer did with a program offered for translation ahead of time.
+enum class SeedResult {
+    Admitted, ///< A job was queued
+    Rejected, ///< Never: known, in flight, uncacheable or AOT off
+    Retry,    ///< Not now: no pending slot or entry budget; offer it again later
+};
+
 class ShaderCache : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
     static constexpr u64 YUZU_PAGEBITS = 14;
     static constexpr u64 YUZU_PAGESIZE = u64(1) << YUZU_PAGEBITS;
@@ -211,10 +218,10 @@ protected:
     /// thread with a program's environment (built as at first use), its unique hash and its
     /// pipeline slot.
     /// `constants`: the program's bank-1 constant section, read from its pool (may be empty).
-    /// `tier`: its scene-manifest tier (ShaderPoolIndex::NoTier if none). Returns whether a
-    /// job was queued.
-    std::function<bool(GenericEnvironment& env, u64 unique_hash, size_t slot,
-                       std::span<const u8> constants, u8 tier)>
+    /// `tier`: its scene-manifest tier (ShaderPoolIndex::NoTier if none). Says whether a job
+    /// was queued, the program will never be (known, uncacheable), or there is no room now.
+    std::function<SeedResult(GenericEnvironment& env, u64 unique_hash, size_t slot,
+                             std::span<const u8> constants, u8 tier)>
         seed_stage;
     /// Whether seed_stage would take another program now (checked before building one).
     std::function<bool()> seed_has_room;

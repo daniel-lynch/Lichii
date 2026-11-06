@@ -12,6 +12,7 @@
 #include "audio_core/audio_core.h"
 #include "common/fs/fs.h"
 #include "common/logging.h"
+#include "common/shader_aot_scene.h"
 #include "common/nx2_sampler.h"
 #include "common/adpf.h"
 #include "common/settings.h"
@@ -374,6 +375,9 @@ struct System::Impl {
         if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
             fs_controller.InitTempStorage();
         }
+        // Shader AOT scene hints belong to this session: the previous game's scene, entry and
+        // hooked files are forgotten before this game's RomFS is built.
+        Common::ShaderAotScene::BeginSession();
 
         const bool switch2_program =
             virtual_filesystem != nullptr &&

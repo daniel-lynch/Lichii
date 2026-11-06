@@ -28,7 +28,9 @@ before and after and records any change in `run.json` (`live_files_changed`).
 `--cold-shader-cache` runs from a private copy of the profile in `<run>/profile` whose
 `user/cache/shader` is empty: no pipeline cache and no translation cache, so every pipeline is
 built at run time. The shared profile is only read. The driver's own cache (`~/.cache/nvidia`)
-stays warm.
+stays warm. `--cold-shader-seed FILE` (repeatable) copies one file into that empty directory, under its
+parent directory's name (the title id): for example only the shader AOT recipe file of an earlier
+run, to measure a session that starts with the recipes but no translations.
 
 ## How it works
 
