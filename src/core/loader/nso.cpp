@@ -330,14 +330,20 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     }
     LOG_INFO(Loader, "Module {} loaded at {:#x} (size {:#x})", nso_file.GetName(), load_base, image_size);
     if (name == "main" && process.GetProgramId() == Service::Nx2OotTime::ProgramId) {
-        const size_t hook = module_start + Service::Nx2OotTime::HookOffset;
-        u32 word = 0;
-        if (codeset.memory.size() >= hook + sizeof(word)) {
-            std::memcpy(&word, codeset.memory.data() + hook, sizeof(word));
-        }
-        process.SetOotDeltaAddress(word == Service::Nx2OotTime::HookInstruction
-                                       ? load_base + module_start + Service::Nx2OotTime::DeltaOffset
-                                       : 0);
+        // Write the delta only into the built-in's own stub: the branch and both stub words, so
+        // a mod that reuses the hook with its own cave gets no host writes.
+        const auto word_at = [&](size_t offset) -> u32 {
+            u32 word = 0;
+            if (codeset.memory.size() >= module_start + offset + sizeof(word)) {
+                std::memcpy(&word, codeset.memory.data() + module_start + offset, sizeof(word));
+            }
+            return word;
+        };
+        namespace OotTime = Service::Nx2OotTime;
+        const bool hooked = word_at(OotTime::HookOffset) == OotTime::HookInstruction &&
+                            word_at(OotTime::LoadDeltaOffset) == OotTime::LoadDeltaInstruction &&
+                            word_at(OotTime::ReturnOffset) == OotTime::ReturnInstruction;
+        process.SetOotDeltaAddress(hooked ? load_base + module_start + OotTime::DeltaOffset : 0);
     }
     process.LoadModule(system.Kernel(), std::move(codeset), load_base);
     Core::ExecCoverage::OnModuleLoaded(process, nso_file.GetName(), load_base, image_size);

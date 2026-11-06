@@ -69,8 +69,9 @@ constexpr std::array OCARINA_MAX_RESOLUTION{
 constexpr std::array OCARINA_REAL_TIME{
     BuiltinPatchWord{Service::Nx2OotTime::DeltaOffset, 0x00000000, 0x3F800000}, // 1.0f
     BuiltinPatchWord{Service::Nx2OotTime::LoadDeltaOffset, 0x00000000,
-                     0x1CFFFFE8}, // ldr s8, 0x3c461e0
-    BuiltinPatchWord{Service::Nx2OotTime::ReturnOffset, 0x00000000, 0x172A82B8}, // b 0x6e6cc8
+                     Service::Nx2OotTime::LoadDeltaInstruction}, // ldr s8, 0x3c461e0
+    BuiltinPatchWord{Service::Nx2OotTime::ReturnOffset, 0x00000000,
+                     Service::Nx2OotTime::ReturnInstruction}, // b 0x6e6cc8
     // fdiv s8, s1, s0 -> b 0x3c461e4
     BuiltinPatchWord{Service::Nx2OotTime::HookOffset, 0x1E201828,
                      Service::Nx2OotTime::HookInstruction},

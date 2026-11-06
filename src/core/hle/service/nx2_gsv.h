@@ -1836,11 +1836,12 @@ private:
         // old fixed step) with the patch still applied: for A/B timing and for routes scripted in
         // frames. The delta is still computed. Unset or 1 writes the measured frame time.
         const bool oot_real_time = Nx2OotTime::WriteEnabled();
-        if (const auto* const process = system.ApplicationProcess(); process != nullptr) {
+        // The presenting process: another client of this service never feeds or gets the delta.
+        if (auto* const process = ctx.GetThread().GetOwnerProcess(); process != nullptr) {
             if (const u64 address = process->GetOotDeltaAddress(); address != 0) {
                 const float delta = m_oot_frame_delta.Update(entered);
                 if (oot_real_time) {
-                    system.ApplicationMemory().Write32(address, std::bit_cast<u32>(delta));
+                    process->GetMemory().Write32(address, std::bit_cast<u32>(delta));
                 }
                 m_stats.oot_last = delta;
                 m_stats.oot_min = (std::min)(m_stats.oot_min, delta);
@@ -1875,8 +1876,8 @@ private:
             m_stats.last_present = entered;
             if (++m_stats.presents == 600) {
                 // Ocarina's real-time delta (nx2_oot_time.h): the last value, its range and how
-                // many presents kept the fixed 1.0. "(off)" when EDEN_NX2_OOT_REAL_TIME=0, where
-                // it is computed but not written.
+                // many presents kept the fixed 1.0. "(off)" when the write is off
+                // (EDEN_NX2_REAL_SPEED=0 or EDEN_NX2_OOT_REAL_TIME=0): computed, not written.
                 const std::string oot =
                     m_stats.oot_presents == 0
                         ? std::string{}
