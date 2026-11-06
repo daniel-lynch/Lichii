@@ -95,6 +95,22 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
     code.mov(code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)], rbp);
     code.lea(rbp, code.ptr[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer) - 8]);
 
+    if (conf.block_coverage) {
+        // Nothing is live in host registers or flags at block entry: guest state is in A64JitState.
+        std::uint8_t mask = 0;
+        std::uint8_t* const byte = conf.block_coverage->OnBlockCompiled(
+            A64::LocationDescriptor{block.Location()}.PC(), A64::LocationDescriptor{block.EndLocation()}.PC(), mask);
+        if (byte != nullptr && mask != 0) {
+            Xbyak::Label marked;
+            code.mov(rax, reinterpret_cast<u64>(byte));
+            code.test(code.byte[rax], mask);
+            code.jnz(marked);
+            code.lock();
+            code.or_(code.byte[rax], mask);
+            code.L(marked);
+        }
+    }
+
     DEBUG_ASSERT(block.GetCondition() == IR::Cond::AL);
     typedef void (EmitX64::*EmitHandlerFn)(EmitContext& context, IR::Inst* inst);
     constexpr EmitHandlerFn opcode_handlers[] = {

@@ -20,6 +20,7 @@
 #include "common/swap.h"
 #include "core/core.h"
 #include "core/arm/dynarmic/window_trace.h"
+#include "core/arm/exec_coverage.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/hle/kernel/code_set.h"
 #include "core/hle/kernel/k_page_table.h"
@@ -328,6 +329,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     }
     LOG_INFO(Loader, "Module {} loaded at {:#x} (size {:#x})", nso_file.GetName(), load_base, image_size);
     process.LoadModule(system.Kernel(), std::move(codeset), load_base);
+    Core::ExecCoverage::OnModuleLoaded(process, nso_file.GetName(), load_base, image_size);
     if (name == "main" && process.GetProgramId() == Settings::MarioKartWorldProgramId) {
         process.SetMkwDynamicFpsPatchApplied(mkw_dynamic_fps_patch_applied);
     }

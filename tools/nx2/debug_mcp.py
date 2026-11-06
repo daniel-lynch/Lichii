@@ -287,6 +287,34 @@ TOOLS = [
     },
 ]
 
+TOOLS += [
+    {
+        "name": f"coverage_{action}",
+        "description": description + " Needs EDEN_NX2_COVERAGE=1 (docs/nx2/exec-coverage.md).",
+        "inputSchema": {"type": "object", "properties": {}},
+    }
+    for action, description in (
+        ("start", "Clears the execution-coverage map of the game's main module and resumes recording."),
+        ("reset", "Same as coverage_start."),
+        ("stop", "Freezes the execution-coverage map: snapshots return it as of now."),
+    )
+]
+TOOLS.append({
+    "name": "coverage_snapshot",
+    "description": "Writes the code of the game's main module hit since boot or the last "
+                   "coverage_start/reset, as merged [offset, length] ranges from the module base, "
+                   "to the JSON file 'out' and returns its summary. Diff two with "
+                   "tools/nx2/coverage_diff.py diff A B --functions functions.tsv. Needs "
+                   "EDEN_NX2_COVERAGE=1.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "out": {"type": "string", "description": "Path of the JSON file to write."},
+            "extents": {"type": "boolean", "description": "Whole blocks (default) or block starts only."},
+        },
+        "required": ["out"],
+    },
+})
 TOOL_NAMES = {tool["name"] for tool in TOOLS}
 
 
@@ -374,6 +402,14 @@ class Adapter:
         if name == "capture_image":
             return self.capture_image(arguments)
         params = dict(arguments)
+        if name == "coverage_snapshot":
+            out = params.pop("out")
+            result = self.emulator.call(name, params, 60)
+            with open(out, "w") as file:
+                json.dump(result, file)
+            summary = {k: v for k, v in result.items() if k not in ("ranges", "bitmap_base64")}
+            summary["out"] = os.path.abspath(out).replace("\\", "/")
+            return summary, None
         index = params.pop("index", False)
         timeout = max(int(params.get("timeout_s", default_timeout(name, params))), 1) + 30
         result = self.emulator.call(name, params, timeout)
