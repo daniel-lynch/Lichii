@@ -51,10 +51,18 @@ runtime variants; untouched offline fallback modules do not count as observed re
 with most-frequent exact-stage recipes first, then class recipes filling remaining slots.
 The baseline default is included in addition to this limit. `--shader-recipe-limit N`
 caps the total catalog entries across exact and class groups (default 200000).
-Import reads at most 256 MiB of record payloads and framing; records beyond that budget
-are skipped without allocating their payload. Logs report admitted catalog entries,
-recipe references omitted by the entry cap, records skipped by the byte budget, and
-imported bytes. The temporary source store is released before emission starts.
+The 256 MiB import budget counts only admitted serialized recipe tails, excluding
+module payloads, entry metadata, and scanned/skipped records.
+The reader seeks over fallback modules, compressed SPIR-V, and unused entry metadata;
+entry keys/queries associate recipe IDs with source stage keys. Only the stage and
+input-load mask are read from metadata when a recipe needs its class key.
+Logs and the JSON import report distinguish scanned, eligible, and admitted records,
+admitted bytes, bytes skipped by framing, and eligible records skipped by the byte
+budget. Logs also report catalog entries and references omitted by the entry cap.
+Cross-configuration imports name the source filename's translator tag and the current
+tag; renamed/untagged sources report an unknown tag because format 10 stores only the
+configuration digest. Runtime open reports other translator tags in the directory once.
+The temporary source store is released before emission starts.
 Canonical duplicate
 variants are emitted only once, and every emission uses fresh IR. Class frequencies
 count distinct recorded runtime variants, not repeated gameplay draw invocations.

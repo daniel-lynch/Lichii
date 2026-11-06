@@ -290,6 +290,10 @@ TEST_CASE("Shader report includes skips and all import limits", "[video_core][tr
     summary.skipped["unsupported_stage"] = 4;
     summary.import_truncated_entries = 8;
     summary.import_skipped_records = 9;
+    summary.import_scanned_records = 100;
+    summary.import_eligible_records = 20;
+    summary.import_admitted_records = 11;
+    summary.import_framing_skipped_bytes = 99999;
     const auto path = std::filesystem::temp_directory_path() / "lichii_report_test.json";
     WriteReport(path, summary);
     std::ifstream file(path);
@@ -299,6 +303,10 @@ TEST_CASE("Shader report includes skips and all import limits", "[video_core][tr
     REQUIRE(report["skips"]["unsupported_stage"] == 4);
     REQUIRE(report["import"]["truncated_entries"] == 8);
     REQUIRE(report["import"]["skipped_records"] == 9);
+    REQUIRE(report["import"]["scanned_records"] == 100);
+    REQUIRE(report["import"]["eligible_records"] == 20);
+    REQUIRE(report["import"]["admitted_records"] == 11);
+    REQUIRE(report["import"]["framing_skipped_bytes"] == 99999);
     REQUIRE(report["sources"]["class"]["modules"] == 0);
     file.close();
     std::filesystem::remove(path);

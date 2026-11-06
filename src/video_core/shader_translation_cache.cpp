@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <system_error>
 #include <type_traits>
 #include <utility>
@@ -249,6 +250,66 @@ public:
 private:
     std::span<const u8>& in;
 };
+
+// A bounded view of one disk record. Payloads that recipes do not use are sought over.
+class FramedReader {
+public:
+    FramedReader(std::ifstream& stream_, u64 begin, u64 end_, u64& skipped_)
+        : stream{stream_}, position{begin}, end{end_}, skipped{skipped_} {
+        stream.seekg(position);
+    }
+    template <typename T>
+    bool Get(T& value) {
+        if (sizeof(T) > Remaining() ||
+            !stream.read(reinterpret_cast<char*>(&value), sizeof(T))) return false;
+        position += sizeof(T);
+        return true;
+    }
+    bool Skip(u64 bytes) {
+        if (bytes > Remaining()) return false;
+        position += bytes;
+        skipped += bytes;
+        stream.seekg(position);
+        return stream.good();
+    }
+    bool Array(u64 element_size) {
+        u32 count{};
+        return Get(count) && count <= (1U << 20) && Skip(u64{count} * element_size);
+    }
+    u64 Remaining() const { return end - position; }
+    u64 Position() const { return position; }
+private:
+    std::ifstream& stream;
+    u64 position, end;
+    u64& skipped;
+};
+
+bool SkipInfo(FramedReader& reader, Shader::Info* catalog_info = nullptr) {
+    Shader::Info info;
+#define POD(field) \
+    if (catalog_info && std::string_view{#field} == "loads") { \
+        if (!reader.Get(catalog_info->loads)) return false; \
+    } else if (!reader.Skip(sizeof(info.field))) return false;
+#define MAP(field) if (!reader.Array(sizeof(decltype(info.field)::key_type) + sizeof(decltype(info.field)::mapped_type))) return false;
+#define VEC(field) if (!reader.Array(sizeof(decltype(info.field)::value_type))) return false;
+#define VECVEC(field) { u32 count{}; if (!reader.Get(count) || count > (1U << 20)) return false; \
+    for (u32 i = 0; i < count; ++i) if (!reader.Array(sizeof(decltype(info.field)::value_type::value_type))) return false; }
+    TRANSLATION_CACHE_INFO_FIELDS(POD, MAP, VEC, VECVEC)
+#undef POD
+#undef MAP
+#undef VEC
+#undef VECVEC
+    return true;
+}
+
+std::string TranslationTag(const std::filesystem::path& path) {
+    const auto name = path.filename().string();
+    constexpr std::string_view prefix = "vulkan_translations.";
+    if (!name.starts_with(prefix)) return "unknown (untagged file)";
+    const auto end = name.find(".fork-v", prefix.size());
+    if (end == std::string::npos) return "unknown (untagged file)";
+    return name.substr(prefix.size(), end - prefix.size());
+}
 
 constexpr size_t MaxElements = 1 << 20;
 
@@ -984,7 +1045,8 @@ RecipeCatalog Store::ReadRecipeCatalog(const std::filesystem::path& path, const 
     if (!source.LoadFile(path, result.source_config, false, byte_budget))
         throw std::runtime_error("Recipe cache is missing or has an incompatible format");
     if (result.source_config != config)
-        LOG_INFO(Render_Vulkan, "Offline recipes: importing recipes from another configuration; modules are not reused");
+        LOG_INFO(Render_Vulkan, "Offline recipes: importing from source translator tag {} into current tag {} (different configuration); modules are not reused",
+                 TranslationTag(path), CurrentCacheIdentity().file_tag);
     using Positions = std::unordered_map<Digest, size_t, DigestHash>;
     std::unordered_map<Digest, Positions, DigestHash> exact_positions;
     std::unordered_map<u64, Positions> class_positions;
@@ -1030,6 +1092,10 @@ RecipeCatalog Store::ReadRecipeCatalog(const std::filesystem::path& path, const 
     result.invalid_recipes = source.invalid_recipes;
     result.skipped_records = source.skipped_import_records;
     result.imported_bytes = source.imported_bytes;
+    result.scanned_records = source.scanned_records;
+    result.eligible_records = source.eligible_records;
+    result.admitted_records = source.admitted_records;
+    result.framing_skipped_bytes = source.framing_skipped_bytes;
     source.Close();
     const auto sort = [](auto& groups) {
         for (auto& [key, recipes] : groups)
@@ -1040,9 +1106,10 @@ RecipeCatalog Store::ReadRecipeCatalog(const std::filesystem::path& path, const 
     };
     sort(result.exact);
     sort(result.classes);
-    LOG_INFO(Render_Vulkan, "Offline recipes: {} catalog entries; {} recipe references truncated by entry limit {}; {} records skipped by byte budget {}; {} bytes imported",
+    LOG_INFO(Render_Vulkan, "Offline recipes: {} catalog entries; {} recipe references truncated by entry limit {}; {} records skipped by byte budget {}; {} bytes admitted; {} records scanned; {} records eligible; {} records admitted; {} bytes skipped-by-framing",
              result.entries, result.truncated_entries, entry_limit, result.skipped_records,
-             byte_budget, result.imported_bytes);
+             byte_budget, result.imported_bytes, result.scanned_records, result.eligible_records,
+             result.admitted_records, result.framing_skipped_bytes);
     return result;
 }
 
@@ -1300,6 +1367,20 @@ void Store::Open(const std::filesystem::path& path, const Digest& config) {
         return;
     }
     LOG_INFO(Render_Vulkan, "Translation cache: translator identity {}", identity.description);
+    std::set<std::string> other_tags;
+    std::error_code scan_error;
+    for (std::filesystem::directory_iterator it{path.parent_path(), scan_error}, end;
+         !scan_error && it != end; it.increment(scan_error)) {
+        const auto tag = TranslationTag(it->path());
+        if (tag != "unknown (untagged file)" && tag != identity.file_tag &&
+            it->path().extension() == ".bin") other_tags.insert(tag);
+    }
+    if (!other_tags.empty()) {
+        std::string found;
+        for (const auto& tag : other_tags) found += (found.empty() ? "" : ", ") + tag;
+        LOG_INFO(Render_Vulkan, "Translation cache: ignoring files with translator tag(s) {}; current tag {}",
+                 found, identity.file_tag.empty() ? "untagged (exe identity)" : identity.file_tag);
+    }
     filename = path;
     const auto begin = std::chrono::steady_clock::now();
     const bool loaded = LoadFile(path, config);
@@ -1316,6 +1397,139 @@ void Store::Open(const std::filesystem::path& path, const Digest& config) {
              loaded_entries, loaded_variants, Common::FS::PathToUTF8String(path.filename()),
              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
                  .count());
+}
+
+bool Store::LoadRecipeRecords(std::ifstream& in, u64 size, u64 byte_budget) {
+    struct Location {
+        u64 meta_begin, end;
+        Digest stage_key;
+    };
+    std::unordered_map<Digest, Location, DigestHash> locations;
+    std::unordered_set<Digest, DigestHash> seen;
+    constexpr u64 HeaderSize = FileMagic.size() + sizeof(u32) + sizeof(Digest);
+    // Drops can follow their variants. Discover them before spending the admission budget.
+    for (u64 offset = HeaderSize; offset + 8 <= size;) {
+        in.seekg(offset);
+        u32 magic{}, length{};
+        u8 type{};
+        if (!in.read(reinterpret_cast<char*>(&magic), sizeof(magic)) ||
+            !in.read(reinterpret_cast<char*>(&length), sizeof(length)) ||
+            magic != RecordMagic || length > size - offset - 8 || !length ||
+            !in.read(reinterpret_cast<char*>(&type), sizeof(type))) break;
+        if (type == RecordDrop && length == 1 + sizeof(Digest)) {
+            Digest id{};
+            if (!in.read(reinterpret_cast<char*>(&id), sizeof(id))) break;
+            dropped_entries.insert(id);
+        }
+        offset += 8 + u64{length};
+    }
+    in.clear();
+    u64 offset = HeaderSize;
+    while (offset + 8 <= size) {
+        in.seekg(offset);
+        u32 magic{}, length{};
+        if (!in.read(reinterpret_cast<char*>(&magic), sizeof(magic)) ||
+            !in.read(reinterpret_cast<char*>(&length), sizeof(length)) ||
+            magic != RecordMagic || length > size - offset - 8) break;
+        const u64 begin = offset + 8, end = begin + length;
+        ++scanned_records;
+        FramedReader reader{in, begin, end, framing_skipped_bytes};
+        u8 type{};
+        if (!reader.Get(type)) break;
+        if (type == RecordEntry) {
+            // The last byte is provenance. Keys/queries locate metadata without reading
+            // entry-only metadata. An offline entry can later acquire a runtime recipe.
+            if (!reader.Remaining()) break;
+            in.seekg(end - 1);
+            u8 offline{};
+            if (!in.read(reinterpret_cast<char*>(&offline), 1) || offline > 1) break;
+            in.seekg(reader.Position());
+            {
+                Digest stage_key{};
+                u32 count{};
+                if (!reader.Get(stage_key) || !reader.Get(count) || count > MaxElements) break;
+                constexpr u64 QueryBytes = sizeof(QueryKind) + 4 * sizeof(u32);
+                if (u64{count} * QueryBytes > reader.Remaining()) break;
+                Hasher hasher;
+                hasher.Add(offline != 0);
+                hasher.Add(stage_key.lo);
+                hasher.Add(stage_key.hi);
+                bool ok = true;
+                for (u32 i = 0; i < count && ok; ++i) {
+                    Query query;
+                    ok = reader.Get(query.kind) && reader.Get(query.a) &&
+                         reader.Get(query.b) && reader.Get(query.answer) && reader.Get(query.c);
+                    hasher.Add(query.kind);
+                    hasher.Add(query.a);
+                    hasher.Add(query.b);
+                    hasher.Add(query.answer);
+                    hasher.Add(query.c);
+                }
+                if (!ok) break;
+                locations.try_emplace(hasher.Finish(), Location{reader.Position(), end, stage_key});
+            }
+        } else if (type == RecordVariant) {
+            Digest key{}, id{};
+            u8 fallback{};
+            if (!reader.Get(key) || !reader.Get(id) || !reader.Get(fallback) || fallback > 1) break;
+            const auto location = locations.find(id);
+            if (!fallback && location != locations.end() && !dropped_entries.contains(id)) {
+                u32 words{}, compressed{};
+                u8 has_recipe{};
+                if (!reader.Skip(sizeof(Shader::Backend::Bindings)) || !SkipInfo(reader) ||
+                    !reader.Get(words) || !reader.Get(compressed) || !reader.Skip(compressed) ||
+                    !reader.Get(has_recipe) || has_recipe > 1) break;
+                if (has_recipe) {
+                    ++eligible_records;
+                    const auto recipe_size = reader.Remaining();
+                    const auto& loc = location->second;
+                    const bool needs_entry = !entry_recipes.contains(id);
+                    const u64 retained = recipe_size;
+                    if (!seen.contains(key) && retained > byte_budget - imported_bytes) {
+                        ++skipped_import_records;
+                    } else if (!seen.contains(key)) {
+                        std::vector<u8> data(recipe_size);
+                        if (!in.read(reinterpret_cast<char*>(data.data()), data.size())) break;
+                        std::span<const u8> bytes{data};
+                        Reader recipe_reader{bytes};
+                        Shader::Stage stage{};
+                        EmissionRecipe recipe;
+                        if (!recipe_reader.Get(stage) || static_cast<size_t>(stage) >= Shader::MaxStageTypes ||
+                            !ReadRecipe(recipe_reader, recipe) || !bytes.empty()) {
+                            ++invalid_recipes;
+                        } else {
+                            if (needs_entry) {
+                                Entry entry;
+                                entry.stage_key = loc.stage_key;
+                                FramedReader metadata{in, loc.meta_begin, loc.end, framing_skipped_bytes};
+                                const auto& meta = entry.meta;
+                                if (!metadata.Get(entry.meta.stage) ||
+                                    !metadata.Skip(sizeof(meta.workgroup_size) + sizeof(meta.output_topology) +
+                                                   sizeof(meta.output_vertices) + sizeof(meta.invocations) +
+                                                   sizeof(meta.local_memory_size) + sizeof(meta.shared_memory_size) +
+                                                   sizeof(meta.is_geometry_passthrough)) ||
+                                    !SkipInfo(metadata, &entry.meta.info)) break;
+                                entry.id = id;
+                                entries[entry.stage_key].push_back(std::make_shared<const Entry>(std::move(entry)));
+                            }
+                            seen.insert(key);
+                            entry_recipes[id].push_back(std::move(recipe));
+                            imported_bytes += retained;
+                            ++admitted_records;
+                        }
+                        // The recipe tail was read, not skipped, even if invalid.
+                        offset = end;
+                        continue;
+                    }
+                }
+            }
+        } else if (type != RecordDrop) {
+            break;
+        }
+        if (!reader.Skip(reader.Remaining())) break;
+        offset = end;
+    }
+    return true;
 }
 
 bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bool writable,
@@ -1343,24 +1557,20 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
                  "Translation cache: written by another build or configuration, starting over");
         return false;
     }
-    skipped_import_records = 0;
-    imported_bytes = 0;
+    if (collect_recipe_entries) {
+        const bool loaded = LoadRecipeRecords(in, size, byte_budget);
+        if (invalid_recipes)
+            LOG_WARNING(Render_Vulkan, "Translation cache: skipped {} invalid recipes in {}",
+                        invalid_recipes, Common::FS::PathToUTF8String(path));
+        return loaded;
+    }
     invalid_recipes = 0;
-    std::unordered_set<Digest, DigestHash> imported_entries;
-    std::unordered_set<Digest, DigestHash> imported_variants;
     size_t offset = HeaderSize;
     while (offset + 8 <= size) {
         u32 magic{}, length{};
         if (!in.read(reinterpret_cast<char*>(&magic), sizeof(magic)) ||
             !in.read(reinterpret_cast<char*>(&length), sizeof(length)) ||
             magic != RecordMagic || length > size - offset - 8) break;
-        if (collect_recipe_entries && length + u64{8} > byte_budget - imported_bytes) {
-            ++skipped_import_records;
-            in.seekg(length, std::ios::cur);
-            offset += 8 + length;
-            continue;
-        }
-        imported_bytes += u64{8} + length;
         std::vector<u8> data(length);
         if (!in.read(reinterpret_cast<char*>(data.data()), length)) break;
         std::span<const u8> record{data};
@@ -1372,13 +1582,7 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
             ok = reader.Get(entry.stage_key) && ReadQueries(reader, entry.queries) &&
                  ReadMeta(record, entry.meta) && reader.Get(entry.offline) && record.empty();
             if (ok) {
-                if (collect_recipe_entries) {
-                    entry.id = EntryId(entry.stage_key, entry.queries, entry.offline);
-                    if (imported_entries.insert(entry.id).second)
-                        entries[entry.stage_key].push_back(std::make_shared<const Entry>(std::move(entry)));
-                } else {
-                    InsertLocked(std::move(entry));
-                }
+                InsertLocked(std::move(entry));
                 ++loaded_entries;
             }
         } else if (ok && type == RecordVariant) {
@@ -1412,11 +1616,7 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
                 }
             }
             ok = ok && record.empty();
-            if (ok && collect_recipe_entries) {
-                if (imported_variants.insert(key).second && has_recipe && !stored->fallback_recipe)
-                    entry_recipes[stored->entry_id].push_back(std::move(recipe));
-                ++loaded_variants;
-            } else if (ok) {
+            if (ok) {
                 if (!writable && has_recipe && !variants.contains(key)) {
                     CountRecipe(stage, recipe);
                 }

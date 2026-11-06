@@ -60,7 +60,8 @@ struct Summary {
     // Entire current product, including modules retained from previous runs.
     std::map<u64, u64> multiplicity;
     u64 import_entries{}, import_truncated_entries{}, import_skipped_records{},
-        import_bytes{}, import_invalid_recipes{};
+        import_bytes{}, import_invalid_recipes{}, import_scanned_records{},
+        import_eligible_records{}, import_admitted_records{}, import_framing_skipped_bytes{};
     std::map<std::string, u64> skipped;
 };
 void WriteReport(const std::filesystem::path& path, const Summary& summary);

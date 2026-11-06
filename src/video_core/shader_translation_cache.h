@@ -263,6 +263,7 @@ struct RecipeCatalog {
     };
     Digest source_config{};
     u64 entries{}, truncated_entries{}, skipped_records{}, imported_bytes{}, invalid_recipes{};
+    u64 scanned_records{}, eligible_records{}, admitted_records{}, framing_skipped_bytes{};
     std::unordered_map<Digest, std::vector<CountedRecipe>, DigestHash> exact;
     std::unordered_map<u64, std::vector<CountedRecipe>> classes;
     [[nodiscard]] std::vector<SelectedRecipe> SelectWithSources(
@@ -380,6 +381,8 @@ private:
     bool LoadFile(const std::filesystem::path& path, const Digest& config, bool writable = true,
                   u64 byte_budget = UINT64_MAX);
 
+    bool LoadRecipeRecords(std::ifstream& in, u64 size, u64 byte_budget);
+
     struct RecipeCount {
         EmissionRecipe recipe;
         Shader::Stage stage;
@@ -390,6 +393,7 @@ private:
 
     bool collect_recipe_entries{};
     u64 skipped_import_records{}, imported_bytes{}, invalid_recipes{};
+    u64 scanned_records{}, eligible_records{}, admitted_records{}, framing_skipped_bytes{};
     std::unordered_map<Digest, std::vector<EmissionRecipe>, DigestHash> entry_recipes;
 
     // Writers serialize publication and append; readers never wait for file I/O.

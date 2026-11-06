@@ -1093,13 +1093,13 @@ TEST_CASE("Recipe catalogs cap exact selection and total import size",
     const auto budgeted = Store::ReadRecipeCatalog(path, config, 200000, 1);
     REQUIRE(budgeted.entries == 0);
     REQUIRE(budgeted.imported_bytes == 0);
-    REQUIRE(budgeted.skipped_records == 11);
+    REQUIRE(budgeted.skipped_records == 8);
     const auto lines = Common::Log::ReadRing(0);
     REQUIRE(std::ranges::any_of(lines, [](const auto& line) {
         return line.text.find("3 catalog entries; 15 recipe references truncated by entry limit 3") != std::string::npos;
     }));
     REQUIRE(std::ranges::any_of(lines, [](const auto& line) {
-        return line.text.find("11 records skipped by byte budget 1; 0 bytes imported") != std::string::npos;
+        return line.text.find("8 records skipped by byte budget 1; 0 bytes admitted") != std::string::npos;
     }));
     Common::Log::SetRingCapacity(0);
     std::filesystem::remove(path);
@@ -1225,4 +1225,111 @@ TEST_CASE("Product multiplicity counts unique modules and excludes dropped entri
     const auto histogram = store.VariantMultiplicity();
     REQUIRE(histogram.size() == 1);
     REQUIRE(histogram.at(0) == 1);
+}
+
+TEST_CASE("Recipe import seeks past large offline products before runtime recipes",
+          "[video_core][translation_cache]") {
+    const auto path = TempPath("vulkan_translations.source-test.fork-v54.bin");
+    std::filesystem::remove(path);
+    const Digest config{101, 102}, key{103, 104};
+    bool offline_entry = false;
+    SECTION("runtime entries") {}
+    SECTION("runtime recipes attached to offline entries") { offline_entry = true; }
+    constexpr u32 payload_size = 100 * 1024 * 1024;
+    {
+        Store source;
+        source.Open(path, config);
+        REQUIRE(source.Insert({201, 202}, {}, {}, true));
+    }
+    // Sparse framed fallback modules: reading their irrelevant payload would allocate 300 MiB.
+    {
+        std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+        file.seekp(0, std::ios::end);
+        const auto put = [&](const auto& value) {
+            file.write(reinterpret_cast<const char*>(&value), sizeof(value));
+        };
+        for (u32 i = 0; i < 3; ++i) {
+            put(u32{0x52435453});
+            put(payload_size);
+            const auto begin = file.tellp();
+            put(u8{1});
+            put(Digest{301, i});
+            put(Digest{201, 202});
+            put(true);
+            file.seekp(begin + std::streamoff(payload_size - 1));
+            put(u8{});
+        }
+    }
+    // Append a valid runtime entry/recipes from another small file without loading the product.
+    const auto tail = TempPath("lichii_recipe_tail.bin");
+    std::filesystem::remove(tail);
+    {
+        Store source;
+        source.Open(tail, config);
+        const auto entry = source.Insert(key, {}, {.stage = Shader::Stage::Fragment}, offline_entry);
+        for (u32 i = 1; i <= 3; ++i) {
+            auto recipe = DefaultEmissionRecipe(Shader::Stage::Fragment);
+            recipe.bindings.texture = i;
+            REQUIRE(source.InsertVariant(*entry,
+                MakeVariantKey(entry->id, DigestRuntimeInfo(recipe.runtime), recipe.bindings),
+                {.spirv = {0x07230203, 1, 2}}, &recipe));
+        }
+        REQUIRE(source.Insert({401, 402}, {}, {})); // Entry-only record.
+    }
+    {
+        std::ifstream input(tail, std::ios::binary);
+        input.seekg(8 + sizeof(u32) + sizeof(Digest));
+        std::ofstream output(path, std::ios::binary | std::ios::app);
+        output << input.rdbuf();
+    }
+    Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, path.parent_path());
+    Common::Log::Initialize();
+    Common::Log::SetGlobalFilter(Common::Log::Filter{Common::Log::Level::Info});
+    Common::Log::SetRingCapacity(64);
+    const auto catalog = Store::ReadRecipeCatalog(path, {999, 999});
+    const auto lines = Common::Log::ReadRing(0);
+    REQUIRE(std::ranges::count_if(lines, [](const auto& line) {
+        return line.text.find("source translator tag source-test into current tag " +
+                              CurrentCacheIdentity().file_tag) != std::string::npos;
+    }) == 1);
+    Common::Log::SetRingCapacity(0);
+    REQUIRE(catalog.source_config == config);
+    REQUIRE(catalog.exact.at(key).size() == 3);
+    REQUIRE(catalog.scanned_records == 9);
+    REQUIRE(catalog.eligible_records == 3);
+    REQUIRE(catalog.admitted_records == 3);
+    REQUIRE(catalog.skipped_records == 0);
+    REQUIRE(catalog.imported_bytes < 16384);
+    REQUIRE(catalog.framing_skipped_bytes > 299ULL * 1024 * 1024);
+    const auto limited = Store::ReadRecipeCatalog(path, config, 200000, catalog.imported_bytes - 1);
+    REQUIRE(limited.admitted_records == 2);
+    REQUIRE(limited.skipped_records == 1);
+    REQUIRE(limited.eligible_records == 3);
+    REQUIRE(limited.imported_bytes < catalog.imported_bytes);
+    std::filesystem::remove(path);
+    std::filesystem::remove(tail);
+}
+
+TEST_CASE("Translation cache open names other translator tags once",
+          "[video_core][translation_cache]") {
+    const auto directory = TempPath("lichii_translation_tag_test");
+    std::filesystem::create_directories(directory);
+    const auto current = CurrentCacheIdentity().file_tag;
+    for (const auto* tag : {"old-tag-a", "old-tag-b"}) {
+        std::ofstream(directory / (std::string{"vulkan_translations."} + tag + ".fork-v54.bin"));
+    }
+    Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, directory);
+    Common::Log::Initialize();
+    Common::Log::SetGlobalFilter(Common::Log::Filter{Common::Log::Level::Info});
+    Common::Log::SetRingCapacity(64);
+    {
+        Store store;
+        store.Open(directory / ("vulkan_translations." + current + ".fork-v54.bin"), {1, 2});
+    }
+    const auto lines = Common::Log::ReadRing(0);
+    REQUIRE(std::ranges::count_if(lines, [&](const auto& line) {
+        return line.text.find("ignoring files with translator tag(s) old-tag-a, old-tag-b; current tag " + current) != std::string::npos;
+    }) == 1);
+    Common::Log::SetRingCapacity(0);
+    std::filesystem::remove_all(directory);
 }

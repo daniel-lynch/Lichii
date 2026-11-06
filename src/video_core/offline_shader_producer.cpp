@@ -112,6 +112,10 @@ void WriteReport(const std::filesystem::path& path, const Summary& summary) {
                     {"truncated_entries", summary.import_truncated_entries},
                     {"skipped_records", summary.import_skipped_records},
                     {"bytes", summary.import_bytes},
+                    {"scanned_records", summary.import_scanned_records},
+                    {"eligible_records", summary.import_eligible_records},
+                    {"admitted_records", summary.import_admitted_records},
+                    {"framing_skipped_bytes", summary.import_framing_skipped_bytes},
                     {"invalid_recipes", summary.import_invalid_recipes}}}};
     std::ofstream file(path, std::ios::trunc);
     file << report.dump(2) << '\n';
@@ -200,6 +204,10 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
     summary.import_truncated_entries = recipes.truncated_entries;
     summary.import_skipped_records = recipes.skipped_records;
     summary.import_bytes = recipes.imported_bytes;
+    summary.import_scanned_records = recipes.scanned_records;
+    summary.import_eligible_records = recipes.eligible_records;
+    summary.import_admitted_records = recipes.admitted_records;
+    summary.import_framing_skipped_bytes = recipes.framing_skipped_bytes;
     summary.import_invalid_recipes = recipes.invalid_recipes;
     std::mutex results;
     // Serialize duplicate stage candidates through lookup and append, without serializing all work.
