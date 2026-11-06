@@ -5,7 +5,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <span>
+#include <utility>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -184,11 +186,8 @@ size_t ShaderPoolIndex::ApplyManifest(std::span<const ManifestRow> rows) {
     return matched;
 }
 
-void ShaderPoolIndex::LoadManifests() {
-    const char* path = std::getenv("EDEN_NX2_AOT_MANIFEST");
-    if (path == nullptr || path[0] == '\0') {
-        return;
-    }
+ShaderPoolIndex::LoadedManifests ShaderPoolIndex::ReadManifests(std::string path) {
+    LoadedManifests loaded;
     const auto begin = std::chrono::steady_clock::now();
     std::vector<std::filesystem::path> files;
     std::error_code error;
@@ -219,14 +218,42 @@ void ShaderPoolIndex::LoadManifests() {
             LOG_WARNING(HW_GPU, "AOT manifest: {} is not a valid manifest", file_path.string());
             continue;
         }
-        ++manifest_files;
-        manifest_rows += rows.size();
-        manifest_rows_matched += ApplyManifest(rows);
+        ++loaded.files;
+        loaded.rows.insert(loaded.rows.end(), std::make_move_iterator(rows.begin()),
+                           std::make_move_iterator(rows.end()));
     }
+    loaded.time = std::chrono::steady_clock::now() - begin;
+    return loaded;
+}
+
+void ShaderPoolIndex::StartManifestLoad() {
+    const char* path = std::getenv("EDEN_NX2_AOT_MANIFEST");
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+    // Parsed on its own thread (a directory may hold a manifest per scene); recognition waits
+    // for it, so no pool is offered in the wrong order.
+    manifest_load = std::async(std::launch::async, &ReadManifests, std::string{path});
+    manifest_pending = true;
+}
+
+bool ShaderPoolIndex::PollManifest() {
+    if (!manifest_pending) {
+        return true;
+    }
+    if (manifest_load.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
+        return false;
+    }
+    manifest_pending = false;
+    const auto apply_begin = std::chrono::steady_clock::now();
+    LoadedManifests loaded = manifest_load.get();
+    manifest_files = loaded.files;
+    manifest_rows = loaded.rows.size();
+    manifest_rows_matched = ApplyManifest(loaded.rows);
     for (const auto& words : manifest_bank1_words) {
         manifest_bytes += words.capacity() * sizeof(u32) + sizeof(words);
     }
-    manifest_time = std::chrono::steady_clock::now() - begin;
+    manifest_time = std::chrono::steady_clock::now() - apply_begin;
     // With a manifest, the siblings it does not name are not offered (run 20261106-020645:
     // 39 of 1418 such seeds were drawn, against 236 of 792 manifest seeds, for 64 % of the
     // worker time). EDEN_NX2_AOT_OTHERS=1 offers them after the manifest programs.
@@ -234,10 +261,13 @@ void ShaderPoolIndex::LoadManifests() {
     offer_others = manifest_files == 0 || (others != nullptr && others[0] == '1');
     LOG_INFO(HW_GPU,
              "AOT manifest: {} files, {} rows of tiers 1-3, {} matched indexed programs, {} with "
-             "bank-1 words ({} bytes); loaded in {:.1f} ms; other siblings {}",
+             "bank-1 words ({} bytes); read in {:.1f} ms on a loader thread, applied in {:.1f} ms; "
+             "{} first uses waited for it; other siblings {}",
              manifest_files, manifest_rows, manifest_rows_matched, manifest_bank1_words.size(),
-             manifest_bytes, std::chrono::duration<double, std::milli>(manifest_time).count(),
-             offer_others ? "offered after them" : "not offered");
+             manifest_bytes, std::chrono::duration<double, std::milli>(loaded.time).count(),
+             std::chrono::duration<double, std::milli>(manifest_time).count(),
+             deferred_first_uses.size(), offer_others ? "offered after them" : "not offered");
+    return true;
 }
 
 std::unique_ptr<ShaderPoolIndex> ShaderPoolIndex::Open() {
@@ -259,7 +289,7 @@ std::unique_ptr<ShaderPoolIndex> ShaderPoolIndex::Open() {
         return nullptr;
     }
     auto index = std::unique_ptr<ShaderPoolIndex>(new ShaderPoolIndex(std::move(containers)));
-    index->LoadManifests();
+    index->StartManifestLoad();
     return index;
 }
 
@@ -351,6 +381,18 @@ std::vector<ShaderPoolIndex::Candidate> ShaderPoolIndex::TakeCandidates(size_t c
 }
 
 void ShaderPoolIndex::OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr address) {
+    if (manifest_pending) {
+        if (!PollManifest()) {
+            if (deferred_first_uses.size() < MaxCandidatesQueued) {
+                deferred_first_uses.push_back(address);
+            }
+            return;
+        }
+        // The first uses seen while the manifest loaded, now in the manifest's order.
+        for (const GPUVAddr deferred : std::exchange(deferred_first_uses, {})) {
+            OnFirstUse(gpu_memory, deferred);
+        }
+    }
     const auto begin = std::chrono::steady_clock::now();
     ++first_uses;
     if (const auto it = predicted.find(address); it != predicted.end()) {

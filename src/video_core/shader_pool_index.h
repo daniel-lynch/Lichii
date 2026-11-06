@@ -7,7 +7,9 @@
 #include <chrono>
 #include <deque>
 #include <filesystem>
+#include <future>
 #include <memory>
+#include <string>
 #include <span>
 #include <string_view>
 #include <unordered_map>
@@ -147,7 +149,18 @@ private:
     size_t candidates_queued_peak{};
 
     /// Scene manifests (EDEN_NX2_AOT_MANIFEST).
-    void LoadManifests();
+    struct LoadedManifests {
+        size_t files{};
+        std::vector<ManifestRow> rows;
+        std::chrono::steady_clock::duration time{};
+    };
+    static LoadedManifests ReadManifests(std::string path);
+    void StartManifestLoad();
+    /// Applies the manifests once loaded; false while they are still being read.
+    bool PollManifest();
+    std::future<LoadedManifests> manifest_load;
+    bool manifest_pending{};
+    std::vector<GPUVAddr> deferred_first_uses;
     std::vector<std::vector<u32>> manifest_bank1_words;
     size_t manifest_files{};
     bool offer_others{true}; ///< Offer siblings no manifest names (EDEN_NX2_AOT_OTHERS=1)
