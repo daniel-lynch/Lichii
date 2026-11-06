@@ -51,3 +51,7 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_SPLIT_SKIP=1
 #EDEN_NX2_AUTO_STUB=1
 #EDEN_NX2_KEEP_ASTC=1
+# A draw that reaches a pipeline still queued for a worker-only build claims and builds it on the
+# GPU thread instead of waiting behind every pipeline queued on the FIFO workers before it
+# (PR 321; single held frames of 1.1-2.2 s in Ocarina). =0 waits for the worker, as after #184.
+#EDEN_NX2_HELD_BUILD_INLINE=0
