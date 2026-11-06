@@ -504,7 +504,16 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 #endif
 }
 
+namespace {
+thread_local std::string current_thread_name{"unnamed"};
+}
+
+std::string_view GetCurrentThreadName() {
+    return current_thread_name;
+}
+
 void SetCurrentThreadName(const char* name) {
+    current_thread_name = name;
     Nx2SampleProfile::OnThreadNamed(name);
 #ifdef _MSC_VER
     // Sets the debugger-visible name of the current thread.

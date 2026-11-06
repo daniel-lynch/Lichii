@@ -292,12 +292,14 @@ GraphicsPipeline::GraphicsPipeline(
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
     const std::array<const Shader::Info*, NUM_STAGES>& infos,
-    std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages)
+    std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages,
+    bool runtime_build_)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)},
-      worker_only_build{worker_thread && static_cast<bool>(emit_stages)} {
+      worker_only_build{worker_thread && static_cast<bool>(emit_stages)},
+      runtime_build{runtime_build_} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -416,13 +418,30 @@ GraphicsPipeline::GraphicsPipeline(
                 shader_notify->MarkShaderComplete();
             }
         };
+        std::chrono::steady_clock::duration emission_time{};
+        bool succeeded = false;
+        SCOPE_EXIT {
+            if (runtime_build) {
+                const auto ms = [](auto duration) {
+                    return std::chrono::duration<double, std::milli>(duration).count();
+                };
+                LOG_INFO(Render_Vulkan,
+                         "Nx2Perf async_pipelines: {:016x} translation/emission and driver build {:.1f} ms "
+                         "executor={} translation_emission_ms={:.3f} driver_ms={:.3f} success={}",
+                         key.Hash(), ms(std::chrono::steady_clock::now() - begin),
+                         Common::GetCurrentThreadName(), ms(emission_time), ms(driver_time),
+                         succeeded);
+            }
+        };
         try {
             if (emit_stages) {
+                SCOPE_EXIT { emission_time = std::chrono::steady_clock::now() - begin; };
                 spv_modules = emit_stages();
             }
             const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
             Validate();
             MakePipeline(render_pass);
+            succeeded = true;
         } catch (const Shader::Exception& exception) {
             LOG_ERROR(Render_Vulkan, "Graphics pipeline {:016x}: {}", key.Hash(), exception.what());
             throw;
@@ -442,16 +461,6 @@ GraphicsPipeline::GraphicsPipeline(
         // of each one's SPIR-V while it lives (title 1: ~1,500 pipelines, 2-5 modules each).
         for (vk::ShaderModule& module : spv_modules) {
             module.reset();
-        }
-        if (worker_only_build) {
-            const auto elapsed = std::chrono::steady_clock::now() - begin;
-            static std::atomic<u32> logged{};
-            if (elapsed > std::chrono::milliseconds{100} ||
-                (elapsed > std::chrono::milliseconds{2} && logged.fetch_add(1) < 400)) {
-                LOG_INFO(Render_Vulkan,
-                         "Nx2Perf async_pipelines: {:016x} worker emission and driver build {:.1f} ms",
-                         key.Hash(), std::chrono::duration<double, std::milli>(elapsed).count());
-            }
         }
     }};
     std::array<bool, NUM_STAGES> present_stages{};
@@ -967,6 +976,14 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             const auto held = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                   std::chrono::steady_clock::now() - begin)
                                   .count();
+            // Completion is logged by the executor; the full held interval is only known here.
+            if (runtime_build && !reported_hold) {
+                reported_hold = true;
+                LOG_INFO(Render_Vulkan,
+                         "Nx2Perf async_pipelines: {:016x} held_ms={:.3f} waiter={}",
+                         key.Hash(), static_cast<double>(held) / 1'000'000.0,
+                         Common::GetCurrentThreadName());
+            }
             hold_time_ns.fetch_add(held, std::memory_order::relaxed);
             hold_ns_by_class[aot_class].fetch_add(static_cast<u64>(held),
                                                   std::memory_order::relaxed);
@@ -1484,27 +1501,31 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
 
-    pipeline = device.GetLogical().CreateGraphicsPipeline({
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = flags,
-        .stageCount = static_cast<u32>(shader_stages.size()),
-        .pStages = shader_stages.data(),
-        .pVertexInputState = is_mesh ? nullptr : &vertex_input_ci,
-        .pInputAssemblyState = is_mesh ? nullptr : &input_assembly_ci,
-        .pTessellationState = is_mesh ? nullptr : &tessellation_ci,
-        .pViewportState = &viewport_ci,
-        .pRasterizationState = &rasterization_ci,
-        .pMultisampleState = &multisample_ci,
-        .pDepthStencilState = &depth_stencil_ci,
-        .pColorBlendState = &color_blend_ci,
-        .pDynamicState = &dynamic_state_ci,
-        .layout = *pipeline_layout,
-        .renderPass = render_pass,
-        .subpass = 0,
-        .basePipelineHandle = nullptr,
-        .basePipelineIndex = 0,
-    }, *pipeline_cache);
+    {
+        const auto driver_begin = std::chrono::steady_clock::now();
+        SCOPE_EXIT { driver_time = std::chrono::steady_clock::now() - driver_begin; };
+        pipeline = device.GetLogical().CreateGraphicsPipeline({
+            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = flags,
+            .stageCount = static_cast<u32>(shader_stages.size()),
+            .pStages = shader_stages.data(),
+            .pVertexInputState = is_mesh ? nullptr : &vertex_input_ci,
+            .pInputAssemblyState = is_mesh ? nullptr : &input_assembly_ci,
+            .pTessellationState = is_mesh ? nullptr : &tessellation_ci,
+            .pViewportState = &viewport_ci,
+            .pRasterizationState = &rasterization_ci,
+            .pMultisampleState = &multisample_ci,
+            .pDepthStencilState = &depth_stencil_ci,
+            .pColorBlendState = &color_blend_ci,
+            .pDynamicState = &dynamic_state_ci,
+            .layout = *pipeline_layout,
+            .renderPass = render_pass,
+            .subpass = 0,
+            .basePipelineHandle = nullptr,
+            .basePipelineIndex = 0,
+        }, *pipeline_cache);
+    }
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {

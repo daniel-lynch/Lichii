@@ -4,6 +4,7 @@
 #include <future>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -380,4 +381,36 @@ TEST_CASE("Concurrent prebuild completion and adoption never return a pipeline t
             REQUIRE(*b == 42);
         }
     }
+}
+
+TEST_CASE("Pipeline executor diagnostics follow worker and inline claims",
+          "[video_core][async_draw][pipeline_build]") {
+    Common::ThreadWorker workers{1, "PipelineTimingTest"};
+    std::string worker_name;
+    PipelineBuild on_worker{&workers, [&] {
+        worker_name = Common::GetCurrentThreadName();
+    }};
+    on_worker.Wait();
+    REQUIRE(worker_name == "PipelineTimingTest");
+
+    std::promise<void> release, entered;
+    auto gate = release.get_future().share();
+    workers.QueueWork([gate, &entered] {
+        entered.set_value();
+        gate.wait();
+    });
+    entered.get_future().wait();
+    std::string inline_name;
+    PipelineBuild inline_build{&workers, [&] {
+        inline_name = Common::GetCurrentThreadName();
+    }};
+    auto waiter = std::async(std::launch::async, [&] {
+        Common::SetCurrentThreadName("PipelineWaiter");
+        inline_build.Wait(true);
+    });
+    waiter.get();
+    release.set_value();
+    workers.WaitForRequests();
+    REQUIRE(inline_name == "PipelineWaiter");
+    REQUIRE(worker_name == "PipelineTimingTest");
 }
