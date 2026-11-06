@@ -1282,6 +1282,16 @@ void PipelineCache::LogStageOutcomes(std::string_view when) {
              aot_variants_failed.load(), static_cast<double>(aot_variant_ns.load()) / 1e6,
              aot_full_hits.load(), aot_emitted_at_draw.load(), worker_variant_hits.load(),
              worker_variant_info_differs.load());
+    LOG_INFO(Render_Vulkan,
+             "Shader AOT ({}): run-time pipelines / ms of draws held, all modules from the cache "
+             "{} / {:.1f}, a seeded stage's module made on a worker {} / {:.1f}, a known "
+             "program's module made on a worker {} / {:.1f}, a stage translated at the draw {} / "
+             "{:.1f}; other pipelines (boot, background) held {:.1f} ms",
+             when, pipelines_by_class[0].load(), GraphicsPipeline::HoldNsOfClass(0) / 1e6,
+             pipelines_by_class[1].load(), GraphicsPipeline::HoldNsOfClass(1) / 1e6,
+             pipelines_by_class[2].load(), GraphicsPipeline::HoldNsOfClass(2) / 1e6,
+             pipelines_by_class[3].load(), GraphicsPipeline::HoldNsOfClass(3) / 1e6,
+             GraphicsPipeline::HoldNsOfClass(4) / 1e6);
     {
         std::scoped_lock lock{recipe_mutex};
         LOG_INFO(Render_Vulkan,
@@ -2385,10 +2395,31 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     // Without a deferred stage (all from the translation cache, or verifying it), the
     // reservation and emit_pools are released when this returns.
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
-    return std::make_unique<GraphicsPipeline>(
+    // AOT statistics, per run-time pipeline: 3 a stage was translated at the draw (new program,
+    // or its answers differed), else 1 a seeded stage's module was made on the worker, else 2 a
+    // known program's module was made on the worker, else 0 every module came from the cache.
+    u8 aot_class = GraphicsPipeline::AotClasses - 1;
+    if (aot_translation && build_in_parallel) {
+        bool translated = false, seeded_deferred = false, deferred_or_missed = deferring;
+        for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+            if (key.unique_hashes[index] == 0) {
+                continue;
+            }
+            translated |= outcomes[index] == StageOutcome::NewKey ||
+                          outcomes[index] == StageOutcome::ReplayFailed ||
+                          outcomes[index] == StageOutcome::Uncacheable;
+            deferred_or_missed |= outcomes[index] == StageOutcome::VariantMiss;
+            seeded_deferred |= seeded[index] && deferring;
+        }
+        aot_class = translated ? 3 : seeded_deferred ? 1 : deferred_or_missed ? 2 : 0;
+        ++pipelines_by_class[aot_class];
+    }
+    auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
         render_pass_cache, key, std::move(modules), infos, std::move(emit_stages));
+    pipeline->SetAotClass(aot_class);
+    return pipeline;
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();

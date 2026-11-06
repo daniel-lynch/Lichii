@@ -270,7 +270,13 @@ ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
 }
 
 std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
+std::array<std::atomic<u64>, GraphicsPipeline::AotClasses> hold_ns_by_class{};
 } // Anonymous namespace
+
+u64 GraphicsPipeline::HoldNsOfClass(size_t aot_class) noexcept {
+    return aot_class < AotClasses ? hold_ns_by_class[aot_class].load(std::memory_order::relaxed)
+                                  : 0;
+}
 
 std::chrono::nanoseconds GraphicsPipeline::TakeHoldTime() noexcept {
     return std::chrono::nanoseconds{hold_time_ns.exchange(0, std::memory_order::relaxed)};
@@ -951,10 +957,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         scheduler.Record([this](vk::CommandBuffer) {
             const auto begin = std::chrono::steady_clock::now();
             build->Wait(!worker_only_build);
-            hold_time_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                       std::chrono::steady_clock::now() - begin)
-                                       .count(),
-                                   std::memory_order::relaxed);
+            const auto held = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - begin)
+                                  .count();
+            hold_time_ns.fetch_add(held, std::memory_order::relaxed);
+            hold_ns_by_class[aot_class].fetch_add(static_cast<u64>(held),
+                                                  std::memory_order::relaxed);
         });
     }
     const bool is_rescaling{texture_cache.IsRescaling()};

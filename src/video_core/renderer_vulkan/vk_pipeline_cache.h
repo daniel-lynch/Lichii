@@ -281,6 +281,7 @@ private:
     std::array<std::atomic<u64>, 4> aot_hits_by_tier{};
     std::atomic<u64> aot_late{};
     std::atomic<u64> aot_variant_meta_differs{};
+    std::array<std::atomic<u64>, GraphicsPipeline::AotClasses> pipelines_by_class{};
     /// (unique hash, slot) of admitted seeds -> their stage key, until the program's first draw.
     std::unordered_map<u64, VideoCommon::TranslationCache::Digest> aot_seeded_programs;
     std::atomic<u64> aot_miss_key_differs{};

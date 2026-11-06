@@ -22,6 +22,24 @@ constexpr std::array<char, 8> Magic{'L', 'X', 'A', 'O', 'T', 'I', 'X', '2'};
 constexpr size_t ProgramRecordSize = 4 + 4 + 1 + 8 + 4 + 2;
 /// A pool counts as recognised when this share of its programs verifies at the expected address.
 constexpr double RecogniseShare = 0.9;
+
+/// The process's resident and peak resident memory (Linux), for the statistics.
+std::string MemoryNote() {
+    std::ifstream status{"/proc/self/status"};
+    std::string line, rss = "?", peak = "?";
+    while (std::getline(status, line)) {
+        const auto value = [&] {
+            const size_t start = line.find_first_not_of(" \t", line.find(':') + 1);
+            return start == std::string::npos ? std::string{"?"} : line.substr(start);
+        };
+        if (line.starts_with("VmRSS:")) {
+            rss = value();
+        } else if (line.starts_with("VmHWM:")) {
+            peak = value();
+        }
+    }
+    return fmt::format("resident {}, peak {}", rss, peak);
+}
 } // Anonymous namespace
 
 u64 ShaderPoolIndex::Fingerprint(std::span<const u8> bytes) {
@@ -262,11 +280,12 @@ bool ShaderPoolIndex::PollManifest() {
     LOG_INFO(HW_GPU,
              "AOT manifest: {} files, {} rows of tiers 1-3, {} matched indexed programs, {} with "
              "bank-1 words ({} bytes); read in {:.1f} ms on a loader thread, applied in {:.1f} ms; "
-             "{} first uses waited for it; other siblings {}",
+             "{} first uses waited for it; other siblings {}; process memory {}",
              manifest_files, manifest_rows, manifest_rows_matched, manifest_bank1_words.size(),
              manifest_bytes, std::chrono::duration<double, std::milli>(loaded.time).count(),
              std::chrono::duration<double, std::milli>(manifest_time).count(),
-             deferred_first_uses.size(), offer_others ? "offered after them" : "not offered");
+             deferred_first_uses.size(), offer_others ? "offered after them" : "not offered",
+             MemoryNote());
     return true;
 }
 
@@ -313,6 +332,7 @@ ShaderPoolIndex::ShaderPoolIndex(std::vector<Container> containers_)
 
 ShaderPoolIndex::~ShaderPoolIndex() {
     LogStatistics("end");
+    LOG_INFO(HW_GPU, "AOT pool index (end): process memory {}", MemoryNote());
 }
 
 void ShaderPoolIndex::LogStatistics(const char* when) const {
