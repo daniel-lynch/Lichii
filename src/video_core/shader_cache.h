@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -22,6 +23,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/shader_environment.h"
+#include "video_core/shader_pool_index.h"
 
 namespace Tegra {
 class MemoryManager;
@@ -197,6 +199,25 @@ private:
     std::atomic<VAddr> rejected_highest{};
     std::atomic<u64> page_serial{1};
     std::atomic<bool> removal_pending{};
+
+    /// use_shader_aot_translation with EDEN_NX2_AOT_INDEX: recognises shader pools at first use.
+    std::unique_ptr<ShaderPoolIndex> pool_index;
+    bool pool_index_opened{};
+    bool seed_enabled{}; ///< EDEN_NX2_AOT_SEED=1, read when the index is first used
+    void SeedPoolCandidates(bool manifest_only);
+
+protected:
+    /// Set by a renderer that translates recognised programs ahead of time: called on the GPU
+    /// thread with a program's environment (built as at first use), its unique hash and its
+    /// pipeline slot.
+    /// `constants`: the program's bank-1 constant section, read from its pool (may be empty).
+    /// `tier`: its scene-manifest tier (ShaderPoolIndex::NoTier if none). Returns whether a
+    /// job was queued.
+    std::function<bool(GenericEnvironment& env, u64 unique_hash, size_t slot,
+                       std::span<const u8> constants, u8 tier)>
+        seed_stage;
+    /// Whether seed_stage would take another program now (checked before building one).
+    std::function<bool()> seed_has_room;
 };
 
 } // namespace VideoCommon

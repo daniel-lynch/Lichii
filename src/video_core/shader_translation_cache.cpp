@@ -327,6 +327,16 @@ void WriteMeta(std::vector<u8>& out, const ProgramMeta& meta) {
     writer.Put(meta.shared_memory_size);
     writer.Put(meta.is_geometry_passthrough);
     WriteInfo(out, meta.info);
+    // Task and mesh entries (only stored with use_shader_aot_translation) carry the mesh sizes
+    // and line maps the emitter and the next stage's runtime info read.
+    if (meta.stage == Shader::Stage::Task || meta.stage == Shader::Stage::Mesh) {
+        writer.Put(meta.mesh.payload_words);
+        writer.Put(meta.mesh.max_vertices);
+        writer.Put(meta.mesh.max_primitives);
+        writer.Put(meta.mesh.topology);
+        writer.PutVector(meta.mesh.vertex_lines);
+        writer.PutVector(meta.mesh.primitive_lines);
+    }
 }
 
 bool ReadMeta(std::span<const u8>& in, ProgramMeta& meta) {
@@ -335,7 +345,12 @@ bool ReadMeta(std::span<const u8>& in, ProgramMeta& meta) {
            reader.Get(meta.output_topology) && reader.Get(meta.output_vertices) &&
            reader.Get(meta.invocations) && reader.Get(meta.local_memory_size) &&
            reader.Get(meta.shared_memory_size) && reader.Get(meta.is_geometry_passthrough) &&
-           ReadInfo(in, meta.info);
+           ReadInfo(in, meta.info) &&
+           ((meta.stage != Shader::Stage::Task && meta.stage != Shader::Stage::Mesh) ||
+            (reader.Get(meta.mesh.payload_words) && reader.Get(meta.mesh.max_vertices) &&
+             reader.Get(meta.mesh.max_primitives) && reader.Get(meta.mesh.topology) &&
+             reader.GetVector(meta.mesh.vertex_lines, meta.mesh.vertex_lines.capacity()) &&
+             reader.GetVector(meta.mesh.primitive_lines, meta.mesh.primitive_lines.capacity())));
 }
 
 Digest EntryId(const Digest& stage_key, std::span<const Query> queries, bool offline) {
@@ -410,6 +425,7 @@ HandleAddress UnpackHandleAddress(const Query& query) {
 
 RecordingEnvironment::RecordingEnvironment(Shader::Environment& inner_, bool class_replay_)
     : inner{inner_}, class_replay{class_replay_} {
+    tracks_texture_handles = class_replay || inner.tracks_texture_handles;
     sph = inner.SPH();
     gp_passthrough_mask = inner.GpPassthroughMask();
     mesh_registers = inner.MeshRegisters();
@@ -446,7 +462,9 @@ bool RecordingEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 off
 }
 
 void RecordingEnvironment::BeginTextureHandle() {
-    ++handle_depth;
+    if (class_replay) {
+        ++handle_depth;
+    }
     inner.BeginTextureHandle();
 }
 
@@ -556,6 +574,12 @@ void RecordingEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
 }
 
 bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env) {
+    return ReplayQueriesUntilMismatch(queries, env) == queries.size();
+}
+
+size_t ReplayQueriesUntilMismatch(std::span<const Query> queries, Shader::Environment& env,
+                                  LiveAnswers* live) {
+    if (live) live->clear();
     // Class-level replay: recorded handle -> live handle.
     std::unordered_map<u32, u32> handles;
     for (size_t index = 0; index < queries.size(); ++index) {
@@ -563,7 +587,7 @@ bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env) {
         if (query.kind == QueryKind::TextureHandle) {
             const HandleAddress cbuf = UnpackHandleAddress(query);
             if (cbuf.shift_left >= 32 || cbuf.secondary_shift_left >= 32) {
-                return false;
+                return index;
             }
             const u32 sec_index = cbuf.has_secondary ? cbuf.secondary_index : cbuf.index;
             const u32 sec_offset = cbuf.has_secondary ? cbuf.secondary_offset : cbuf.offset;
@@ -576,11 +600,11 @@ bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env) {
             address.secondary_shift_left = cbuf.secondary_shift_left;
             address.has_secondary = cbuf.has_secondary;
             address.count = 1;
-            u32 handle{};
+            u32 handle{}, lhs_word{}, rhs_word{};
             env.BeginTextureHandle();
             try {
-                const u32 lhs_word = env.ReadCbufValue(cbuf.index, cbuf.offset);
-                const u32 rhs_word = env.ReadCbufValue(sec_index, sec_offset);
+                lhs_word = env.ReadCbufValue(cbuf.index, cbuf.offset);
+                rhs_word = env.ReadCbufValue(sec_index, sec_offset);
                 handle = (lhs_word << cbuf.shift_left) | (rhs_word << cbuf.secondary_shift_left);
             } catch (...) {
                 env.EndTextureHandle(address, handle);
@@ -591,7 +615,11 @@ bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env) {
                 !inserted && it->second != handle) {
                 // One recorded handle standing for two live ones: the texture queries cannot be
                 // told apart.
-                return false;
+                return index;
+            }
+            if (live) {
+                live->push_back({QueryKind::CbufValue, cbuf.index, cbuf.offset, lhs_word});
+                live->push_back({QueryKind::CbufValue, sec_index, sec_offset, rhs_word});
             }
             continue;
         }
@@ -633,13 +661,18 @@ bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env) {
             break;
         }
         default:
-            return false;
+            return index;
         }
         if (answer != query.answer) {
-            return false;
+            return index;
+        }
+        if (live) {
+            Query live_query = query;
+            live_query.a = argument;
+            live->push_back(live_query);
         }
     }
-    return true;
+    return queries.size();
 }
 
 Digest MakeStageKey(Shader::Environment& env, u64 unique_hash, u32 slot, const Digest& config) {
@@ -840,6 +873,77 @@ std::array<EmissionRecipe, Shader::MaxStageTypes> Store::ReadRecipes(
     return result;
 }
 
+u64 RecipeClass(Shader::Stage stage, const Shader::Info* info) {
+    u64 key = (static_cast<u64>(stage) + 1) * 0x9e3779b97f4a7c15ULL;
+    if (info != nullptr)
+        key ^= std::hash<std::bitset<512>>{}(info->loads.mask) * 0xff51afd7ed558ccdULL + 1;
+    return key;
+}
+
+std::vector<EmissionRecipe> RecipeCatalog::Select(const Digest& stage_key, Shader::Stage stage,
+                                                 const Shader::Info& info, u32 top_k) const {
+    std::vector<EmissionRecipe> result;
+    std::unordered_set<Digest, DigestHash> seen;
+    auto add = [&](const EmissionRecipe& recipe) {
+        const auto runtime = CanonicalRuntimeInfo(recipe.runtime, info, stage);
+        if (seen.insert(MakeVariantKey({}, DigestRuntimeInfo(runtime), recipe.bindings)).second)
+            result.push_back(recipe);
+    };
+    if (const auto it = exact.find(stage_key); it != exact.end())
+        for (const auto& recipe : it->second) add(recipe);
+    auto it = classes.find(RecipeClass(stage, &info));
+    if (it == classes.end()) it = classes.find(RecipeClass(stage, nullptr));
+    if (it != classes.end())
+        for (size_t i = 0; i < std::min<size_t>(top_k, it->second.size()); ++i)
+            add(it->second[i].recipe);
+    // Keep the baseline coverage even when observed recipes fill the class budget.
+    add(DefaultEmissionRecipe(stage));
+    return result;
+}
+
+RecipeCatalog Store::ReadRecipeCatalog(const std::filesystem::path& path, const Digest& config) {
+    RecipeCatalog result;
+    // The source config is used only to recover exact-stage keys from the current archive.
+    // All emitted programs, metadata, and variant keys use the destination configuration.
+    std::ifstream header(path, std::ios::binary);
+    header.seekg(FileMagic.size() + sizeof(u32));
+    if (!header.read(reinterpret_cast<char*>(&result.source_config), sizeof(Digest)))
+        throw std::runtime_error("Recipe cache header is missing");
+    header.close();
+    Store source;
+    source.collect_recipe_entries = true;
+    if (!source.LoadFile(path, result.source_config, false))
+        throw std::runtime_error("Recipe cache is missing or has an incompatible format");
+    if (result.source_config != config)
+        LOG_INFO(Render_Vulkan, "Offline recipes: importing recipes from another configuration; modules are not reused");
+    auto add = [&](u64 class_key, const EmissionRecipe& recipe) {
+        auto& list = result.classes[class_key];
+        const auto key = MakeVariantKey({}, DigestRuntimeInfo(recipe.runtime), recipe.bindings);
+        const auto it = std::ranges::find(list, key, &RecipeCatalog::CountedRecipe::key);
+        if (it == list.end()) list.push_back({recipe, key, 1});
+        else ++it->count;
+    };
+    for (const auto& [stage_key, entries] : source.entries) {
+        for (const auto& entry : entries) {
+            if (source.dropped_entries.contains(entry->id)) continue;
+            const auto it = source.entry_recipes.find(entry->id);
+            if (it == source.entry_recipes.end()) continue;
+            auto& exact = result.exact[stage_key];
+            for (const auto& recipe : it->second) {
+                exact.push_back(recipe);
+                add(RecipeClass(entry->meta.stage, &entry->meta.info), recipe);
+                add(RecipeClass(entry->meta.stage, nullptr), recipe);
+            }
+        }
+    }
+    for (auto& [key, recipes] : result.classes)
+        std::ranges::sort(recipes, [](const auto& a, const auto& b) {
+            if (a.count != b.count) return a.count > b.count;
+            return std::tie(a.key.lo, a.key.hi) < std::tie(b.key.lo, b.key.hi);
+        });
+    return result;
+}
+
 Shader::RuntimeInfo CanonicalRuntimeInfo(Shader::RuntimeInfo runtime, const Shader::Info& info,
                                           Shader::Stage stage) {
     if ((stage != Shader::Stage::VertexB && stage != Shader::Stage::Fragment) ||
@@ -904,6 +1008,7 @@ ProgramMeta ProgramMeta::From(const Shader::IR::Program& program) {
         .shared_memory_size = program.shared_memory_size,
         .is_geometry_passthrough = program.is_geometry_passthrough,
         .info = program.info,
+        .mesh = program.mesh,
     };
 }
 
@@ -918,6 +1023,7 @@ Shader::IR::Program ProgramMeta::ToProgram() const {
     program.local_memory_size = local_memory_size;
     program.shared_memory_size = shared_memory_size;
     program.is_geometry_passthrough = is_geometry_passthrough;
+    program.mesh = mesh;
     return program;
 }
 
@@ -1064,6 +1170,7 @@ void Store::Close() {
     entries_with_modules.clear();
     offline_entry_only_rejected = 0;
     enabled = false;
+    ++generation;
 }
 
 void Store::Open(const std::filesystem::path& path, const Digest& config) {
@@ -1171,7 +1278,11 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
             }
             ok = ok && record.empty();
             if (ok) {
-                if (has_recipe && !variants.contains(key)) CountRecipe(stage, recipe);
+                if (has_recipe && !variants.contains(key)) {
+                    CountRecipe(stage, recipe);
+                    if (collect_recipe_entries && !stored->fallback_recipe)
+                        entry_recipes[stored->entry_id].push_back(recipe);
+                }
                 if (stored->spirv_words && (stored->compressed_size || !stored->compressed_spirv.empty()))
                     entries_with_modules.insert(stored->entry_id);
                 variants.insert_or_assign(key, std::move(stored));
@@ -1188,16 +1299,6 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
             break;
         }
         offset += 8 + length;
-    }
-    for (auto it = entries.begin(); it != entries.end();) {
-        std::erase_if(it->second, [&](const auto& entry) {
-            if (!entry->offline || entries_with_modules.contains(entry->id)) return false;
-            ++offline_entry_only_rejected;
-            --loaded_entries;
-            return true;
-        });
-        if (it->second.empty()) it = entries.erase(it);
-        else ++it;
     }
     in.close();
     if (!writable) return true;
@@ -1229,7 +1330,8 @@ std::shared_ptr<const Entry> Store::InsertLocked(Entry entry) {
     return shared;
 }
 
-std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::Environment& env) {
+std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::Environment& env,
+                                              LiveAnswers* live) {
     std::vector<std::shared_ptr<const Entry>> candidates;
     {
         std::scoped_lock lock{mutex};
@@ -1240,15 +1342,21 @@ std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::E
         }
         for (const auto& entry : it->second) {
             if (entry->offline && dropped_entries.contains(entry->id)) ++offline_dropped_misses;
-            if (!dropped_entries.contains(entry->id) &&
-                (!entry->offline || entries_with_modules.contains(entry->id)))
+            if (!dropped_entries.contains(entry->id))
                 candidates.push_back(entry);
         }
     }
+    size_t furthest = 0;
+    std::optional<QueryKind> furthest_kind;
     for (const auto& candidate : candidates) {
         try {
-            if (ReplayQueries(candidate->queries, env)) {
+            const size_t matched = ReplayQueriesUntilMismatch(candidate->queries, env, live);
+            if (matched == candidate->queries.size()) {
                 return candidate;
+            }
+            if (!furthest_kind || matched > furthest) {
+                furthest = matched;
+                furthest_kind = candidate->queries[matched].kind;
             }
         } catch (const Shader::Exception&) {
             // An environment read from the pipeline cache only answers the queries its own
@@ -1256,7 +1364,15 @@ std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::E
         }
         if (candidate->offline) ++offline_replay_misses;
     }
+    if (count_mismatches && furthest_kind) {
+        ++first_mismatch[static_cast<size_t>(*furthest_kind) % first_mismatch.size()];
+    }
     return nullptr;
+}
+
+bool Store::HasStageKey(const Digest& stage_key) {
+    std::scoped_lock lock{mutex};
+    return entries.contains(stage_key);
 }
 
 std::optional<Variant> Store::FindVariant(const Digest& variant_key) {
@@ -1295,7 +1411,8 @@ std::optional<Variant> Store::FindVariant(const Digest& variant_key) {
 }
 
 std::shared_ptr<const Entry> Store::Insert(const Digest& stage_key, std::vector<Query> queries,
-                                           const ProgramMeta& meta, bool offline) {
+                                           const ProgramMeta& meta, bool offline,
+                                           std::optional<u64> expected_generation) {
     Entry entry{.stage_key = stage_key, .queries = std::move(queries), .meta = meta,
                 .offline = offline};
     std::vector<u8> record;
@@ -1309,7 +1426,7 @@ std::shared_ptr<const Entry> Store::Insert(const Digest& stage_key, std::vector<
     }
     std::scoped_lock writer_lock{writer_mutex};
     std::unique_lock lock{mutex};
-    if (!enabled) {
+    if (!enabled || (expected_generation && *expected_generation != generation.load())) {
         return nullptr;
     }
     const size_t before = entries.contains(stage_key) ? entries[stage_key].size() : 0;
@@ -1320,7 +1437,7 @@ std::shared_ptr<const Entry> Store::Insert(const Digest& stage_key, std::vector<
     return shared;
 }
 
-void Store::InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant,
+bool Store::InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant,
                           const EmissionRecipe* recipe) {
     if (recipe && recipe->runtime.xfb_count > recipe->runtime.xfb_varyings.size()) {
         throw std::runtime_error("Translation cache: invalid recipe");
@@ -1353,15 +1470,26 @@ void Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
     std::scoped_lock writer_lock{writer_mutex};
     std::unique_lock lock{mutex};
     if (!enabled) {
-        return;
+        return false;
     }
-    if (dropped_entries.contains(entry.id)) return;
+    // Only for an entry of this store: one held across a reopen (or never inserted) names a
+    // program of another configuration.
+    const auto list = entries.find(entry.stage_key);
+    if (list == entries.end() ||
+        std::ranges::none_of(list->second, [&](const auto& stored_entry) {
+            return stored_entry.get() == &entry;
+        })) {
+        ++rejected_variants;
+        return false;
+    }
+    if (dropped_entries.contains(entry.id)) return false;
     if (variants.try_emplace(variant_key, std::move(stored)).second) {
         if (!variant.spirv.empty()) entries_with_modules.insert(entry.id);
         if (recipe) CountRecipe(entry.meta.stage, *recipe);
         lock.unlock();
         Append(record);
     }
+    return true;
 }
 
 void Store::Append(const std::vector<u8>& record) {

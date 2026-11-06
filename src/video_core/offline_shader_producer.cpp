@@ -138,7 +138,7 @@ Input ParseInput(std::string_view text, const std::filesystem::path& directory) 
 Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
             const std::filesystem::path& recipe_cache, const Shader::Profile& profile,
             const Shader::HostTranslateInfo& host, const TranslationCache::Digest& config,
-            TranslationCache::Store& store) {
+            TranslationCache::Store& store, u32 recipe_count) {
     namespace TC = TranslationCache;
     const auto begin = std::chrono::steady_clock::now();
     const auto index_size = std::filesystem::file_size(input);
@@ -156,10 +156,10 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                                    input.parent_path());
     if (parsed.title_id != title_id) throw std::runtime_error("Archive title ID differs from game");
     if (!store.Enabled()) throw std::runtime_error("Translation cache must be enabled");
-    std::array<TC::EmissionRecipe, Shader::MaxStageTypes> recipes;
-    for (size_t i = 0; i < recipes.size(); ++i)
-        recipes[i] = TC::DefaultEmissionRecipe(static_cast<Shader::Stage>(i));
-    if (!recipe_cache.empty()) recipes = TC::Store::ReadRecipes(recipe_cache, config);
+    if (recipe_count == 0 || recipe_count > 64)
+        throw std::runtime_error("Recipe count must be between 1 and 64");
+    TC::RecipeCatalog recipes;
+    if (!recipe_cache.empty()) recipes = TC::Store::ReadRecipeCatalog(recipe_cache, config);
     if (workers == 0) workers = std::max(1U, std::thread::hardware_concurrency() / 2);
     workers = std::min({workers, 64U, std::max(1U, static_cast<u32>(parsed.programs.size()))});
     Summary summary;
@@ -192,43 +192,69 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                 const auto hash = env.Analyze();
                 if (!hash) throw std::runtime_error("unsupported_lowering");
                 const auto key = TC::MakeStageKey(env, *hash, static_cast<u32>(row.stage) + 1, config);
+                const auto recipe_key = recipe_cache.empty() ? key :
+                    TC::MakeStageKey(env, *hash, static_cast<u32>(row.stage) + 1, recipes.source_config);
                 std::scoped_lock stage_lock(stage_locks[key.lo % stage_locks.size()]);
                 if (StopSignal()) break;
-                auto recipe = recipes[static_cast<size_t>(row.stage)];
                 TC::RecordingEnvironment resume(env, true);
-                if (const auto entry = store.FindEntry(key, resume)) {
-                    const auto runtime = TC::CanonicalRuntimeInfo(recipe.runtime, entry->meta.info,
-                                                                  entry->meta.stage);
-                    if (store.FindVariant(TC::MakeVariantKey(entry->id, TC::DigestRuntimeInfo(runtime), recipe.bindings))) {
-                        std::scoped_lock lock(results);
-                        ++summary.resumed;
-                        continue;
+                auto entry = store.FindEntry(key, resume);
+                std::vector<TC::EmissionRecipe> selected;
+                if (entry) selected = recipes.Select(recipe_key, row.stage, entry->meta.info, recipe_count);
+                size_t candidate{};
+                bool translated{};
+                while (!StopSignal()) {
+                    if (entry) {
+                        while (candidate < selected.size()) {
+                            const auto& recipe = selected[candidate];
+                            const auto runtime = TC::CanonicalRuntimeInfo(recipe.runtime,
+                                entry->meta.info, entry->meta.stage);
+                            if (!store.FindVariant(TC::MakeVariantKey(entry->id,
+                                    TC::DigestRuntimeInfo(runtime), recipe.bindings))) break;
+                            ++candidate;
+                        }
+                        if (candidate == selected.size()) break;
                     }
+                    // Each emission owns a fresh program: EmitSPIRV and legacy conversion mutate IR.
+                    TC::RecordingEnvironment recording(env, true);
+                    Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+                    Shader::ObjectPool<Shader::IR::Inst> inst_pool;
+                    Shader::ObjectPool<Shader::IR::Block> block_pool;
+                    Shader::Maxwell::Flow::CFG cfg(recording, flow_pool,
+                        Shader::Maxwell::Location{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))});
+                    auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, recording, cfg, host);
+                    if (!env.CanCacheTranslation() || program.info.requires_layer_emulation)
+                        throw std::runtime_error("lowering_or_emission_rejected");
+                    translated = true;
+                    {
+                        std::scoped_lock lock(results);
+                        ++summary.translated;
+                    }
+                    if (!entry) {
+                        entry = store.Insert(key, recording.TakeQueries(), TC::ProgramMeta::From(program), true);
+                        if (!entry) throw std::runtime_error("cache_disabled");
+                        selected = recipes.Select(recipe_key, row.stage, program.info, recipe_count);
+                    }
+                    auto recipe = selected[candidate++];
+                    recipe.runtime = TC::CanonicalRuntimeInfo(recipe.runtime, program.info, program.stage);
+                    const auto variant_key = TC::MakeVariantKey(entry->id,
+                        TC::DigestRuntimeInfo(recipe.runtime), recipe.bindings);
+                    if (store.FindVariant(variant_key)) continue;
+                    Shader::Maxwell::ConvertLegacyToGeneric(program, recipe.runtime);
+                    auto bindings = recipe.bindings;
+                    const auto code = Shader::Backend::SPIRV::EmitSPIRV(profile, recipe.runtime, program, bindings);
+                    if (code.size() < 5 || code.front() != 0x07230203)
+                        throw std::runtime_error("lowering_or_emission_rejected");
+                    if (!store.InsertVariant(*entry, variant_key,
+                                             {bindings, program.info, code, true}, &recipe))
+                        throw std::runtime_error("cache_disabled");
+                    std::scoped_lock lock(results);
+                    ++summary.modules;
+                    summary.module_bytes += code.size() * sizeof(u32);
                 }
-                TC::RecordingEnvironment recording(env, true);
-                Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
-                Shader::ObjectPool<Shader::IR::Inst> inst_pool;
-                Shader::ObjectPool<Shader::IR::Block> block_pool;
-                Shader::Maxwell::Flow::CFG cfg(recording, flow_pool,
-                    Shader::Maxwell::Location{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))});
-                auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, recording, cfg, host);
-                if (!env.CanCacheTranslation() || program.info.requires_layer_emulation)
-                    throw std::runtime_error("lowering_or_emission_rejected");
-                const auto meta = TC::ProgramMeta::From(program);
-                recipe.runtime = TC::CanonicalRuntimeInfo(recipe.runtime, program.info, program.stage);
-                const auto runtime = TC::DigestRuntimeInfo(recipe.runtime);
-                Shader::Maxwell::ConvertLegacyToGeneric(program, recipe.runtime);
-                auto bindings = recipe.bindings;
-                const auto code = Shader::Backend::SPIRV::EmitSPIRV(profile, recipe.runtime, program, bindings);
-                if (code.size() < 5 || code.front() != 0x07230203)
-                    throw std::runtime_error("lowering_or_emission_rejected");
-                const auto entry = store.Insert(key, recording.TakeQueries(), meta, true);
-                if (!entry) throw std::runtime_error("cache_disabled");
-                store.InsertVariant(*entry, TC::MakeVariantKey(entry->id, runtime, recipe.bindings),
-                                    {bindings, program.info, code, true}, &recipe);
-                std::scoped_lock lock(results);
-                ++summary.translated;
-                ++summary.modules;
+                if (!translated && !StopSignal()) {
+                    std::scoped_lock lock(results);
+                    ++summary.resumed;
+                }
             } catch (const std::exception& error) {
                 std::scoped_lock lock(results);
                 ++summary.skipped[Reason(error.what())];
@@ -249,8 +275,8 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
         skipped += count;
         LOG_INFO(Render_Vulkan, "Offline translation: skipped reason={} count={}", reason, count);
     }
-    LOG_INFO(Render_Vulkan, "Offline translation: seen={} translated={} resumed={} skipped={} modules={} elapsed_ms={}",
-             summary.seen, summary.translated, summary.resumed, skipped, summary.modules,
+    LOG_INFO(Render_Vulkan, "Offline translation: seen={} translated={} resumed={} skipped={} modules={} module_bytes={} elapsed_ms={}",
+             summary.seen, summary.translated, summary.resumed, skipped, summary.modules, summary.module_bytes,
              std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
     return summary;
 }

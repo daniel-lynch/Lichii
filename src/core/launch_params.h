@@ -43,6 +43,7 @@ struct LaunchParams {
     std::string shader_archive_index;
     std::string shader_recipe_cache;
     u32 shader_workers = 0;
+    u32 shader_recipe_count = 3;
     // print
     bool print_version = false;
     bool print_help = false;

@@ -2831,8 +2831,8 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
 }
 
 bool RasterizerVulkan::PrecompileArchiveShaders(const std::filesystem::path& input, u64 title_id,
-                                               u32 workers, const std::filesystem::path& recipes) {
-    return pipeline_cache.PrecompileArchiveShaders(input, title_id, workers, recipes);
+                                               u32 workers, const std::filesystem::path& recipes, u32 recipe_count) {
+    return pipeline_cache.PrecompileArchiveShaders(input, title_id, workers, recipes, recipe_count);
 }
 
 void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
@@ -2847,10 +2847,7 @@ void RasterizerVulkan::FlushWork() {
     static constexpr bool android = false;
 #endif // __ANDROID__
     const bool native = gpu_memory->UsesNativeTiling();
-    // The 128-draw native budget is tuned for MoltenVK; desktop Vulkan takes the legacy 4096 (#161).
-    const u32 default_native_budget =
-        !device.IsMoltenVK() ? 4096U : SubmissionPolicy::DefaultNativeBudget;
-    u32 budget = default_native_budget;
+    u32 budget = SubmissionPolicy::DefaultNativeBudget;
     if (native && !android) {
         static const std::optional<u32> configured_budget = []() -> std::optional<u32> {
             if (const char* value = std::getenv("EDEN_NX2_FLUSH_DRAWS")) {
@@ -2863,7 +2860,7 @@ void RasterizerVulkan::FlushWork() {
             }
             return std::nullopt;
         }();
-        budget = configured_budget.value_or(default_native_budget);
+        budget = configured_budget.value_or(SubmissionPolicy::DefaultNativeBudget);
     }
     u32 legacy_budget = 4096;
     if (!native && !android) {

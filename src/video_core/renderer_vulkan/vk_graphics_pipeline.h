@@ -92,6 +92,15 @@ public:
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
 
+    /// AOT statistics: the kind of run-time pipeline this is (set by the pipeline cache), and the
+    /// time draws were held for unbuilt pipelines of each kind since the start.
+    /// 0-3 run-time pipelines by how their modules were made, 4 any other (boot, background).
+    static constexpr size_t AotClasses = 5;
+    void SetAotClass(u8 value) noexcept {
+        aot_class = value < AotClasses ? value : AotClasses - 1;
+    }
+    [[nodiscard]] static u64 HoldNsOfClass(size_t aot_class) noexcept;
+
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
         return key.unique_hashes;
@@ -225,6 +234,10 @@ public:
         return delta_mismatch;
     }
 
+    [[nodiscard]] bool Failed() const noexcept {
+        return build->Failed();
+    }
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
@@ -309,6 +322,7 @@ private:
     u64 last_descriptor_buffer_generation{};
 
     const bool worker_only_build;
+    u8 aot_class{AotClasses - 1};
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
     std::optional<PipelineBuild> build;

@@ -49,7 +49,7 @@ private:
 };
 [[nodiscard]] int StopSignal();
 struct Summary {
-    u64 seen{}, translated{}, resumed{}, modules{};
+    u64 seen{}, translated{}, resumed{}, modules{}, module_bytes{};
     bool cancelled{};
     std::map<std::string, u64> skipped;
 };
@@ -57,5 +57,6 @@ struct Summary {
 [[nodiscard]] Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                           const std::filesystem::path& recipe_cache,
                           const Shader::Profile& profile, const Shader::HostTranslateInfo& host,
-                          const TranslationCache::Digest& config, TranslationCache::Store& store);
+                          const TranslationCache::Digest& config, TranslationCache::Store& store,
+                          u32 recipe_count = 3);
 } // namespace VideoCommon::OfflineShaders

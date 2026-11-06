@@ -53,6 +53,11 @@ public:
 
     ~GenericEnvironment() override;
 
+    GenericEnvironment(const GenericEnvironment&) = default;
+    GenericEnvironment(GenericEnvironment&&) = default;
+    GenericEnvironment& operator=(const GenericEnvironment&) = default;
+    GenericEnvironment& operator=(GenericEnvironment&&) = default;
+
     [[nodiscard]] u32 TextureBoundBuffer() const final;
 
     [[nodiscard]] u32 LocalMemorySize() const final;
@@ -223,6 +228,8 @@ public:
     FileEnvironment(const FileEnvironment&) = delete;
 
     void Deserialize(std::ifstream& file);
+
+    [[nodiscard]] size_t MemorySize() const;
 
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
 

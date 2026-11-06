@@ -39,10 +39,26 @@ Repeat `--source TITLE_ID=PATH` for more archives, or use the extractor's existi
 loaded application's program ID; this prevents accidental cross-title population.
 
 Optionally add `--shader-recipe-cache /absolute/path/to/vulkan_translations.TAG.fork-vN.bin`
-to the CLI command. That input must be a format-10 cache with the **same translator,
-GPU and settings configuration**. It is opened read-only, including when its tail
-is incomplete. It can be the destination cache. Format-9 and earlier inputs are
-rejected because their records or keys are incompatible. Run gameplay with this build to collect format-10 recipes first.
+to the CLI command. That input must be a format-10 translation cache. The producer
+imports emission recipes read-only, including from an incomplete tail or a different
+translator/GPU/settings configuration. It derives the source stage key using the source
+configuration, then translates and canonicalizes with the current destination configuration;
+source metadata and SPIR-V are never reused. It can be the destination cache.
+Format-9 and earlier inputs are rejected. Use the round-4 product-run cache to capture
+runtime variants; untouched offline fallback modules do not count as observed recipes.
+
+`--shader-recipe-count N` selects the most frequent N recipes for each stage's input
+class (stage kind if that class has no observations); default 3, allowed range 1–64.
+All exact-stage recipes are included in addition to this limit. Canonical duplicate
+variants are emitted only once, and every emission uses fresh IR. Class frequencies
+count distinct recorded runtime variants, not repeated gameplay draw invocations.
+The producer reports uncompressed emitted SPIR-V bytes as `module_bytes`; `translated`
+counts fresh IR translations, which can exceed the number of archive rows when emitting
+multiple variants. Complete-variant resume still translates zero programs.
+
+Playthrough-hint JSON is not accepted as an emission recipe source: its pipeline keys
+need device/runtime-state reconstruction before they can supply emission inputs.
+Use a format-10 translation cache recorded during the scene tour instead.
 The shared command parser exposes the options, but archive production is an
 **eden-cli** feature, not a GUI precompile operation.
 
@@ -149,7 +165,7 @@ the same title cache concurrently.
 The producer logs per-reason skip counts, followed by:
 
 ```text
-Offline translation: seen=N translated=N resumed=N skipped=N modules=N elapsed_ms=N
+Offline translation: seen=N translated=N resumed=N skipped=N modules=N module_bytes=N elapsed_ms=N
 ```
 
 Reasons include `missing_constant` (a value-consumed word outside exact bank 1),

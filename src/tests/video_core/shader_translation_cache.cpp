@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <catch2/catch_test_macros.hpp>
+#include "video_core/shader_pool_index.h"
 #include "shader_recompiler/translator_identity.h"
 #include "video_core/shader_translation_cache.h"
 #include "video_core/shader_archive_environment.h"
@@ -317,6 +318,51 @@ TEST_CASE("Translation cache persists entries and variants", "[video_core][trans
     std::filesystem::remove(path);
 }
 
+TEST_CASE("Translation cache persists the mesh info of task and mesh entries",
+          "[video_core][translation_cache]") {
+    const auto path = TempPath("lichii_translation_cache_mesh_test.bin");
+    std::filesystem::remove(path);
+    const Digest config{0x31, 0x32};
+    FakeEnvironment env;
+    const Digest stage_key = MakeStageKey(env, 0x77, 3, config);
+
+    ProgramMeta meta{};
+    meta.stage = Shader::Stage::Mesh;
+    meta.workgroup_size = {32, 1, 1};
+    meta.info = SampleInfo();
+    meta.info.is_mesh = true;
+    meta.mesh.payload_words = 64;
+    meta.mesh.max_vertices = 64;
+    meta.mesh.max_primitives = 126;
+    meta.mesh.topology = 4;
+    for (u32 i = 0; i < 20; ++i) {
+        meta.mesh.vertex_lines.push_back(100 + i);
+    }
+    meta.mesh.primitive_lines.push_back(7);
+    {
+        Store store;
+        store.Open(path, config);
+        RecordingEnvironment recording{env};
+        Translate(recording);
+        REQUIRE(store.Insert(stage_key, recording.TakeQueries(), meta));
+    }
+    {
+        Store store;
+        store.Open(path, config);
+        const auto entry = store.FindEntry(stage_key, env);
+        REQUIRE(entry);
+        REQUIRE(entry->meta.info.is_mesh);
+        const auto program = entry->meta.ToProgram();
+        REQUIRE(program.mesh.payload_words == 64);
+        REQUIRE(program.mesh.max_vertices == 64);
+        REQUIRE(program.mesh.max_primitives == 126);
+        REQUIRE(program.mesh.topology == 4);
+        REQUIRE(std::ranges::equal(program.mesh.vertex_lines, meta.mesh.vertex_lines));
+        REQUIRE(std::ranges::equal(program.mesh.primitive_lines, meta.mesh.primitive_lines));
+    }
+    std::filesystem::remove(path);
+}
+
 TEST_CASE("Translation cache records indirect storage pointer classifications",
           "[video_core][translation_cache]") {
     FakeEnvironment env;
@@ -334,6 +380,243 @@ TEST_CASE("Translation cache records indirect storage pointer classifications",
     // A pointer table that now classifies differently no longer matches.
     env.indirect_pointers.insert(0x08);
     REQUIRE_FALSE(ReplayQueries(queries, env));
+}
+
+TEST_CASE("Translation cache refuses publications from before a reopen",
+          "[video_core][translation_cache]") {
+    const Digest config{0x41, 0x42};
+    FakeEnvironment env;
+    const Digest stage_key = MakeStageKey(env, 0x99, 1, config);
+    ProgramMeta meta{};
+    meta.stage = Shader::Stage::VertexB;
+    meta.info = SampleInfo();
+    Store store;
+    store.Open({}, config);
+    REQUIRE(store.Enabled());
+    const u64 generation = store.Generation();
+    RecordingEnvironment recording{env};
+    Translate(recording);
+    const auto queries = recording.TakeQueries();
+    const auto entry = store.Insert(stage_key, queries, meta, generation);
+    REQUIRE(entry);
+    const Variant variant{.info = SampleInfo(), .spirv = {0x07230203}};
+    REQUIRE(store.InsertVariant(*entry, Digest{1, 1}, variant));
+    // An entry that is not the store's own is refused.
+    Entry copy = *entry;
+    REQUIRE_FALSE(store.InsertVariant(copy, Digest{2, 2}, variant));
+
+    store.Open({}, config);
+    REQUIRE(store.Generation() != generation);
+    REQUIRE_FALSE(store.Insert(stage_key, queries, meta, generation));
+    REQUIRE_FALSE(store.InsertVariant(*entry, Digest{3, 3}, variant));
+    REQUIRE_FALSE(store.FindVariant(Digest{3, 3}));
+    REQUIRE(store.Insert(stage_key, queries, meta, store.Generation()));
+}
+
+TEST_CASE("AOT pool index parses the index file and fingerprints like the tool",
+          "[video_core][translation_cache]") {
+    using VideoCommon::ShaderPoolIndex;
+    // FNV-1a 64 test vectors (tools/oot/container/aot_index.py uses the same function).
+    REQUIRE(ShaderPoolIndex::Fingerprint({}) == 0xcbf29ce484222325ULL);
+    const std::array<u8, 1> a{'a'};
+    REQUIRE(ShaderPoolIndex::Fingerprint(a) == 0xaf63dc4c8601ec8cULL);
+
+    std::vector<u8> data{'L', 'X', 'A', 'O', 'T', 'I', 'X', '2'};
+    const auto put = [&](auto value) {
+        const auto* bytes = reinterpret_cast<const u8*>(&value);
+        data.insert(data.end(), bytes, bytes + sizeof(value));
+    };
+    put(u32{1});
+    put(u32{2});
+    put(u32{0x100});
+    put(u32{0x380});
+    put(u8{4});
+    put(u64{0x1122334455667788ULL});
+    put(u32{0x300});
+    put(u16{0x40});
+    put(u32{0x480});
+    put(u32{0x80});
+    put(u8{0});
+    put(u64{7});
+    put(u32{~0U});
+    put(u16{0});
+    std::vector<ShaderPoolIndex::Container> containers;
+    REQUIRE(ShaderPoolIndex::Parse(data, containers));
+    REQUIRE(containers.size() == 1);
+    REQUIRE(containers[0].programs.size() == 2);
+    REQUIRE(containers[0].programs[0].offset == 0x100);
+    REQUIRE(containers[0].programs[0].stage == 4);
+    REQUIRE(containers[0].programs[1].fingerprint == 7);
+    REQUIRE(containers[0].programs[0].constants_offset == 0x300);
+    REQUIRE(containers[0].programs[0].constants_size == 0x40);
+    data.pop_back();
+    REQUIRE_FALSE(ShaderPoolIndex::Parse(data, containers));
+}
+
+TEST_CASE("AOT scene manifest marks indexed programs by tier and keeps the bank-1 words",
+          "[video_core][translation_cache]") {
+    using VideoCommon::ShaderPoolIndex;
+    // Rows as build_manifest.py writes them (made-up values, not game data).
+    const std::string_view json = R"({"scene": "Test", "schema": "oot-aot-static-manifest-1",
+      "programs": [
+        {"fingerprint": "00000000000000aa", "pool_offset": 256, "size": 896, "stage": "fragment",
+         "tier": 3, "bank1": {"offset": 768, "size": 8, "words": [1, 2]}},
+        {"fingerprint": "00000000000000aa", "pool_offset": 256, "size": 896, "stage": "fragment",
+         "tier": 1, "bank1": null},
+        {"fingerprint": "0000000000000007", "pool_offset": 1152, "size": 128, "stage": "vertex",
+         "tier": 4},
+        {"fingerprint": "0000000000000009", "pool_offset": 64, "size": 128, "stage": "vertex",
+         "tier": 2},
+        {"fingerprint": "0000000000000007", "pool_offset": 1152, "size": 128, "stage": "mesh",
+         "tier": 2}
+      ]})";
+    std::vector<ShaderPoolIndex::ManifestRow> rows;
+    REQUIRE(ShaderPoolIndex::ParseManifest(json, rows));
+    // Tier 4 is off.
+    REQUIRE(rows.size() == 4);
+    REQUIRE(rows[0].fingerprint == 0xaa);
+    REQUIRE(rows[0].stage == 4);
+    REQUIRE(rows[0].bank1_offset == 768);
+    REQUIRE(rows[0].bank1_words == std::vector<u32>{1, 2});
+    REQUIRE(rows[3].stage == 8);
+
+    std::vector<ShaderPoolIndex::Container> containers(1);
+    containers[0].programs.push_back({0x100, 0x380, 4, 0xaa, 768, 8});
+    containers[0].programs.push_back({0x480, 0x80, 0, 7, ~0U, 0});
+    auto index = ShaderPoolIndex::ForTesting(std::move(containers));
+    // Rows 0 and 1 match program 0 (the lowest tier wins, the bank-1 words are kept); row 2
+    // names no indexed program; row 3 names program 1's key with another stage.
+    REQUIRE(index->ApplyManifest(rows) == 2);
+    const auto& programs = index->Containers()[0].programs;
+    REQUIRE(programs[0].tier == 1);
+    REQUIRE(programs[0].manifest_bank1 == 0);
+    REQUIRE(programs[1].tier == ShaderPoolIndex::NoTier);
+
+    REQUIRE_FALSE(ShaderPoolIndex::ParseManifest("{\"programs\": [{\"fingerprint\": \"zz\"}]}",
+                                                 rows));
+    REQUIRE_FALSE(ShaderPoolIndex::ParseManifest("not json", rows));
+}
+
+namespace {
+// What the texture pass does for one handle: Begin, the two word reads, End.
+u32 ReadHandle(Shader::Environment& env, const Shader::ConstBufferAddr& cbuf) {
+    env.BeginTextureHandle();
+    const u32 sec_index = cbuf.has_secondary ? cbuf.secondary_index : cbuf.index;
+    const u32 sec_offset = cbuf.has_secondary ? cbuf.secondary_offset : cbuf.offset;
+    const u32 handle = (env.ReadCbufValue(cbuf.index, cbuf.offset) << cbuf.shift_left) |
+                       (env.ReadCbufValue(sec_index, sec_offset) << cbuf.secondary_shift_left);
+    env.EndTextureHandle(cbuf, handle);
+    return handle;
+}
+
+Shader::ConstBufferAddr HandleAt(u32 index, u32 offset) {
+    Shader::ConstBufferAddr cbuf{};
+    cbuf.index = index;
+    cbuf.offset = offset;
+    return cbuf;
+}
+
+size_t CountKind(const std::vector<Query>& queries, QueryKind kind) {
+    return static_cast<size_t>(std::ranges::count(queries, kind, &Query::kind));
+}
+} // Anonymous namespace
+
+TEST_CASE("Class-level replay compares texture classes instead of handle words with live answers",
+          "[video_core][translation_cache]") {
+    FakeEnvironment env;
+    const u64 word = (u64{2} << 32) | 0x20;
+    env.cbufs[word] = 5; // a 2D texture
+    std::vector<Query> queries;
+    {
+        RecordingEnvironment recording{env, true};
+        const u32 handle = ReadHandle(recording, HandleAt(2, 0x20));
+        (void)recording.ReadTextureType(handle);
+        queries = recording.TakeQueries();
+    }
+    // Handle-only word: no exact query, one TextureHandle query.
+    REQUIRE(CountKind(queries, QueryKind::CbufValue) == 0);
+    REQUIRE(CountKind(queries, QueryKind::TextureHandle) == 1);
+    // A different handle of the same class matches, and the live answers carry the new words.
+    env.cbufs[word] = 6;
+    LiveAnswers live;
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) == queries.size());
+    REQUIRE(std::ranges::any_of(live, [](const Query& q) {
+        return q.kind == QueryKind::CbufValue && q.answer == 6;
+    }));
+    REQUIRE(std::ranges::any_of(live, [](const Query& q) {
+        return q.kind == QueryKind::TextureType && q.a == 6;
+    }));
+    // A handle of another class does not.
+    env.cbufs[word] = 7; // ColorArray2D in FakeEnvironment
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) < queries.size());
+    // Validation also works without collecting a worker replay snapshot.
+    env.cbufs[word] = 5;
+    REQUIRE(ReplayQueries(queries, env));
+}
+
+TEST_CASE("Class-level replay keeps exact words exact with live answers", "[video_core][translation_cache]") {
+    FakeEnvironment env;
+    env.cbufs[(u64{1} << 32) | 0x10] = 0x40;
+    env.cbufs[(u64{2} << 32) | 0x20] = 5;
+    std::vector<Query> queries;
+    {
+        RecordingEnvironment recording{env, true};
+        // Exact-only word (a folded driver constant).
+        (void)recording.ReadCbufValue(1, 0x10);
+        // Shared word: read for a handle, then consumed by value from the pass's word cache.
+        const u32 handle = ReadHandle(recording, HandleAt(2, 0x20));
+        recording.NoteExactCbufWord(2, 0x20);
+        (void)recording.ReadTextureType(handle);
+        queries = recording.TakeQueries();
+    }
+    REQUIRE(CountKind(queries, QueryKind::CbufValue) == 4); // exact word, handle reads and explicit exact notification
+    LiveAnswers live;
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) == queries.size());
+    env.cbufs[(u64{1} << 32) | 0x10] = 0x44;
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) < queries.size());
+    env.cbufs[(u64{1} << 32) | 0x10] = 0x40;
+    env.cbufs[(u64{2} << 32) | 0x20] = 6; // same class, but the word is also used by value
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) < queries.size());
+}
+
+TEST_CASE("Class-level replay covers two-word handles and rejects one-to-many mappings with live answers",
+          "[video_core][translation_cache]") {
+    FakeEnvironment env;
+    Shader::ConstBufferAddr two_word = HandleAt(2, 0x20);
+    two_word.has_secondary = true;
+    two_word.secondary_index = 3;
+    two_word.secondary_offset = 0x40;
+    two_word.secondary_shift_left = 20;
+    env.cbufs[(u64{2} << 32) | 0x20] = 5;
+    env.cbufs[(u64{3} << 32) | 0x40] = 1;
+    env.cbufs[(u64{2} << 32) | 0x30] = 5;
+    std::vector<Query> queries;
+    {
+        RecordingEnvironment recording{env, true};
+        const u32 first = ReadHandle(recording, two_word);
+        (void)recording.ReadTextureType(first);
+        // A second handle recorded with the same value from other words.
+        Shader::ConstBufferAddr other = HandleAt(2, 0x30);
+        other.has_secondary = true;
+        other.secondary_index = 3;
+        other.secondary_offset = 0x40;
+        other.secondary_shift_left = 20;
+        const u32 second = ReadHandle(recording, other);
+        REQUIRE(second == first);
+        (void)recording.ReadTextureType(second);
+        queries = recording.TakeQueries();
+    }
+    REQUIRE(CountKind(queries, QueryKind::CbufValue) == 0);
+    REQUIRE(CountKind(queries, QueryKind::TextureHandle) == 2);
+    LiveAnswers live;
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) == queries.size());
+    // The secondary word is covered: changing it changes the live handle (7 << 20 here is
+    // still a 2D texture, so it matches with a new handle).
+    env.cbufs[(u64{3} << 32) | 0x40] = 2;
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) == queries.size());
+    // The two recorded-equal handles now differ live: one recorded handle, two live ones.
+    env.cbufs[(u64{2} << 32) | 0x30] = 6;
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) < queries.size());
 }
 
 namespace {
@@ -430,29 +713,7 @@ TEST_CASE("Translation cache identifies the translator by its source",
     }
 }
 
-namespace {
-// What the texture pass does for one handle: Begin, the two word reads, End.
-u32 ReadHandle(Shader::Environment& env, const Shader::ConstBufferAddr& cbuf) {
-    env.BeginTextureHandle();
-    const u32 sec_index = cbuf.has_secondary ? cbuf.secondary_index : cbuf.index;
-    const u32 sec_offset = cbuf.has_secondary ? cbuf.secondary_offset : cbuf.offset;
-    const u32 handle = (env.ReadCbufValue(cbuf.index, cbuf.offset) << cbuf.shift_left) |
-                       (env.ReadCbufValue(sec_index, sec_offset) << cbuf.secondary_shift_left);
-    env.EndTextureHandle(cbuf, handle);
-    return handle;
-}
 
-Shader::ConstBufferAddr HandleAt(u32 index, u32 offset) {
-    Shader::ConstBufferAddr cbuf{};
-    cbuf.index = index;
-    cbuf.offset = offset;
-    return cbuf;
-}
-
-size_t CountKind(const std::vector<Query>& queries, QueryKind kind) {
-    return static_cast<size_t>(std::ranges::count(queries, kind, &Query::kind));
-}
-} // Anonymous namespace
 
 TEST_CASE("Class-level replay compares texture classes instead of handle words",
           "[video_core][translation_cache]") {
@@ -586,7 +847,7 @@ TEST_CASE("Offline metadata can be reused after replay and is dropped on disagre
     REQUIRE(store.FindEntry({91, 1}, env)->id == demand->id);
 }
 
-TEST_CASE("Offline entry-only records are rejected after load and truncated append",
+TEST_CASE("Offline entry-only records remain reusable after load and truncated append",
           "[translation_cache][video_core]") {
     const auto path = std::filesystem::temp_directory_path() / "lichii_offline_entry_only_test.bin";
     std::filesystem::remove(path);
@@ -597,7 +858,7 @@ TEST_CASE("Offline entry-only records are rejected after load and truncated appe
         store.Open(path, config);
         REQUIRE(store.Persistent());
         const auto offline = store.Insert({1, 2}, {}, {}, true);
-        REQUIRE_FALSE(store.FindEntry({1, 2}, env));
+        REQUIRE(store.FindEntry({1, 2}, env));
         REQUIRE(offline);
         REQUIRE(store.Insert({3, 4}, {}, {}));
     }
@@ -608,9 +869,9 @@ TEST_CASE("Offline entry-only records are rejected after load and truncated appe
     {
         Store store;
         store.Open(path, config);
-        REQUIRE_FALSE(store.FindEntry({1, 2}, env));
+        REQUIRE(store.FindEntry({1, 2}, env));
         REQUIRE(store.FindEntry({3, 4}, env));
-        REQUIRE(store.offline_entry_only_rejected.load() == 1);
+        REQUIRE(store.offline_entry_only_rejected.load() == 0);
     }
     std::filesystem::remove(path);
 }

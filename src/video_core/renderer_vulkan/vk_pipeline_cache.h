@@ -28,13 +28,16 @@
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/object_pool.h"
+#include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/profile.h"
+#include "shader_recompiler/runtime_info.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache_prebuild.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_translation_cache.h"
@@ -49,6 +52,10 @@ struct Program;
 
 namespace VideoCore {
 class ShaderNotify;
+}
+
+namespace VideoCommon {
+class ReplayEnvironment;
 }
 
 namespace Vulkan {
@@ -119,7 +126,7 @@ struct ComputePipelineCacheEntry {
 class PipelineCache : public VideoCommon::ShaderCache {
 public:
     bool PrecompileArchiveShaders(const std::filesystem::path& input, u64 title_id, u32 workers,
-                                  const std::filesystem::path& recipes);
+                                  const std::filesystem::path& recipes, u32 recipe_count);
     explicit PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, const Device& device,
                            Scheduler& scheduler, DescriptorPool& descriptor_pool,
                            GuestDescriptorQueue& guest_descriptor_queue,
@@ -211,6 +218,136 @@ private:
     void OpenTranslationCache(const std::filesystem::path& filename);
     [[nodiscard]] bool IsTranslationCacheable(const Shader::Environment& env) const;
 
+    /// use_shader_aot_translation (or EDEN_NX2_AOT_TRANSLATE=1): task and mesh stages are cached
+    /// too, and each run-time graphics stage is counted by why it was or was not taken from the
+    /// cache.
+    bool aot_translation{};
+    enum class StageOutcome : u8 {
+        Hit,
+        Uncacheable,
+        NewKey,
+        ReplayFailed,
+        VariantMiss,
+        VariantDeferred,
+        Count
+    };
+    std::atomic<u64> replay_translations{};
+    std::atomic<u64> replay_translation_ns{};
+    std::atomic<u64> replay_translation_mismatches{};
+    struct OutcomeCounter {
+        std::atomic<u64> stages{};
+        std::atomic<u64> ns{};
+    };
+    /// [outcome][0 = task/mesh, 1 = other stages]
+    std::array<std::array<OutcomeCounter, 2>, static_cast<size_t>(StageOutcome::Count)>
+        stage_outcomes{};
+    std::atomic<u64> boot_pipelines_failed{};
+    std::atomic<u64> boot_mesh_pipelines{};
+    void CountStageOutcome(StageOutcome outcome, Shader::Stage stage, u64 ns);
+    void LogStageOutcomes(std::string_view when);
+
+    /// Ahead-of-time translation of recognised pool programs (ShaderCache::seed_stage): the
+    /// GPU thread builds the environment and an owned copy of it; a worker translates the copy,
+    /// which answers no queries, and stores programs that needed none as ordinary entries.
+    bool SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_hash, size_t slot,
+                   std::span<const u8> constants, u8 tier);
+    [[nodiscard]] static size_t AotWorkerCount();
+    size_t aot_worker_count{};
+    static constexpr u64 MaxAotPending = 32;
+    static constexpr u64 MaxAotEntries = 4096;
+    std::atomic<u64> aot_pending{};
+    std::atomic<u64> aot_reserved{}; ///< Admitted jobs plus stored entries, against MaxAotEntries
+    [[nodiscard]] bool AotHasRoom() const noexcept {
+        return aot_translation && aot_pending.load() < MaxAotPending &&
+               aot_reserved.load() < MaxAotEntries;
+    }
+    std::atomic<u64> aot_candidates{};
+    std::atomic<u64> aot_skipped_known{};
+    std::atomic<u64> aot_skipped_uncacheable{};
+    std::atomic<u64> aot_skipped_full{};
+    std::atomic<u64> aot_completed{};
+    std::atomic<u64> aot_failed{};
+    std::array<std::atomic<u64>, 16> aot_needs_query{}; ///< By TranslationCache::QueryKind
+    std::atomic<u64> aot_capture_ns{};
+    std::atomic<u64> aot_translate_ns{};
+    std::atomic<u64> aot_entry_hits{};
+    std::atomic<u64> aot_with_constants{};
+    std::mutex aot_mutex;
+    /// Stage keys of entries the workers stored, not yet used by a draw, with their tier index.
+    std::unordered_map<VideoCommon::TranslationCache::Digest, u8,
+                       VideoCommon::TranslationCache::DigestHash>
+        aot_keys;
+    /// Stage keys of jobs queued or running.
+    std::unordered_set<VideoCommon::TranslationCache::Digest, VideoCommon::TranslationCache::DigestHash>
+        aot_in_flight;
+    std::array<std::atomic<u64>, 4> aot_stored_by_tier{}; ///< Tiers 1-3, then no manifest tier
+    std::array<std::atomic<u64>, 4> aot_hits_by_tier{};
+    std::atomic<u64> aot_late{};
+    std::atomic<u64> aot_variant_meta_differs{};
+    std::array<std::atomic<u64>, GraphicsPipeline::AotClasses> pipelines_by_class{};
+    /// (unique hash, slot) of admitted seeds -> their stage key, until the program's first draw.
+    std::unordered_map<u64, VideoCommon::TranslationCache::Digest> aot_seeded_programs;
+    std::atomic<u64> aot_miss_key_differs{};
+    std::atomic<u64> aot_miss_replay_failed{};
+    std::atomic<u64> aot_miss_not_stored{};
+
+    /// Seeded variants: a seeded entry also gets the SPIR-V module of the emission recipe
+    /// (runtime info and bindings in) most often seen at run time for stages of its class (stage
+    /// and loaded varyings), so its first draw neither translates nor emits. A wrong guess is
+    /// never used: the variant key holds the runtime info and the bindings. Off with
+    /// EDEN_NX2_AOT_EMIT=0.
+    struct EmissionRecipe {
+        Shader::RuntimeInfo runtime_info;
+        Shader::Backend::Bindings binding_in{};
+        VideoCommon::TranslationCache::Digest digest{};
+        u64 count{};
+    };
+    bool aot_emit_variants{};
+    std::mutex recipe_mutex;
+    /// Class key -> recipes seen (a few per class; key 0 of a stage holds the stage's recipes).
+    std::unordered_map<u64, std::vector<EmissionRecipe>> recipes;
+    /// A plain vertex-B + fragment pipeline's stage was emitted (or taken from the cache) with
+    /// this runtime info and these bindings in.
+    void RecordRecipe(Shader::Stage stage, const Shader::Info& info,
+                      const Shader::RuntimeInfo& runtime_info,
+                      const Shader::Backend::Bindings& binding_in);
+    /// The most common recipe of the program's class, else of its stage; `class_match` says
+    /// which.
+    [[nodiscard]] std::optional<EmissionRecipe> BestRecipe(Shader::Stage stage,
+                                                           const Shader::Info& info,
+                                                           bool& class_match);
+    std::atomic<u64> aot_variants_class{};      ///< Emitted with the class's recipe
+    std::atomic<u64> aot_variants_stage{};      ///< Emitted with the stage's recipe
+    std::atomic<u64> aot_variants_none{};       ///< No recipe seen yet for the stage
+    std::atomic<u64> aot_variants_failed{};
+    std::atomic<u64> aot_variant_ns{};
+    std::atomic<u64> aot_full_hits{};           ///< Seeded stages whose first draw found the module
+    std::atomic<u64> aot_emitted_at_draw{};     ///< Seeded stages emitted at their first draw
+    std::atomic<u64> worker_variant_hits{};     ///< Deferred stages whose module the worker found
+    std::atomic<u64> worker_variant_info_differs{};
+    /// Seeds emitted with a stage-level guess wait (owning their environment) for their
+    /// class's first recipe, then get a module for it on an AOT worker.
+    struct WaitingSeed {
+        std::shared_ptr<VideoCommon::ReplayEnvironment> env;
+        std::shared_ptr<const VideoCommon::TranslationCache::Entry> entry;
+        u64 bytes{};
+        u64 generation{};
+    };
+    std::unordered_map<u64, std::vector<WaitingSeed>> waiting_seeds; ///< Under recipe_mutex
+    size_t waiting_count{};
+    void ParkSeed(const std::shared_ptr<VideoCommon::ReplayEnvironment>& env,
+                  const std::shared_ptr<const VideoCommon::TranslationCache::Entry>& entry,
+                  Shader::Stage stage, const Shader::Info& info, u64 bytes, u64 generation);
+    void EmitWaitingSeeds(std::vector<WaitingSeed> seeds);
+    std::atomic<u64> aot_parked{};
+    std::atomic<u64> aot_waiting_dropped{};
+    std::atomic<u64> aot_late_variants{};
+    std::atomic<u64> aot_late_info_differs{};
+    std::atomic<u64> canonical_verified{};
+    std::atomic<u64> canonical_mismatches{};
+    std::atomic<u64> aot_bytes{};
+    std::atomic<u64> aot_bytes_peak{};
+
     std::filesystem::path pipeline_cache_filename;
 
     /// Key hashes of the graphics pipelines in the disk cache. Only those a recent session used
@@ -232,7 +369,11 @@ private:
 
     Common::ThreadWorker workers;
     Common::ThreadWorker serialization_thread;
+    /// Created on the first AOT job, so the setting off starts no thread. Declared after the
+    /// translation cache: destroyed (and joined) before it.
+    std::unique_ptr<Common::ThreadWorker> aot_workers;
     DynamicFeatures dynamic_features;
+    PipelinePrebuild<GraphicsPipelineCacheKey, GraphicsPipeline> background_pipelines;
 };
 
 } // namespace Vulkan

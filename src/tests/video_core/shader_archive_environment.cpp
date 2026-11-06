@@ -237,6 +237,42 @@ TEST_CASE("Offline producer resumes complete modules and repairs interrupted app
         REQUIRE(result.resumed == 1);
         REQUIRE(result.skipped.empty());
     }
+    // Exact-stage recipes survive source configuration changes and each gets a fresh IR emission.
+    const auto recipes_path = directory / "recipes.bin";
+    const Digest source_config{123, 456};
+    {
+        auto env = source.Make();
+        Store recipes;
+        recipes.Open(recipes_path, source_config);
+        const auto key = MakeStageKey(env, *env.Analyze(), 1, source_config);
+        ProgramMeta meta{};
+        meta.stage = Shader::Stage::VertexB;
+        const auto entry = recipes.Insert(key, {}, meta);
+        for (u32 texture : {2, 3, 4}) {
+            auto recipe = DefaultEmissionRecipe(meta.stage);
+            recipe.bindings.texture = texture;
+            REQUIRE(recipes.InsertVariant(*entry,
+                MakeVariantKey(entry->id, DigestRuntimeInfo(recipe.runtime), recipe.bindings),
+                {.spirv = {0x07230203, 0x10000, 0, 1, 0}}, &recipe));
+        }
+    }
+    {
+        Store store;
+        store.Open(directory / "multi.bin", config);
+        const auto first = Offline::Run(input, 0x0400000000000000ULL, 2, recipes_path,
+                                        profile, {}, config, store, 1);
+        REQUIRE(first.modules == 4);
+        REQUIRE(first.translated == 4);
+        REQUIRE(first.module_bytes >= first.modules * 20);
+        REQUIRE(first.skipped.empty());
+        const auto size = std::filesystem::file_size(directory / "multi.bin");
+        const auto second = Offline::Run(input, 0x0400000000000000ULL, 2, recipes_path,
+                                         profile, {}, config, store, 1);
+        REQUIRE(second.modules == 0);
+        REQUIRE(second.translated == 0);
+        REQUIRE(second.resumed == 2);
+        REQUIRE(std::filesystem::file_size(directory / "multi.bin") == size);
+    }
     std::filesystem::remove_all(directory);
 }
 

@@ -77,6 +77,9 @@ enum class QueryKind : u8 {
     CbufStorageBufferPointer,
     ReplaceConstBuffer,
     CbufIndirectStorageBufferPointer,
+    /// The texture handle built from constant buffer words (class-level replay only): a, b and c
+    /// pack the ConstBufferAddr (PackHandleAddress), the answer is the handle. Replay computes
+    /// the live handle and compares the texture queries made with it, not the words.
     TextureHandle,
 };
 
@@ -93,11 +96,14 @@ struct Query {
 /// Forwards to a live environment and records each query the translator makes with its answer.
 class RecordingEnvironment final : public Shader::Environment {
 public:
+    /// With class_replay, a constant buffer word consumed only as part of a texture handle is
+    /// recorded as the handle (QueryKind::TextureHandle) instead of its raw value.
     explicit RecordingEnvironment(Shader::Environment& inner, bool class_replay = false);
+    ~RecordingEnvironment() override = default;
+
     void BeginTextureHandle() override;
     void EndTextureHandle(const Shader::ConstBufferAddr& cbuf, u32 handle) override;
     void NoteExactCbufWord(u32 index, u32 offset) override;
-    ~RecordingEnvironment() override = default;
 
     u64 ReadInstruction(u32 address) override;
     u32 TranslateProgramAddress(u32 address) const override;
@@ -130,9 +136,18 @@ private:
     std::unordered_set<u64> exact_words;
 };
 
+/// Live answers gathered by a class-level replay, for retranslating the stage elsewhere: the
+/// queries with the live environment's words, handles and answers.
+using LiveAnswers = std::vector<Query>;
+
 /// Asks the live environment the recorded queries in order; true when every answer matches.
 /// Stops at the first mismatch, so it never makes a query the translation would not make.
 [[nodiscard]] bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env);
+/// ReplayQueries that also says where it stopped: the index of the first query answered
+/// differently (queries.size() when all matched).
+[[nodiscard]] size_t ReplayQueriesUntilMismatch(std::span<const Query> queries,
+                                                Shader::Environment& env,
+                                                LiveAnswers* live = nullptr);
 
 /// Key of a stage: its hash and the environment values the translator reads besides queries.
 [[nodiscard]] Digest MakeStageKey(Shader::Environment& env, u64 unique_hash, u32 slot,
@@ -179,6 +194,7 @@ struct ProgramMeta {
     u32 shared_memory_size{};
     bool is_geometry_passthrough{};
     Shader::Info info;
+    Shader::MeshInfo mesh;
 
     [[nodiscard]] static ProgramMeta From(const Shader::IR::Program& program);
     /// A program with these fields and no IR blocks.
@@ -224,6 +240,21 @@ struct EmissionRecipe {
 
 [[nodiscard]] EmissionRecipe DefaultEmissionRecipe(Shader::Stage stage);
 
+[[nodiscard]] u64 RecipeClass(Shader::Stage stage, const Shader::Info* info);
+
+struct RecipeCatalog {
+    struct CountedRecipe {
+        EmissionRecipe recipe;
+        Digest key;
+        u64 count{};
+    };
+    Digest source_config{};
+    std::unordered_map<Digest, std::vector<EmissionRecipe>, DigestHash> exact;
+    std::unordered_map<u64, std::vector<CountedRecipe>> classes;
+    [[nodiscard]] std::vector<EmissionRecipe> Select(const Digest& stage_key, Shader::Stage stage,
+                                                    const Shader::Info& info, u32 top_k) const;
+};
+
 enum class OfflineOutcome { VariantHit, VariantMiss, MetaMismatch, FullHit };
 
 class Store {
@@ -242,20 +273,40 @@ public:
     }
 
     /// The entry of a stage whose recorded queries the environment answers the same way.
+    /// TextureHandle queries replay by class; optional `live` captures the matching entry's
+    /// current answers for worker-side reconstruction.
     [[nodiscard]] std::shared_ptr<const Entry> FindEntry(const Digest& stage_key,
-                                                         Shader::Environment& env);
+                                                         Shader::Environment& env,
+                                                         LiveAnswers* live = nullptr);
+    /// True when entries exist for the stage key (whether or not the environment matches them).
+    [[nodiscard]] bool HasStageKey(const Digest& stage_key);
     /// The variant, decompressed.
     [[nodiscard]] std::optional<Variant> FindVariant(const Digest& variant_key);
 
-    /// Adds an entry (when new) and a variant, and appends both to the file.
+    /// Adds an entry (when new) and appends it to the file. With `expected_generation`, nothing
+    /// is added unless the store is still the one opened then (checked under the store mutex).
     std::shared_ptr<const Entry> Insert(const Digest& stage_key, std::vector<Query> queries,
-                                        const ProgramMeta& meta, bool offline = false);
-    void InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant,
+                                        const ProgramMeta& meta, bool offline = false,
+                                        std::optional<u64> expected_generation = std::nullopt);
+    std::shared_ptr<const Entry> Insert(const Digest& stage_key, std::vector<Query> queries,
+                                        const ProgramMeta& meta, u64 expected_generation) {
+        return Insert(stage_key, std::move(queries), meta, false, expected_generation);
+    }
+    /// Adds a variant only if its entry still belongs to this store.
+    bool InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant,
                        const EmissionRecipe* recipe = nullptr);
+    [[nodiscard]] u64 Generation() const noexcept {
+        return generation.load();
+    }
+    std::atomic<u64> rejected_variants{};
 
     /// Reads recipes without modifying the source cache, including an incomplete tail.
     [[nodiscard]] static std::array<EmissionRecipe, Shader::MaxStageTypes> ReadRecipes(
         const std::filesystem::path& path, const Digest& config);
+
+    /// Read only recipes from any compatible format-10 configuration; never reuse its modules.
+    [[nodiscard]] static RecipeCatalog ReadRecipeCatalog(const std::filesystem::path& path,
+                                                        const Digest& config);
 
     /// Reject speculative metadata before any pipeline state is derived from it.
     [[nodiscard]] bool ValidateOfflineEntry(const Entry& entry, const Shader::IR::Program& live);
@@ -263,6 +314,12 @@ public:
     void DropEntry(const Entry& entry);
     void LogOfflineOutcome(Shader::Stage stage, u64 hash, OfflineOutcome outcome);
     void LogStatistics(std::string_view when);
+
+    /// With count_mismatches set (use_shader_aot_translation), FindEntry misses on a known
+    /// stage key are counted by the kind of the first query answered differently, taken from the
+    /// candidate whose replay got furthest.
+    bool count_mismatches{};
+    std::array<std::atomic<u64>, 16> first_mismatch{};
 
     // Statistics
     std::array<std::array<std::atomic<u64>, 4>, Shader::MaxStageTypes> offline_outcomes{};
@@ -298,10 +355,14 @@ private:
     void CountRecipe(Shader::Stage stage, const EmissionRecipe& recipe);
     std::unordered_map<Digest, RecipeCount, DigestHash> recipes;
 
+    bool collect_recipe_entries{};
+    std::unordered_map<Digest, std::vector<EmissionRecipe>, DigestHash> entry_recipes;
+
     // Writers serialize publication and append; readers never wait for file I/O.
     std::mutex writer_mutex;
     std::mutex mutex;
     bool enabled{};
+    std::atomic<u64> generation{};
     std::unordered_map<Digest, std::vector<std::shared_ptr<const Entry>>, DigestHash> entries;
     std::unordered_map<Digest, std::shared_ptr<const StoredVariant>, DigestHash> variants;
     std::unordered_set<Digest, DigestHash> dropped_entries;

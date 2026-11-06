@@ -691,7 +691,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         if (!lp.shader_archive_index.empty()) {
             archive_ok = state->system.Renderer().ReadRasterizer()->PrecompileArchiveShaders(
                 lp.shader_archive_index, state->system.GetApplicationProcessProgramID(),
-                lp.shader_workers, lp.shader_recipe_cache);
+                lp.shader_workers, lp.shader_recipe_cache, lp.shader_recipe_count);
             if (!archive_ok) LOG_ERROR(Frontend, "Archive precompile failed (requires Vulkan and disk translation cache)");
         }
         // LoadDiskResources saved the Vulkan pipeline cache; SDL_AppQuit shuts the renderer down,

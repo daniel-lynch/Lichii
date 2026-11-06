@@ -618,6 +618,12 @@ struct Values {
     SwitchableSetting<bool> use_shader_translation_cache{
         linkage, true, "use_shader_translation_cache", Category::RendererAdvanced};
 
+    // Task and mesh stages join the translation cache, and cached pipelines the boot preload
+    // could not build are reported (docs/shader-aot-translation.md). Off by default; the
+    // environment variable EDEN_NX2_AOT_TRANSLATE=1 also turns it on.
+    SwitchableSetting<bool> use_shader_aot_translation{
+        linkage, false, "use_shader_aot_translation", Category::RendererAdvanced};
+
     SwitchableSetting<bool> use_disk_shader_cache{linkage, true, "use_disk_shader_cache",
                                                   Category::RendererAdvanced};
 

@@ -186,6 +186,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "built again (at boot, after\nbeing evicted, or for new render state over known "
               "shaders) skip shader translation.\nEntries are checked against the game's current "
               "shader inputs before use and are discarded by a new build."));
+    INSERT(Settings, use_shader_aot_translation, tr("Translate shaders ahead of first use"),
+           tr("Also caches the translated task and mesh shaders, so a pipeline that reuses them "
+              "skips translation.\nNeeds \"Cache translated shaders\". Experimental."));
     INSERT(
         Settings, use_asynchronous_gpu_emulation, tr("Use asynchronous GPU emulation"),
         tr("Uses an extra CPU thread for rendering.\nThis option should always remain enabled."));

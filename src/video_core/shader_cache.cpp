@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <exception>
@@ -32,6 +33,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
+#include "common/settings.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/util.h"
@@ -117,6 +119,15 @@ u64 ShaderCache::MeshStateHash() const {
 }
 
 bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
+    // Scene-manifest programs of recognised pools are fed to the AOT workers as fast as they take
+    // them, not only when a new program is used: a loading screen or a stretch of known draws
+    // would otherwise leave the workers idle while the scene's programs wait.
+    if (seed_enabled && pool_index && pool_index->HasManifestCandidates() && seed_has_room &&
+        seed_has_room()) {
+        const auto seed_begin = std::chrono::steady_clock::now();
+        SeedPoolCandidates(true);
+        pool_index->AddSeedTime(std::chrono::steady_clock::now() - seed_begin);
+    }
     auto& dirty{maxwell3d->dirty.flags};
     if (!dirty[VideoCommon::Dirty::Shaders]) {
         return last_shaders_valid;
@@ -168,6 +179,29 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                 RethrowIfRejected(*cpu_shader_addr);
                 GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address};
                 shader_info = MakeShaderInfo(env, *cpu_shader_addr);
+                if (native) {
+                    if (!pool_index_opened) {
+                        pool_index_opened = true;
+                        const char* aot = std::getenv("EDEN_NX2_AOT_TRANSLATE");
+                        if (Settings::values.use_shader_aot_translation.GetValue() ||
+                            (aot != nullptr && aot[0] == '1')) {
+                            pool_index = ShaderPoolIndex::Open();
+                            // Seeding costs GPU-thread time to build candidate environments
+                            // (329 ms in cold run 20261106-001156): opt-in with
+                            // EDEN_NX2_AOT_SEED=1 until it is shown to pay for itself.
+                            const char* seed = std::getenv("EDEN_NX2_AOT_SEED");
+                            seed_enabled = pool_index && seed != nullptr && seed[0] == '1';
+                        }
+                    }
+                    if (pool_index) {
+                        pool_index->OnFirstUse(*gpu_memory, shader_addr);
+                        if (seed_enabled && seed_stage && !mesh) {
+                            const auto seed_begin = std::chrono::steady_clock::now();
+                            SeedPoolCandidates(false);
+                            pool_index->AddSeedTime(std::chrono::steady_clock::now() - seed_begin);
+                        }
+                    }
+                }
             } catch (const Shader::Exception&) {
                 RememberRejection(*cpu_shader_addr);
                 // Once per program: which stage slot it is bound to, its header and the slot's
@@ -250,6 +284,50 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
         }
     }
     return false;
+}
+
+void ShaderCache::SeedPoolCandidates(bool manifest_only) {
+    // A few per call, so a recognised pool is fed to the workers over many draws instead of
+    // building thousands of environments on one.
+    static constexpr size_t PerCall = 4;
+    if (seed_has_room && !seed_has_room()) {
+        return;
+    }
+    for (const auto& candidate : pool_index->TakeCandidates(PerCall, manifest_only)) {
+        if (seed_has_room && !seed_has_room()) {
+            break;
+        }
+        const std::optional<VAddr> cpu_addr{gpu_memory->GpuToCpuAddress(candidate.address)};
+        if (!cpu_addr || TryGet(*cpu_addr) || IsRejected(*cpu_addr)) {
+            continue;
+        }
+        const auto program = candidate.stage == 0 ? Tegra::Engines::Maxwell3D::Regs::ShaderType::VertexB
+                                                  : Tegra::Engines::Maxwell3D::Regs::ShaderType::Pixel;
+        try {
+            GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, candidate.address, 0};
+            const std::optional<u64> hash{env.Analyze()};
+            if (!hash) {
+                continue;
+            }
+            // Bank 1 is the program's own constant section, a part of the pool bound with it
+            // and never written: its words are exact answers, not guesses.
+            std::vector<u8> constants;
+            if (candidate.constants_offset != ~0U && candidate.constants_size != 0 &&
+                gpu_memory->IsFullyMappedRange(candidate.address + candidate.constants_offset,
+                                               candidate.constants_size)) {
+                constants.resize(candidate.constants_size);
+                gpu_memory->ReadBlockUnsafe(candidate.address + candidate.constants_offset,
+                                            constants.data(), constants.size());
+            }
+            // The pool is authoritative; the manifest's copy of the words is only checked.
+            pool_index->CheckBank1(candidate, constants);
+            if (seed_stage(env, *hash, static_cast<size_t>(program), constants, candidate.tier)) {
+                pool_index->CountSeeded(candidate);
+            }
+        } catch (const Shader::Exception&) {
+            // Rejected or not lowerable: its first use will say so.
+        }
+    }
 }
 
 const ShaderInfo* ShaderCache::ComputeShader() {

@@ -23,6 +23,7 @@ u32 Word(std::span<const u8> bytes, size_t offset) {
 ArchiveEnvironment::ArchiveEnvironment(std::span<const u8> program, std::span<const u8> control,
                                        Shader::Stage shader_stage, u32 texture_buffer) {
     using namespace Shader::Ampere;
+    tracks_texture_handles = true;
     if (shader_stage != Shader::Stage::VertexB && shader_stage != Shader::Stage::Fragment &&
         shader_stage != Shader::Stage::Geometry) {
         throw Shader::RuntimeError("Archive environment: unsupported_stage");

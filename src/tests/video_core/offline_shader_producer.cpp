@@ -177,3 +177,58 @@ TEST_CASE("Offline production signals request cancellation without terminating",
     // Leave the producer ready for other tests in this process.
     SignalGuard reset;
 }
+
+TEST_CASE("Recipe catalogs retain exact variants and rank runtime recipes by class",
+          "[video_core][translation_cache]") {
+    const auto path = std::filesystem::temp_directory_path() / "lichii_offline_recipe_catalog.bin";
+    std::filesystem::remove(path);
+    const Digest source_config{27, 91};
+    ProgramMeta meta{};
+    meta.stage = Shader::Stage::VertexB;
+    auto common = DefaultEmissionRecipe(meta.stage);
+    common.bindings.texture = 2;
+    auto rare = common;
+    rare.bindings.texture = 3;
+    auto fallback = common;
+    fallback.bindings.texture = 99;
+    auto other_class = common;
+    other_class.bindings.texture = 4;
+    {
+        Store store;
+        store.Open(path, source_config);
+        for (u64 i = 0; i < 6; ++i) {
+            auto info = meta;
+            if (i == 5) info.info.loads.mask.set(128);
+            const auto entry = store.Insert({i, 1}, {}, info);
+            const auto& recipe = i < 3 ? common : i == 3 ? rare : i == 4 ? fallback : other_class;
+            const Variant variant{.spirv = {0x07230203, 0x10000, 0, 1, 0},
+                                  .fallback_recipe = i == 4};
+            const auto key = MakeVariantKey(entry->id, DigestRuntimeInfo(recipe.runtime), recipe.bindings);
+            REQUIRE(store.InsertVariant(*entry, key, variant, &recipe));
+            REQUIRE(store.InsertVariant(*entry, key, variant, &recipe));
+        }
+    }
+    const auto size = std::filesystem::file_size(path);
+    {
+        std::ofstream file(path, std::ios::binary | std::ios::app);
+        file << "partial";
+    }
+    const auto catalog = Store::ReadRecipeCatalog(path, {100, 200});
+    REQUIRE(catalog.source_config == source_config);
+    REQUIRE(std::filesystem::file_size(path) == size + 7);
+    const auto exact = catalog.Select({3, 1}, meta.stage, meta.info, 1);
+    REQUIRE(exact.size() == 3);
+    REQUIRE(exact[0].bindings.texture == 3);
+    REQUIRE(exact[1].bindings.texture == 2);
+    REQUIRE(exact[2].bindings.texture == 0);
+    const auto ranked = catalog.Select({99, 1}, meta.stage, meta.info, 3);
+    REQUIRE(ranked.size() == 3);
+    REQUIRE(ranked[0].bindings.texture == 2);
+    REQUIRE(ranked[1].bindings.texture == 3);
+    meta.info.loads.mask.set(128);
+    const auto classified = catalog.Select({99, 1}, meta.stage, meta.info, 3);
+    REQUIRE(classified.size() == 2);
+    REQUIRE(classified[0].bindings.texture == 4);
+    REQUIRE(classified[1].bindings.texture == 0);
+    std::filesystem::remove(path);
+}
