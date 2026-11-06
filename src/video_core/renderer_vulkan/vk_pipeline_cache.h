@@ -206,6 +206,7 @@ private:
     bool translation_cache_verify{};
     std::atomic<u64> translation_cache_verified{};
     std::atomic<u64> translation_cache_mismatches{};
+    std::atomic<u64> translation_cache_canonical_differences{};
     std::chrono::steady_clock::time_point translation_cache_logged{};
     void OpenTranslationCache(const std::filesystem::path& filename);
     [[nodiscard]] bool IsTranslationCacheable(const Shader::Environment& env) const;

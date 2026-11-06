@@ -858,6 +858,8 @@ PipelineCache::~PipelineCache() {
         LOG_INFO(Render_Vulkan,
                  "Translation cache: {} cached stages compared with a fresh translation, {} differed",
                  translation_cache_verified.load(), translation_cache_mismatches.load());
+        LOG_INFO(Render_Vulkan, "Translation cache: canonical runtime differences={}",
+                 translation_cache_canonical_differences.load());
     }
     SaveUsedPipelines();
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
@@ -1114,6 +1116,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         LOG_INFO(Render_Vulkan,
                  "Translation cache: {} cached stages compared with a fresh translation, {} differed",
                  translation_cache_verified.load(), translation_cache_mismatches.load());
+        LOG_INFO(Render_Vulkan, "Translation cache: canonical runtime differences={}",
+                 translation_cache_canonical_differences.load());
     }
     translation_cache.stage_hits = 0;
     translation_cache.stage_misses = 0;
@@ -1589,8 +1593,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 code = EmitSPIRV(profile, runtime_info, program, binding);
                 if (translation_cache_verify && (full_code != code ||
                     std::memcmp(&full_binding, &binding, sizeof(binding)) != 0)) {
-                    ++translation_cache_mismatches;
-                    throw Shader::LogicError("Translation cache: canonical runtime info changed stage {}", index);
+                    const auto count = ++translation_cache_canonical_differences;
+                    if (count <= 20) {
+                        LOG_INFO(Render_Vulkan,
+                                 "Translation cache: canonical runtime info differs stage={} "
+                                 "shader={:016x} full_words={} canonical_words={} count={}",
+                                 index, key.unique_hashes[index], full_code.size(), code.size(), count);
+                    }
                 }
                 if (build_in_parallel) {
                     AddRuntimeSpirvTime(0, begin);
@@ -1608,6 +1617,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                                   info_equal,
                                   std::memcmp(&variant->binding_out, &binding, sizeof(binding)) ==
                                       0);
+                        if (entry) translation_cache.DropEntry(*entry);
+                        throw Shader::LogicError("Translation cache: fresh translation mismatch stage {}", index);
                     }
                 } else if (entry) {
                     translation_cache.InsertVariant(*entry, variant_key,
@@ -1979,6 +1990,8 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                               "Translation cache: compute shader {:016x} differs from a fresh "
                               "translation (spirv {}, info {})",
                               key.unique_hash, cached->spirv == code, info_equal);
+                    translation_cache.DropEntry(*entry);
+                    throw Shader::LogicError("Translation cache: fresh compute translation mismatch");
                 }
             }
         }
