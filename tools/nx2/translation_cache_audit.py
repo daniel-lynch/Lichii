@@ -212,6 +212,13 @@ def read_cache(path, provenance, needed_keys=None):
             pos = 20 + count * 17
             stage, = struct.unpack_from("<I", data, pos)
             fields, end = read_info(data, pos + 37)
+            if stage in (7, 8):
+                # Task and mesh entries end with their MeshInfo: four u32 sizes, then the
+                # vertex and primitive line maps (u32 count + u32 elements each).
+                end += 16
+                for _ in range(2):
+                    lines, = struct.unpack_from("<I", data, end)
+                    end += 4 + lines * 4
             if end + 1 != len(data):
                 raise ValueError("unexpected entry size (ABI mismatch)")
             entries.append(dict(key=key, stage=STAGES.get(stage, str(stage)),

@@ -14,6 +14,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/maxwell/structured_control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
+#include "video_core/offline_compute_producer.h"
 #include "video_core/offline_shader_producer.h"
 #include "video_core/shader_archive_environment.h"
 
@@ -67,7 +68,8 @@ u32 Word(std::span<const u8> bytes, size_t offset) {
 }
 std::string Reason(std::string_view message) {
     for (const auto reason : {"missing_constant", "unsupported_stage", "base_dependent",
-                              "bank1_too_large",
+                              "bank1_too_large", "invalid_workgroup", "unsupported_local_memory",
+                              "unsupported_control", "trap_guard",
                               "unsupported_lowering", "invalid_range", "input_io",
                               "fingerprint_mismatch", "constants_mismatch"}) {
         if (message.find(reason) != std::string_view::npos) return reason;
@@ -108,6 +110,10 @@ void WriteReport(const std::filesystem::path& path, const Summary& summary) {
         {"cancelled", summary.cancelled},
         {"skips", summary.skipped}, {"sources", sources},
         {"product_entry_multiplicity", histogram}, {"product_modules", summary.product_modules},
+        {"compute", {{"translated", summary.compute.translated},
+                     {"resumed", summary.compute.resumed},
+                     {"modules", summary.compute.modules},
+                     {"module_bytes", summary.compute.module_bytes}}},
         {"import", {{"entries", summary.import_entries},
                     {"truncated_entries", summary.import_truncated_entries},
                     {"skipped_records", summary.import_skipped_records},
@@ -146,9 +152,11 @@ Input ParseInput(std::string_view text, const std::filesystem::path& directory) 
             program.offset > UINT64_MAX - program.size ||
             program.control_offset > UINT64_MAX - 0x58)
             throw std::runtime_error("invalid_range");
+        // Compute rows carry bank-1 constants the same way (control +0x40/+0x3c).
         const bool graphics = program.stage == Shader::Stage::VertexB ||
                               program.stage == Shader::Stage::Fragment ||
-                              program.stage == Shader::Stage::Geometry;
+                              program.stage == Shader::Stage::Geometry ||
+                              program.stage == Shader::Stage::Compute;
         if (graphics && program.constants_size != 0 &&
             (program.constants_offset > program.size ||
              program.constants_size > program.size - program.constants_offset))
@@ -174,7 +182,8 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
             const std::filesystem::path& recipe_cache, const Shader::Profile& profile,
             const Shader::HostTranslateInfo& host, const TranslationCache::Digest& config,
             TranslationCache::Store& store, u32 recipe_count, u32 recipe_limit,
-            const std::filesystem::path& report, TranslationCache::RecipeBaseline baseline) {
+            const std::filesystem::path& report, TranslationCache::RecipeBaseline baseline,
+            u32 compute_shared_memory_limit) {
     namespace TC = TranslationCache;
     const auto begin = std::chrono::steady_clock::now();
     const auto index_size = std::filesystem::file_size(input);
@@ -220,6 +229,25 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
             if (index >= parsed.programs.size()) break;
             const auto& row = parsed.programs[index];
             try {
+                if (row.stage == Shader::Stage::Compute && ComputeEnabled()) {
+                    const auto outcome = ProduceCompute(row, profile, host, config, store,
+                                                        compute_shared_memory_limit);
+                    std::scoped_lock lock(results);
+                    summary.translated += outcome.translated ? 1 : 0;
+                    summary.resumed += outcome.resumed ? 1 : 0;
+                    summary.validated_modules += outcome.validated ? 1 : 0;
+                    summary.invalidated_modules += outcome.invalidated ? 1 : 0;
+                    summary.compute.translated += outcome.translated ? 1 : 0;
+                    summary.compute.resumed += outcome.resumed ? 1 : 0;
+                    if (outcome.module_bytes != 0) {
+                        ++summary.modules;
+                        summary.module_bytes += outcome.module_bytes;
+                        ++summary.compute.modules;
+                        summary.compute.module_bytes += outcome.module_bytes;
+                        summary.replaced_modules += outcome.invalidated ? 1 : 0;
+                    }
+                    continue;
+                }
                 if (row.stage != Shader::Stage::VertexB && row.stage != Shader::Stage::Fragment &&
                     row.stage != Shader::Stage::Geometry) throw std::runtime_error("unsupported_stage");
                 if (!row.skip_reason.empty()) throw std::runtime_error(row.skip_reason);
@@ -346,6 +374,9 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                  names[i], summary.sources[i].modules, summary.sources[i].module_bytes);
     for (const auto& [modules, entries] : summary.multiplicity)
         LOG_INFO(Render_Vulkan, "Offline translation: multiplicity={} entries={}", modules, entries);
+    LOG_INFO(Render_Vulkan, "Offline translation: compute translated={} resumed={} modules={} module_bytes={}",
+             summary.compute.translated, summary.compute.resumed, summary.compute.modules,
+             summary.compute.module_bytes);
     LOG_INFO(Render_Vulkan, "Offline translation: product_entries={} product_modules={}",
              summary.entries, summary.product_modules);
     if (summary.cancelled) {

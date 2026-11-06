@@ -63,6 +63,10 @@ struct Summary {
         import_bytes{}, import_invalid_recipes{}, import_scanned_records{},
         import_eligible_records{}, import_admitted_records{}, import_framing_skipped_bytes{};
     std::map<std::string, u64> skipped;
+    /// Compute rows (one module each, no recipes); also counted in the totals above.
+    struct {
+        u64 translated{}, resumed{}, modules{}, module_bytes{};
+    } compute;
 };
 void WriteReport(const std::filesystem::path& path, const Summary& summary);
 [[nodiscard]] Input ParseInput(std::string_view json, const std::filesystem::path& directory);
@@ -74,5 +78,6 @@ void WriteReport(const std::filesystem::path& path, const Summary& summary);
                           u32 recipe_limit = TranslationCache::DefaultRecipeLimit,
                           const std::filesystem::path& report = {},
                           TranslationCache::RecipeBaseline baseline =
-                              TranslationCache::RecipeBaseline::Auto);
+                              TranslationCache::RecipeBaseline::Auto,
+                          u32 compute_shared_memory_limit = 0);
 } // namespace VideoCommon::OfflineShaders

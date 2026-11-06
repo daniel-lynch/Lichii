@@ -67,10 +67,16 @@ ArchiveEnvironment::ArchiveEnvironment(std::span<const u8> program, std::span<co
         constants.assign(section.begin(), section.end());
     }
 
+    LowerProgram(program, HeaderSize, code_size, stage == Shader::Stage::Geometry);
+}
+
+void ArchiveEnvironment::LowerProgram(std::span<const u8> program, size_t code_begin,
+                                      size_t code_end, bool geometry) {
+    using namespace Shader::Ampere;
     std::vector<Instruction> native;
     ProgramCaptureState capture;
     bool complete = false;
-    for (size_t offset = HeaderSize; offset < code_size; offset += sizeof(Instruction)) {
+    for (size_t offset = code_begin; offset < code_end; offset += sizeof(Instruction)) {
         if (native.size() == ProgramCaptureState::MaximumInstructions) {
             throw Shader::RuntimeError("Archive environment: program_limit");
         }
@@ -94,7 +100,6 @@ ArchiveEnvironment::ArchiveEnvironment(std::span<const u8> program, std::span<co
     if (!complete) {
         throw Shader::RuntimeError("Archive environment: incomplete_program");
     }
-    const bool geometry = stage == Shader::Stage::Geometry;
     auto lowered = LowerToMaxwell(native, {.geometry = geometry, .tensor = true,
                                            .native_code_address = 0xfffffff0ULL});
     if (!lowered) {
@@ -112,7 +117,7 @@ ArchiveEnvironment::ArchiveEnvironment(std::span<const u8> program, std::span<co
     auto result = std::make_shared<LoweredNativeCode>();
     result->native_program_key = NativeProgramKey(native);
     result->texture_bound = lowered.required_texture_buffer;
-    result->source_size = HeaderSize + lowered.source_size;
+    result->source_size = code_begin + lowered.source_size;
     result->code.resize(sizeof(sph) / sizeof(u64));
     std::memcpy(result->code.data(), &sph, sizeof(sph));
     for (const u64 instruction : lowered.instructions) {
@@ -123,7 +128,65 @@ ArchiveEnvironment::ArchiveEnvironment(std::span<const u8> program, std::span<co
     }
     result->code.push_back(0);
     AppendNativeAddressMap(result->code, lowered.source_instruction_offsets);
-    InitializeNativeCode(std::move(result), HeaderSize, geometry);
+    InitializeNativeCode(std::move(result), static_cast<u32>(code_begin), geometry);
+}
+
+ArchiveEnvironment::ComputeState ArchiveEnvironment::ReadComputeState(std::span<const u8> control) {
+    // Words 0x58..0x6b of the control section: block dimensions, the shared memory the program
+    // declares and its per-thread local memory. The QMD the game's driver builds from them
+    // carries the shared size rounded up to 256 bytes (checked against recorded launches).
+    if (control.size() < 0x6c || Word(control, 0) != 0x98761234 || Word(control, 4) != 0xc9 ||
+        Word(control, 8) != 20) {
+        throw Shader::RuntimeError("Archive environment: unsupported_control");
+    }
+    ComputeState state;
+    u64 invocations = 1;
+    for (size_t i = 0; i < state.workgroup_size.size(); ++i) {
+        state.workgroup_size[i] = Word(control, 0x58 + i * sizeof(u32));
+        invocations *= state.workgroup_size[i];
+    }
+    if (invocations == 0 || invocations > 1024) {
+        throw Shader::RuntimeError("Archive environment: invalid_workgroup");
+    }
+    const u32 shared = Word(control, 0x64);
+    if (shared > 0x40000) {
+        throw Shader::RuntimeError("Archive environment: invalid_workgroup (shared memory)");
+    }
+    state.shared_memory_size = (shared + 0xff) & ~0xffU;
+    state.local_memory_size = Word(control, 0x68);
+    return state;
+}
+
+ArchiveEnvironment::ArchiveEnvironment(ComputeProgram, std::span<const u8> program,
+                                       std::span<const u8> control, u32 texture_buffer) {
+    using namespace Shader::Ampere;
+    tracks_texture_handles = true;
+    const ComputeState state = ReadComputeState(control);
+    if (control[0x56] != 5) {
+        throw Shader::RuntimeError("Archive environment: stage_mismatch");
+    }
+    const u32 code_size = Word(control, 0x38);
+    const u32 constant_size = Word(control, 0x3c);
+    const u32 constant_offset = Word(control, 0x40);
+    if (code_size < sizeof(Instruction) || code_size > program.size() ||
+        code_size % sizeof(Instruction) != 0 || constant_size > 0x100 ||
+        (constant_size && (constant_offset < code_size || constant_offset > program.size() ||
+                          constant_size > program.size() - constant_offset))) {
+        throw Shader::RuntimeError("Archive environment: invalid_range");
+    }
+    stage = Shader::Stage::Compute;
+    is_proprietary_driver = true;
+    texture_bound = texture_buffer;
+    initial_offset = sizeof(sph);
+    start_address = sizeof(sph);
+    workgroup_size = state.workgroup_size;
+    shared_memory_size = state.shared_memory_size;
+    local_memory_size = state.local_memory_size;
+    if (constant_size) {
+        const auto section = program.subspan(constant_offset, constant_size);
+        constants.assign(section.begin(), section.end());
+    }
+    LowerProgram(program, 0, code_size, false);
 }
 
 u32 ArchiveEnvironment::ExactWord(u32 index, u32 offset) const {
