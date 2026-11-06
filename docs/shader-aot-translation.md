@@ -521,6 +521,27 @@ A read-only review of the branch found seven defects. Each is fixed in its own c
 
 A scene is also posted only after a read that returned bytes.
 
+A second review left two of these partial, and both are now finished:
+- A full class whose recipes have all been seen more than once keeps up to four turned-away
+  recipes with a tally. One replaces the weakest resident once its tally is higher.
+- A candidate whose address is unmapped when it is taken is offered again after 2 s, 4 s, and so
+  on, at most eight times.
+
+Runs on the fixed binary, before these two follow-ups, in the step-2 configuration:
+
+| Run | Config | Whole log | Burst | After | Seeds stored / drawn | Full hits / emitted at the draw | fps med / p5 |
+|---|---|---|---|---|---|---|---|
+| 20261106-095432 | step 2 (the recipe file of 072033 was refused, see below) | 872 / 1852 / 664 = 2515 | 1766 | 591 | 1316 / 417 | 184 / 233 | 43.9 / 24.4 |
+| 20261106-120248 | + only 095432's recipe file (step 3) | 901 / 1755 / 349 = 2104 | 1472 | 487 | 1321 / 414 | 341 / 73 | 44.6 / 25.3 |
+
+- Run 120248 loaded 318 recipes of 249 classes, and 668 seeds used one of them. Its 2104 ms is
+  below the 2216 of run 073407, the step-3 run before the fixes.
+- The translation configuration digest includes the translator's identity, so a recipe file is
+  refused after a translator change, like the translation file. A run with the new translator
+  therefore had to write the file first: run 095432, with the same configuration as 072033.
+- Run 095432 crashed at shutdown (the known teardown fault), so its recipe file holds what it had
+  written by its last 30-s save.
+
 Open assumption: returning to an earlier scene (A → B → A) relies on the game reading A's
 GameBancParam again when it re-enters A. No trace has shown a return yet; the tour run made a
 single change. If the game does not read it again, B's rows stay selected until the next entry.
