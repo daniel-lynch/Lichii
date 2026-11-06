@@ -1842,6 +1842,11 @@ private:
                 if (oot_real_time) {
                     system.ApplicationMemory().Write32(address, std::bit_cast<u32>(delta));
                 }
+                m_stats.oot_last = delta;
+                m_stats.oot_min = (std::min)(m_stats.oot_min, delta);
+                m_stats.oot_max = (std::max)(m_stats.oot_max, delta);
+                m_stats.oot_fixed += delta == 1.0f ? 1 : 0;
+                ++m_stats.oot_presents;
             }
         }
         // Where each frame's time goes on the present thread, averaged per 600 presents: the
@@ -1869,13 +1874,24 @@ private:
             }
             m_stats.last_present = entered;
             if (++m_stats.presents == 600) {
+                // Ocarina's real-time delta (nx2_oot_time.h): the last value, its range and how
+                // many presents kept the fixed 1.0. "(off)" when EDEN_NX2_OOT_REAL_TIME=0, where
+                // it is computed but not written.
+                const std::string oot =
+                    m_stats.oot_presents == 0
+                        ? std::string{}
+                        : fmt::format(" oot_delta={:.2f}{} (min {:.2f}, max {:.2f}, 1.00 on {} "
+                                      "of {})",
+                                      m_stats.oot_last, oot_real_time ? "" : "(off)",
+                                      m_stats.oot_min, m_stats.oot_max, m_stats.oot_fixed,
+                                      m_stats.oot_presents);
                 LOG_INFO(Service,
                          "nx2:vi2 last 600 presents: frame {} us (max {}, {} over 100 ms), "
                          "blocked on the GPU fence {} us (max {}), composite {} us, vblank "
-                         "pacing {} us, {} ran a frame ahead",
+                         "pacing {} us, {} ran a frame ahead{}",
                          m_stats.frame_us / 599, m_stats.max_frame_us, m_stats.hitches,
                          m_stats.fence_us / 600, m_stats.max_fence_us, m_stats.composite_us / 600,
-                         m_stats.pace_us / 600, m_stats.ran_ahead);
+                         m_stats.pace_us / 600, m_stats.ran_ahead, oot);
                 m_stats = {.last_present = entered};
             }
         }
@@ -1895,6 +1911,8 @@ private:
         long long max_frame_us{}, hitches{};
         u32 presents{}, ran_ahead{};
         std::chrono::steady_clock::time_point last_present{};
+        float oot_last{}, oot_min{100.0f}, oot_max{};
+        u32 oot_fixed{}, oot_presents{};
     } m_stats{};
     u32 m_previous_fence_id{~0U}; // none yet (WaitForFrame ignores ids >= 192)
     u32 m_previous_fence_value{};
