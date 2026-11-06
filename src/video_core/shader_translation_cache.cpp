@@ -31,7 +31,9 @@ namespace {
 // 2: StorageBufferDescriptor gained write_extent (records store descriptors as raw structures).
 // 3: StorageBufferDescriptor gained native_indirect, Info native_indirect_slots.
 // 4: StorageBufferDescriptor gained indirect_offset (upstream nx2 #150, merged at 27226d2568).
-constexpr u32 FormatVersion = 4;
+// 5: IsCbufIndirectStorageBufferPointer is recorded and replayed (queries gained a third
+//    argument); before, the recording environment answered it with the base class's `true`.
+constexpr u32 FormatVersion = 5;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
@@ -252,6 +254,7 @@ void WriteQueries(Writer& writer, std::span<const Query> queries) {
         writer.Put(query.a);
         writer.Put(query.b);
         writer.Put(query.answer);
+        writer.Put(query.c);
     }
 }
 
@@ -263,7 +266,7 @@ bool ReadQueries(Reader& reader, std::vector<Query>& queries) {
     queries.resize(count);
     for (Query& query : queries) {
         if (!reader.Get(query.kind) || !reader.Get(query.a) || !reader.Get(query.b) ||
-            !reader.Get(query.answer)) {
+            !reader.Get(query.answer) || !reader.Get(query.c)) {
             return false;
         }
     }
@@ -316,6 +319,7 @@ Digest EntryId(const Digest& stage_key, std::span<const Query> queries) {
         hasher.Add(query.a);
         hasher.Add(query.b);
         hasher.Add(query.answer);
+        hasher.Add(query.c);
     }
     return hasher.Finish();
 }
@@ -362,6 +366,14 @@ bool RecordingEnvironment::IsNativeProgram() const {
 bool RecordingEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
     const bool answer = inner.IsCbufStorageBufferPointer(index, offset);
     queries.push_back({QueryKind::CbufStorageBufferPointer, index, offset, answer ? 1U : 0U});
+    return answer;
+}
+
+bool RecordingEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset,
+                                                              u32 indirect) {
+    const bool answer = inner.IsCbufIndirectStorageBufferPointer(index, offset, indirect);
+    queries.push_back(
+        {QueryKind::CbufIndirectStorageBufferPointer, index, offset, answer ? 1U : 0U, indirect});
     return answer;
 }
 
@@ -456,6 +468,9 @@ bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env) {
             break;
         case QueryKind::CbufStorageBufferPointer:
             answer = env.IsCbufStorageBufferPointer(query.a, query.b) ? 1U : 0U;
+            break;
+        case QueryKind::CbufIndirectStorageBufferPointer:
+            answer = env.IsCbufIndirectStorageBufferPointer(query.a, query.b, query.c) ? 1U : 0U;
             break;
         case QueryKind::ReplaceConstBuffer: {
             const auto value = env.GetReplaceConstBuffer(query.a, query.b);

@@ -75,6 +75,7 @@ enum class QueryKind : u8 {
     ViewportTransformState,
     CbufStorageBufferPointer,
     ReplaceConstBuffer,
+    CbufIndirectStorageBufferPointer,
 };
 
 struct Query {
@@ -82,6 +83,7 @@ struct Query {
     u32 a{};
     u32 b{};
     u32 answer{};
+    u32 c{}; ///< Third argument (the indirect offset of CbufIndirectStorageBufferPointer)
 
     bool operator==(const Query&) const = default;
 };
@@ -96,6 +98,7 @@ public:
     u32 TranslateProgramAddress(u32 address) const override;
     bool IsNativeProgram() const override;
     bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
+    bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) override;
     u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
     Shader::TextureType ReadTextureType(u32 raw_handle) override;
     Shader::TexturePixelFormat ReadTexturePixelFormat(u32 raw_handle) override;

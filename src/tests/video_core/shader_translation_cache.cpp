@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <catch2/catch_test_macros.hpp>
 #include "video_core/shader_translation_cache.h"
 
@@ -55,6 +56,9 @@ public:
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
         return std::nullopt;
     }
+    bool IsCbufIndirectStorageBufferPointer(u32, u32, u32 indirect) override {
+        return indirect_pointers.contains(indirect);
+    }
     void Dump(u64, u64) override {}
 
     void SetHeaderWord(size_t word, u32 value) {
@@ -65,6 +69,7 @@ public:
     u32 viewport = 1;
     u32 texture_bound = 2;
     u32 reads = 0;
+    std::set<u32> indirect_pointers;
 };
 
 // What a translation does with its environment, for the record/replay tests: the second read
@@ -348,4 +353,23 @@ TEST_CASE("Translation cache persists the mesh info of task and mesh entries",
         REQUIRE(std::ranges::equal(program.mesh.primitive_lines, meta.mesh.primitive_lines));
     }
     std::filesystem::remove(path);
+}
+
+TEST_CASE("Translation cache records indirect storage pointer classifications",
+          "[video_core][translation_cache]") {
+    FakeEnvironment env;
+    env.indirect_pointers.insert(0x18);
+    RecordingEnvironment recording{env};
+    // The recording environment forwards the live answer instead of the base class's `true`.
+    REQUIRE(recording.IsCbufIndirectStorageBufferPointer(2, 0x20, 0x18));
+    REQUIRE_FALSE(recording.IsCbufIndirectStorageBufferPointer(2, 0x20, 0x08));
+    const std::vector<Query> queries = recording.TakeQueries();
+    REQUIRE(queries.size() == 2);
+    REQUIRE(queries[0].kind == QueryKind::CbufIndirectStorageBufferPointer);
+    REQUIRE(queries[0].c == 0x18);
+    REQUIRE(ReplayQueries(queries, env));
+
+    // A pointer table that now classifies differently no longer matches.
+    env.indirect_pointers.insert(0x08);
+    REQUIRE_FALSE(ReplayQueries(queries, env));
 }
