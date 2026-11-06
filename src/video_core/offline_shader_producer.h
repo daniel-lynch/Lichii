@@ -79,6 +79,7 @@ struct Summary {
     std::vector<TranslationCache::SelectedRecipe> selected, Shader::Stage stage,
     const Shader::Info& info, std::span<const PartnerStage> partners,
     std::span<const TranslationCache::EmissionRecipe> layouts);
+[[nodiscard]] Shader::TextureType TextureTypeForProgram(const Program& program);
 void WriteReport(const std::filesystem::path& path, const Summary& summary);
 [[nodiscard]] Input ParseInput(std::string_view json, const std::filesystem::path& directory);
 [[nodiscard]] Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,

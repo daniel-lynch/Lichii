@@ -519,3 +519,9 @@ by the target: canonical recipes erase unused fields, so those fields cannot sup
 a different program's layout. The archive schema does not expose FVTX/shape attribute records yet. No layout is
 inferred from shader code alone. Reports attribute new modules to `partner_stage`
 and `input_layout`; existing exact/class/baseline counts retain precedence on duplicates.
+
+For Effect `.vsetb` containers the archive environment's class replay answer is
+`ColorArray2D`; other containers retain `Color2D`. This is a container-class guess,
+not a decoded sampler dimension: the current index has no sampler metadata. It is
+recorded as a replay query and checked against the live answer before reuse.
+Float format, direct/indirect pointer and viewport guesses are unchanged.

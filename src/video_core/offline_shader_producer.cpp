@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <charconv>
+#include <cctype>
 #include <chrono>
 #include <fstream>
 #include <unordered_set>
@@ -134,6 +135,19 @@ std::vector<TranslationCache::SelectedRecipe> ExpandRecipes(
         }
     }
     return selected;
+}
+
+Shader::TextureType TextureTypeForProgram(const Program& program) {
+    auto effect = [](std::string name) {
+        std::ranges::transform(name, name.begin(), [](unsigned char c) { return std::tolower(c); });
+        return name.find(".vsetb") != std::string::npos;
+    };
+    // Owned code filenames are content hashes. Classify using original container identities,
+    // including nested/compressed members, instead of guessing from the allocation filename.
+    for (const auto& origin : program.origins)
+        if (effect(origin.source) || effect(origin.member)) return Shader::TextureType::ColorArray2D;
+    if (effect(program.container.string())) return Shader::TextureType::ColorArray2D;
+    return Shader::TextureType::Color2D;
 }
 
 void WriteReport(const std::filesystem::path& path, const Summary& summary) {
@@ -276,7 +290,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
         for (size_t i = 0; i < row.bank1_words.size(); ++i)
             if (Word(program_bytes, row.constants_offset + i * 4) != row.bank1_words[i])
                 throw std::runtime_error("constants_mismatch");
-        return ArchiveEnvironment(program_bytes, control, row.stage);
+        return ArchiveEnvironment(program_bytes, control, row.stage, 0, TextureTypeForProgram(row));
     };
     using Member = std::pair<std::string, std::string>;
     std::map<Member, std::vector<std::pair<u32, size_t>>> members;

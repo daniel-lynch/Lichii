@@ -21,7 +21,8 @@ u32 Word(std::span<const u8> bytes, size_t offset) {
 } // namespace
 
 ArchiveEnvironment::ArchiveEnvironment(std::span<const u8> program, std::span<const u8> control,
-                                       Shader::Stage shader_stage, u32 texture_buffer) {
+                                       Shader::Stage shader_stage, u32 texture_buffer,
+                                       Shader::TextureType texture_type_) : texture_type{texture_type_} {
     using namespace Shader::Ampere;
     tracks_texture_handles = true;
     if (shader_stage != Shader::Stage::VertexB && shader_stage != Shader::Stage::Fragment &&
@@ -162,7 +163,7 @@ void ArchiveEnvironment::EndTextureHandle(const Shader::ConstBufferAddr&, u32) {
 }
 
 Shader::TextureType ArchiveEnvironment::ReadTextureType(u32) {
-    return Shader::TextureType::Color2D;
+    return texture_type;
 }
 Shader::TexturePixelFormat ArchiveEnvironment::ReadTexturePixelFormat(u32) {
     return Shader::TexturePixelFormat::A8B8G8R8_UNORM;

@@ -14,7 +14,8 @@ public:
     // Program includes the 128-byte native graphics header; control is its archive control
     // section. Initially only vertex, fragment and geometry have supported scalar recipes.
     ArchiveEnvironment(std::span<const u8> program, std::span<const u8> control,
-                       Shader::Stage shader_stage, u32 texture_buffer = 0);
+                       Shader::Stage shader_stage, u32 texture_buffer = 0,
+                       Shader::TextureType texture_type = Shader::TextureType::Color2D);
 
     u32 ReadCbufValue(u32 index, u32 offset) override;
     Shader::TextureType ReadTextureType(u32) override;
@@ -34,6 +35,7 @@ private:
     std::vector<u8> constants;
     std::map<std::pair<u32, u32>, u32> guessed_words;
     u32 handle_depth{};
+    Shader::TextureType texture_type;
 };
 
 } // namespace VideoCommon

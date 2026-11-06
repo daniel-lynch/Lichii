@@ -517,6 +517,39 @@ TEST_CASE("Native archive texture bank starts at zero and follows bound instruct
     }
 }
 
+TEST_CASE("Synthetic Effect program records array texture replay answers",
+          "[video_core][translation_cache][archive_environment]") {
+    namespace Offline = VideoCommon::OfflineShaders;
+    SyntheticProgram source;
+    Offline::Program row;
+    row.container = "programs/hash-vertex.bin";
+    REQUIRE(Offline::TextureTypeForProgram(row) == Shader::TextureType::Color2D);
+    row.origins.push_back({"Effect/synthetic.vsetb.byml.zs", "synthetic!zstd!BNSH@100", 0});
+    ArchiveEnvironment effect(source.bytes, source.control, Shader::Stage::VertexB, 0,
+                              Offline::TextureTypeForProgram(row));
+    RecordingEnvironment recording(effect, true);
+    recording.BeginTextureHandle();
+    const auto handle = recording.ReadCbufValue(2, 0x20);
+    recording.EndTextureHandle(Handle(), handle);
+    REQUIRE(recording.ReadTextureType(handle) == Shader::TextureType::ColorArray2D);
+    REQUIRE(recording.ReadTexturePixelFormat(handle) == Shader::TexturePixelFormat::A8B8G8R8_UNORM);
+    REQUIRE(recording.IsCbufStorageBufferPointer(0, 0));
+    REQUIRE_FALSE(recording.IsCbufIndirectStorageBufferPointer(0, 0, 0));
+    REQUIRE(recording.ReadViewportTransformState() == 1);
+    const auto config = MakeConfigDigest({}, {}, 0);
+    const auto key = MakeStageKey(effect, *effect.Analyze(), 1, config);
+    Store store;
+    store.Open({}, config);
+    ProgramMeta meta{};
+    meta.stage = Shader::Stage::VertexB;
+    REQUIRE(store.Insert(key, recording.TakeQueries(), meta, true));
+    REQUIRE(store.FindEntry(key, effect));
+    auto ordinary = source.Make();
+    REQUIRE_FALSE(store.FindEntry(key, ordinary));
+    row.origins[0] = {"archive.sarc", "archive!EFFECT.VSETB.BYML!BNSH@100", 0};
+    REQUIRE(Offline::TextureTypeForProgram(row) == Shader::TextureType::ColorArray2D);
+}
+
 TEST_CASE("Producer emits and resumes a fragment recipe from its archive vertex partner",
           "[video_core][translation_cache][archive_environment]") {
     namespace Offline = VideoCommon::OfflineShaders;
