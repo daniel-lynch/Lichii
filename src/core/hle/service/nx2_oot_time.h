@@ -24,11 +24,16 @@ inline constexpr u32 HookInstruction = 0x14D57D48; // b 0x3c461e4
 
 /// EDEN_NX2_REAL_SPEED=0 stops the present path writing the measured delta: the patched loop then
 /// reads the 1.0 the built-in patch starts the word with, the game's fixed step at 60 fps. The
-/// Add-Ons entry "Real-time speed (built-in)" turns the code patch itself off.
+/// delta is still computed. EDEN_NX2_OOT_REAL_TIME=0 is Anthony's spelling of the
+/// same switch, accepted so either fork's run scripts work: either one set to 0 turns the write
+/// off. The Add-Ons entry "Real-time speed (built-in)" turns the code patch itself off.
 [[nodiscard]] inline bool WriteEnabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_REAL_SPEED");
-        return value == nullptr || value[0] != '0';
+        const auto off = [](const char* name) {
+            const char* value = std::getenv(name);
+            return value != nullptr && value[0] == '0';
+        };
+        return !off("EDEN_NX2_REAL_SPEED") && !off("EDEN_NX2_OOT_REAL_TIME");
     }();
     return enabled;
 }

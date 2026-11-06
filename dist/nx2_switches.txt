@@ -26,6 +26,14 @@ EDEN_NX2_FENCE_BATCH=1
 # Terrain/indirect drawing fix for Donkey Kong Bananza: enabled by default. Set to 0 only to leave to GPU.
 #EDEN_NX2_RESETFIX=0
 
+# Ocarina of Time real-time speed (the "Real-time speed (built-in)" add-on): below 60 fps the game
+# gets the measured frame time as its step, so it no longer runs in slow motion. =0 keeps the
+# patch but never writes the delta, i.e. the old fixed 60 Hz step (slow motion below 60 fps).
+# EDEN_NX2_OOT_REAL_TIME=0 (Anthony's fork) and EDEN_NX2_REAL_SPEED=0 (Daniel's) are the same
+# switch; either one set to 0 turns the write off.
+#EDEN_NX2_REAL_SPEED=0
+#EDEN_NX2_OOT_REAL_TIME=0
+
 # Drop reactive-flushing read traps on Switch 2 programs (opt-in; can reduce FPS from 29 to 24 in MKW).
 #EDEN_NX2_NO_REACTIVE=1
 
