@@ -820,23 +820,65 @@ void PipelineCache::OpenTranslationCache(const std::filesystem::path& filename) 
                     Shader::Optimization::NativeStorageBoundsCheck() ? 1 : 0);
     translation_config = TC::MakeConfigDigest(
         profile, host_info, Common::CityHash64(device_id.data(), device_id.size()));
+    const char* aot_env = std::getenv("EDEN_NX2_AOT_TRANSLATE");
+    aot_translation = Settings::values.use_shader_aot_translation.GetValue() ||
+                      (aot_env != nullptr && aot_env[0] == '1');
+    if (aot_translation) {
+        LOG_INFO(Render_Vulkan, "Shader AOT translation on: task and mesh stages are cached");
+    }
     translation_cache.Open(filename, translation_config);
     translation_cache_logged = std::chrono::steady_clock::now();
 }
 
 bool PipelineCache::IsTranslationCacheable(const Shader::Environment& env) const {
     const Shader::Stage stage = env.ShaderStage();
-    if (stage == Shader::Stage::VertexA || stage == Shader::Stage::Task ||
-        stage == Shader::Stage::Mesh) {
+    if (stage == Shader::Stage::VertexA) {
+        return false;
+    }
+    // Task and mesh translations also depend on the mesh registers and the primitive header bound
+    // with the mesh program; both are in the stage key, and their MeshInfo is stored with the
+    // entry.
+    if ((stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) && !aot_translation) {
         return false;
     }
     return env.CanCacheTranslation();
+}
+
+void PipelineCache::CountStageOutcome(StageOutcome outcome, Shader::Stage stage, u64 ns) {
+    const bool mesh = stage == Shader::Stage::Task || stage == Shader::Stage::Mesh;
+    auto& counter = stage_outcomes[static_cast<size_t>(outcome)][mesh ? 0 : 1];
+    counter.stages.fetch_add(1, std::memory_order::relaxed);
+    counter.ns.fetch_add(ns, std::memory_order::relaxed);
+}
+
+void PipelineCache::LogStageOutcomes(std::string_view when) {
+    if (!aot_translation) {
+        return;
+    }
+    static constexpr std::array names{"from the cache", "not cacheable", "new stage key",
+                                      "known key, different answers", "entry hit, new variant"};
+    std::string text;
+    for (size_t outcome = 0; outcome < names.size(); ++outcome) {
+        for (size_t kind = 0; kind < 2; ++kind) {
+            const auto& counter = stage_outcomes[outcome][kind];
+            const u64 stages = counter.stages.load(std::memory_order::relaxed);
+            if (stages == 0) {
+                continue;
+            }
+            text += fmt::format("; {} {}: {} in {:.1f} ms", kind == 0 ? "task/mesh" : "other",
+                                names[outcome], stages,
+                                static_cast<double>(counter.ns.load(std::memory_order::relaxed)) /
+                                    1e6);
+        }
+    }
+    LOG_INFO(Render_Vulkan, "Graphics stages ({}){}", when, text.empty() ? "; none" : text);
 }
 
 PipelineCache::~PipelineCache() {
     workers.WaitForRequests();
     serialization_thread.WaitForRequests();
     translation_cache.LogStatistics("run time");
+    LogStageOutcomes("run time");
     if (translation_cache_verify) {
         LOG_INFO(Render_Vulkan,
                  "Translation cache: {} cached stages compared with a fresh translation, {} differed",
@@ -1055,6 +1097,18 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             }
             auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs),
                                                  state.statistics.get(), false)};
+            if (aot_translation) {
+                const bool mesh = std::ranges::any_of(envs_, [](const FileEnvironment& env) {
+                    return env.ShaderStage() == Shader::Stage::Task ||
+                           env.ShaderStage() == Shader::Stage::Mesh;
+                });
+                boot_mesh_pipelines += mesh ? 1 : 0;
+                if (!pipeline) {
+                    ++boot_pipelines_failed;
+                    LOG_INFO(Render_Vulkan, "Cached pipeline {:016x}{} was not built at boot",
+                             key.Hash(), mesh ? " (task/mesh)" : "");
+                }
+            }
 
             std::scoped_lock lock{state.mutex};
             if (pipeline) {
@@ -1085,6 +1139,17 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     workers.WaitForRequests(stop_loading);
 
     translation_cache.LogStatistics("boot");
+    if (aot_translation) {
+        LOG_INFO(Render_Vulkan, "Boot preload: {} task/mesh pipelines queued, {} pipelines failed",
+                 boot_mesh_pipelines.load(), boot_pipelines_failed.load());
+        LogStageOutcomes("boot");
+        for (auto& outcome : stage_outcomes) {
+            for (auto& counter : outcome) {
+                counter.stages = 0;
+                counter.ns = 0;
+            }
+        }
+    }
     if (translation_cache_verify) {
         LOG_INFO(Render_Vulkan,
                  "Translation cache: {} cached stages compared with a fresh translation, {} differed",
@@ -1312,6 +1377,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     std::array<bool, Maxwell::MaxShaderProgram> from_cache{};
     std::array<Shader::Environment*, Maxwell::MaxShaderProgram> stage_envs{};
     std::array<Clock::duration, Maxwell::MaxShaderProgram> stage_time{};
+    std::array<StageOutcome, Maxwell::MaxShaderProgram> outcomes{};
 
     // Layer passthrough generation for devices without VK_EXT_shader_viewport_index_layer
     Shader::IR::Program* layer_source_program{};
@@ -1359,6 +1425,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                                          translation_config);
             cached_entries[index] = translation_cache.FindEntry(stage_key, env);
             from_cache[index] = cached_entries[index] != nullptr;
+        }
+        if (aot_translation) {
+            outcomes[index] = !cacheable                ? StageOutcome::Uncacheable
+                              : from_cache[index]       ? StageOutcome::Hit
+                              : translation_cache.HasStageKey(stage_key) ? StageOutcome::ReplayFailed
+                                                                         : StageOutcome::NewKey;
         }
         if (from_cache[index]) {
             // Only the program's metadata: the IR is translated again if no module fits.
@@ -1496,6 +1568,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
                 program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
                 from_cache[index] = false;
+                outcomes[index] = StageOutcome::VariantMiss;
             }
             ConvertLegacyToGeneric(program, runtime_info);
             if (defer) {
@@ -1549,6 +1622,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             } else {
                 ++translation_cache.stage_misses;
                 translation_cache.miss_ns += ns;
+            }
+            if (aot_translation) {
+                CountStageOutcome(outcomes[index], program.stage, ns);
             }
         }
         LogUntrackedGlobal(key.unique_hashes[index], program.stage, program.info);
@@ -1689,6 +1765,9 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     const auto begin = std::chrono::steady_clock::now();
+    // With AOT translation on, the log says whether the pipeline was in the disk cache (and so
+    // should have been built at boot).
+    const bool was_on_disk = aot_translation && disk_pipelines.contains(graphics_key.Hash());
     SCOPE_EXIT {
         std::string shaders = fmt::format("pipeline={:016x}", graphics_key.Hash());
         for (size_t stage = 0; stage < graphics_key.unique_hashes.size(); ++stage) {
@@ -1696,12 +1775,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
                 shaders += fmt::format(" s{}:{:016x}", stage, graphics_key.unique_hashes[stage]);
             }
         }
+        if (was_on_disk) {
+            shaders += " (in the disk cache)";
+        }
         ReportRuntimePipeline("Graphics", begin, shaders);
     };
     if (translation_cache.Enabled() &&
         begin - translation_cache_logged > std::chrono::seconds{30}) {
         translation_cache_logged = begin;
         translation_cache.LogStatistics("run time so far");
+        LogStageOutcomes("run time so far");
     }
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);

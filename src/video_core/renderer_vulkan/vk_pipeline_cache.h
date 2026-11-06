@@ -208,6 +208,23 @@ private:
     void OpenTranslationCache(const std::filesystem::path& filename);
     [[nodiscard]] bool IsTranslationCacheable(const Shader::Environment& env) const;
 
+    /// use_shader_aot_translation (or EDEN_NX2_AOT_TRANSLATE=1): task and mesh stages are cached
+    /// too, and each run-time graphics stage is counted by why it was or was not taken from the
+    /// cache.
+    bool aot_translation{};
+    enum class StageOutcome : u8 { Hit, Uncacheable, NewKey, ReplayFailed, VariantMiss, Count };
+    struct OutcomeCounter {
+        std::atomic<u64> stages{};
+        std::atomic<u64> ns{};
+    };
+    /// [outcome][0 = task/mesh, 1 = other stages]
+    std::array<std::array<OutcomeCounter, 2>, static_cast<size_t>(StageOutcome::Count)>
+        stage_outcomes{};
+    std::atomic<u64> boot_pipelines_failed{};
+    std::atomic<u64> boot_mesh_pipelines{};
+    void CountStageOutcome(StageOutcome outcome, Shader::Stage stage, u64 ns);
+    void LogStageOutcomes(std::string_view when);
+
     std::filesystem::path pipeline_cache_filename;
 
     /// Key hashes of the graphics pipelines in the disk cache. Only those a recent session used
