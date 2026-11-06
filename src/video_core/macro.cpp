@@ -1459,7 +1459,11 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                         VideoCommon::QueryDma::Trace(memory, maxwell3d.Rasterizer(), method, address,
                                                      source, read_bytes);
                     }
-                    if (owns_caches) {
+                    // EDEN_NX2_QUERY_DMA_FLUSH=0 keeps the old gating (no flush under the split).
+                    const bool flush_queries = VideoCommon::QueryDma::FlushUnderSplit()
+                                                   ? owns_caches
+                                                   : !VideoCommon::GpuSplit::Get().Active();
+                    if (flush_queries) {
                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
                     }
                     const bool dirty = memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache);

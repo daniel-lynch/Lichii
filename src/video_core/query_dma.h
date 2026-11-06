@@ -25,6 +25,17 @@ inline bool TraceEnabled() {
     return enabled;
 }
 
+/// EDEN_NX2_QUERY_DMA_FLUSH=0: restores the pre-#204 gating, where macro DMA reads of reports
+/// flush the query cache only while the split GPU thread is inactive (so under the split they
+/// can read stale counts). Default on: the flush runs wherever the query cache is owned.
+inline bool FlushUnderSplit() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_QUERY_DMA_FLUSH");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 /// Whether [source, source + size) holds reports still waiting for host query results. Runs
 /// where the rasterizer's caches are owned (the back of a split GPU thread).
 inline bool HasPendingQueries(const Tegra::MemoryManager& memory,
