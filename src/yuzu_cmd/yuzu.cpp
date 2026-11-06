@@ -673,6 +673,13 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             });
     }
     if (lp.precompile_shaders) {
+        bool archive_ok = true;
+        if (!lp.shader_archive_index.empty()) {
+            archive_ok = state->system.Renderer().ReadRasterizer()->PrecompileArchiveShaders(
+                lp.shader_archive_index, state->system.GetApplicationProcessProgramID(),
+                lp.shader_workers, lp.shader_recipe_cache);
+            if (!archive_ok) LOG_ERROR(Frontend, "Archive precompile failed (requires Vulkan and disk translation cache)");
+        }
         // LoadDiskResources saved the Vulkan pipeline cache; SDL_AppQuit shuts the renderer down,
         // which saves it again. The cores are started once first: shutting down a process whose
         // cores never ran hangs in ServerManager's destructor.
@@ -682,7 +689,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         }
         LOG_INFO(Frontend, "Precompile finished: {} pipelines built; exiting", pipeline_total);
         void(state->system.Run());
-        return SDL_APP_SUCCESS;
+        return archive_ok ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
     }
 
     // don't do anything, SDL3 already exists for us :D

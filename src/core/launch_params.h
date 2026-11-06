@@ -40,6 +40,9 @@ struct LaunchParams {
     bool force_single_core = false;
     // --precompile-shaders: build every cached pipeline of the game, save the caches and exit.
     bool precompile_shaders = false;
+    std::string shader_archive_index;
+    std::string shader_recipe_cache;
+    u32 shader_workers = 0;
     // print
     bool print_version = false;
     bool print_help = false;

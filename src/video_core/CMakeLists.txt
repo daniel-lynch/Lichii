@@ -271,6 +271,8 @@ add_library(video_core STATIC
 
     shader_cache.cpp
     shader_cache.h
+    offline_shader_producer.cpp
+    offline_shader_producer.h
     shader_archive_environment.cpp
     shader_archive_environment.h
     shader_environment.cpp

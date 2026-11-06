@@ -1,0 +1,212 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <algorithm>
+#include <atomic>
+#include <charconv>
+#include <chrono>
+#include <fstream>
+#include "common/polyfill_thread.h"
+#include <nlohmann/json.hpp>
+#include "common/logging.h"
+#include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/frontend/maxwell/structured_control_flow.h"
+#include "shader_recompiler/frontend/maxwell/translate_program.h"
+#include "video_core/offline_shader_producer.h"
+#include "video_core/shader_archive_environment.h"
+
+namespace VideoCommon::OfflineShaders {
+namespace {
+using Json = nlohmann::json;
+u64 Unsigned(const Json& value) {
+    if (!value.is_number_unsigned()) throw std::runtime_error("Expected unsigned integer");
+    return value.get<u64>();
+}
+u32 SmallUnsigned(const Json& value) {
+    const auto number = Unsigned(value);
+    if (number > UINT32_MAX) throw std::runtime_error("Integer exceeds 32 bits");
+    return static_cast<u32>(number);
+}
+u64 Hex(const Json& value) {
+    const auto text = value.get<std::string>();
+    u64 result{};
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), result, 16);
+    if (text.size() != 16 || error != std::errc{} || end != text.data() + text.size())
+        throw std::runtime_error("Expected 16 hexadecimal digits");
+    return result;
+}
+Shader::Stage Stage(std::string_view name) {
+    static constexpr std::array names{"vertex", "tess-control", "tess-eval", "geometry",
+                                      "fragment", "compute", "vertex-a", "task", "mesh"};
+    const auto it = std::ranges::find(names, name);
+    if (it == names.end()) throw std::runtime_error("Unknown shader stage");
+    return static_cast<Shader::Stage>(it - names.begin());
+}
+std::vector<u8> Read(const std::filesystem::path& path, u64 offset, u64 size) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file || file.tellg() < 0) throw std::runtime_error("input_io");
+    const auto length = static_cast<u64>(file.tellg());
+    if (offset > length || size > length - offset || size > MaxProgramBytes)
+        throw std::runtime_error("invalid_range");
+    std::vector<u8> bytes(size);
+    file.seekg(static_cast<std::streamoff>(offset));
+    if (!file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size)))
+        throw std::runtime_error("input_io");
+    return bytes;
+}
+u32 Word(std::span<const u8> bytes, size_t offset) {
+    return u32{bytes[offset]} | (u32{bytes[offset + 1]} << 8) |
+           (u32{bytes[offset + 2]} << 16) | (u32{bytes[offset + 3]} << 24);
+}
+std::string Reason(std::string_view message) {
+    for (const auto reason : {"missing_constant", "unsupported_stage", "base_dependent",
+                              "unsupported_lowering", "invalid_range", "input_io",
+                              "fingerprint_mismatch", "constants_mismatch"}) {
+        if (message.find(reason) != std::string_view::npos) return reason;
+    }
+    return "lowering_or_emission_rejected";
+}
+} // namespace
+
+Input ParseInput(std::string_view text, const std::filesystem::path& directory) {
+    if (text.size() > MaxProgramBytes) throw std::runtime_error("Input index exceeds 16 MiB");
+    const auto json = Json::parse(text);
+    if (Unsigned(json.at("schema_version")) != 1) throw std::runtime_error("Unknown input version");
+    Input result{.title_id = Hex(json.at("title_id"))};
+    const auto& rows = json.at("programs");
+    if (!rows.is_array() || rows.size() > 100000) throw std::runtime_error("Invalid program list");
+    for (const auto& row : rows) {
+        Program program;
+        program.container = directory / row.at("container").get<std::string>();
+        program.control = directory / row.at("control").get<std::string>();
+        program.offset = Unsigned(row.at("offset"));
+        program.size = Unsigned(row.at("size"));
+        program.control_offset = Unsigned(row.at("control_offset"));
+        program.constants_offset = SmallUnsigned(row.at("constants_offset"));
+        program.constants_size = SmallUnsigned(row.at("constants_size"));
+        program.fingerprint = Hex(row.at("fingerprint"));
+        program.stage = Stage(row.at("stage").get<std::string>());
+        if (row.contains("tier")) program.tier = SmallUnsigned(row.at("tier"));
+        if (program.size == 0 || program.size > MaxProgramBytes ||
+            program.offset > UINT64_MAX - program.size ||
+            program.control_offset > UINT64_MAX - 0x58)
+            throw std::runtime_error("invalid_range");
+        if ((program.stage == Shader::Stage::VertexB || program.stage == Shader::Stage::Fragment ||
+             program.stage == Shader::Stage::Geometry) &&
+            (program.constants_size > 256 ||
+             (program.constants_size != 0 && (program.constants_offset > program.size ||
+              program.constants_size > program.size - program.constants_offset))))
+            throw std::runtime_error("invalid_range");
+        if (row.contains("bank1_words")) {
+            const auto& words = row.at("bank1_words");
+            if (!words.is_array() || words.size() > 64 || words.size() * 4 != program.constants_size)
+                throw std::runtime_error("constants_mismatch");
+            for (const auto& word : words) program.bank1_words.push_back(SmallUnsigned(word));
+        }
+        result.programs.push_back(std::move(program));
+    }
+    std::stable_sort(result.programs.begin(), result.programs.end(),
+                     [](const auto& a, const auto& b) { return a.tier < b.tier; });
+    return result;
+}
+
+Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
+            const std::filesystem::path& recipe_cache, const Shader::Profile& profile,
+            const Shader::HostTranslateInfo& host, const TranslationCache::Digest& config,
+            TranslationCache::Store& store) {
+    namespace TC = TranslationCache;
+    const auto begin = std::chrono::steady_clock::now();
+    const auto bytes = Read(input, 0, std::filesystem::file_size(input));
+    const auto parsed = ParseInput({reinterpret_cast<const char*>(bytes.data()), bytes.size()},
+                                   input.parent_path());
+    if (parsed.title_id != title_id) throw std::runtime_error("Archive title ID differs from game");
+    if (!store.Enabled()) throw std::runtime_error("Translation cache must be enabled");
+    std::array<TC::EmissionRecipe, Shader::MaxStageTypes> recipes;
+    for (size_t i = 0; i < recipes.size(); ++i)
+        recipes[i] = TC::DefaultEmissionRecipe(static_cast<Shader::Stage>(i));
+    if (!recipe_cache.empty()) recipes = TC::Store::ReadRecipes(recipe_cache, config);
+    if (workers == 0) workers = std::max(1U, std::thread::hardware_concurrency() / 2);
+    workers = std::min({workers, 64U, std::max(1U, static_cast<u32>(parsed.programs.size()))});
+    Summary summary;
+    summary.seen = parsed.programs.size();
+    std::mutex results;
+    // Serialize duplicate stage candidates through lookup and append, without serializing all work.
+    std::array<std::mutex, 64> stage_locks;
+    std::atomic<size_t> next{};
+    auto work = [&] {
+        while (true) {
+            const size_t index = next.fetch_add(1);
+            if (index >= parsed.programs.size()) break;
+            const auto& row = parsed.programs[index];
+            try {
+                if (row.stage != Shader::Stage::VertexB && row.stage != Shader::Stage::Fragment &&
+                    row.stage != Shader::Stage::Geometry) throw std::runtime_error("unsupported_stage");
+                const auto program_bytes = Read(row.container, row.offset, row.size);
+                const auto control = Read(row.control, row.control_offset, 0x58);
+                u64 fingerprint = 0xcbf29ce484222325ULL;
+                for (const auto byte : std::span(program_bytes).first(std::min<size_t>(256, row.size)))
+                    fingerprint = (fingerprint ^ byte) * 0x100000001b3ULL;
+                if (fingerprint != row.fingerprint) throw std::runtime_error("fingerprint_mismatch");
+                if (Word(control, 0x40) != row.constants_offset || Word(control, 0x3c) != row.constants_size)
+                    throw std::runtime_error("constants_mismatch");
+                for (size_t i = 0; i < row.bank1_words.size(); ++i)
+                    if (Word(program_bytes, row.constants_offset + i * 4) != row.bank1_words[i])
+                        throw std::runtime_error("constants_mismatch");
+                ArchiveEnvironment env(program_bytes, control, row.stage);
+                const auto hash = env.Analyze();
+                if (!hash) throw std::runtime_error("unsupported_lowering");
+                const auto key = TC::MakeStageKey(env, *hash, static_cast<u32>(row.stage) + 1, config);
+                std::scoped_lock stage_lock(stage_locks[key.lo % stage_locks.size()]);
+                const auto& recipe = recipes[static_cast<size_t>(row.stage)];
+                const auto runtime = TC::DigestRuntimeInfo(recipe.runtime);
+                if (const auto entry = store.FindEntry(key, env)) {
+                    if (store.FindVariant(TC::MakeVariantKey(entry->id, runtime, recipe.bindings))) {
+                        std::scoped_lock lock(results);
+                        ++summary.resumed;
+                        continue;
+                    }
+                }
+                TC::RecordingEnvironment recording(env, true);
+                Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+                Shader::ObjectPool<Shader::IR::Inst> inst_pool;
+                Shader::ObjectPool<Shader::IR::Block> block_pool;
+                Shader::Maxwell::Flow::CFG cfg(recording, flow_pool,
+                    Shader::Maxwell::Location{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))});
+                auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, recording, cfg, host);
+                if (!env.CanCacheTranslation() || program.info.requires_layer_emulation)
+                    throw std::runtime_error("lowering_or_emission_rejected");
+                const auto meta = TC::ProgramMeta::From(program);
+                Shader::Maxwell::ConvertLegacyToGeneric(program, recipe.runtime);
+                auto bindings = recipe.bindings;
+                const auto code = Shader::Backend::SPIRV::EmitSPIRV(profile, recipe.runtime, program, bindings);
+                if (code.size() < 5 || code.front() != 0x07230203)
+                    throw std::runtime_error("lowering_or_emission_rejected");
+                const auto entry = store.Insert(key, recording.TakeQueries(), meta);
+                if (!entry) throw std::runtime_error("cache_disabled");
+                store.InsertVariant(*entry, TC::MakeVariantKey(entry->id, runtime, recipe.bindings),
+                                    {bindings, program.info, code}, &recipe);
+                std::scoped_lock lock(results);
+                ++summary.translated;
+                ++summary.modules;
+            } catch (const std::exception& error) {
+                std::scoped_lock lock(results);
+                ++summary.skipped[Reason(error.what())];
+                LOG_DEBUG(Render_Vulkan, "Offline translation: program {}: {}", index, error.what());
+            }
+        }
+    };
+    {
+        std::vector<std::jthread> threads;
+        for (u32 i = 0; i < workers; ++i) threads.emplace_back(work);
+    }
+    u64 skipped{};
+    for (const auto& [reason, count] : summary.skipped) {
+        skipped += count;
+        LOG_INFO(Render_Vulkan, "Offline translation: skipped reason={} count={}", reason, count);
+    }
+    LOG_INFO(Render_Vulkan, "Offline translation: seen={} translated={} resumed={} skipped={} modules={} elapsed_ms={}",
+             summary.seen, summary.translated, summary.resumed, skipped, summary.modules,
+             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
+    return summary;
+}
+} // namespace VideoCommon::OfflineShaders

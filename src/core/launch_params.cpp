@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <regex>
+#include <charconv>
 #include <cctype>
 
 #include "common/assert.h"
@@ -51,6 +52,9 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
         {"clear-nup-version", no_argument, 0, 0x106},
         {"clear-nup-publisher", no_argument, 0, 0x107},
         {"precompile-shaders", no_argument, 0, 0x108},
+        {"shader-archive-index", required_argument, 0, 0x109},
+        {"shader-workers", required_argument, 0, 0x10a},
+        {"shader-recipe-cache", required_argument, 0, 0x10b},
         {0, 0, 0, 0},
         // clang-format on
     };
@@ -109,6 +113,23 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                 break;
             case 0x108:
                 p.precompile_shaders = true;
+                break;
+            case 0x109:
+                p.shader_archive_index = optarg;
+                p.precompile_shaders = true;
+                break;
+            case 0x10a: {
+                const std::string_view value{optarg};
+                const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), p.shader_workers);
+                if (error != std::errc{} || end != value.data() + value.size() ||
+                    p.shader_workers == 0 || p.shader_workers > 64) {
+                    LOG_ERROR(Frontend, "--shader-workers must be between 1 and 64");
+                    p.print_help = true;
+                }
+                break;
+            }
+            case 0x10b:
+                p.shader_recipe_cache = optarg;
                 break;
             case 'i': {
                 p.input_profile = std::string(optarg);
@@ -253,6 +274,9 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             " --nup-publisher NAME --clear-nup-name --clear-nup-icon --clear-nup-version"
             " --clear-nup-publisher]"
             " Rewrite default-language NUP metadata in place and exit\n"
+            "--shader-archive-index FILE  Translate extracted archive index (eden-cli, Vulkan)\n"
+            "--shader-workers N    Archive workers, 1..64 (default: hardware threads / 2)\n"
+            "--shader-recipe-cache FILE  Use most frequent emission recipe per stage\n"
             "--precompile-shaders  Build every cached pipeline of the game, save the pipeline"
             " caches and exit before the game runs\n",
             lp.argv0

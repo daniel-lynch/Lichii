@@ -47,6 +47,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/offline_shader_producer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -799,6 +800,22 @@ bool PreloadAllPipelines() {
 }
 } // Anonymous namespace
 
+bool PipelineCache::PrecompileArchiveShaders(const std::filesystem::path& input, u64 title_id,
+                                             u32 workers, const std::filesystem::path& recipes) {
+    try {
+        if (pipeline_cache_filename.empty() || !translation_cache.Persistent()) {
+            throw std::runtime_error("Disk shader cache must be enabled and initialized");
+        }
+        (void)VideoCommon::OfflineShaders::Run(input, title_id, workers, recipes, profile, host_info,
+                                               translation_config, translation_cache);
+        if (!translation_cache.Persistent()) throw std::runtime_error("Translation cache write failed");
+        return true;
+    } catch (const std::exception& error) {
+        LOG_ERROR(Render_Vulkan, "Offline translation failed: {}", error.what());
+        return false;
+    }
+}
+
 void PipelineCache::OpenTranslationCache(const std::filesystem::path& filename) {
     namespace TC = VideoCommon::TranslationCache;
     translation_cache.Close();
@@ -1493,6 +1510,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
         const auto stage_begin = Clock::now();
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        const TC::EmissionRecipe emission_recipe{runtime_info, binding};
         // Modules of a layer-emulating pipeline depend on the generated geometry stage.
         const std::shared_ptr<const TC::Entry> entry =
             is_emulated_stage || layer_source_program != nullptr ? nullptr
@@ -1556,7 +1574,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     }
                 } else if (entry) {
                     translation_cache.InsertVariant(*entry, variant_key,
-                                                    TC::Variant{binding, program.info, code});
+                                                    TC::Variant{binding, program.info, code}, &emission_recipe);
                 }
             }
         } else {
@@ -1616,6 +1634,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     stage_variant_key = TC::MakeVariantKey(
                         stage_entry->id, TC::DigestRuntimeInfo(stage_runtime_info), stage_binding);
                 }
+                const TC::EmissionRecipe emission_recipe{stage_runtime_info, stage_binding};
                 const std::vector<u32> stage_code =
                     EmitPipelineShader(profile, stage_runtime_info, stage_program, stage_binding,
                                        hashes[stage + 1], job->reference_spirv[stage]);
@@ -1623,7 +1642,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     // The store takes its own lock: the GPU thread may look variants up meanwhile.
                     translation_cache.InsertVariant(
                         *stage_entry, stage_variant_key,
-                        TC::Variant{stage_binding, stage_program.info, stage_code});
+                        TC::Variant{stage_binding, stage_program.info, stage_code}, &emission_recipe);
                 }
                 stage_modules[stage] =
                     BuildStageModule(device, stage_code, hashes[stage + 1], stage);

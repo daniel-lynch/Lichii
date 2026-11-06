@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstring>
+#include <fstream>
+#include <nlohmann/json.hpp>
+#include "video_core/offline_shader_producer.h"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include "shader_recompiler/exception.h"
@@ -156,4 +159,71 @@ TEST_CASE("Archive program emits an ordinary translation cache variant", "[video
     REQUIRE(variant.has_value());
     REQUIRE(variant->spirv == code);
     REQUIRE(InfoEqual(variant->info, program.info));
+}
+
+TEST_CASE("Offline producer resumes complete modules and repairs interrupted appends",
+          "[video_core][translation_cache][archive_environment]") {
+    namespace Offline = VideoCommon::OfflineShaders;
+    const auto directory = std::filesystem::temp_directory_path() / "lichii_offline_producer_test";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    SyntheticProgram source;
+    auto write = [&](const char* name, const std::vector<u8>& bytes) {
+        std::ofstream file(directory / name, std::ios::binary);
+        file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    };
+    write("code.bin", source.bytes);
+    write("control.bin", source.control);
+    u64 fingerprint = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < 256; ++i) fingerprint = (fingerprint ^ source.bytes[i]) * 0x100000001b3ULL;
+    nlohmann::json row{{"container", "code.bin"}, {"control", "control.bin"},
+                       {"offset", 0}, {"size", source.bytes.size()}, {"control_offset", 0},
+                       {"constants_offset", 256}, {"constants_size", 4},
+                       {"stage", "vertex"}, {"fingerprint", fmt::format("{:016x}", fingerprint)},
+                       {"bank1_words", {0x12345678}}};
+    nlohmann::json index{{"schema_version", 1}, {"title_id", "0400000000000000"},
+                         {"programs", {row, row}}};
+    const auto input = directory / "index.json";
+    {
+        std::ofstream file(input);
+        file << index;
+    }
+    const auto path = directory / "cache.bin";
+    Shader::Profile profile{};
+    profile.supported_spirv = 0x00010300;
+    const auto config = MakeConfigDigest(profile, {}, 0);
+    size_t metadata_length{};
+    std::vector<u8> complete;
+    {
+        Store store;
+        store.Open(path, config);
+        const auto first = Offline::Run(input, 0x0400000000000000ULL, 2, {}, profile, {}, config, store);
+        REQUIRE(first.translated == 1);
+        REQUIRE(first.resumed == 1);
+        REQUIRE(first.modules == 1);
+        REQUIRE(first.skipped.empty());
+        REQUIRE_THROWS(Offline::Run(input, 1, 2, {}, profile, {}, config, store));
+        const auto size = std::filesystem::file_size(path);
+        const auto second = Offline::Run(input, 0x0400000000000000ULL, 2, path, profile, {}, config, store);
+        REQUIRE(second.translated == 0);
+        REQUIRE(second.resumed == 2);
+        REQUIRE(std::filesystem::file_size(path) == size);
+        std::ifstream file(path, std::ios::binary);
+        complete.assign(std::istreambuf_iterator<char>(file), {});
+        REQUIRE(complete.size() > 36);
+        u32 record_length{};
+        std::memcpy(&record_length, complete.data() + 32, 4);
+        metadata_length = 36 + record_length;
+    }
+    // Cut every byte of the first appended record, then verify that resumption emits the module.
+    for (size_t length = metadata_length; length < complete.size(); ++length) {
+        write("cache.bin", std::vector<u8>(complete.begin(), complete.begin() + length));
+        Store store;
+        store.Open(path, config);
+        const auto result = Offline::Run(input, 0x0400000000000000ULL, 1, {}, profile, {}, config, store);
+        REQUIRE(result.modules == 1);
+        REQUIRE(result.resumed == 1);
+        REQUIRE(result.skipped.empty());
+    }
+    std::filesystem::remove_all(directory);
 }

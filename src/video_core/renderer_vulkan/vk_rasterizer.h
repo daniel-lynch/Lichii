@@ -161,6 +161,8 @@ public:
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;
+    bool PrecompileArchiveShaders(const std::filesystem::path& input, u64 title_id, u32 workers,
+                                  const std::filesystem::path& recipes) override;
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback) override;
 
