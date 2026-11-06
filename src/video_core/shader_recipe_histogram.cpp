@@ -3,9 +3,22 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <functional>
+#include <random>
+#include <system_error>
 #include <type_traits>
+
+#include <fmt/format.h>
+#ifdef _WIN32
+#include <io.h>
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "video_core/shader_recipe_histogram.h"
 
@@ -299,6 +312,58 @@ bool RecipeHistogram::Load(std::span<const u8> data, const TC::Digest& config, s
         return refuse("trailing bytes");
     }
     ++revision;
+    return true;
+}
+
+bool WriteFileAtomically(const std::filesystem::path& path, std::span<const u8> data,
+                         std::string& why) {
+    static std::atomic<u64> counter{};
+#ifdef _WIN32
+    const auto pid = static_cast<u64>(_getpid());
+#else
+    const auto pid = static_cast<u64>(getpid());
+#endif
+    std::FILE* file = nullptr;
+    std::filesystem::path temporary;
+    std::random_device random;
+    for (int attempt = 0; attempt < 8 && file == nullptr; ++attempt) {
+        temporary = path;
+        temporary += fmt::format(".tmp.{}.{}.{:08x}", pid, counter.fetch_add(1), random());
+        // "x": created exclusively, never an existing file another writer has open.
+#ifdef _WIN32
+        file = _wfopen(temporary.c_str(), L"wbx");
+#else
+        file = std::fopen(temporary.c_str(), "wbx");
+#endif
+        if (file == nullptr && errno != EEXIST) {
+            break;
+        }
+    }
+    if (file == nullptr) {
+        why = fmt::format("cannot create a temporary file next to {}: {}", path.string(),
+                          std::strerror(errno));
+        return false;
+    }
+    bool ok = data.empty() || std::fwrite(data.data(), 1, data.size(), file) == data.size();
+    ok = std::fflush(file) == 0 && ok;
+#ifdef _WIN32
+    ok = _commit(_fileno(file)) == 0 && ok;
+#else
+    ok = fsync(fileno(file)) == 0 && ok;
+#endif
+    ok = std::fclose(file) == 0 && ok;
+    std::error_code error;
+    if (!ok) {
+        why = fmt::format("cannot write {}: {}", temporary.string(), std::strerror(errno));
+        std::filesystem::remove(temporary, error);
+        return false;
+    }
+    std::filesystem::rename(temporary, path, error);
+    if (error) {
+        why = fmt::format("cannot replace {}: {}", path.string(), error.message());
+        std::filesystem::remove(temporary, error);
+        return false;
+    }
     return true;
 }
 

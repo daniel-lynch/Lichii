@@ -944,23 +944,11 @@ void PipelineCache::SaveRecipes() {
         classes = recipe_histogram.Classes();
         written = recipe_histogram.Recipes();
     }
-    // Written next to the file and renamed over it, so a crash leaves the previous histogram.
-    auto temporary = recipes_filename;
-    temporary += ".tmp";
-    {
-        std::ofstream file{temporary, std::ios::binary | std::ios::trunc};
-        file.write(reinterpret_cast<const char*>(data.data()),
-                   static_cast<std::streamsize>(data.size()));
-        if (!file) {
-            LOG_WARNING(Render_Vulkan, "Shader AOT: cannot write {}", temporary.string());
-            return;
-        }
-    }
-    std::error_code error;
-    std::filesystem::rename(temporary, recipes_filename, error);
-    if (error) {
-        LOG_WARNING(Render_Vulkan, "Shader AOT: cannot replace {}: {}",
-                    recipes_filename.string(), error.message());
+    // Written to a temporary file of this writer and renamed over the file, so a crash or a
+    // second instance on the same profile leaves an intact histogram.
+    std::string why;
+    if (!VideoCommon::WriteFileAtomically(recipes_filename, data, why)) {
+        LOG_WARNING(Render_Vulkan, "Shader AOT: recipes not written: {}", why);
         return;
     }
     LOG_INFO(Render_Vulkan, "Shader AOT: {} emission recipes of {} classes written", written,

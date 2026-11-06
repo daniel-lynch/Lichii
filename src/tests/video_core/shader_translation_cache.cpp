@@ -879,3 +879,32 @@ TEST_CASE("AOT recipe histogram picks the class's most common recipe and round-t
     REQUIRE_FALSE(loaded.Load(truncated, config, why));
     REQUIRE(loaded.Classes() == 0);
 }
+
+TEST_CASE("AOT recipe file: atomic replacement through a unique temporary file",
+          "[video_core][translation_cache]") {
+    const auto dir = TempPath("eden-aot-recipe-write");
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto path = dir / "recipes.bin";
+    std::string why;
+    const std::vector<u8> first{1, 2, 3}, second{4, 5, 6, 7};
+    REQUIRE(VideoCommon::WriteFileAtomically(path, first, why));
+    // A stale temporary of another writer under the old fixed name is neither used nor touched.
+    {
+        std::ofstream stale{dir / "recipes.bin.tmp", std::ios::binary};
+        stale << "other writer";
+    }
+    REQUIRE(VideoCommon::WriteFileAtomically(path, second, why));
+    std::ifstream in{path, std::ios::binary};
+    const std::vector<u8> read{std::istreambuf_iterator<char>{in}, {}};
+    REQUIRE(read == second);
+    size_t files = 0;
+    for ([[maybe_unused]] const auto& item : std::filesystem::directory_iterator(dir)) {
+        ++files;
+    }
+    REQUIRE(files == 2); // the file and the stale temporary, no temporary of ours left
+    // A missing directory fails without leaving anything behind.
+    REQUIRE_FALSE(VideoCommon::WriteFileAtomically(dir / "missing" / "recipes.bin", first, why));
+    REQUIRE_FALSE(why.empty());
+    std::filesystem::remove_all(dir);
+}

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <bitset>
+#include <filesystem>
 #include <optional>
 #include <span>
 #include <string>
@@ -80,5 +81,12 @@ private:
     std::unordered_map<u64, Class> classes;
     u64 revision{};
 };
+
+/// Replaces `path` with `data` atomically: the bytes go to a temporary file next to it, created
+/// exclusively under a name unique to this writer, which is flushed, synced, closed and renamed
+/// over `path`. Two writers each publish an intact file (the last rename wins). On failure the
+/// temporary file is removed, `path` is untouched and `why` says what failed.
+bool WriteFileAtomically(const std::filesystem::path& path, std::span<const u8> data,
+                         std::string& why);
 
 } // namespace VideoCommon
