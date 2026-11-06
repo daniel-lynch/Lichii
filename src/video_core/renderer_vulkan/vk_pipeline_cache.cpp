@@ -1517,7 +1517,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         infos[stage_index] = &program.info;
 
         const auto stage_begin = Clock::now();
-        const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        const auto full_runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        const auto runtime_info = TC::CanonicalRuntimeInfo(full_runtime_info, program.info, program.stage);
         const TC::EmissionRecipe emission_recipe{runtime_info, binding};
         // Modules of a layer-emulating pipeline depend on the generated geometry stage.
         const std::shared_ptr<const TC::Entry> entry =
@@ -1568,7 +1569,17 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 }
             } else {
                 const auto begin = std::chrono::steady_clock::now();
+                auto full_binding = binding;
+                std::vector<u32> full_code;
+                if (translation_cache_verify) {
+                    full_code = EmitSPIRV(profile, full_runtime_info, program, full_binding);
+                }
                 code = EmitSPIRV(profile, runtime_info, program, binding);
+                if (translation_cache_verify && (full_code != code ||
+                    std::memcmp(&full_binding, &binding, sizeof(binding)) != 0)) {
+                    ++translation_cache_mismatches;
+                    throw Shader::LogicError("Translation cache: canonical runtime info changed stage {}", index);
+                }
                 if (build_in_parallel) {
                     AddRuntimeSpirvTime(0, begin);
                 }

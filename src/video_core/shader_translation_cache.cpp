@@ -791,6 +791,26 @@ std::array<EmissionRecipe, Shader::MaxStageTypes> Store::ReadRecipes(
     return result;
 }
 
+Shader::RuntimeInfo CanonicalRuntimeInfo(Shader::RuntimeInfo runtime, const Shader::Info& info,
+                                          Shader::Stage stage) {
+    if ((stage != Shader::Stage::VertexB && stage != Shader::Stage::Fragment) ||
+        info.loads.Legacy() || info.stores.Legacy()) return runtime;
+    Shader::VaryingState stores{};
+    for (size_t index = 0; index < Shader::IR::NUM_GENERICS; ++index) {
+        if (!info.loads.Generic(index) && !info.passthrough.Generic(index)) {
+            runtime.generic_input_types[index] = Shader::AttributeType::Float;
+            continue;
+        }
+        for (size_t component = 0; component < 4; ++component) {
+            const auto attribute = Shader::IR::Attribute::Generic0X + index * 4 + component;
+            stores.Set(attribute, runtime.previous_stage_stores[attribute]);
+        }
+    }
+    runtime.previous_stage_stores = stores;
+    runtime.input_topology = Shader::InputTopology{};
+    return runtime;
+}
+
 Digest DigestRuntimeInfo(const Shader::RuntimeInfo& info) {
     Hasher hasher;
     hasher.Add(info.generic_input_types);
@@ -1082,7 +1102,8 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
         } else if (ok && type == RecordVariant) {
             Digest key{};
             auto stored = std::make_shared<StoredVariant>();
-            ok = reader.Get(key) && reader.Get(stored->entry_id) && reader.Get(stored->binding_out) &&
+            ok = reader.Get(key) && reader.Get(stored->entry_id) && reader.Get(stored->fallback_recipe) &&
+                 reader.Get(stored->binding_out) &&
                  ReadInfo(record, stored->info) && reader.Get(stored->spirv_words) &&
                  reader.GetBytes(stored->compressed_spirv);
             bool has_recipe{};
@@ -1192,6 +1213,7 @@ std::optional<Variant> Store::FindVariant(const Digest& variant_key) {
         .binding_out = stored->binding_out,
         .info = stored->info,
         .spirv = std::vector<u32>(stored->spirv_words),
+        .fallback_recipe = stored->fallback_recipe,
     };
     const size_t bytes = Common::Compression::DecompressDataZSTD(
         stored->compressed_spirv,
@@ -1235,6 +1257,7 @@ void Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
     }
     auto stored = std::make_shared<StoredVariant>();
     stored->entry_id = entry.id;
+    stored->fallback_recipe = variant.fallback_recipe;
     stored->binding_out = variant.binding_out;
     stored->info = variant.info;
     stored->spirv_words = static_cast<u32>(variant.spirv.size());
@@ -1246,6 +1269,7 @@ void Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
         writer.Put(RecordVariant);
         writer.Put(variant_key);
         writer.Put(entry.id);
+        writer.Put(stored->fallback_recipe);
         writer.Put(stored->binding_out);
         WriteInfo(record, stored->info);
         writer.Put(stored->spirv_words);

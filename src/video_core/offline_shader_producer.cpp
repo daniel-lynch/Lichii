@@ -175,10 +175,11 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                 if (!hash) throw std::runtime_error("unsupported_lowering");
                 const auto key = TC::MakeStageKey(env, *hash, static_cast<u32>(row.stage) + 1, config);
                 std::scoped_lock stage_lock(stage_locks[key.lo % stage_locks.size()]);
-                const auto& recipe = recipes[static_cast<size_t>(row.stage)];
-                const auto runtime = TC::DigestRuntimeInfo(recipe.runtime);
+                auto recipe = recipes[static_cast<size_t>(row.stage)];
                 if (const auto entry = store.FindEntry(key, env)) {
-                    if (store.FindVariant(TC::MakeVariantKey(entry->id, runtime, recipe.bindings))) {
+                    const auto runtime = TC::CanonicalRuntimeInfo(recipe.runtime, entry->meta.info,
+                                                                  entry->meta.stage);
+                    if (store.FindVariant(TC::MakeVariantKey(entry->id, TC::DigestRuntimeInfo(runtime), recipe.bindings))) {
                         std::scoped_lock lock(results);
                         ++summary.resumed;
                         continue;
@@ -194,6 +195,8 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                 if (!env.CanCacheTranslation() || program.info.requires_layer_emulation)
                     throw std::runtime_error("lowering_or_emission_rejected");
                 const auto meta = TC::ProgramMeta::From(program);
+                recipe.runtime = TC::CanonicalRuntimeInfo(recipe.runtime, program.info, program.stage);
+                const auto runtime = TC::DigestRuntimeInfo(recipe.runtime);
                 Shader::Maxwell::ConvertLegacyToGeneric(program, recipe.runtime);
                 auto bindings = recipe.bindings;
                 const auto code = Shader::Backend::SPIRV::EmitSPIRV(profile, recipe.runtime, program, bindings);
@@ -202,7 +205,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                 const auto entry = store.Insert(key, recording.TakeQueries(), meta, true);
                 if (!entry) throw std::runtime_error("cache_disabled");
                 store.InsertVariant(*entry, TC::MakeVariantKey(entry->id, runtime, recipe.bindings),
-                                    {bindings, program.info, code}, &recipe);
+                                    {bindings, program.info, code, true}, &recipe);
                 std::scoped_lock lock(results);
                 ++summary.translated;
                 ++summary.modules;

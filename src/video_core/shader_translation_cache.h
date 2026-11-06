@@ -164,6 +164,9 @@ struct CacheIdentity {
                                       const Shader::HostTranslateInfo& host_info, u64 extra);
 
 [[nodiscard]] Digest DigestRuntimeInfo(const Shader::RuntimeInfo& runtime_info);
+[[nodiscard]] Shader::RuntimeInfo CanonicalRuntimeInfo(Shader::RuntimeInfo runtime,
+                                                      const Shader::Info& info,
+                                                      Shader::Stage stage);
 
 /// A program without its IR: what pipelines and later stages read from a translated program.
 struct ProgramMeta {
@@ -197,6 +200,7 @@ struct Variant {
     Shader::Backend::Bindings binding_out{};
     Shader::Info info;
     std::vector<u32> spirv;
+    bool fallback_recipe{};
 };
 
 [[nodiscard]] Digest MakeVariantKey(const Digest& entry_id, const Digest& runtime,
@@ -266,6 +270,7 @@ public:
 private:
     struct StoredVariant {
         Digest entry_id{};
+        bool fallback_recipe{};
         Shader::Backend::Bindings binding_out{};
         Shader::Info info;
         u32 spirv_words{};
