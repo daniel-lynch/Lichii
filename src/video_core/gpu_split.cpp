@@ -143,6 +143,7 @@ void GpuSplit::Stop() {
     last_writer_position = 0;
     pending_write_count = 0;
     async_writes.clear();
+    report_pages.clear();
     last_sync_position = 0;
     last_memory_write_position = 0;
     published_local = 0;
