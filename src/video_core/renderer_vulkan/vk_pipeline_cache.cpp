@@ -2192,7 +2192,17 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 std::vector<u32> full_code;
                 Shader::Backend::Bindings full_binding = binding;
                 if (canonical && translation_cache_verify) {
-                    full_code = EmitSPIRV(profile, full_runtime_info, program, full_binding);
+                    // Emission writes SPIR-V ids into the IR: the full runtime info's module
+                    // is emitted from a fresh translation of the stage, never from `program`
+                    // a second time (that emits stale ids).
+                    Shader::Environment& verify_env{*stage_envs[index]};
+                    const u32 cfg_offset{static_cast<u32>(verify_env.StartAddress() +
+                                                          sizeof(Shader::ProgramHeader))};
+                    Shader::Maxwell::Flow::CFG cfg(verify_env, pools.flow_block, cfg_offset,
+                                                   index == 0);
+                    Shader::IR::Program fresh =
+                        TranslateProgram(pools.inst, pools.block, verify_env, cfg, host_info);
+                    full_code = EmitSPIRV(profile, full_runtime_info, fresh, full_binding);
                 }
                 const auto begin = std::chrono::steady_clock::now();
                 code = EmitSPIRV(profile, runtime_info, program, binding);
