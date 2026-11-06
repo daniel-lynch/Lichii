@@ -139,6 +139,15 @@ TEST_CASE("Translation cache covers every field of the shader structures",
     REQUIRE(LayoutIsCovered());
 }
 
+TEST_CASE("Translation cache separates fragment shuffle workaround profiles",
+          "[video_core][translation_cache][fragment_shuffle]") {
+    Shader::Profile profile{};
+    const Shader::HostTranslateInfo host_info{};
+    const auto native = MakeConfigDigest(profile, host_info, 0);
+    profile.has_broken_spirv_fragment_shuffle = true;
+    REQUIRE(MakeConfigDigest(profile, host_info, 0) != native);
+}
+
 TEST_CASE("Translation cache round-trips the shader info", "[video_core][translation_cache]") {
     const Shader::Info info = SampleInfo();
     std::vector<u8> bytes;

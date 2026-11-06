@@ -10,7 +10,7 @@ export EDEN_NX2_SHADER_DUMP="$OOT/shaders"
 # 35.6 -> 39.4 fps with both off; vegetation unchanged). Default them off for this game;
 # OOT_UPSTREAM_DEFAULTS=1 restores upstream behaviour for comparison.
 if [ "${OOT_UPSTREAM_DEFAULTS:-0}" != "1" ]; then
-  export EDEN_NX2_GFX_STORAGE_SIZE_LIKE_COMPUTE=0 EDEN_NX2_UNIFORM_BANK_REUPLOAD=0 EDEN_NX2_NATIVE_PREFLUSH=1  # preflush: +3.4 fps median, interleaved A/B 2026-11-06
+  export EDEN_NX2_GFX_STORAGE_SIZE_LIKE_COMPUTE=0 EDEN_NX2_UNIFORM_BANK_REUPLOAD=0 EDEN_NX2_NATIVE_PREFLUSH="${OOT_PREFLUSH:-1}"  # preflush: +3.4 fps median, interleaved A/B 2026-11-06
 fi
 # OOT_GPU=fast|accurate pins the per-game GPU Mode and reactive flushing before boot
 # (fast = GPU Mode Fast + reactive flushing off; accurate = Accurate + flushing on).
