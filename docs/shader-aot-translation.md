@@ -9,8 +9,10 @@ showed, and where the proposal was changed.
 
 Everything is behind the per-game setting **Graphics > Advanced > Translate shaders ahead of
 first use** (`use_shader_aot_translation`, default **off**). `EDEN_NX2_AOT_TRANSLATE=1` also
-turns it on. With the setting off, translation, recording and replay behave exactly as before.
-The cache file format version did change (5 → 6), so existing files are rebuilt once.
+turns it on. The setting remains off by default. Offline products are a separate CLI mode and can
+reuse replay-validated entries and defer missing variants without enabling AOT seeding.
+Both paths now use the Format 10 writer, shared runtime-info canonicalization and
+class-replay hooks; older formats are rebuilt.
 
 ## What the switch does
 

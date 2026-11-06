@@ -157,6 +157,8 @@ add_executable(tests
     video_core/ampere_vote.cpp
     video_core/shader_attributes.cpp
     video_core/indirect_reset.cpp
+    video_core/offline_shader_producer.cpp
+    video_core/shader_archive_environment.cpp
     video_core/shader_translation_cache.cpp
     input_common/calibration_configuration_job.cpp
 )

@@ -17,6 +17,7 @@
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
+#include "video_core/shader_translation_cache.h"
 
 namespace {
 namespace IR = Shader::IR;
@@ -331,7 +332,22 @@ TEST_CASE("Depth sampling emits float image and result types for integer descrip
                 : ir.ImageSampleExplicitLod(ir.Imm32(0), coords, ir.Imm32(0.0f), {}, flags);
             Shader::HostTranslateInfo host;
             host.ApplyDescriptorLimitPolicy();
-            Shader::Optimization::TexturePass(env, program, host);
+            namespace TC = VideoCommon::TranslationCache;
+            TC::RecordingEnvironment recording{env, true};
+            Shader::Optimization::TexturePass(recording, program, host);
+            const auto queries = recording.TakeQueries();
+            size_t integer_queries{};
+            for (const auto& query : queries) {
+                if (query.kind == TC::QueryKind::TexturePixelFormatInteger) {
+                    ++integer_queries;
+                    CHECK(query.answer == static_cast<u32>(integer));
+                }
+            }
+            CHECK(integer_queries == (depth ? 0 : 1));
+            CHECK(TC::ReplayQueries(queries, env));
+            env.integer_format = !integer;
+            CHECK(TC::ReplayQueries(queries, env) == depth);
+            env.integer_format = integer;
             REQUIRE(program.info.texture_descriptors.size() == 1);
             CHECK(program.info.texture_descriptors[0].is_integer == (integer && !depth));
             CHECK(sample.Inst()->Flags<IR::TextureInstInfo>().is_integer ==
