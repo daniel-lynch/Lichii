@@ -21,16 +21,25 @@
 /// first entry (boot, title) a placement read names the scene; after it only an entry does.
 namespace Common::ShaderAotScene {
 
+/// Starts an emulation session (Core::System::Load, before the game's RomFS is built): forgets
+/// the previous session's scene, entry and hooked files. Returns the session's token; wrappers
+/// built in an earlier session keep their token and are ignored from now on.
+u64 BeginSession();
+/// The current session's token.
+[[nodiscard]] u64 Session();
+
 /// Whether scene hints are wanted: the AOT switch is on and a manifest set is named.
 [[nodiscard]] bool Wanted();
 
-/// The RomFS builder wrapped this many scene placement files (0: the scene cannot be known).
-void SetHookedFiles(size_t count);
+/// The RomFS builder wrapped this many scene files in session `session` (0 after BeginSession:
+/// the scene cannot be known).
+void SetHookedFiles(size_t count, u64 session);
 [[nodiscard]] size_t HookedFiles();
 
 /// The game read a file of `scene`: its parameters (`entered`) or a placement file. A repeat of
 /// the current scene changes nothing; a placement read after the first entry is a prefetch.
-void Post(std::string_view scene, bool entered);
+/// A wrapper of another session posts nothing.
+void Post(std::string_view scene, bool entered, u64 session);
 
 /// Placement reads ignored as prefetches so far.
 [[nodiscard]] u64 Prefetches();

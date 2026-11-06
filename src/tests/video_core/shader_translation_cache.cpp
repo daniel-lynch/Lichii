@@ -537,20 +537,47 @@ TEST_CASE("AOT scene manifests replace the previous scene's tiers and keep the g
 TEST_CASE("AOT scene hints: placement reads count before the first entry only",
           "[video_core][translation_cache]") {
     namespace Scene = Common::ShaderAotScene;
+    const u64 session = Scene::BeginSession();
     u64 generation{};
     const u64 start = Scene::Generation();
-    Scene::Post("TestTitle_Child", false); // boot: the save's scene is loaded behind the title
+    Scene::Post("TestTitle_Child", false, session); // boot: the save's scene behind the title
     REQUIRE(Scene::Current(generation) == "TestTitle_Child");
     REQUIRE(generation == start + 1);
-    Scene::Post("TestTitle_Child", true); // entering it changes nothing
+    Scene::Post("TestTitle_Child", true, session); // entering it changes nothing
     REQUIRE(Scene::Generation() == start + 1);
     const u64 prefetches = Scene::Prefetches();
-    Scene::Post("TestField_Child", false); // a neighbour prefetched after the entry
+    Scene::Post("TestField_Child", false, session); // a neighbour prefetched after the entry
     REQUIRE(Scene::Current(generation) == "TestTitle_Child");
     REQUIRE(Scene::Prefetches() == prefetches + 1);
-    Scene::Post("TestField_Child", true);
+    Scene::Post("TestField_Child", true, session);
     REQUIRE(Scene::Current(generation) == "TestField_Child");
     REQUIRE(generation == start + 2);
+}
+
+TEST_CASE("AOT scene hints belong to one emulation session",
+          "[video_core][translation_cache]") {
+    namespace Scene = Common::ShaderAotScene;
+    u64 generation{};
+    const u64 first = Scene::BeginSession();
+    Scene::SetHookedFiles(240, first);
+    Scene::Post("TestA_Child", false, first);
+    Scene::Post("TestA_Child", true, first);
+    REQUIRE(Scene::HookedFiles() == 240);
+    // The next game: nothing of the first session is left, the zero-hook case included.
+    const u64 before = Scene::Generation();
+    const u64 second = Scene::BeginSession();
+    REQUIRE(second != first);
+    REQUIRE(Scene::Generation() != before);
+    REQUIRE(Scene::HookedFiles() == 0);
+    REQUIRE(Scene::Current(generation).empty());
+    // A wrapper of the first session (its RomFS outlived the boundary) posts nothing.
+    Scene::Post("TestB_Child", true, first);
+    Scene::SetHookedFiles(240, first);
+    REQUIRE(Scene::Current(generation).empty());
+    REQUIRE(Scene::HookedFiles() == 0);
+    // Boot placement reads name the scene again, since nothing has been entered yet.
+    Scene::Post("TestB_Child", false, second);
+    REQUIRE(Scene::Current(generation) == "TestB_Child");
 }
 
 TEST_CASE("AOT scene names come from the placement and parameter files only",

@@ -16,6 +16,7 @@ std::atomic<u64> generation{};
 std::atomic<size_t> hooked_files{};
 std::atomic<u64> prefetches{};
 bool entered_any{};
+std::atomic<u64> session{1};
 
 bool EnvIs(const char* name, char value) {
     const char* text = std::getenv(name);
@@ -32,17 +33,35 @@ bool Wanted() {
            EnvIs("EDEN_NX2_AOT_TRANSLATE", '1');
 }
 
-void SetHookedFiles(size_t count) {
-    hooked_files.store(count, std::memory_order_release);
+u64 BeginSession() {
+    std::scoped_lock lock{mutex};
+    current.clear();
+    entered_any = false;
+    hooked_files.store(0, std::memory_order_release);
+    prefetches.store(0, std::memory_order_relaxed);
+    // A new generation, so a pool index polling across the boundary sees the empty scene.
+    generation.fetch_add(1, std::memory_order_release);
+    return session.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+
+u64 Session() {
+    return session.load(std::memory_order_acquire);
+}
+
+void SetHookedFiles(size_t count, u64 session_token) {
+    std::scoped_lock lock{mutex};
+    if (session_token == session.load(std::memory_order_acquire)) {
+        hooked_files.store(count, std::memory_order_release);
+    }
 }
 
 size_t HookedFiles() {
     return hooked_files.load(std::memory_order_acquire);
 }
 
-void Post(std::string_view scene, bool entered) {
+void Post(std::string_view scene, bool entered, u64 session_token) {
     std::scoped_lock lock{mutex};
-    if (scene.empty()) {
+    if (scene.empty() || session_token != session.load(std::memory_order_acquire)) {
         return;
     }
     if (!entered && entered_any) {

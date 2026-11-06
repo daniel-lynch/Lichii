@@ -92,9 +92,9 @@ namespace {
 class SceneHintFile final : public VfsFile {
 public:
     SceneHintFile(VirtualFile file_, std::string scene_, bool entered_, std::string path_,
-                  bool trace_)
+                  bool trace_, u64 session_)
         : file{std::move(file_)}, scene{std::move(scene_)}, entered{entered_},
-          path{std::move(path_)}, trace{trace_} {}
+          path{std::move(path_)}, trace{trace_}, session{session_} {}
 
     std::string GetName() const override {
         return file->GetName();
@@ -125,7 +125,7 @@ public:
             }
         }
         if (!scene.empty()) {
-            Common::ShaderAotScene::Post(scene, entered);
+            Common::ShaderAotScene::Post(scene, entered, session);
         }
         return file->Read(data, length, offset);
     }
@@ -145,6 +145,7 @@ private:
     bool entered;
     std::string path;
     bool trace;
+    u64 session;
     mutable std::atomic<std::chrono::steady_clock::time_point> last_read{};
 };
 } // Anonymous namespace
@@ -307,6 +308,7 @@ std::vector<std::pair<u64, VirtualFile>> RomFSBuildContext::Build() {
     if (Common::ShaderAotScene::Wanted()) {
         const char* trace_env = std::getenv("EDEN_NX2_AOT_SCENE_TRACE");
         const bool trace = trace_env != nullptr && trace_env[0] == '1';
+        const u64 session = Common::ShaderAotScene::Session();
         size_t hooked = 0;
         for (const auto& file : files) {
             auto scene = Common::ShaderAotScene::SceneOfPath(file->path);
@@ -315,11 +317,11 @@ std::vector<std::pair<u64, VirtualFile>> RomFSBuildContext::Build() {
                 hooked += scene.has_value() ? 1 : 0;
                 file->source = std::make_shared<SceneHintFile>(
                     std::move(file->source), scene ? std::move(scene->scene) : std::string{},
-                    scene && scene->entered, file->path, trace);
+                    scene && scene->entered, file->path, trace, session);
             }
         }
         if (hooked != 0) {
-            Common::ShaderAotScene::SetHookedFiles(hooked);
+            Common::ShaderAotScene::SetHookedFiles(hooked, session);
             LOG_INFO(Loader, "Shader AOT: {} scene files (placement and parameters) report their "
                              "reads",
                      hooked);
