@@ -93,7 +93,10 @@ ComputeOutcome ProduceCompute(const Program& row, const Shader::Profile& profile
         if (LoadWord(program_bytes, row.constants_offset + i * 4) != row.bank1_words[i])
             throw std::runtime_error("constants_mismatch");
 
-    ArchiveEnvironment env(ArchiveEnvironment::ComputeProgram{}, program_bytes, control);
+    // Effect (vsetb) programs sample array textures, as for graphics rows.
+    const auto texture_type = TextureTypeForProgram(row);
+    ArchiveEnvironment env(ArchiveEnvironment::ComputeProgram{}, program_bytes, control, 0,
+                           texture_type);
     const auto hash = env.Analyze();
     if (!hash) throw std::runtime_error("unsupported_lowering");
     const auto key = TC::MakeStageKey(env, *hash, ComputeSlot, config);
@@ -113,7 +116,8 @@ ComputeOutcome ProduceCompute(const Program& row, const Shader::Profile& profile
         }
     }
     for (size_t set = 0; set < answer_sets.size(); ++set) {
-        ArchiveEnvironment variant_env(ArchiveEnvironment::ComputeProgram{}, program_bytes, control);
+        ArchiveEnvironment variant_env(ArchiveEnvironment::ComputeProgram{}, program_bytes,
+                                       control, 0, texture_type);
         variant_env.SetStoragePointerAnswers(answer_sets[set]);
         if (set != 0) ++outcome.recorded_sets;
         TC::RecordingEnvironment resume(variant_env, true);

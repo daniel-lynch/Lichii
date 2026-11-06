@@ -16,7 +16,8 @@ public:
     // Program includes the 128-byte native graphics header; control is its archive control
     // section. Initially only vertex, fragment and geometry have supported scalar recipes.
     ArchiveEnvironment(std::span<const u8> program, std::span<const u8> control,
-                       Shader::Stage shader_stage, u32 texture_buffer = 0);
+                       Shader::Stage shader_stage, u32 texture_buffer = 0,
+                       Shader::TextureType texture_type = Shader::TextureType::Color2D);
 
     /// The dispatch state a native compute program's control section records: what the runtime
     /// reads from the launch descriptor (QMD) when it builds the program's environment.
@@ -34,7 +35,8 @@ public:
     /// followed by its bank-1 constants; the environment matches ComputeEnvironment in native
     /// mode (start address and initial offset past an all-zero header, proprietary driver).
     ArchiveEnvironment(ComputeProgram, std::span<const u8> program, std::span<const u8> control,
-                       u32 texture_buffer = 0);
+                       u32 texture_buffer = 0,
+                       Shader::TextureType texture_type = Shader::TextureType::Color2D);
 
     u32 ReadCbufValue(u32 index, u32 offset) override;
     Shader::TextureType ReadTextureType(u32) override;
@@ -63,6 +65,7 @@ private:
     std::map<std::pair<u32, u32>, u32> guessed_words;
     u32 handle_depth{};
     std::map<std::tuple<u32, u32, u32, bool>, bool> pointer_answers;
+    Shader::TextureType texture_type = Shader::TextureType::Color2D;
 };
 
 } // namespace VideoCommon

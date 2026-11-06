@@ -312,3 +312,85 @@ TEST_CASE("Shader report includes skips and all import limits", "[video_core][tr
     std::filesystem::remove(path);
     REQUIRE_THROWS(WriteReport(path / "missing-parent.json", summary));
 }
+
+TEST_CASE("Offline index preserves all member and variation aliases", "[video_core][translation_cache]") {
+    auto input = Index();
+    input["programs"][0]["origins"] = {
+        {{"source", "archive-a"}, {"member", "Model!BNSH@100"}, {"variation", 3}},
+        {{"source", "archive-b"}, {"member", "Model!BNSH@100"}, {"variation", 7}}};
+    const auto parsed = ParseInput(input.dump(), {});
+    REQUIRE(parsed.programs[0].origins.size() == 2);
+    REQUIRE(parsed.programs[0].origins[1].source == "archive-b");
+    REQUIRE(parsed.programs[0].origins[1].variation == 7);
+    input["programs"][0]["origins"][0]["variation"] = -1;
+    REQUIRE_THROWS(ParseInput(input.dump(), {}));
+}
+
+TEST_CASE("Partner recipes use emitted bindings and stores while retaining draw state",
+          "[video_core][translation_cache]") {
+    Shader::Info info;
+    info.loads.Set(Shader::IR::Attribute::Generic0X);
+    auto base = DefaultEmissionRecipe(Shader::Stage::Fragment);
+    base.runtime.force_early_z = true;
+    base.bindings.unified = 17;
+    PartnerStage partner{};
+    partner.bindings.unified = 8;
+    partner.bindings.texture_scaling_index = 2;
+    partner.info.stores.Set(Shader::IR::Attribute::Generic0X);
+    auto second = partner;
+    second.bindings.unified = 12;
+    const std::array partners{partner, second, partner};
+    const auto result = ExpandRecipes({{base, RecipeSource::ExactStage}}, Shader::Stage::Fragment,
+                                      info, partners, {});
+    REQUIRE(result.size() == 3);
+    REQUIRE(result[0].source == RecipeSource::ExactStage);
+    REQUIRE(result[1].source == RecipeSource::PartnerStage);
+    REQUIRE(result[1].recipe.bindings.unified == 8);
+    REQUIRE(result[1].recipe.bindings.texture_scaling_index == 2);
+    REQUIRE(result[1].recipe.runtime.previous_stage_stores.mask == partner.info.stores.mask);
+    REQUIRE(result[1].recipe.runtime.force_early_z);
+    REQUIRE(result[2].recipe.bindings.unified == 12);
+    auto other_state = base;
+    other_state.runtime.force_early_z = false;
+    const auto bounded = ExpandRecipes({{base, RecipeSource::ExactStage},
+                                         {other_state, RecipeSource::Class}},
+                                        Shader::Stage::Fragment, info, partners, {});
+    REQUIRE(bounded.size() == 4); // Two original recipes and one per distinct partner.
+    REQUIRE(bounded[2].recipe.runtime.force_early_z);
+}
+
+TEST_CASE("Member layouts add every distinct enabled input and type combination",
+          "[video_core][translation_cache]") {
+    Shader::Info info;
+    info.loads.Set(Shader::IR::Attribute::Generic0X);
+    const auto base = DefaultEmissionRecipe(Shader::Stage::VertexB);
+    auto disabled = base;
+    disabled.runtime.previous_stage_stores.Set(Shader::IR::Attribute::Generic0X, false);
+    disabled.runtime.generic_input_types[0] = Shader::AttributeType::Disabled;
+    auto integer = base;
+    integer.runtime.generic_input_types[0] = Shader::AttributeType::SignedInt;
+    auto unused = integer;
+    unused.runtime.generic_input_types[9] = Shader::AttributeType::UnsignedInt;
+    const std::array layouts{disabled, integer, unused};
+    const auto result = ExpandRecipes({{base, RecipeSource::Baseline}}, Shader::Stage::VertexB,
+                                      info, {}, layouts);
+    REQUIRE(result.size() == 3);
+    REQUIRE(result[1].source == RecipeSource::InputLayout);
+    REQUIRE_FALSE(result[1].recipe.runtime.previous_stage_stores[Shader::IR::Attribute::Generic0X]);
+    REQUIRE(result[2].recipe.runtime.generic_input_types[0] == Shader::AttributeType::SignedInt);
+    REQUIRE(result[2].recipe.bindings.unified == base.bindings.unified);
+}
+
+TEST_CASE("Canonical donor layouts cannot invent unobserved vertex inputs",
+          "[video_core][translation_cache]") {
+    Shader::Info target;
+    target.loads.Set(Shader::IR::Attribute::Generic0X);
+    target.loads.Set(Shader::IR::Attribute::Generic1X);
+    Shader::VaryingState observed;
+    observed.Set(Shader::IR::Attribute::Generic0X);
+    REQUIRE_FALSE(CanShareInputLayout(target, observed));
+    observed.Set(Shader::IR::Attribute::Generic1W); // A canonical recipe retains the whole generic once any component is used.
+    REQUIRE(CanShareInputLayout(target, observed));
+    target.passthrough.Set(Shader::IR::Attribute::Generic2X);
+    REQUIRE_FALSE(CanShareInputLayout(target, observed));
+}

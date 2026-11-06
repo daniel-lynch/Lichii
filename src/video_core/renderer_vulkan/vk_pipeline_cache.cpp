@@ -2637,7 +2637,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
-        render_pass_cache, key, std::move(modules), infos, std::move(emit_stages));
+        render_pass_cache, key, std::move(modules), infos, std::move(emit_stages),
+        build_in_parallel);
     pipeline->SetAotClass(aot_class);
     return pipeline;
 
@@ -2680,27 +2681,21 @@ void LogRuntimeComputeBuilds(std::string_view when) {
 }
 
 // Pipelines built on the GPU thread at run time (shader translation, and the SPIR-V unless a worker
-// emits it; the driver compile is on workers): the first 400 over 2 ms and every one over 100 ms
-// are logged, and the totals every 10 s, to tell how much of the stutter on new content is
-// translation.
+// emits it). Preparation is logged for every hash so it can be joined with executor,
+// translation/emission, driver and held-wait timings.
+// Totals are reported every 10 s.
 void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_point begin,
                            const std::string& shaders) {
     static std::chrono::steady_clock::duration total{};
-    static u32 count{}, logged{};
+    static u32 count{};
     static auto window = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     const auto elapsed = now - begin;
     total += elapsed;
     ++count;
     const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
-    // Slow builds are always logged with their shaders, to find the programs that are slow to
-    // translate.
-    if (elapsed > std::chrono::milliseconds{100} ||
-        (elapsed > std::chrono::milliseconds{2} && logged < 400)) {
-        ++logged;
-        LOG_INFO(Render_Vulkan, "{} pipeline built on the GPU thread in {:.1f} ms: {}", kind,
-                 ms(elapsed), shaders);
-    }
+    LOG_INFO(Render_Vulkan, "{} pipeline built on the GPU thread in {:.1f} ms: {}", kind,
+             ms(elapsed), shaders);
     if (now - window > std::chrono::seconds{10}) {
         const auto take = [](auto& counter) {
             return std::chrono::nanoseconds{counter.exchange(0, std::memory_order::relaxed)};

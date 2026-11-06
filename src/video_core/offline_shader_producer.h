@@ -15,7 +15,16 @@ constexpr u64 MaxProgramBytes = 16 * 1024 * 1024;
 constexpr u64 MaxIndexBytes = 64 * 1024 * 1024;
 /// Largest bank-1 constant section the archive environment can read exactly.
 constexpr u32 MaxBank1Bytes = 256;
+struct Origin {
+    std::string source, member;
+    u32 variation{};
+};
+struct PartnerStage {
+    Shader::Backend::Bindings bindings;
+    Shader::Info info;
+};
 struct Program {
+    std::vector<Origin> origins;
     std::filesystem::path container;
     std::filesystem::path control;
     u64 offset{};
@@ -56,7 +65,7 @@ struct Summary {
     u64 entries{}, product_modules{};
     u64 validated_modules{}, invalidated_modules{}, replaced_modules{};
     bool cancelled{};
-    std::array<SourceSummary, 3> sources{};
+    std::array<SourceSummary, 5> sources{};
     // Entire current product, including modules retained from previous runs.
     std::map<u64, u64> multiplicity;
     u64 import_entries{}, import_truncated_entries{}, import_skipped_records{},
@@ -69,6 +78,13 @@ struct Summary {
         u64 pointer_modules{}, recorded_sets{};
     } compute;
 };
+[[nodiscard]] bool CanShareInputLayout(const Shader::Info& target,
+                                       const Shader::VaryingState& observed_inputs);
+[[nodiscard]] std::vector<TranslationCache::SelectedRecipe> ExpandRecipes(
+    std::vector<TranslationCache::SelectedRecipe> selected, Shader::Stage stage,
+    const Shader::Info& info, std::span<const PartnerStage> partners,
+    std::span<const TranslationCache::EmissionRecipe> layouts);
+[[nodiscard]] Shader::TextureType TextureTypeForProgram(const Program& program);
 void WriteReport(const std::filesystem::path& path, const Summary& summary);
 [[nodiscard]] Input ParseInput(std::string_view json, const std::filesystem::path& directory);
 [[nodiscard]] Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,

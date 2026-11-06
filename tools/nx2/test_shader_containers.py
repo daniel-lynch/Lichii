@@ -98,6 +98,9 @@ class SharcbTests(unittest.TestCase):
             self.assertEqual(row["constants_offset"], 0xf0)
             self.assertEqual(row["constants_size"], 4)
             self.assertEqual(row["stage"], "vertex")
+            self.assertEqual([origin["variation"] for origin in row["origins"]], [0, 1])
+            self.assertEqual(row["origins"][0]["source"], str(source))
+            self.assertEqual(row["origins"][0]["member"], source.name)
             self.assertEqual((output / row["container"]).read_bytes()[0xf0:0xf4],
                              bytes.fromhex("78563412"))
             self.assertEqual(len(row["fingerprint"]), 16)
