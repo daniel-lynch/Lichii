@@ -243,10 +243,17 @@ CheatEngine::CheatEngine(System& system_, std::vector<CheatEntry> cheats_,
 }
 
 CheatEngine::~CheatEngine() {
-    if (event)
-        core_timing.UnscheduleEvent(event);
-    else
-        LOG_ERROR(CheatEngine, "~CheatEngine before event was registered");
+    Shutdown();
+}
+
+void CheatEngine::Shutdown() {
+    is_running.store(false, std::memory_order_release);
+    if (event) {
+        // Wait: returns only once a FrameCallback running on the timer thread has finished, so
+        // the caller may tear down what the VM reads (services, HID, the process) right after.
+        core_timing.UnscheduleEvent(event, Core::Timing::UnscheduleEventType::Wait);
+        event.reset();
+    }
 }
 
 void CheatEngine::Initialize() {
@@ -256,7 +263,6 @@ void CheatEngine::Initialize() {
             FrameCallback(ns_late);
             return std::nullopt;
         });
-    core_timing.ScheduleLoopingEvent(CHEAT_ENGINE_NS, CHEAT_ENGINE_NS, event);
 
     metadata.process_id = system.ApplicationProcess()->GetProcessId();
     metadata.title_id = system.GetApplicationProcessProgramID();
@@ -276,6 +282,10 @@ void CheatEngine::Initialize() {
     };
 
     is_pending_reload.exchange(true);
+
+    // Schedule last, once the metadata the callback reads is filled in.
+    is_running.store(true, std::memory_order_release);
+    core_timing.ScheduleLoopingEvent(CHEAT_ENGINE_NS, CHEAT_ENGINE_NS, event);
 }
 
 void CheatEngine::SetMainMemoryParameters(VAddr main_region_begin, u64 main_region_size) {
@@ -291,6 +301,13 @@ void CheatEngine::Reload(std::vector<CheatEntry> reload_cheats) {
 }
 
 void CheatEngine::FrameCallback(std::chrono::nanoseconds ns_late) {
+    // Once the engine is stopped or the system is shutting down, touch nothing: the VM reads HID
+    // through the service manager and guest memory through the process, and both go away during
+    // ShutdownMainProcess while the timer thread keeps running.
+    if (!is_running.load(std::memory_order_acquire) || system.IsShuttingDown()) {
+        return;
+    }
+
     if (is_pending_reload.exchange(false)) {
         vm.LoadProgram(cheats);
     }

@@ -7,8 +7,9 @@
 #include <fstream>
 #include <iterator>
 #include <span>
-#include <utility>
 #include <string>
+#include <tuple>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
@@ -170,12 +171,15 @@ bool ShaderPoolIndex::ParseManifest(std::string_view text, std::vector<ManifestR
 }
 
 size_t ShaderPoolIndex::ApplyManifest(std::span<const ManifestRow> rows) {
-    // (fingerprint, pool offset) -> programs with that key.
-    std::unordered_multimap<u64, Program*> by_key;
-    for (Container& container : containers) {
-        for (Program& program : container.programs) {
-            by_key.emplace(program.fingerprint ^ (u64{program.offset} * 0x9e3779b97f4a7c15ULL),
-                           &program);
+    // (fingerprint, pool offset) -> programs with that key, built once (scenes apply again).
+    auto& by_key = programs_by_key;
+    if (by_key.empty()) {
+        for (Container& container : containers) {
+            for (Program& program : container.programs) {
+                by_key.emplace(program.fingerprint ^
+                                   (u64{program.offset} * 0x9e3779b97f4a7c15ULL),
+                               &program);
+            }
         }
     }
     size_t matched = 0;
@@ -202,6 +206,27 @@ size_t ShaderPoolIndex::ApplyManifest(std::span<const ManifestRow> rows) {
         matched += found ? 1 : 0;
     }
     return matched;
+}
+
+void ShaderPoolIndex::KeepTiersAsGlobal() {
+    for (Container& container : containers) {
+        for (Program& program : container.programs) {
+            program.global_tier = program.tier;
+            program.global_bank1 = program.manifest_bank1;
+        }
+    }
+    global_bank1_count = manifest_bank1_words.size();
+}
+
+size_t ShaderPoolIndex::SelectSceneRows(std::span<const ManifestRow> rows) {
+    for (Container& container : containers) {
+        for (Program& program : container.programs) {
+            program.tier = program.global_tier;
+            program.manifest_bank1 = program.global_bank1;
+        }
+    }
+    manifest_bank1_words.resize(global_bank1_count);
+    return ApplyManifest(rows);
 }
 
 ShaderPoolIndex::LoadedManifests ShaderPoolIndex::ReadManifests(std::string path) {
@@ -249,9 +274,37 @@ void ShaderPoolIndex::StartManifestLoad() {
     if (path == nullptr || path[0] == '\0') {
         return;
     }
+    // A directory with the global manifest selects scene manifests by the scene the game reads
+    // (when the RomFS builder could hook its placement files); the global one loads first.
+    std::error_code error;
+    const std::filesystem::path root{path};
+    const auto global = root / "manifest-_global.json";
+    std::string first_load{path};
+    if (std::filesystem::is_directory(root, error) &&
+        std::filesystem::is_regular_file(global, error)) {
+        const size_t hooked = Common::ShaderAotScene::HookedFiles();
+        if (hooked != 0 && Common::ShaderAotScene::Wanted()) {
+            scene_mode = true;
+            manifest_dir = root;
+            first_load = global.string();
+            const char* wait = std::getenv("EDEN_NX2_AOT_SCENE_WAIT");
+            const long seconds = wait != nullptr && wait[0] != '\0' ? std::atol(wait) : 120;
+            scene_deadline = std::chrono::steady_clock::now() +
+                             std::chrono::seconds{(std::max)(seconds, 0L)};
+            LOG_INFO(HW_GPU,
+                     "AOT manifest: per-scene selection ({} scene files hooked); the global "
+                     "manifest now, a scene's when the game enters it, all of them after {} s "
+                     "without one",
+                     hooked, seconds);
+        } else {
+            LOG_INFO(HW_GPU, "AOT manifest: the scene cannot be known ({}); every manifest is "
+                             "loaded",
+                     hooked == 0 ? "no scene file hooked" : "EDEN_NX2_AOT_SCENES=0");
+        }
+    }
     // Parsed on its own thread (a directory may hold a manifest per scene); recognition waits
     // for it, so no pool is offered in the wrong order.
-    manifest_load = std::async(std::launch::async, &ReadManifests, std::string{path});
+    manifest_load = std::async(std::launch::async, &ReadManifests, std::move(first_load));
     manifest_pending = true;
 }
 
@@ -268,6 +321,9 @@ bool ShaderPoolIndex::PollManifest() {
     manifest_files = loaded.files;
     manifest_rows = loaded.rows.size();
     manifest_rows_matched = ApplyManifest(loaded.rows);
+    if (scene_mode) {
+        KeepTiersAsGlobal();
+    }
     for (const auto& words : manifest_bank1_words) {
         manifest_bytes += words.capacity() * sizeof(u32) + sizeof(words);
     }
@@ -400,6 +456,61 @@ std::vector<ShaderPoolIndex::Candidate> ShaderPoolIndex::TakeCandidates(size_t c
     return result;
 }
 
+void ShaderPoolIndex::Acknowledge(const Candidate& candidate) {
+    taken.insert(candidate.address);
+    retries.erase(candidate.address);
+}
+
+void ShaderPoolIndex::Defer(const Candidate& candidate) {
+    u32& attempts = retries[candidate.address];
+    if (++attempts > MaxRetries) {
+        ++deferred_dropped;
+        return;
+    }
+    deferred.push_back({candidate, std::chrono::steady_clock::now() + RetryInterval * attempts});
+}
+
+void ShaderPoolIndex::RequeueDeferred(std::chrono::steady_clock::time_point now) {
+    for (auto it = deferred.begin(); it != deferred.end();) {
+        if (it->retry_at > now) {
+            ++it;
+            continue;
+        }
+        const Candidate& candidate = it->candidate;
+        if (!used.contains(candidate.address) && !taken.contains(candidate.address) &&
+            !queued_tier.contains(candidate.address) &&
+            candidates_queued < MaxCandidatesQueued) {
+            candidates_queues[(std::min<size_t>)(candidate.tier, NoTier) - 1].push_back(candidate);
+            queued_tier.emplace(candidate.address, candidate.tier);
+            ++candidates_queued;
+            manifest_queued += candidate.tier != NoTier ? 1 : 0;
+        }
+        it = deferred.erase(it);
+    }
+}
+
+void ShaderPoolIndex::ReturnCandidates(std::span<const Candidate> returned) {
+    for (auto it = returned.rbegin(); it != returned.rend(); ++it) {
+        const Candidate& candidate = *it;
+        if (used.contains(candidate.address) || queued_tier.contains(candidate.address) ||
+            candidates_queued >= MaxCandidatesQueued) {
+            continue;
+        }
+        const size_t priority = (std::min<size_t>)(candidate.tier, NoTier) - 1;
+        candidates_queues[priority].push_front(candidate);
+        queued_tier.emplace(candidate.address, candidate.tier);
+        ++candidates_queued;
+        manifest_queued += candidate.tier != NoTier ? 1 : 0;
+    }
+}
+
+void ShaderPoolIndex::QueueForTesting(const Candidate& candidate) {
+    candidates_queues[(std::min<size_t>)(candidate.tier, NoTier) - 1].push_back(candidate);
+    queued_tier.emplace(candidate.address, candidate.tier);
+    ++candidates_queued;
+    manifest_queued += candidate.tier != NoTier ? 1 : 0;
+}
+
 void ShaderPoolIndex::OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr address) {
     if (manifest_pending) {
         if (!PollManifest()) {
@@ -515,6 +626,9 @@ void ShaderPoolIndex::OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr addr
         }
         if (static_cast<double>(verified) >= RecogniseShare * static_cast<double>(total)) {
             ++containers_recognised;
+            if (scene_mode) {
+                recognised_pools.emplace_back(container_index, pool);
+            }
             if (manifest_files != 0) {
                 std::array<size_t, PriorityCount> tiers{};
                 for (const auto& [where, program] : found) {
@@ -578,6 +692,130 @@ void ShaderPoolIndex::OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr addr
     if (first_uses % 100 == 0) {
         LogStatistics("so far");
     }
+}
+
+} // namespace VideoCommon
+
+namespace VideoCommon {
+
+void ShaderPoolIndex::UpdateScene(Tegra::MemoryManager& gpu_memory) {
+    if (manifest_pending) {
+        return; // The global manifest first.
+    }
+    if (scene_load_pending) {
+        if (!scene_load_done->load(std::memory_order_acquire)) {
+            return;
+        }
+        scene_load_pending = false;
+        ApplyScene(gpu_memory, scene_load.get());
+        return;
+    }
+    std::filesystem::path file;
+    if (Common::ShaderAotScene::Generation() != scene_generation) {
+        u64 generation{};
+        std::string scene = Common::ShaderAotScene::Current(generation);
+        scene_generation = generation;
+        if (scene.empty() || scene == scene_name) {
+            return;
+        }
+        std::error_code error;
+        file = manifest_dir / fmt::format("manifest-{}.json", scene);
+        if (!std::filesystem::is_regular_file(file, error)) {
+            ++scenes_without_manifest;
+            LOG_INFO(HW_GPU, "AOT scene {}: no manifest, the rows of {} stay", scene,
+                     scene_name.empty() ? std::string{"no scene"} : scene_name);
+            return;
+        }
+        scene_loading = std::move(scene);
+    } else if (scene_name.empty() && std::chrono::steady_clock::now() >= scene_deadline) {
+        // No scene was read in time: every manifest, as without selection.
+        LOG_INFO(HW_GPU, "AOT scene: none read in time; every manifest is loaded");
+        file = manifest_dir;
+        scene_loading = "*";
+    } else {
+        return;
+    }
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    scene_load_done = done;
+    scene_load = std::async(std::launch::async, [path = file.string(), done] {
+        LoadedManifests loaded = ReadManifests(path);
+        done->store(true, std::memory_order_release);
+        return loaded;
+    });
+    scene_load_pending = true;
+}
+
+void ShaderPoolIndex::ApplyScene(Tegra::MemoryManager& gpu_memory, LoadedManifests loaded) {
+    const auto begin = std::chrono::steady_clock::now();
+    const std::string previous = std::exchange(scene_name, std::move(scene_loading));
+    // The previous scene's queued programs go; the new scene's are offered from every pool
+    // recognised so far, in tier order. Seeds already stored stay.
+    const size_t dropped = candidates_queued;
+    for (auto& queue : candidates_queues) {
+        queue.clear();
+    }
+    queued_tier.clear();
+    candidates_queued = 0;
+    manifest_queued = 0;
+    const size_t matched = SelectSceneRows(loaded.rows);
+    std::array<u8, FingerprintBytes> bytes{};
+    std::vector<std::tuple<u8, GPUVAddr, const Program*>> offer;
+    for (const auto& [container_index, pool] : recognised_pools) {
+        for (const Program& program : containers[container_index].programs) {
+            const GPUVAddr where = pool + program.offset;
+            if (const auto it = predicted.find(where); it != predicted.end()) {
+                it->second = program.tier;
+            }
+            if ((program.stage != 0 && program.stage != 4) ||
+                (program.tier == NoTier && !offer_others)) {
+                continue;
+            }
+            if (used.contains(where) || taken.contains(where)) {
+                continue;
+            }
+            // The pool may have gone with the previous scene: verify again.
+            const size_t length = (std::min)(size_t{program.size}, FingerprintBytes);
+            if (!gpu_memory.IsFullyMappedRange(where, length)) {
+                continue;
+            }
+            gpu_memory.ReadBlockUnsafe(where, bytes.data(), length);
+            if (Fingerprint(std::span{bytes.data(), length}) != program.fingerprint) {
+                continue;
+            }
+            offer.emplace_back(program.tier, where, &program);
+        }
+    }
+    std::ranges::stable_sort(offer, {}, [](const auto& item) { return std::get<0>(item); });
+    size_t offered = 0;
+    for (const auto& [tier, where, program] : offer) {
+        if (candidates_queued >= MaxCandidatesQueued || queued_tier.contains(where)) {
+            continue;
+        }
+        candidates_queues[tier - 1].push_back({where, program->stage, tier,
+                                               program->constants_offset,
+                                               program->constants_size, program->manifest_bank1});
+        queued_tier.emplace(where, tier);
+        ++candidates_queued;
+        manifest_queued += tier != NoTier ? 1 : 0;
+        ++candidates_offered;
+        ++offered_by_tier[tier - 1];
+        ++offered;
+    }
+    candidates_queued_peak = (std::max)(candidates_queued_peak, candidates_queued);
+    ++scenes_applied;
+    manifest_files += loaded.files;
+    LOG_INFO(HW_GPU,
+             "AOT scene {} (was {}): {} files, {} rows of tiers 1-3, {} matched indexed "
+             "programs; read in {:.1f} ms on a loader thread, applied in {:.1f} ms; queue: {} "
+             "dropped, {} offered from {} recognised pools; {} prefetch reads ignored so far; "
+             "process memory {}",
+             scene_name, previous.empty() ? std::string{"none"} : previous, loaded.files,
+             loaded.rows.size(), matched,
+             std::chrono::duration<double, std::milli>(loaded.time).count(),
+             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+                 .count(),
+             dropped, offered, recognised_pools.size(), Common::ShaderAotScene::Prefetches(),
+             MemoryNote());
 }
 
 } // namespace VideoCommon

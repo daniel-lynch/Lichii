@@ -4,6 +4,9 @@
 # Between files, the user copy (%APPDATA%\eden\nx2_switches.txt, or
 # $XDG_CONFIG_HOME/eden/nx2_switches.txt) wins over this one, so editing this file is never
 # needed: copy the lines you want into your own and restart.
+# Beside-application files accept EDEN_NX2_* and the emulator's diagnostic switches only.
+# Host environment settings, including library paths such as EDEN_STREAMLINE_DIR, must be
+# set in the real environment or the user configuration file at an absolute config location.
 #
 # Restart the emulator after editing.
 
@@ -26,6 +29,18 @@ EDEN_NX2_FENCE_BATCH=1
 # Terrain/indirect drawing fix for Donkey Kong Bananza: enabled by default. Set to 0 only to leave to GPU.
 #EDEN_NX2_RESETFIX=0
 
+# Ocarina of Time real-time speed (the "Real-time speed (built-in)" add-on): below 60 fps the game
+# gets the measured frame time as its step, so it no longer runs in slow motion. =0 keeps the
+# patch but never writes the delta, i.e. the old fixed 60 Hz step (slow motion below 60 fps).
+# EDEN_NX2_OOT_REAL_TIME=0 (Anthony's fork) and EDEN_NX2_REAL_SPEED=0 (Daniel's) are the same
+# switch; either one set to 0 turns the write off.
+#EDEN_NX2_REAL_SPEED=0
+#EDEN_NX2_OOT_REAL_TIME=0
+# Deltas below this (default 1.03 = 58.3 fps) are delivered as the fixed 1.0. Range 1.0-1.5. =1.1
+# (the earlier default, 54.5 fps) ignores more jitter near 60 fps but runs 54.5-58 fps up to 10 %
+# slow, with a speed step where the smoothed frame time crosses 18.3 ms.
+#EDEN_NX2_OOT_REAL_TIME_SNAP=1.1
+
 # Drop reactive-flushing read traps on Switch 2 programs (opt-in; can reduce FPS from 29 to 24 in MKW).
 #EDEN_NX2_NO_REACTIVE=1
 
@@ -36,3 +51,7 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_SPLIT_SKIP=1
 #EDEN_NX2_AUTO_STUB=1
 #EDEN_NX2_KEEP_ASTC=1
+# A draw that reaches a pipeline still queued for a worker-only build claims and builds it on the
+# GPU thread instead of waiting behind every pipeline queued on the FIFO workers before it
+# (PR 321; single held frames of 1.1-2.2 s in Ocarina). =0 waits for the worker, as after #184.
+#EDEN_NX2_HELD_BUILD_INLINE=0

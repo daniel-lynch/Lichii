@@ -1831,11 +1831,23 @@ private:
             }
             m_frame_trace.last_present = entered;
         }
-        if (const auto* const process = system.ApplicationProcess();
-            process != nullptr && Nx2OotTime::WriteEnabled()) {
+        // Nx2OotTime::WriteEnabled(): EDEN_NX2_REAL_SPEED=0 (ours) or EDEN_NX2_OOT_REAL_TIME=0
+        // (Anthony's spelling) never writes the delta, so the game keeps the patched-in 1.0 (its
+        // old fixed step) with the patch still applied: for A/B timing and for routes scripted in
+        // frames. The delta is still computed. Unset or 1 writes the measured frame time.
+        const bool oot_real_time = Nx2OotTime::WriteEnabled();
+        // The presenting process: another client of this service never feeds or gets the delta.
+        if (auto* const process = ctx.GetThread().GetOwnerProcess(); process != nullptr) {
             if (const u64 address = process->GetOotDeltaAddress(); address != 0) {
-                system.ApplicationMemory().Write32(
-                    address, std::bit_cast<u32>(m_oot_frame_delta.Update(entered)));
+                const float delta = m_oot_frame_delta.Update(entered);
+                if (oot_real_time) {
+                    process->GetMemory().Write32(address, std::bit_cast<u32>(delta));
+                }
+                m_stats.oot_last = delta;
+                m_stats.oot_min = (std::min)(m_stats.oot_min, delta);
+                m_stats.oot_max = (std::max)(m_stats.oot_max, delta);
+                m_stats.oot_fixed += delta == 1.0f ? 1 : 0;
+                ++m_stats.oot_presents;
             }
         }
         // Where each frame's time goes on the present thread, averaged per 600 presents: the
@@ -1863,13 +1875,24 @@ private:
             }
             m_stats.last_present = entered;
             if (++m_stats.presents == 600) {
+                // Ocarina's real-time delta (nx2_oot_time.h): the last value, its range and how
+                // many presents kept the fixed 1.0. "(off)" when the write is off
+                // (EDEN_NX2_REAL_SPEED=0 or EDEN_NX2_OOT_REAL_TIME=0): computed, not written.
+                const std::string oot =
+                    m_stats.oot_presents == 0
+                        ? std::string{}
+                        : fmt::format(" oot_delta={:.2f}{} (min {:.2f}, max {:.2f}, 1.00 on {} "
+                                      "of {}, snap {:.2f})",
+                                      m_stats.oot_last, oot_real_time ? "" : "(off)",
+                                      m_stats.oot_min, m_stats.oot_max, m_stats.oot_fixed,
+                                      m_stats.oot_presents, m_oot_frame_delta.SnapBelow());
                 LOG_INFO(Service,
                          "nx2:vi2 last 600 presents: frame {} us (max {}, {} over 100 ms), "
                          "blocked on the GPU fence {} us (max {}), composite {} us, vblank "
-                         "pacing {} us, {} ran a frame ahead",
+                         "pacing {} us, {} ran a frame ahead{}",
                          m_stats.frame_us / 599, m_stats.max_frame_us, m_stats.hitches,
                          m_stats.fence_us / 600, m_stats.max_fence_us, m_stats.composite_us / 600,
-                         m_stats.pace_us / 600, m_stats.ran_ahead);
+                         m_stats.pace_us / 600, m_stats.ran_ahead, oot);
                 m_stats = {.last_present = entered};
             }
         }
@@ -1889,6 +1912,8 @@ private:
         long long max_frame_us{}, hitches{};
         u32 presents{}, ran_ahead{};
         std::chrono::steady_clock::time_point last_present{};
+        float oot_last{}, oot_min{100.0f}, oot_max{};
+        u32 oot_fixed{}, oot_presents{};
     } m_stats{};
     u32 m_previous_fence_id{~0U}; // none yet (WaitForFrame ignores ids >= 192)
     u32 m_previous_fence_value{};
@@ -1898,7 +1923,7 @@ private:
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     Nx2PresentPacer m_present_pacer;
     u32 m_swap_word{};
-    Nx2OotTime::FrameDelta m_oot_frame_delta;
+    Nx2OotTime::FrameDelta m_oot_frame_delta{Nx2OotTime::SnapFromEnv()};
 
     struct FrameTrace {
         Common::DkbFrameTrace::RateLimit rate;

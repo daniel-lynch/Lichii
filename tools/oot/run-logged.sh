@@ -3,15 +3,21 @@
 # then keep this run's emulator log next to the frametime CSV.
 set -u
 OOT="$HOME/Downloads/OOT"
-BIN="${BIN:-$HOME/dev/Lichii/build/bin/lichii}"
+BIN="${BIN:-$HOME/dev/Lichii/build-test/bin/lichii}"  # the dev play binary (build-test is built from the dev worktree); BIN=… overrides
 STAMP=$(date +%Y%m%d-%H%M%S)
-export EDEN_NX2_SHADER_DUMP="$OOT/shaders"
+# Shader dump: off for play (the 2026-11-06 field session wrote 1,342 dump files from the GPU thread);
+# OOT_SHADER_DUMP=1 turns it back on for analysis runs.
+if [ "${OOT_SHADER_DUMP:-0}" = "1" ]; then export EDEN_NX2_SHADER_DUMP="$OOT/shaders"; fi
 # OoT fps: upstream #150's two unswitched commits cost ~10 % here (harness A/B 2026-11-05:
 # 35.6 -> 39.4 fps with both off; vegetation unchanged). Default them off for this game;
 # OOT_UPSTREAM_DEFAULTS=1 restores upstream behaviour for comparison.
 if [ "${OOT_UPSTREAM_DEFAULTS:-0}" != "1" ]; then
   export EDEN_NX2_GFX_STORAGE_SIZE_LIKE_COMPUTE=0 EDEN_NX2_UNIFORM_BANK_REUPLOAD=0 EDEN_NX2_NATIVE_PREFLUSH="${OOT_PREFLUSH:-1}"  # preflush: +3.4 fps median, interleaved A/B 2026-11-06
 fi
+# Pipeline eviction: upstream destroys graphics pipelines unused for 9000 frames (~2.5 min at 60),
+# so re-entering an area rebuilds them on the GPU thread (upstream issue #293 — stutter).
+# Off for this game; OOT_EVICT=1 restores upstream behaviour.
+if [ "${OOT_EVICT:-0}" != "1" ]; then export EDEN_NX2_PIPELINE_EVICT=0; fi
 # OOT_GPU=fast|accurate pins the per-game GPU Mode and reactive flushing before boot
 # (fast = GPU Mode Fast + reactive flushing off; accurate = Accurate + flushing on).
 # OOT_FLUSH=0|1 overrides the flushing half. Unset = leave the config alone.
@@ -57,10 +63,10 @@ fi
 # OOT_AOT_MANIFEST=<file or dir> overrides the manifest set; OOT_AOT_WORKERS=N sets the
 # translation threads (unset = the emulator's default, 2).
 if [ "${OOT_AOT:-1}" = "1" ]; then  # default ON since dev 18832d80a5 (AOT merged; -36% frame-blocking cold)
-  AOT_INDEX="$OOT/aot/index/oot-aot-index.bin"
+  AOT_INDEX="$OOT/aot/index/${OOT_AOT_INDEX_FILE:-oot-aot-index-sharcb.bin}"  # sharcb index (engine shaders) since AOT branch 3; oot-aot-index.bin = BNSH-only
   if [ -f "$AOT_INDEX" ]; then
     export EDEN_NX2_AOT_TRANSLATE=1 EDEN_NX2_AOT_INDEX="$AOT_INDEX" EDEN_NX2_AOT_SEED=1
-    export EDEN_NX2_AOT_MANIFEST="${OOT_AOT_MANIFEST:-$OOT/aot/manifests-active}"  # global + current scene; the 81-file union overfills the seed queue until per-scene selection lands
+    export EDEN_NX2_AOT_MANIFEST="${OOT_AOT_MANIFEST:-$OOT/aot/manifests}"  # full directory: per-scene selection (AOT branch 3) picks the scene the game enters; OOT_AOT_MANIFEST=$OOT/aot/manifests-active restores the global+Kokiri union
     [ -n "${OOT_AOT_WORKERS:-}" ] && export EDEN_NX2_AOT_WORKERS="$OOT_AOT_WORKERS"
     [ -e "$EDEN_NX2_AOT_MANIFEST" ] || echo "OOT_AOT: no manifests at $EDEN_NX2_AOT_MANIFEST (index only; see $OOT/aot/README.md)" >&2
     echo "OOT_AOT: index $AOT_INDEX, manifests $EDEN_NX2_AOT_MANIFEST"
@@ -70,9 +76,46 @@ if [ "${OOT_AOT:-1}" = "1" ]; then  # default ON since dev 18832d80a5 (AOT merge
     echo "  (then the manifests: see $OOT/aot/README.md)" >&2
   fi
 fi
+
+# OOT_PRODUCT: offline shader product (a translation cache written by eden-cli --precompile-shaders).
+# Every vulkan_translations.*.bin under $OOT/offline-translate/product-live/ is copied (reflink when
+# the filesystem allows, else a real copy) into the live shader cache dir if a file of that name is
+# not there yet; the runtime uses the one whose translator tag matches this build and logs the tags
+# it ignores. OOT_PRODUCT=0 skips the step.
+if [ "${OOT_PRODUCT:-1}" = "1" ]; then
+  PRODUCT_DIR="$OOT/offline-translate/product-live"
+  LIVE_SHADER_DIR="$HOME/.cache/eden/shader/0400486024dec000"
+  if [ -d "$PRODUCT_DIR" ] && [ -d "$LIVE_SHADER_DIR" ]; then
+    for f in "$PRODUCT_DIR"/vulkan_translations.*.bin; do
+      [ -f "$f" ] || continue
+      b=$(basename "$f")
+      # A product can be re-produced under the same name (same build, more recipes): the
+      # producer writes <name>.sha256 beside it and the install records it in <name>.installed;
+      # a changed sha replaces the live copy (its runtime records are already in the new product).
+      want=$(cat "$f.sha256" 2>/dev/null | cut -c1-64)
+      have=$(cat "$LIVE_SHADER_DIR/$b.installed" 2>/dev/null | cut -c1-64)
+      if [ ! -e "$LIVE_SHADER_DIR/$b" ]; then
+        cp --reflink=auto "$f" "$LIVE_SHADER_DIR/$b" && echo "offline shader product installed: $b" >&2 \
+          && [ -n "$want" ] && echo "$want" > "$LIVE_SHADER_DIR/$b.installed"
+      elif [ -n "$want" ] && [ "$want" != "$have" ]; then
+        cp --reflink=auto "$f" "$LIVE_SHADER_DIR/$b.new" && mv -f "$LIVE_SHADER_DIR/$b.new" "$LIVE_SHADER_DIR/$b" \
+          && echo "$want" > "$LIVE_SHADER_DIR/$b.installed" && echo "offline shader product updated: $b" >&2
+      fi
+    done
+  fi
+fi
 # MangoHud: overlay + CSV of fps/frametime, starts 5 s after launch, runs until exit.
-export MANGOHUD=1
-export MANGOHUD_CONFIG="fps,frametime,gpu_stats,cpu_stats,output_folder=$OOT/logs,autostart_log=5,log_duration=0,log_interval=100"
+# MangoHud: OOT_MANGOHUD=0 disables the overlay and the frametime log entirely. The NVIDIA GPU
+# sampler (gpu_stats) aborts the process inside libMangoHud.so on this host since 2026-11-06
+# (NVIDIA::get_samples_and_copy -> free(): invalid pointer), so it is off; OOT_MANGOHUD_GPU_STATS=1
+# turns it back on once MangoHud is fixed.
+# NVIDIA driver shader cache: large and never cleaned up, so pipelines compiled once stay warm
+# across sessions (the driver cache is where the 0.7-0.9 s runtime builds end up). OOT_GL_CACHE=0 leaves the driver defaults.
+if [ "${OOT_GL_CACHE:-1}" = "1" ]; then export __GL_SHADER_DISK_CACHE_SIZE=8589934592 __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1; fi
+export MANGOHUD="${OOT_MANGOHUD:-1}"
+MH_CFG="fps,frametime,cpu_stats,output_folder=$OOT/logs,autostart_log=5,log_duration=0,log_interval=100"
+[ "${OOT_MANGOHUD_GPU_STATS:-0}" = "1" ] && MH_CFG="$MH_CFG,gpu_stats"
+export MANGOHUD_CONFIG="$MH_CFG"
 # PCIe + GPU load sampler (1 s) for the whole session, saved beside the logs.
 nvidia-smi dmon -s tu -d 1 > "$OOT/logs/pcie-$STAMP.txt" 2>/dev/null &
 SAMPLER=$!

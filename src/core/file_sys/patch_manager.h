@@ -10,6 +10,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <vector>
 #include "common/common_types.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/vfs/vfs_types.h"
@@ -72,8 +74,11 @@ public:
     // - IPS
     // - IPSwitch
     // - Built-in patches, keyed by title and build id
-    [[nodiscard]] std::vector<u8> PatchNSO(const std::vector<u8>& nso,
-                                           const std::string& name) const;
+    // `applied`, when given, receives the names of the built-in patches that were written (all of
+    // their records); a rejected, disabled or yielding built-in, or one a user mod pre-empted, is
+    // not listed. The names point at static storage.
+    [[nodiscard]] std::vector<u8> PatchNSO(const std::vector<u8>& nso, const std::string& name,
+                                           std::vector<std::string_view>* applied = nullptr) const;
 
     // Checks to see if PatchNSO() will have any effect given the NSO's build ID.
     // Used to prevent expensive copies in NSO loader.

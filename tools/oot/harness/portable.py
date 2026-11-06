@@ -66,9 +66,11 @@ def refresh(profile: Path, log=print):
     log(f"profile refreshed from live dirs into {profile}")
 
 
-def cold_copy(profile: Path, dest: Path, log=print):
+def cold_copy(profile: Path, dest: Path, log=print, seed=()):
     """Copy the profile to `dest` without its shader caches, for a run that starts with an empty
-    shader directory. The source profile is only read; the copy is left in the run folder."""
+    shader directory. The source profile is only read; the copy is left in the run folder.
+    Each `seed` file is copied into that directory under its parent directory's name (the title
+    id), so a run can start with one chosen cache file and nothing else."""
     profile, dest = Path(profile).resolve(), Path(dest).resolve()
     if dest.exists():
         shutil.rmtree(dest)
@@ -76,7 +78,13 @@ def cold_copy(profile: Path, dest: Path, log=print):
     shutil.copytree(profile, dest, symlinks=False,
                     ignore=lambda d, names: [n for n in names if Path(d, n).resolve() == shader])
     (dest / "user/cache/shader").mkdir(parents=True, exist_ok=True)
-    log(f"cold shader cache: running from {dest} (empty user/cache/shader)")
+    for f in seed:
+        f = Path(f).resolve()
+        target = dest / "user/cache/shader" / f.parent.name / f.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, target)
+        log(f"cold shader cache: seeded {target.relative_to(dest)}")
+    log(f"cold shader cache: running from {dest} (empty user/cache/shader{', seeded' if seed else ''})")
     return dest
 
 

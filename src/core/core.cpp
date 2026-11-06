@@ -12,6 +12,7 @@
 #include "audio_core/audio_core.h"
 #include "common/fs/fs.h"
 #include "common/logging.h"
+#include "common/shader_aot_scene.h"
 #include "common/nx2_sampler.h"
 #include "common/adpf.h"
 #include "common/settings.h"
@@ -184,6 +185,13 @@ struct System::Impl {
     explicit Impl(System& system)
         : kernel{system}, fs_controller{system}, hid_core{kernel}, cpu_manager{system},
           reporter{system}, applet_manager{system}, frontend_applets{system}, profile_manager{} {}
+
+    ~Impl() {
+        // Members go in reverse declaration order: service_manager before cheat_engine, and
+        // core_timing (whose timer thread runs the cheat event) last. Stop the engine first for a
+        // System destroyed without ShutdownMainProcess.
+        cheat_engine.reset();
+    }
 
     u64 program_id;
 
@@ -367,6 +375,9 @@ struct System::Impl {
         if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
             fs_controller.InitTempStorage();
         }
+        // Shader AOT scene hints belong to this session: the previous game's scene, entry and
+        // hooked files are forgotten before this game's RomFS is built.
+        Common::ShaderAotScene::BeginSession();
 
         const bool switch2_program =
             virtual_filesystem != nullptr &&
@@ -510,6 +521,13 @@ struct System::Impl {
             gpu_core->NotifyShutdown();
 
         stop_event.request_stop();
+        // Stop the cheat engine before anything it touches goes away. Its looping CoreTiming event
+        // reads HID through the service manager and guest memory through the process, and
+        // SyncPause(false) below restarts the timer thread for the rest of the teardown: with the
+        // reset left after service_manager.reset(), the event ran on a destroyed ServiceManager
+        // and the process died with SIGSEGV at shutdown. reset() unschedules the event and waits
+        // out a callback in flight.
+        cheat_engine.reset();
         core_timing.SyncPause(false);
         Network::CancelPendingSocketOperations();
         kernel.SuspendEmulation(true);
@@ -518,7 +536,6 @@ struct System::Impl {
         services.reset();
         service_manager.reset();
         fs_controller.Reset();
-        cheat_engine.reset();
         core_timing.ClearPendingEvents();
         app_loader.reset();
         audio_core.reset();
