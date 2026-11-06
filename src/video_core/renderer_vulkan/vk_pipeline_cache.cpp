@@ -910,19 +910,101 @@ void PipelineCache::RecordRecipe(Shader::Stage stage, const Shader::Info& info,
         TC::MakeVariantKey(TC::Digest{}, TC::DigestRuntimeInfo(runtime_info), binding_in);
     static constexpr size_t MaxPerClass = 8;
     static constexpr size_t MaxClasses = 4096;
-    std::scoped_lock lock{recipe_mutex};
-    for (const u64 class_key : {RecipeClass(stage, &info), RecipeClass(stage, nullptr)}) {
-        if (!recipes.contains(class_key) && recipes.size() >= MaxClasses) {
-            continue;
-        }
-        auto& list = recipes[class_key];
-        const auto it = std::ranges::find(list, digest, &EmissionRecipe::digest);
-        if (it != list.end()) {
-            ++it->count;
-        } else if (list.size() < MaxPerClass) {
-            list.push_back({runtime_info, binding_in, digest, 1});
+    std::vector<WaitingSeed> ready;
+    {
+        std::scoped_lock lock{recipe_mutex};
+        const u64 own_class = RecipeClass(stage, &info);
+        for (const u64 class_key : {own_class, RecipeClass(stage, nullptr)}) {
+            if (!recipes.contains(class_key) && recipes.size() >= MaxClasses) {
+                continue;
+            }
+            auto& list = recipes[class_key];
+            const auto it = std::ranges::find(list, digest, &EmissionRecipe::digest);
+            if (it != list.end()) {
+                ++it->count;
+            } else if (list.size() < MaxPerClass) {
+                list.push_back({runtime_info, binding_in, digest, 1});
+                // The class's first recipe: seeds of the class emitted with a stage-level
+                // guess get a module for it now, usually before their own first draw.
+                if (list.size() == 1 && class_key == own_class) {
+                    if (const auto waiting = waiting_seeds.find(class_key);
+                        waiting != waiting_seeds.end()) {
+                        ready = std::move(waiting->second);
+                        waiting_count -= ready.size();
+                        waiting_seeds.erase(waiting);
+                    }
+                }
+            }
         }
     }
+    if (!ready.empty()) {
+        EmitWaitingSeeds(std::move(ready));
+    }
+}
+
+void PipelineCache::ParkSeed(const std::shared_ptr<VideoCommon::ReplayEnvironment>& env,
+                             const std::shared_ptr<const VideoCommon::TranslationCache::Entry>& entry,
+                             Shader::Stage stage, const Shader::Info& info, u64 bytes,
+                             u64 generation) {
+    static constexpr size_t MaxWaiting = 2048;
+    std::scoped_lock lock{recipe_mutex};
+    if (waiting_count >= MaxWaiting) {
+        ++aot_waiting_dropped;
+        return;
+    }
+    waiting_seeds[RecipeClass(stage, &info)].push_back({env, entry, bytes, generation});
+    ++waiting_count;
+    ++aot_parked;
+    // The environment stays owned until the class's recipe is seen.
+    const u64 in_flight = aot_bytes.fetch_add(bytes) + bytes;
+    for (u64 peak = aot_bytes_peak.load();
+         in_flight > peak && !aot_bytes_peak.compare_exchange_weak(peak, in_flight);) {
+    }
+}
+
+void PipelineCache::EmitWaitingSeeds(std::vector<WaitingSeed> seeds) {
+    namespace TC = VideoCommon::TranslationCache;
+    aot_workers->QueueWork([this, seeds = std::move(seeds)] {
+        for (const WaitingSeed& seed : seeds) {
+            const auto begin = std::chrono::steady_clock::now();
+            try {
+                if (seed.generation == aot_generation.load()) {
+                    // The same translation as the seed's (the guessed words are kept by the
+                    // environment), checked against the entry before its module is stored.
+                    ShaderPools pools;
+                    TC::RecordingEnvironment recording{*seed.env, true};
+                    const u32 cfg_offset{static_cast<u32>(seed.env->StartAddress() +
+                                                          sizeof(Shader::ProgramHeader))};
+                    Shader::Maxwell::Flow::CFG cfg(recording, pools.flow_block, cfg_offset, false);
+                    Shader::IR::Program program =
+                        TranslateProgram(pools.inst, pools.block, recording, cfg, host_info);
+                    bool class_match = false;
+                    auto recipe = BestRecipe(program.stage, program.info, class_match);
+                    if (!TC::InfoEqual(program.info, seed.entry->meta.info)) {
+                        ++aot_late_info_differs;
+                    } else if (recipe && class_match) {
+                        CanonicalizeRuntimeInfo(recipe->runtime_info, program.info, program.stage);
+                        Shader::Backend::Bindings binding = recipe->binding_in;
+                        std::vector<u32> code =
+                            EmitSPIRV(profile, recipe->runtime_info, program, binding);
+                        translation_cache.InsertVariant(
+                            *seed.entry,
+                            TC::MakeVariantKey(seed.entry->id,
+                                               TC::DigestRuntimeInfo(recipe->runtime_info),
+                                               recipe->binding_in),
+                            TC::Variant{binding, program.info, std::move(code)});
+                        ++aot_late_variants;
+                    }
+                }
+            } catch (const Shader::Exception&) {
+                ++aot_variants_failed;
+            }
+            aot_variant_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now() - begin)
+                                                   .count());
+            aot_bytes -= seed.bytes;
+        }
+    });
 }
 
 std::optional<PipelineCache::EmissionRecipe> PipelineCache::BestRecipe(Shader::Stage stage,
@@ -1056,11 +1138,16 @@ bool PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
                                                recipe->binding_in),
                             TC::Variant{binding, program.info, std::move(code)});
                         ++(class_match ? aot_variants_class : aot_variants_stage);
+                        if (!class_match) {
+                            ParkSeed(owned, entry, program.stage, program.info, job_bytes,
+                                     generation);
+                        }
                     } catch (const Shader::Exception&) {
                         ++aot_variants_failed;
                     }
                 } else {
                     ++aot_variants_none;
+                    ParkSeed(owned, entry, program.stage, program.info, job_bytes, generation);
                 }
                 aot_variant_ns += static_cast<u64>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1168,6 +1255,15 @@ void PipelineCache::LogStageOutcomes(std::string_view when) {
              aot_variants_failed.load(), static_cast<double>(aot_variant_ns.load()) / 1e6,
              aot_full_hits.load(), aot_emitted_at_draw.load(), worker_variant_hits.load(),
              worker_variant_info_differs.load());
+    {
+        std::scoped_lock lock{recipe_mutex};
+        LOG_INFO(Render_Vulkan,
+                 "Shader AOT ({}): seeds parked for their class's recipe {}, {} still waiting, "
+                 "{} dropped; modules emitted once the class's recipe was seen {}, {} retranslated "
+                 "with another info",
+                 when, aot_parked.load(), waiting_count, aot_waiting_dropped.load(),
+                 aot_late_variants.load(), aot_late_info_differs.load());
+    }
     if (translation_cache_verify) {
         LOG_INFO(Render_Vulkan,
                  "Shader AOT ({}): {} stages emitted with the canonical and the full runtime "

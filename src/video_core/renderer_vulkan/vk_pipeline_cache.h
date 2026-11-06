@@ -53,6 +53,10 @@ namespace VideoCore {
 class ShaderNotify;
 }
 
+namespace VideoCommon {
+class ReplayEnvironment;
+}
+
 namespace Vulkan {
 
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
@@ -317,6 +321,24 @@ private:
     std::atomic<u64> aot_emitted_at_draw{};     ///< Seeded stages emitted at their first draw
     std::atomic<u64> worker_variant_hits{};     ///< Deferred stages whose module the worker found
     std::atomic<u64> worker_variant_info_differs{};
+    /// Seeds emitted with a stage-level guess wait (owning their environment) for their
+    /// class's first recipe, then get a module for it on an AOT worker.
+    struct WaitingSeed {
+        std::shared_ptr<VideoCommon::ReplayEnvironment> env;
+        std::shared_ptr<const VideoCommon::TranslationCache::Entry> entry;
+        u64 bytes{};
+        u64 generation{};
+    };
+    std::unordered_map<u64, std::vector<WaitingSeed>> waiting_seeds; ///< Under recipe_mutex
+    size_t waiting_count{};
+    void ParkSeed(const std::shared_ptr<VideoCommon::ReplayEnvironment>& env,
+                  const std::shared_ptr<const VideoCommon::TranslationCache::Entry>& entry,
+                  Shader::Stage stage, const Shader::Info& info, u64 bytes, u64 generation);
+    void EmitWaitingSeeds(std::vector<WaitingSeed> seeds);
+    std::atomic<u64> aot_parked{};
+    std::atomic<u64> aot_waiting_dropped{};
+    std::atomic<u64> aot_late_variants{};
+    std::atomic<u64> aot_late_info_differs{};
     std::atomic<u64> canonical_verified{};
     std::atomic<u64> canonical_mismatches{};
     std::atomic<u64> aot_bytes{};
