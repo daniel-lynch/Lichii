@@ -567,10 +567,26 @@ bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env) {
             }
             const u32 sec_index = cbuf.has_secondary ? cbuf.secondary_index : cbuf.index;
             const u32 sec_offset = cbuf.has_secondary ? cbuf.secondary_offset : cbuf.offset;
-            const u32 lhs_word = env.ReadCbufValue(cbuf.index, cbuf.offset);
-            const u32 rhs_word = env.ReadCbufValue(sec_index, sec_offset);
-            const u32 handle =
-                (lhs_word << cbuf.shift_left) | (rhs_word << cbuf.secondary_shift_left);
+            Shader::ConstBufferAddr address{};
+            address.index = cbuf.index;
+            address.offset = cbuf.offset;
+            address.shift_left = cbuf.shift_left;
+            address.secondary_index = cbuf.secondary_index;
+            address.secondary_offset = cbuf.secondary_offset;
+            address.secondary_shift_left = cbuf.secondary_shift_left;
+            address.has_secondary = cbuf.has_secondary;
+            address.count = 1;
+            u32 handle{};
+            env.BeginTextureHandle();
+            try {
+                const u32 lhs_word = env.ReadCbufValue(cbuf.index, cbuf.offset);
+                const u32 rhs_word = env.ReadCbufValue(sec_index, sec_offset);
+                handle = (lhs_word << cbuf.shift_left) | (rhs_word << cbuf.secondary_shift_left);
+            } catch (...) {
+                env.EndTextureHandle(address, handle);
+                throw;
+            }
+            env.EndTextureHandle(address, handle);
             if (const auto [it, inserted] = handles.try_emplace(query.answer, handle);
                 !inserted && it->second != handle) {
                 // One recorded handle standing for two live ones: the texture queries cannot be

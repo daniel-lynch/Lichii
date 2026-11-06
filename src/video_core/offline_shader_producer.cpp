@@ -176,7 +176,8 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                 const auto key = TC::MakeStageKey(env, *hash, static_cast<u32>(row.stage) + 1, config);
                 std::scoped_lock stage_lock(stage_locks[key.lo % stage_locks.size()]);
                 auto recipe = recipes[static_cast<size_t>(row.stage)];
-                if (const auto entry = store.FindEntry(key, env)) {
+                TC::RecordingEnvironment resume(env, true);
+                if (const auto entry = store.FindEntry(key, resume)) {
                     const auto runtime = TC::CanonicalRuntimeInfo(recipe.runtime, entry->meta.info,
                                                                   entry->meta.stage);
                     if (store.FindVariant(TC::MakeVariantKey(entry->id, TC::DigestRuntimeInfo(runtime), recipe.bindings))) {

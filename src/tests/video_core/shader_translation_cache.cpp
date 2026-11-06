@@ -14,6 +14,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "shader_recompiler/translator_identity.h"
 #include "video_core/shader_translation_cache.h"
+#include "video_core/shader_archive_environment.h"
 
 namespace {
 using namespace VideoCommon::TranslationCache;
@@ -695,4 +696,28 @@ TEST_CASE("Canonical vertex and fragment keys ignore only unused runtime inputs"
             REQUIRE(digest(b) == DigestRuntimeInfo(b));
         }
     }
+}
+
+TEST_CASE("Offline resume replays guessed handles in their original scope",
+          "[video_core][translation_cache]") {
+    std::vector<u8> bytes(0x200), control(0x58);
+    auto put = [](auto& out, size_t offset, u32 word) {
+        std::memcpy(out.data() + offset, &word, sizeof(word));
+    };
+    put(bytes, 0, 1 << 10);
+    put(bytes, 0x80, 0x0000794d);
+    put(bytes, 0x88, 0x03800000);
+    put(control, 0, 0x98761234);
+    put(control, 4, 0xc9);
+    put(control, 8, 20);
+    put(control, 0x38, 0x90);
+    VideoCommon::ArchiveEnvironment env(bytes, control, Shader::Stage::VertexB);
+    RecordingEnvironment recording(env, true);
+    auto handle = ReadHandle(recording, HandleAt(2, 0x20));
+    (void)recording.ReadTextureType(handle);
+    const auto queries = recording.TakeQueries();
+    VideoCommon::ArchiveEnvironment resumed(bytes, control, Shader::Stage::VertexB);
+    RecordingEnvironment replay(resumed, true);
+    REQUIRE(ReplayQueries(queries, replay));
+    REQUIRE_THROWS(resumed.ReadCbufValue(2, 0x20));
 }
