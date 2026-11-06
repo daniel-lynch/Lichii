@@ -54,6 +54,7 @@ struct SourceSummary {
 struct Summary {
     u64 seen{}, translated{}, resumed{}, modules{}, module_bytes{};
     u64 entries{}, product_modules{};
+    u64 validated_modules{}, invalidated_modules{}, replaced_modules{};
     bool cancelled{};
     std::array<SourceSummary, 3> sources{};
     // Entire current product, including modules retained from previous runs.

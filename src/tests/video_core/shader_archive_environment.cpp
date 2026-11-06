@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -226,6 +228,59 @@ TEST_CASE("Offline producer resumes complete modules and repairs interrupted app
         u32 record_length{};
         std::memcpy(&record_length, complete.data() + 32, 4);
         metadata_length = 36 + record_length;
+    }
+    // Keep the record framing and compressed length intact while breaking its ZSTD payload.
+    for (const bool corrupt : {false, true}) {
+        auto bytes = complete;
+        const std::array<u8, 4> magic{0x28, 0xb5, 0x2f, 0xfd};
+        const auto payload = std::search(bytes.begin() + metadata_length, bytes.end(),
+                                         magic.begin(), magic.end());
+        REQUIRE(payload != bytes.end());
+        if (corrupt) *payload = 0;
+        write("cache.bin", bytes);
+        const auto report_path = directory / "report.json";
+        {
+            Store store;
+            store.Open(path, config);
+            auto env = source.Make();
+            const auto hash = env.Analyze();
+            REQUIRE(hash);
+            const auto stage_key = MakeStageKey(env, *hash,
+                static_cast<u32>(Shader::Stage::VertexB) + 1, config);
+            RecordingEnvironment recording(env, true);
+            const auto entry = store.FindEntry(stage_key, recording);
+            REQUIRE(entry);
+            const auto recipe = DefaultEmissionRecipe(entry->meta.stage);
+            const auto runtime = CanonicalRuntimeInfo(recipe.runtime, entry->meta.info,
+                                                      entry->meta.stage);
+            const auto key = MakeVariantKey(entry->id, DigestRuntimeInfo(runtime), recipe.bindings);
+            REQUIRE(store.HasVariant(key));
+            REQUIRE(store.FindVariant(key).has_value() == !corrupt);
+            const auto result = Offline::Run(input, 0x0400000000000000ULL, 2, {}, profile, {},
+                config, store, DefaultRecipeCount, DefaultRecipeLimit, report_path);
+            REQUIRE(result.validated_modules == (corrupt ? 0 : 1));
+            REQUIRE(result.invalidated_modules == (corrupt ? 1 : 0));
+            REQUIRE(result.replaced_modules == (corrupt ? 1 : 0));
+            REQUIRE(result.modules == (corrupt ? 1 : 0));
+            REQUIRE(result.resumed == (corrupt ? 1 : 2));
+            REQUIRE(result.skipped.empty());
+            REQUIRE(store.FindVariant(key));
+            REQUIRE(store.ValidateVariantForResume(key) == Store::ResumeVariant::Ready);
+            std::ifstream report_file(report_path);
+            const auto report = nlohmann::json::parse(report_file);
+            REQUIRE(report["schema_version"] == 1);
+            REQUIRE(report["validated_modules"] == result.validated_modules);
+            REQUIRE(report["invalidated_modules"] == result.invalidated_modules);
+            REQUIRE(report["replaced_modules"] == result.replaced_modules);
+        }
+        // The appended replacement wins over the damaged record on the next boot.
+        Store reopened;
+        reopened.Open(path, config);
+        const auto resumed = Offline::Run(input, 0x0400000000000000ULL, 2, {}, profile, {}, config, reopened);
+        REQUIRE(resumed.validated_modules == 1);
+        REQUIRE(resumed.invalidated_modules == 0);
+        REQUIRE(resumed.modules == 0);
+        REQUIRE(resumed.resumed == 2);
     }
     // Cut every byte of the first appended record, then verify that resumption emits the module.
     for (size_t length = metadata_length; length < complete.size(); ++length) {

@@ -1525,6 +1525,28 @@ bool Store::HasVariant(const Digest& variant_key) {
     return it != variants.end() && !dropped_entries.contains(it->second->entry_id);
 }
 
+Store::ResumeVariant Store::ValidateVariantForResume(const Digest& variant_key) {
+    // Keep reopen/insertion out of the validation-and-erasure transaction.
+    std::scoped_lock writer_lock{writer_mutex};
+    std::shared_ptr<const StoredVariant> stored;
+    {
+        std::scoped_lock lock{mutex};
+        const auto it = variants.find(variant_key);
+        if (it == variants.end() || dropped_entries.contains(it->second->entry_id))
+            return ResumeVariant::Missing;
+        stored = it->second;
+        if (stored->source.empty() || stored->resume_validated) return ResumeVariant::Ready;
+    }
+    const bool valid = FindVariant(variant_key).has_value();
+    std::scoped_lock lock{mutex};
+    if (!valid) {
+        variants.erase(variant_key);
+        return ResumeVariant::Invalidated;
+    }
+    stored->resume_validated = true;
+    return ResumeVariant::Validated;
+}
+
 std::map<u64, u64> Store::VariantMultiplicity() {
     std::scoped_lock lock{mutex};
     std::unordered_map<Digest, u64, DigestHash> counts;

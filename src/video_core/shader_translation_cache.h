@@ -301,8 +301,12 @@ public:
     [[nodiscard]] bool HasStageKey(const Digest& stage_key);
     /// Current non-dropped entries grouped by their number of stored modules.
     [[nodiscard]] std::map<u64, u64> VariantMultiplicity();
-    /// The variant, decompressed.
+    /// Key presence only; does not validate disk payloads.
     [[nodiscard]] bool HasVariant(const Digest& variant_key);
+    enum class ResumeVariant { Missing, Ready, Validated, Invalidated };
+    /// Fully decode a disk-backed variant once per open store; erase it on failure.
+    [[nodiscard]] ResumeVariant ValidateVariantForResume(const Digest& variant_key);
+    /// The variant, decompressed.
     [[nodiscard]] std::optional<Variant> FindVariant(const Digest& variant_key);
 
     /// Adds an entry (when new) and appends it to the file. With `expected_generation`, nothing
@@ -357,6 +361,7 @@ public:
 private:
     struct StoredVariant {
         Digest entry_id{};
+        mutable bool resume_validated{}; // Guarded by mutex.
         bool fallback_recipe{};
         Shader::Backend::Bindings binding_out{};
         std::unique_ptr<Shader::Info> info;

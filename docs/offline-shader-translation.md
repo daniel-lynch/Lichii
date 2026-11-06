@@ -62,6 +62,26 @@ The producer reports uncompressed emitted SPIR-V bytes as `module_bytes`; `trans
 counts fresh IR translations, which can exceed the number of archive rows when emitting
 multiple variants. Complete-variant resume still translates zero programs.
 
+Resume fully reads and decompresses each disk-backed module once per open store,
+including its deferred Info, before counting it as complete. A ZSTD frame-header
+check alone cannot detect corrupt block data. Validation costs one file open/read
+and one decompression per distinct existing module: O(total compressed plus
+uncompressed bytes), including 100,000 such operations for 100,000 modules.
+Validation is serialized with cache writers and temporarily holds only one decoded
+module and its compressed payload; it does not retain decoded modules. Generated
+and successfully validated modules subsequently use a presence/state check.
+Failures erase the in-memory key so emission can append a replacement; the last
+record wins on reload. If emission fails or production is interrupted, a later run
+retries the damaged record.
+
+Logs and `--shader-report` include `validated_modules` (successful disk checks),
+`invalidated_modules` (failed disk checks), and `replaced_modules` (failed keys
+successfully re-emitted in this run). Duplicate input rows do not double-count
+these modules. These additive JSON fields keep `schema_version` at 1. Validation
+is not a cryptographic integrity check and assumes the product is not externally
+modified while its store is open.
+
+
 Playthrough-hint JSON is not accepted as an emission recipe source: its pipeline keys
 need device/runtime-state reconstruction before they can supply emission inputs.
 Use a format-10 translation cache recorded during the scene tour instead.

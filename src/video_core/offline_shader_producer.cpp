@@ -6,6 +6,7 @@
 #include <charconv>
 #include <chrono>
 #include <fstream>
+#include <unordered_set>
 #include <fmt/format.h>
 #include "common/polyfill_thread.h"
 #include <nlohmann/json.hpp>
@@ -99,6 +100,9 @@ void WriteReport(const std::filesystem::path& path, const Summary& summary) {
         histogram[std::to_string(modules)] = entries;
     const Json report{{"schema_version", 1}, {"seen", summary.seen},
         {"entries", summary.entries}, {"translated", summary.translated},
+        {"validated_modules", summary.validated_modules},
+        {"invalidated_modules", summary.invalidated_modules},
+        {"replaced_modules", summary.replaced_modules},
         {"resumed", summary.resumed}, {"modules", summary.modules},
         {"module_bytes", summary.module_bytes}, {"module_bytes_encoding", "uncompressed_spirv"},
         {"cancelled", summary.cancelled},
@@ -200,6 +204,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
     std::mutex results;
     // Serialize duplicate stage candidates through lookup and append, without serializing all work.
     std::array<std::mutex, 64> stage_locks;
+    std::array<std::unordered_set<TC::Digest, TC::DigestHash>, 64> damaged;
     std::atomic<size_t> next{};
     auto work = [&] {
         while (!StopSignal()) {
@@ -228,6 +233,18 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                 const auto recipe_key = recipe_cache.empty() ? key :
                     TC::MakeStageKey(env, *hash, static_cast<u32>(row.stage) + 1, recipes.source_config);
                 std::scoped_lock stage_lock(stage_locks[key.lo % stage_locks.size()]);
+                auto& damaged_variants = damaged[key.lo % stage_locks.size()];
+                auto ready = [&](const TC::Digest& variant_key) {
+                    const auto state = store.ValidateVariantForResume(variant_key);
+                    std::scoped_lock lock(results);
+                    if (state == TC::Store::ResumeVariant::Validated) ++summary.validated_modules;
+                    if (state == TC::Store::ResumeVariant::Invalidated) {
+                        ++summary.invalidated_modules;
+                        damaged_variants.insert(variant_key);
+                    }
+                    return state == TC::Store::ResumeVariant::Ready ||
+                           state == TC::Store::ResumeVariant::Validated;
+                };
                 if (StopSignal()) break;
                 TC::RecordingEnvironment resume(env, true);
                 auto entry = store.FindEntry(key, resume);
@@ -245,7 +262,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                                 entry->meta.info, entry->meta.stage);
                             const auto variant_key = TC::MakeVariantKey(entry->id,
                                 TC::DigestRuntimeInfo(runtime), recipe.bindings);
-                            if (!store.HasVariant(variant_key)) break;
+                            if (!ready(variant_key)) break;
                             ++candidate;
                         }
                         if (candidate == selected.size()) break;
@@ -277,7 +294,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                     recipe.runtime = TC::CanonicalRuntimeInfo(recipe.runtime, program.info, program.stage);
                     const auto variant_key = TC::MakeVariantKey(entry->id,
                         TC::DigestRuntimeInfo(recipe.runtime), recipe.bindings);
-                    if (store.HasVariant(variant_key)) continue;
+                    if (ready(variant_key)) continue;
                     Shader::Maxwell::ConvertLegacyToGeneric(program, recipe.runtime);
                     auto bindings = recipe.bindings;
                     const auto code = Shader::Backend::SPIRV::EmitSPIRV(profile, recipe.runtime, program, bindings);
@@ -291,6 +308,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                     ++source.modules;
                     source.module_bytes += code.size() * sizeof(u32);
                     ++summary.modules;
+                    if (damaged_variants.erase(variant_key)) ++summary.replaced_modules;
                     summary.module_bytes += code.size() * sizeof(u32);
                 }
                 if (!translated && !StopSignal()) {
@@ -330,8 +348,8 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
         skipped += count;
         LOG_INFO(Render_Vulkan, "Offline translation: skipped reason={} count={}", reason, count);
     }
-    LOG_INFO(Render_Vulkan, "Offline translation: seen={} entries={} translated={} resumed={} skipped={} modules={} module_bytes={} elapsed_ms={}",
-             summary.seen, summary.entries, summary.translated, summary.resumed, skipped, summary.modules, summary.module_bytes,
+    LOG_INFO(Render_Vulkan, "Offline translation: seen={} entries={} translated={} resumed={} validated_modules={} invalidated_modules={} replaced_modules={} skipped={} modules={} module_bytes={} elapsed_ms={}",
+             summary.seen, summary.entries, summary.translated, summary.resumed, summary.validated_modules, summary.invalidated_modules, summary.replaced_modules, skipped, summary.modules, summary.module_bytes,
              std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
     if (!report.empty()) WriteReport(report, summary);
     return summary;
