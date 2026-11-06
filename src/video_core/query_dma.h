@@ -71,8 +71,9 @@ inline void FlushPending(const Tegra::MemoryManager& memory,
 
 /// Logs a read of pending reports with the words it reads, and the same words once the next
 /// fence has popped and the results have landed.
-inline void Trace(const Tegra::MemoryManager& memory, VideoCore::RasterizerInterface& rasterizer,
-                  u32 macro, u32 method, GPUVAddr source, size_t size) {
+/// Returns the read number when it was logged (0 past the log cap).
+inline u64 Trace(const Tegra::MemoryManager& memory, VideoCore::RasterizerInterface& rasterizer,
+                 u32 macro, u32 method, GPUVAddr source, size_t size) {
     static constexpr u64 max_reads = 4000;
     static std::atomic<u64> reads{};
     const u64 read = reads.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -80,7 +81,7 @@ inline void Trace(const Tegra::MemoryManager& memory, VideoCore::RasterizerInter
         if (read % 10000 == 0) {
             LOG_INFO(HW_GPU, "Query DMA read of pending reports ({} so far)", read);
         }
-        return;
+        return 0;
     }
     std::array<u32, 4> words{};
     const size_t bytes = (std::min)(size, sizeof(words));
@@ -94,6 +95,15 @@ inline void Trace(const Tegra::MemoryManager& memory, VideoCore::RasterizerInter
         memory.ReadBlockUnsafe(source, landed.data(), bytes);
         LOG_INFO(HW_GPU, "Query DMA read #{} landed words={:08x}", read, fmt::join(landed, ","));
     });
+    return read;
+}
+
+/// Logs the words a traced read sees after the query flush step, as the macro reads them.
+inline void TracePostFlush(const Tegra::MemoryManager& memory, u64 read, GPUVAddr source,
+                           size_t size) {
+    std::array<u32, 4> words{};
+    memory.ReadBlockUnsafe(source, words.data(), (std::min)(size, sizeof(words)));
+    LOG_INFO(HW_GPU, "Query DMA read #{} post-flush words={:08x}", read, fmt::join(words, ","));
 }
 
 } // namespace VideoCommon::QueryDma
