@@ -1831,7 +1831,8 @@ private:
             }
             m_frame_trace.last_present = entered;
         }
-        if (const auto* const process = system.ApplicationProcess(); process != nullptr) {
+        if (const auto* const process = system.ApplicationProcess();
+            process != nullptr && Nx2OotTime::WriteEnabled()) {
             if (const u64 address = process->GetOotDeltaAddress(); address != 0) {
                 system.ApplicationMemory().Write32(
                     address, std::bit_cast<u32>(m_oot_frame_delta.Update(entered)));

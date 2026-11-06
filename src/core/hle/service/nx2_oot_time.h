@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 
 #include "common/common_types.h"
 
@@ -20,6 +21,17 @@ inline constexpr u64 LoadDeltaOffset = 0x3C461E4;
 inline constexpr u64 ReturnOffset = 0x3C461E8;
 inline constexpr u64 HookOffset = 0x6E6CC4;
 inline constexpr u32 HookInstruction = 0x14D57D48; // b 0x3c461e4
+
+/// EDEN_NX2_REAL_SPEED=0 stops the present path writing the measured delta: the patched loop then
+/// reads the 1.0 the built-in patch starts the word with, the game's fixed step at 60 fps. The
+/// Add-Ons entry "Real-time speed (built-in)" turns the code patch itself off.
+[[nodiscard]] inline bool WriteEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_REAL_SPEED");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
 
 /// The game's delta (1.0 = one 60th of a second) for the frame that follows a present.
 class FrameDelta {
