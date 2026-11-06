@@ -496,3 +496,31 @@ Correctness and limits:
 - `d30e337226` AOT scenes: the scene is the one the game enters; placement reads are prefetches after that
 - `c014adbc3a` tools/oot/harness: --gdb resumes the guest only once the process is suspended
 - `9de4d57112` tools/oot/harness: wait at most 10 s for the suspension line (the log is flushed late)
+
+### Review fixes
+
+A read-only review of the branch found seven defects. Each is fixed in its own commit:
+
+1. Scene hints are scoped to the emulation session. `Core::System::Load` begins a session
+   before the game's RomFS is built. That clears the scene, the entry flag and the hooked-file
+   count, including the zero-hook case, and moves the generation on. A wrapper that outlives
+   its session carries an old token and posts nothing.
+2. The recipe file is written through a temporary file that is created exclusively, under a
+   name unique to the writer. It is flushed, synced and closed, then renamed.
+3. Fresh seeds and re-emissions reserve their pending slot with the same atomic check-and-take.
+   The slot is released in a scoped way.
+4. A candidate is marked done only once it is seeded or can never be seeded. Candidates there
+   was no room for go back to the front of their queues.
+5. The size of the recipe file is checked against a maximum derived from the format before it
+   is read, and the file is parsed as a stream. A class repeated in the file, or a recipe
+   repeated within a class, makes the whole file rejected.
+6. A save that fails stays pending: the histogram carries a revision, and only a successful
+   write records the revision of its snapshot.
+7. A full class replaces its weakest recipe that was only loaded from the file, else a recipe
+   seen only once this session. A new dominant recipe therefore gets in.
+
+A scene is also posted only after a read that returned bytes.
+
+Open assumption: returning to an earlier scene (A → B → A) relies on the game reading A's
+GameBancParam again when it re-enters A. No trace has shown a return yet; the tour run made a
+single change. If the game does not read it again, B's rows stay selected until the next entry.
