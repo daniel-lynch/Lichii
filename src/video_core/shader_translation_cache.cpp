@@ -1116,6 +1116,7 @@ RecipeCatalog Store::ReadRecipeCatalog(const std::filesystem::path& path, const 
             source.entry_recipes.erase(it);
         }
     }
+    result.compute_pointers = std::move(source.compute_pointers);
     result.invalid_recipes = source.invalid_recipes;
     result.skipped_records = source.skipped_import_records;
     result.imported_bytes = source.imported_bytes;
@@ -1428,6 +1429,7 @@ void Store::Close() {
     variant_disk_reads = 0;
     recipes.clear();
     entry_recipes.clear();
+    compute_pointers.clear();
     dropped_entries.clear();
     entries_with_modules.clear();
     offline_entry_only_rejected = 0;
@@ -1545,6 +1547,7 @@ bool Store::LoadRecipeRecords(std::ifstream& in, u64 size, u64 byte_budget) {
                 hasher.Add(stage_key.lo);
                 hasher.Add(stage_key.hi);
                 bool ok = true;
+                std::vector<Query> pointers;
                 for (u32 i = 0; i < count && ok; ++i) {
                     Query query;
                     ok = reader.Get(query.kind) && reader.Get(query.a) &&
@@ -1554,9 +1557,24 @@ bool Store::LoadRecipeRecords(std::ifstream& in, u64 size, u64 byte_budget) {
                     hasher.Add(query.b);
                     hasher.Add(query.answer);
                     hasher.Add(query.c);
+                    if (query.kind == QueryKind::CbufStorageBufferPointer ||
+                        query.kind == QueryKind::CbufIndirectStorageBufferPointer)
+                        pointers.push_back(query);
                 }
                 if (!ok) break;
-                locations.try_emplace(hasher.Finish(), Location{reader.Position(), end, stage_key});
+                const auto id = hasher.Finish();
+                const u64 meta_begin = reader.Position();
+                locations.try_emplace(id, Location{meta_begin, end, stage_key});
+                // Storage-pointer answers of compute translations made at run time (offline
+                // entries answered guesses), for the producer's per-area compute entries.
+                Shader::Stage stage{};
+                if (collect_recipe_entries && !offline && !pointers.empty() &&
+                    !dropped_entries.contains(id) && reader.Get(stage) &&
+                    stage == Shader::Stage::Compute) {
+                    auto& sets = compute_pointers[stage_key];
+                    if (sets.size() < 16 && std::ranges::find(sets, pointers) == sets.end())
+                        sets.push_back(std::move(pointers));
+                }
             }
         } else if (type == RecordVariant) {
             Digest key{}, id{};

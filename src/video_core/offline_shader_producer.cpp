@@ -111,6 +111,8 @@ void WriteReport(const std::filesystem::path& path, const Summary& summary) {
         {"skips", summary.skipped}, {"sources", sources},
         {"product_entry_multiplicity", histogram}, {"product_modules", summary.product_modules},
         {"compute", {{"translated", summary.compute.translated},
+                     {"pointer_modules", summary.compute.pointer_modules},
+                     {"recorded_pointer_sets", summary.compute.recorded_sets},
                      {"resumed", summary.compute.resumed},
                      {"modules", summary.compute.modules},
                      {"module_bytes", summary.compute.module_bytes}}},
@@ -231,21 +233,22 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
             try {
                 if (row.stage == Shader::Stage::Compute && ComputeEnabled()) {
                     const auto outcome = ProduceCompute(row, profile, host, config, store,
-                                                        compute_shared_memory_limit);
+                                                        compute_shared_memory_limit,
+                                                        recipe_cache.empty() ? nullptr : &recipes);
                     std::scoped_lock lock(results);
                     summary.translated += outcome.translated ? 1 : 0;
                     summary.resumed += outcome.resumed ? 1 : 0;
                     summary.validated_modules += outcome.validated ? 1 : 0;
                     summary.invalidated_modules += outcome.invalidated ? 1 : 0;
+                    summary.replaced_modules += outcome.replaced;
+                    summary.modules += outcome.modules;
+                    summary.module_bytes += outcome.module_bytes;
                     summary.compute.translated += outcome.translated ? 1 : 0;
                     summary.compute.resumed += outcome.resumed ? 1 : 0;
-                    if (outcome.module_bytes != 0) {
-                        ++summary.modules;
-                        summary.module_bytes += outcome.module_bytes;
-                        ++summary.compute.modules;
-                        summary.compute.module_bytes += outcome.module_bytes;
-                        summary.replaced_modules += outcome.invalidated ? 1 : 0;
-                    }
+                    summary.compute.modules += outcome.modules;
+                    summary.compute.module_bytes += outcome.module_bytes;
+                    summary.compute.pointer_modules += outcome.pointer_modules;
+                    summary.compute.recorded_sets += outcome.recorded_sets;
                     continue;
                 }
                 if (row.stage != Shader::Stage::VertexB && row.stage != Shader::Stage::Fragment &&
@@ -374,9 +377,10 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                  names[i], summary.sources[i].modules, summary.sources[i].module_bytes);
     for (const auto& [modules, entries] : summary.multiplicity)
         LOG_INFO(Render_Vulkan, "Offline translation: multiplicity={} entries={}", modules, entries);
-    LOG_INFO(Render_Vulkan, "Offline translation: compute translated={} resumed={} modules={} module_bytes={}",
+    LOG_INFO(Render_Vulkan, "Offline translation: compute translated={} resumed={} modules={} module_bytes={} recorded_pointer_sets={} pointer_modules={}",
              summary.compute.translated, summary.compute.resumed, summary.compute.modules,
-             summary.compute.module_bytes);
+             summary.compute.module_bytes, summary.compute.recorded_sets,
+             summary.compute.pointer_modules);
     LOG_INFO(Render_Vulkan, "Offline translation: product_entries={} product_modules={}",
              summary.entries, summary.product_modules);
     if (summary.cancelled) {

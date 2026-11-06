@@ -75,7 +75,8 @@ bool ComputeEnabled() {
 ComputeOutcome ProduceCompute(const Program& row, const Shader::Profile& profile,
                               const Shader::HostTranslateInfo& host,
                               const TranslationCache::Digest& config,
-                              TranslationCache::Store& store, u32 shared_memory_limit) {
+                              TranslationCache::Store& store, u32 shared_memory_limit,
+                              const TranslationCache::RecipeCatalog* recipes) {
     namespace TC = TranslationCache;
     if (row.stage != Shader::Stage::Compute) throw std::runtime_error("unsupported_stage");
     if (!row.skip_reason.empty()) throw std::runtime_error(row.skip_reason);
@@ -99,47 +100,72 @@ ComputeOutcome ProduceCompute(const Program& row, const Shader::Profile& profile
     std::scoped_lock lock(compute_locks[key.lo % compute_locks.size()]);
 
     ComputeOutcome outcome;
-    TC::RecordingEnvironment resume(env, true);
-    auto entry = store.FindEntry(key, resume);
-    if (entry) {
-        const auto state = store.ValidateVariantForResume(
-            TC::MakeVariantKey(entry->id, TC::Digest{}, Shader::Backend::Bindings{}));
-        outcome.validated = state == TC::Store::ResumeVariant::Validated;
-        outcome.invalidated = state == TC::Store::ResumeVariant::Invalidated;
-        if (state == TC::Store::ResumeVariant::Ready ||
-            state == TC::Store::ResumeVariant::Validated) {
-            outcome.resumed = true;
-            return outcome;
+    // One entry per storage-pointer answer set: the guess (every direct slot mapped, no
+    // indirect one), then each set recorded at run time for this program. The runtime replays
+    // the answers against the live constant buffers, so an entry is served only where the
+    // same slots hold mapped pointers; elsewhere it falls back to translating.
+    std::vector<std::span<const TC::Query>> answer_sets{{}};
+    if (recipes != nullptr) {
+        const auto source_key = TC::MakeStageKey(env, *hash, ComputeSlot, recipes->source_config);
+        if (const auto it = recipes->compute_pointers.find(source_key);
+            it != recipes->compute_pointers.end()) {
+            for (const auto& set : it->second) answer_sets.emplace_back(set);
         }
     }
-    // As the runtime translates it: the control flow starts at the environment's start address
-    // (past the zeroed header), not past a graphics program header.
-    TC::RecordingEnvironment recording(env, true);
-    Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
-    Shader::ObjectPool<Shader::IR::Inst> inst_pool;
-    Shader::ObjectPool<Shader::IR::Block> block_pool;
-    Shader::Maxwell::Flow::CFG cfg(recording, flow_pool,
-                                   Shader::Maxwell::Location{env.StartAddress()});
-    auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, recording, cfg, host);
-    if (!env.CanCacheTranslation()) throw std::runtime_error("lowering_or_emission_rejected");
-    if (program.local_memory_size == 0 && UsesLocalMemory(program))
-        throw std::runtime_error("unsupported_local_memory");
-    outcome.translated = true;
-    if (!entry) {
-        entry = store.Insert(key, recording.TakeQueries(), TC::ProgramMeta::From(program), true);
-        if (!entry) throw std::runtime_error("cache_disabled");
+    for (size_t set = 0; set < answer_sets.size(); ++set) {
+        ArchiveEnvironment variant_env(ArchiveEnvironment::ComputeProgram{}, program_bytes, control);
+        variant_env.SetStoragePointerAnswers(answer_sets[set]);
+        if (set != 0) ++outcome.recorded_sets;
+        TC::RecordingEnvironment resume(variant_env, true);
+        auto entry = store.FindEntry(key, resume);
+        bool invalidated = false;
+        if (entry) {
+            const auto state = store.ValidateVariantForResume(
+                TC::MakeVariantKey(entry->id, TC::Digest{}, Shader::Backend::Bindings{}));
+            outcome.validated |= state == TC::Store::ResumeVariant::Validated;
+            invalidated = state == TC::Store::ResumeVariant::Invalidated;
+            outcome.invalidated |= invalidated;
+            if (state == TC::Store::ResumeVariant::Ready ||
+                state == TC::Store::ResumeVariant::Validated) {
+                // Already produced, or an earlier set's entry answers this set the same way.
+                if (set == 0) outcome.resumed = true;
+                continue;
+            }
+        }
+        // As the runtime translates it: the control flow starts at the environment's start
+        // address (past the zeroed header), not past a graphics program header.
+        TC::RecordingEnvironment recording(variant_env, true);
+        Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+        Shader::ObjectPool<Shader::IR::Inst> inst_pool;
+        Shader::ObjectPool<Shader::IR::Block> block_pool;
+        Shader::Maxwell::Flow::CFG cfg(recording, flow_pool,
+                                       Shader::Maxwell::Location{variant_env.StartAddress()});
+        auto program =
+            Shader::Maxwell::TranslateProgram(inst_pool, block_pool, recording, cfg, host);
+        if (!variant_env.CanCacheTranslation())
+            throw std::runtime_error("lowering_or_emission_rejected");
+        if (program.local_memory_size == 0 && UsesLocalMemory(program))
+            throw std::runtime_error("unsupported_local_memory");
+        outcome.translated = true;
+        if (!entry) {
+            entry = store.Insert(key, recording.TakeQueries(), TC::ProgramMeta::From(program), true);
+            if (!entry) throw std::runtime_error("cache_disabled");
+        }
+        // The runtime records the entry before clamping and emits after it.
+        if (shared_memory_limit != 0 && program.shared_memory_size > shared_memory_limit)
+            program.shared_memory_size = shared_memory_limit;
+        const auto code = Shader::Backend::SPIRV::EmitSPIRV(profile, program);
+        if (code.size() < 5 || code.front() != 0x07230203)
+            throw std::runtime_error("lowering_or_emission_rejected");
+        if (!store.InsertVariant(
+                *entry, TC::MakeVariantKey(entry->id, TC::Digest{}, Shader::Backend::Bindings{}),
+                {{}, program.info, code, true}))
+            throw std::runtime_error("cache_disabled");
+        ++outcome.modules;
+        outcome.replaced += invalidated ? 1 : 0;
+        outcome.pointer_modules += set != 0 ? 1 : 0;
+        outcome.module_bytes += code.size() * sizeof(u32);
     }
-    // The runtime records the entry before clamping and emits after it.
-    if (shared_memory_limit != 0 && program.shared_memory_size > shared_memory_limit)
-        program.shared_memory_size = shared_memory_limit;
-    const auto code = Shader::Backend::SPIRV::EmitSPIRV(profile, program);
-    if (code.size() < 5 || code.front() != 0x07230203)
-        throw std::runtime_error("lowering_or_emission_rejected");
-    if (!store.InsertVariant(*entry,
-                             TC::MakeVariantKey(entry->id, TC::Digest{}, Shader::Backend::Bindings{}),
-                             {{}, program.info, code, true}))
-        throw std::runtime_error("cache_disabled");
-    outcome.module_bytes = code.size() * sizeof(u32);
     return outcome;
 }
 } // namespace VideoCommon::OfflineShaders

@@ -229,3 +229,59 @@ TEST_CASE("Compute rows parse with bank-1 checks", "[video_core][translation_cac
     index["programs"][0]["constants_offset"] = 400;
     REQUIRE_THROWS(Offline::ParseInput(index.dump(), {}));
 }
+
+TEST_CASE("Recorded storage-pointer answers override the archive guesses",
+          "[video_core][archive_environment]") {
+    auto env = SyntheticCompute{}.Make();
+    REQUIRE(env.IsCbufStorageBufferPointer(4, 0x90));
+    REQUIRE_FALSE(env.IsCbufIndirectStorageBufferPointer(4, 0x90, 8));
+    const std::array answers{
+        Query{QueryKind::CbufStorageBufferPointer, 4, 0x90, 0, 0},
+        Query{QueryKind::CbufIndirectStorageBufferPointer, 4, 0x130, 1, 8},
+        Query{QueryKind::CbufValue, 4, 0x90, 7, 0},
+    };
+    env.SetStoragePointerAnswers(answers);
+    REQUIRE_FALSE(env.IsCbufStorageBufferPointer(4, 0x90));
+    REQUIRE(env.IsCbufStorageBufferPointer(4, 0x98)); // unrecorded: the guess
+    REQUIRE(env.IsCbufIndirectStorageBufferPointer(4, 0x130, 8));
+    REQUIRE_FALSE(env.IsCbufIndirectStorageBufferPointer(4, 0x130, 16));
+    // Only pointer answers are taken; constant words stay exact bank-1 reads.
+    REQUIRE_THROWS_WITH(env.ReadCbufValue(4, 0x90), ContainsSubstring("missing_constant"));
+}
+
+TEST_CASE("The recipe catalog keeps each compute entry's storage-pointer answer set",
+          "[video_core][translation_cache]") {
+    const auto directory = std::filesystem::temp_directory_path() / "lichii_compute_pointer_catalog";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    const auto path = directory / "source.bin";
+    const Digest config = MakeConfigDigest(TestProfile(), {}, 7);
+    const Digest key{1, 2};
+    ProgramMeta meta;
+    meta.stage = Shader::Stage::Compute;
+    auto queries = [](u32 first, u32 indirect) {
+        return std::vector<Query>{{QueryKind::CbufValue, 1, 0, 5, 0},
+                                  {QueryKind::CbufStorageBufferPointer, 4, 0x90, first, 0},
+                                  {QueryKind::CbufIndirectStorageBufferPointer, 4, 0x130, indirect, 8}};
+    };
+    {
+        Store store;
+        store.Open(path, config);
+        REQUIRE(store.Insert(key, queries(1, 0), meta));
+        REQUIRE(store.Insert(key, queries(0, 0), meta));
+        REQUIRE(store.Insert(key, queries(0, 1), meta));
+        ProgramMeta fragment;
+        fragment.stage = Shader::Stage::Fragment;
+        REQUIRE(store.Insert(Digest{3, 4}, queries(0, 1), fragment));
+    }
+    const auto catalog = Store::ReadRecipeCatalog(path, config);
+    REQUIRE(catalog.compute_pointers.size() == 1);
+    const auto& sets = catalog.compute_pointers.at(key);
+    REQUIRE(sets.size() == 3);
+    for (const auto& set : sets) {
+        REQUIRE(set.size() == 2);
+        REQUIRE(set[0].kind == QueryKind::CbufStorageBufferPointer);
+        REQUIRE(set[1].kind == QueryKind::CbufIndirectStorageBufferPointer);
+    }
+    std::filesystem::remove_all(directory);
+}

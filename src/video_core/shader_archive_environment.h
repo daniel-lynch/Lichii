@@ -4,7 +4,9 @@
 #pragma once
 
 #include <map>
+#include <tuple>
 #include "video_core/shader_environment.h"
+#include "video_core/shader_translation_cache.h"
 
 namespace VideoCommon {
 
@@ -47,6 +49,11 @@ public:
     void NoteExactCbufWord(u32 index, u32 offset) override;
     void Dump(u64, u64) override {}
 
+    /// Answers recorded storage-pointer queries (CbufStorageBufferPointer and
+    /// CbufIndirectStorageBufferPointer) as recorded; other slots keep the guesses (direct
+    /// slots hold a mapped pointer, indirect ones do not).
+    void SetStoragePointerAnswers(std::span<const TranslationCache::Query> answers);
+
 private:
     /// Captures and lowers [code_begin, code_end) of program and adopts the lowered code.
     void LowerProgram(std::span<const u8> program, size_t code_begin, size_t code_end,
@@ -55,6 +62,7 @@ private:
     std::vector<u8> constants;
     std::map<std::pair<u32, u32>, u32> guessed_words;
     u32 handle_depth{};
+    std::map<std::tuple<u32, u32, u32, bool>, bool> pointer_answers;
 };
 
 } // namespace VideoCommon

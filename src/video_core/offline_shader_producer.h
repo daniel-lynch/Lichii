@@ -66,6 +66,7 @@ struct Summary {
     /// Compute rows (one module each, no recipes); also counted in the totals above.
     struct {
         u64 translated{}, resumed{}, modules{}, module_bytes{};
+        u64 pointer_modules{}, recorded_sets{};
     } compute;
 };
 void WriteReport(const std::filesystem::path& path, const Summary& summary);

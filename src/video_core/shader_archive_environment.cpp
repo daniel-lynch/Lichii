@@ -239,10 +239,27 @@ u32 ArchiveEnvironment::ReadViewportTransformState() {
 std::optional<Shader::ReplaceConstant> ArchiveEnvironment::GetReplaceConstBuffer(u32, u32) {
     return std::nullopt;
 }
-bool ArchiveEnvironment::IsCbufStorageBufferPointer(u32, u32) {
+void ArchiveEnvironment::SetStoragePointerAnswers(
+    std::span<const TranslationCache::Query> answers) {
+    using TranslationCache::QueryKind;
+    pointer_answers.clear();
+    for (const auto& query : answers) {
+        if (query.kind == QueryKind::CbufStorageBufferPointer)
+            pointer_answers[{query.a, query.b, 0, false}] = query.answer != 0;
+        else if (query.kind == QueryKind::CbufIndirectStorageBufferPointer)
+            pointer_answers[{query.a, query.b, query.c, true}] = query.answer != 0;
+    }
+}
+
+bool ArchiveEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
+    if (const auto it = pointer_answers.find({index, offset, 0, false}); it != pointer_answers.end())
+        return it->second;
     return true;
 }
-bool ArchiveEnvironment::IsCbufIndirectStorageBufferPointer(u32, u32, u32) {
+bool ArchiveEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
+    if (const auto it = pointer_answers.find({index, offset, indirect, true});
+        it != pointer_answers.end())
+        return it->second;
     return false;
 }
 } // namespace VideoCommon
