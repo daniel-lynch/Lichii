@@ -87,14 +87,15 @@ bool TranslatorVisitor::DSB(Imm<4> /*CRm*/) {
 }
 
 bool TranslatorVisitor::DMB(Imm<4> CRm) {
-#if defined(_M_X64) || defined(__x86_64__)
-    const u32 access = CRm.ZeroExtend() & 3U;
-    if (access == 1U || access == 2U) {
-        return true;
+    // CRm<1:0> is the access type: 1 = loads (DMB *LD), 2 = stores (DMB *ST), 3 = all. x86-64 TSO
+    // never reorders load->load, load->store or store->store, so only the full barrier needs an
+    // MFENCE there.
+    if (options.elide_tso_barriers) {
+        const u32 access = CRm.ZeroExtend() & 3U;
+        if (access == 1U || access == 2U) {
+            return true;
+        }
     }
-#else
-    (void)CRm;
-#endif
     ir.DataMemoryBarrier();
     return true;
 }

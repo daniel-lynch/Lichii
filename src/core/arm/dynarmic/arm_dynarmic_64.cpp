@@ -245,6 +245,19 @@ u64 DynarmicCallbacks64::GetTicksRemaining() {
     return std::max<s64>(m_parent.m_system.CoreTiming().downcount, 0);
 }
 
+namespace {
+// EDEN_NX2_JIT_TSO=0 turns off upstream PR #161's JIT changes for A/B tests: the inline RDTSC
+// CNTPCT_EL0, plain-MOV ordered loads and elided DMB LD/ST (UserConfig::x64_tso_memory), and the
+// Auto/Unsafe FMA and FPCR flag changes, restoring the previous emission. Read once per process.
+bool JitTsoEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_JIT_TSO");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+} // Anonymous namespace
+
 u64 DynarmicCallbacks64::GetCNTPCT() {
     const u64 ticks = m_parent.m_system.CoreTiming().GetClockTicks();
     // Guest code that waits by polling the counter (title 1's main thread reads it ~17 million
@@ -363,7 +376,8 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     config.wall_clock_cntpct = m_uses_wall_clock;
     config.enable_cycle_counting = !m_uses_wall_clock;
 #if defined(ARCHITECTURE_x86_64)
-    if (m_uses_wall_clock && Common::g_wall_clock.IsNative() &&
+    config.x64_tso_memory = JitTsoEnabled();
+    if (JitTsoEnabled() && m_uses_wall_clock && Common::g_wall_clock.IsNative() &&
         Settings::values.cpu_clock.GetValue() == Settings::CpuClock::Normal &&
         !Settings::values.sync_core_speed.GetValue()) {
         static const bool allow_inline = [] {
@@ -445,7 +459,8 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
             config.fastmem_exclusive_access = false;
         }
 #ifdef ARCHITECTURE_x86_64
-        if (Settings::values.cpuopt_unsafe_unfuse_fma && !Common::g_cpu_caps.fma) {
+        if (Settings::values.cpuopt_unsafe_unfuse_fma &&
+            (!JitTsoEnabled() || !Common::g_cpu_caps.fma)) {
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA;
         }
 #else
@@ -454,8 +469,10 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         }
 #endif
         if (Settings::values.cpuopt_unsafe_reduce_fp_error) {
-            config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP |
-                                    Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
+            config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
+            if (JitTsoEnabled()) {
+                config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
+            }
         }
         if (Settings::values.cpuopt_unsafe_inaccurate_nan) {
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
@@ -466,14 +483,16 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         if (Settings::values.cpuopt_unsafe_ignore_global_monitor) {
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
         }
-        config.optimizations |= Dynarmic::OptimizationFlag::CodeSpeed |
-                                Dynarmic::OptimizationFlag::DisableVerification;
+        if (JitTsoEnabled()) {
+            config.optimizations |= Dynarmic::OptimizationFlag::CodeSpeed |
+                                    Dynarmic::OptimizationFlag::DisableVerification;
+        }
         break;
     // Safe optimisations
     case Settings::CpuAccuracy::Auto:
         config.unsafe_optimizations = true;
 #ifdef ARCHITECTURE_x86_64
-        if (!Common::g_cpu_caps.fma) {
+        if (!JitTsoEnabled() || !Common::g_cpu_caps.fma) {
             config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA;
         }
 #else
