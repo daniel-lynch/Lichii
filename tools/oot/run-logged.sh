@@ -119,6 +119,11 @@ export MANGOHUD_CONFIG="$MH_CFG"
 # PCIe + GPU load sampler (1 s) for the whole session, saved beside the logs.
 nvidia-smi dmon -s tu -d 1 > "$OOT/logs/pcie-$STAMP.txt" 2>/dev/null &
 SAMPLER=$!
+# Field test in progress: every harness/build agent yields to this marker, so nothing else uses the
+# GPU or the emulator lock while the game is up. Removed when the game exits (trap covers signals).
+FIELD_MARKER="$OOT/harness-runs/.aot-priority"
+touch "$FIELD_MARKER" 2>/dev/null
+trap 'rm -f "$FIELD_MARKER"' EXIT
 "$BIN" "$@"
 kill $SAMPLER 2>/dev/null
 cp "$HOME/.local/share/eden/log/eden_log.txt" "$OOT/logs/eden_log-$STAMP.txt" 2>/dev/null
