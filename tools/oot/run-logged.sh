@@ -10,7 +10,7 @@ export EDEN_NX2_SHADER_DUMP="$OOT/shaders"
 # 35.6 -> 39.4 fps with both off; vegetation unchanged). Default them off for this game;
 # OOT_UPSTREAM_DEFAULTS=1 restores upstream behaviour for comparison.
 if [ "${OOT_UPSTREAM_DEFAULTS:-0}" != "1" ]; then
-  export EDEN_NX2_GFX_STORAGE_SIZE_LIKE_COMPUTE=0 EDEN_NX2_UNIFORM_BANK_REUPLOAD=0 EDEN_NX2_NATIVE_PREFLUSH=1  # preflush: +3.4 fps median, interleaved A/B 2026-11-06
+  export EDEN_NX2_GFX_STORAGE_SIZE_LIKE_COMPUTE=0 EDEN_NX2_UNIFORM_BANK_REUPLOAD=0 EDEN_NX2_NATIVE_PREFLUSH="${OOT_PREFLUSH:-1}"  # preflush: +3.4 fps median, interleaved A/B 2026-11-06
 fi
 # OOT_GPU=fast|accurate pins the per-game GPU Mode and reactive flushing before boot
 # (fast = GPU Mode Fast + reactive flushing off; accurate = Accurate + flushing on).
@@ -56,11 +56,11 @@ fi
 # the pool index, and a directory of static scene manifests the emulator loads and unites.
 # OOT_AOT_MANIFEST=<file or dir> overrides the manifest set; OOT_AOT_WORKERS=N sets the
 # translation threads (unset = the emulator's default, 2).
-if [ "${OOT_AOT:-0}" = "1" ]; then
+if [ "${OOT_AOT:-1}" = "1" ]; then  # default ON since dev 18832d80a5 (AOT merged; -36% frame-blocking cold)
   AOT_INDEX="$OOT/aot/index/oot-aot-index.bin"
   if [ -f "$AOT_INDEX" ]; then
     export EDEN_NX2_AOT_TRANSLATE=1 EDEN_NX2_AOT_INDEX="$AOT_INDEX" EDEN_NX2_AOT_SEED=1
-    export EDEN_NX2_AOT_MANIFEST="${OOT_AOT_MANIFEST:-$OOT/aot/manifests}"
+    export EDEN_NX2_AOT_MANIFEST="${OOT_AOT_MANIFEST:-$OOT/aot/manifests-active}"  # global + current scene; the 81-file union overfills the seed queue until per-scene selection lands
     [ -n "${OOT_AOT_WORKERS:-}" ] && export EDEN_NX2_AOT_WORKERS="$OOT_AOT_WORKERS"
     [ -e "$EDEN_NX2_AOT_MANIFEST" ] || echo "OOT_AOT: no manifests at $EDEN_NX2_AOT_MANIFEST (index only; see $OOT/aot/README.md)" >&2
     echo "OOT_AOT: index $AOT_INDEX, manifests $EDEN_NX2_AOT_MANIFEST"

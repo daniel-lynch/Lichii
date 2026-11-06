@@ -180,6 +180,7 @@ add_library(video_core STATIC
     renderer_vulkan/maxwell_to_vk.h
     renderer_vulkan/pipeline_build.h
     renderer_vulkan/pipeline_helper.h
+    renderer_vulkan/pipeline_optimization.h
     renderer_vulkan/pipeline_shader_emission.h
     renderer_vulkan/pipeline_statistics.cpp
     renderer_vulkan/pipeline_statistics.h
@@ -273,6 +274,10 @@ add_library(video_core STATIC
     shader_cache.h
     shader_environment.cpp
     shader_environment.h
+    shader_pool_index.cpp
+    shader_pool_index.h
+    shader_replay_environment.cpp
+    shader_replay_environment.h
     shader_translation_cache.cpp
     shader_translation_cache.h
     shader_handle_program.h

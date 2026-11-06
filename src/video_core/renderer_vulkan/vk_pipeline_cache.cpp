@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bitset>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -52,6 +53,7 @@
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
+#include "video_core/shader_replay_environment.h"
 #include "video_core/shader_notify.h"
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -384,7 +386,42 @@ struct DeferredStages {
         entries;
     /// The bindings before the first deferred stage.
     Shader::Backend::Bindings binding{};
+    /// use_shader_aot_translation: stages whose entry matched without a module for this runtime
+    /// info, translated again on the worker from the entry's answers instead of on the GPU thread.
+    std::array<std::unique_ptr<VideoCommon::ReplayEnvironment>, Maxwell::MaxShaderStage> replay_envs;
+    /// AOT: stages whose entry a seed stored, at their first draw.
+    std::array<bool, Maxwell::MaxShaderStage> seeded{};
+    /// A vertex-B + fragment pipeline (its recipes are recorded for seeded variants).
+    bool plain{};
 };
+
+/// AOT translation: the runtime info of a vertex-B or fragment stage without legacy varyings,
+/// with what its SPIR-V does not read cleared: the type and the previous stage's stores of
+/// generic inputs it neither loads nor passes through, and the input topology (read for
+/// geometry stages only). Pipelines that differ only there then share a variant, which is what
+/// lets a seeded module match its first draw. EDEN_NX2_TRANSLATION_CACHE_VERIFY=1 also emits
+/// with the full runtime info and counts modules that differ.
+bool CanonicalizeRuntimeInfo(Shader::RuntimeInfo& runtime_info, const Shader::Info& info,
+                             Shader::Stage stage) {
+    if ((stage != Shader::Stage::VertexB && stage != Shader::Stage::Fragment) ||
+        info.loads.Legacy() || info.stores.Legacy()) {
+        return false;
+    }
+    Shader::VaryingState stores{};
+    for (size_t index = 0; index < Shader::IR::NUM_GENERICS; ++index) {
+        if (!info.loads.Generic(index) && !info.passthrough.Generic(index)) {
+            runtime_info.generic_input_types[index] = Shader::AttributeType::Float;
+            continue;
+        }
+        for (size_t component = 0; component < 4; ++component) {
+            const auto attribute = Shader::IR::Attribute::Generic0X + index * 4 + component;
+            stores.Set(attribute, runtime_info.previous_stage_stores[attribute]);
+        }
+    }
+    runtime_info.previous_stage_stores = stores;
+    runtime_info.input_topology = Shader::InputTopology{};
+    return true;
+}
 
 size_t GetTotalPipelineWorkers() {
     const size_t max_core_threads =
@@ -526,6 +563,11 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       workers(num_pipeline_workers, "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {}, Common::ThreadPlacement::Background),
       background_pipelines{64, 16 * 1024 * 1024, device.HasBrokenParallelShaderCompiling()} {
+    seed_stage = [this](VideoCommon::GenericEnvironment& env, u64 unique_hash, size_t slot,
+                        std::span<const u8> constants, u8 tier) {
+        return SeedStage(env, unique_hash, slot, constants, tier);
+    };
+    seed_has_room = [this] { return AotHasRoom(); };
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -633,6 +675,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY &&
             device.GetDriverVersion() < VK_MAKE_VERSION(512, 672, 0),
         .has_broken_spirv_subgroup_shuffle = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
+        .has_broken_spirv_fragment_shuffle = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY,
         .max_subgroup_size = device.GetMaxSubgroupSize(),
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
@@ -818,24 +861,480 @@ void PipelineCache::OpenTranslationCache(const std::filesystem::path& filename) 
                     Shader::Optimization::NativeStorageBoundsCheck() ? 1 : 0);
     translation_config = TC::MakeConfigDigest(
         profile, host_info, Common::CityHash64(device_id.data(), device_id.size()));
+    const char* aot_env = std::getenv("EDEN_NX2_AOT_TRANSLATE");
+    aot_translation = Settings::values.use_shader_aot_translation.GetValue() ||
+                      (aot_env != nullptr && aot_env[0] == '1');
+    if (aot_translation) {
+        LOG_INFO(Render_Vulkan, "Shader AOT translation on: task and mesh stages are cached");
+    }
+    const char* emit_env = std::getenv("EDEN_NX2_AOT_EMIT");
+    aot_emit_variants = aot_translation && !(emit_env != nullptr && emit_env[0] == '0');
+    // AOT jobs queued for the previous file must not store into this one: Open changes the
+    // store's generation, which every AOT publication checks under the store mutex.
     translation_cache.Open(filename, translation_config);
+    translation_cache.count_mismatches = aot_translation;
     translation_cache_logged = std::chrono::steady_clock::now();
 }
 
 bool PipelineCache::IsTranslationCacheable(const Shader::Environment& env) const {
     const Shader::Stage stage = env.ShaderStage();
-    if (stage == Shader::Stage::VertexA || stage == Shader::Stage::Task ||
-        stage == Shader::Stage::Mesh) {
+    if (stage == Shader::Stage::VertexA) {
+        return false;
+    }
+    // Task and mesh translations also depend on the mesh registers and the primitive header bound
+    // with the mesh program; both are in the stage key, and their MeshInfo is stored with the
+    // entry.
+    if ((stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) && !aot_translation) {
         return false;
     }
     return env.CanCacheTranslation();
 }
 
+u64 PipelineCache::RecipeClass(Shader::Stage stage, const Shader::Info* info) {
+    u64 key = (static_cast<u64>(stage) + 1) * 0x9e3779b97f4a7c15ULL;
+    if (info != nullptr) {
+        key ^= std::hash<std::bitset<512>>{}(info->loads.mask) * 0xff51afd7ed558ccdULL + 1;
+    }
+    return key;
+}
+
+void PipelineCache::RecordRecipe(Shader::Stage stage, const Shader::Info& info,
+                                 const Shader::RuntimeInfo& runtime_info,
+                                 const Shader::Backend::Bindings& binding_in) {
+    namespace TC = VideoCommon::TranslationCache;
+    if (!aot_emit_variants || info.loads.Legacy() || info.stores.Legacy()) {
+        return;
+    }
+    const TC::Digest digest =
+        TC::MakeVariantKey(TC::Digest{}, TC::DigestRuntimeInfo(runtime_info), binding_in);
+    static constexpr size_t MaxPerClass = 8;
+    static constexpr size_t MaxClasses = 4096;
+    std::vector<WaitingSeed> ready;
+    {
+        std::scoped_lock lock{recipe_mutex};
+        const u64 own_class = RecipeClass(stage, &info);
+        for (const u64 class_key : {own_class, RecipeClass(stage, nullptr)}) {
+            if (!recipes.contains(class_key) && recipes.size() >= MaxClasses) {
+                continue;
+            }
+            auto& list = recipes[class_key];
+            const auto it = std::ranges::find(list, digest, &EmissionRecipe::digest);
+            if (it != list.end()) {
+                ++it->count;
+            } else if (list.size() < MaxPerClass) {
+                list.push_back({runtime_info, binding_in, digest, 1});
+                // The class's first recipe: seeds of the class emitted with a stage-level
+                // guess get a module for it now, usually before their own first draw.
+                if (list.size() == 1 && class_key == own_class) {
+                    if (const auto waiting = waiting_seeds.find(class_key);
+                        waiting != waiting_seeds.end()) {
+                        ready = std::move(waiting->second);
+                        waiting_count -= ready.size();
+                        waiting_seeds.erase(waiting);
+                    }
+                }
+            }
+        }
+    }
+    if (!ready.empty()) {
+        EmitWaitingSeeds(std::move(ready));
+    }
+}
+
+void PipelineCache::ParkSeed(const std::shared_ptr<VideoCommon::ReplayEnvironment>& env,
+                             const std::shared_ptr<const VideoCommon::TranslationCache::Entry>& entry,
+                             Shader::Stage stage, const Shader::Info& info, u64 bytes,
+                             u64 generation) {
+    // The environment stays owned until the class's recipe is seen (EmitWaitingSeeds releases
+    // the bytes).
+    const auto account_bytes = [this](u64 count) {
+        const u64 in_flight = aot_bytes.fetch_add(count) + count;
+        for (u64 peak = aot_bytes_peak.load();
+             in_flight > peak && !aot_bytes_peak.compare_exchange_weak(peak, in_flight);) {
+        }
+    };
+    static constexpr size_t MaxWaiting = 2048;
+    const u64 class_key = RecipeClass(stage, &info);
+    {
+        std::scoped_lock lock{recipe_mutex};
+        // The class's first recipe may have been recorded since this seed chose a stage-level
+        // one: that recording drained the waiting list already, so emit now instead of parking.
+        const auto known = recipes.find(class_key);
+        if (known == recipes.end() || known->second.empty()) {
+            if (waiting_count >= MaxWaiting) {
+                ++aot_waiting_dropped;
+                return;
+            }
+            waiting_seeds[class_key].push_back({env, entry, bytes, generation});
+            ++waiting_count;
+            ++aot_parked;
+            account_bytes(bytes);
+            return;
+        }
+    }
+    ++aot_parked;
+    account_bytes(bytes);
+    EmitWaitingSeeds({WaitingSeed{env, entry, bytes, generation}});
+}
+
+void PipelineCache::EmitWaitingSeeds(std::vector<WaitingSeed> seeds) {
+    namespace TC = VideoCommon::TranslationCache;
+    aot_workers->QueueWork([this, seeds = std::move(seeds)] {
+        for (const WaitingSeed& seed : seeds) {
+            const auto begin = std::chrono::steady_clock::now();
+            try {
+                if (seed.generation == translation_cache.Generation()) {
+                    // The same translation as the seed's (the guessed words are kept by the
+                    // environment), checked against the entry before its module is stored.
+                    ShaderPools pools;
+                    TC::RecordingEnvironment recording{*seed.env, true};
+                    const u32 cfg_offset{static_cast<u32>(seed.env->StartAddress() +
+                                                          sizeof(Shader::ProgramHeader))};
+                    Shader::Maxwell::Flow::CFG cfg(recording, pools.flow_block, cfg_offset, false);
+                    Shader::IR::Program program =
+                        TranslateProgram(pools.inst, pools.block, recording, cfg, host_info);
+                    bool class_match = false;
+                    auto recipe = BestRecipe(program.stage, program.info, class_match);
+                    if (!TC::InfoEqual(program.info, seed.entry->meta.info)) {
+                        ++aot_late_info_differs;
+                    } else if (recipe && class_match) {
+                        CanonicalizeRuntimeInfo(recipe->runtime_info, program.info, program.stage);
+                        Shader::Backend::Bindings binding = recipe->binding_in;
+                        std::vector<u32> code =
+                            EmitSPIRV(profile, recipe->runtime_info, program, binding);
+                        translation_cache.InsertVariant(
+                            *seed.entry,
+                            TC::MakeVariantKey(seed.entry->id,
+                                               TC::DigestRuntimeInfo(recipe->runtime_info),
+                                               recipe->binding_in),
+                            TC::Variant{binding, program.info, std::move(code)});
+                        ++aot_late_variants;
+                    }
+                }
+            } catch (const Shader::Exception&) {
+                ++aot_variants_failed;
+            }
+            aot_variant_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now() - begin)
+                                                   .count());
+            aot_bytes -= seed.bytes;
+        }
+    });
+}
+
+std::optional<PipelineCache::EmissionRecipe> PipelineCache::BestRecipe(Shader::Stage stage,
+                                                                      const Shader::Info& info,
+                                                                      bool& class_match) {
+    std::scoped_lock lock{recipe_mutex};
+    for (const bool by_class : {true, false}) {
+        const auto it = recipes.find(RecipeClass(stage, by_class ? &info : nullptr));
+        if (it == recipes.end() || it->second.empty()) {
+            continue;
+        }
+        class_match = by_class;
+        return *std::ranges::max_element(it->second, {}, &EmissionRecipe::count);
+    }
+    return std::nullopt;
+}
+
+size_t PipelineCache::AotWorkerCount() {
+    // EDEN_NX2_AOT_WORKERS: background threads translating recognised programs (default 2, at
+    // most half the host's threads).
+    const size_t limit = (std::max<size_t>)(std::thread::hardware_concurrency() / 2, 1);
+    size_t count = 2;
+    if (const char* value = std::getenv("EDEN_NX2_AOT_WORKERS"); value && value[0] != '\0') {
+        count = static_cast<size_t>(std::strtoul(value, nullptr, 10));
+    }
+    return std::clamp<size_t>(count, 1, limit);
+}
+
+bool PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_hash,
+                              size_t slot, std::span<const u8> constants, u8 tier) {
+    namespace TC = VideoCommon::TranslationCache;
+    if (!aot_translation || !translation_cache.Enabled()) {
+        return false;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    ++aot_candidates;
+    if (!IsTranslationCacheable(env)) {
+        ++aot_skipped_uncacheable;
+        return false;
+    }
+    if (aot_pending.load() >= MaxAotPending) {
+        ++aot_skipped_full;
+        return false;
+    }
+    const TC::Digest stage_key = TC::MakeStageKey(env, unique_hash, static_cast<u32>(slot),
+                                                  translation_config);
+    if (translation_cache.HasStageKey(stage_key)) {
+        ++aot_skipped_known;
+        return false;
+    }
+    {
+        // A job for the same stage key queued or running: translating it twice stores nothing.
+        std::scoped_lock lock{aot_mutex};
+        if (aot_in_flight.contains(stage_key)) {
+            ++aot_skipped_known;
+            return false;
+        }
+    }
+    // No recorded answers: the worker answers with the common case (guess mode) and records
+    // what it answered; the draw's class-level replay keeps the entry only if the live
+    // environment agrees. A word consumed by value cannot be guessed and aborts the job.
+    auto owned = std::make_shared<VideoCommon::ReplayEnvironment>(
+        env, std::span<const TC::Query>{}, true, constants);
+    aot_with_constants += constants.empty() ? 0 : 1;
+    aot_capture_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - begin)
+                                           .count());
+    // Reserve the entry at admission so jobs in flight cannot take the store past the cap.
+    if (aot_reserved.fetch_add(1) >= MaxAotEntries) {
+        --aot_reserved;
+        ++aot_skipped_full;
+        return false;
+    }
+    ++aot_pending;
+    if (!aot_workers) {
+        aot_worker_count = AotWorkerCount();
+        LOG_INFO(Render_Vulkan, "Shader AOT: {} translation workers", aot_worker_count);
+        aot_workers.reset(new Common::ThreadWorker(aot_worker_count, "VkAotTranslate", {},
+                                                   Common::ThreadPlacement::Background));
+    }
+    // Bytes the queued and running jobs own (environment copies), for the statistics.
+    const u64 job_bytes = owned->OwnedBytes();
+    const u64 in_flight = aot_bytes.fetch_add(job_bytes) + job_bytes;
+    for (u64 peak = aot_bytes_peak.load(); in_flight > peak &&
+                                           !aot_bytes_peak.compare_exchange_weak(peak, in_flight);) {
+    }
+    const size_t tier_index = (std::min<size_t>)((std::max<size_t>)(tier, 1), aot_hits_by_tier.size()) - 1;
+    {
+        std::scoped_lock lock{aot_mutex};
+        aot_in_flight.insert(stage_key);
+        if (aot_seeded_programs.size() < MaxAotEntries * 2) {
+            aot_seeded_programs.emplace(unique_hash * 8 + slot, stage_key);
+        }
+    }
+    aot_workers->QueueWork([this, owned = std::move(owned), stage_key, unique_hash, job_bytes,
+                            tier_index, generation = translation_cache.Generation()] {
+        const auto translate_begin = std::chrono::steady_clock::now();
+        bool stored = false;
+        try {
+            ShaderPools pools;
+            TC::RecordingEnvironment recording{*owned, true};
+            const u32 cfg_offset{
+                static_cast<u32>(owned->StartAddress() + sizeof(Shader::ProgramHeader))};
+            Shader::Maxwell::Flow::CFG cfg(recording, pools.flow_block, cfg_offset, false);
+            Shader::IR::Program program =
+                TranslateProgram(pools.inst, pools.block, recording, cfg, host_info);
+            const bool broken = device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
+                                Shader::Optimization::HasBrokenPattern(program);
+            std::shared_ptr<const TC::Entry> entry;
+            if (program.info.requires_layer_emulation || broken) {
+                ++aot_failed;
+            } else if ((entry = translation_cache.Insert(stage_key, recording.TakeQueries(),
+                                                         TC::ProgramMeta::From(program),
+                                                         generation))) {
+                stored = true;
+                ++aot_completed;
+                ++aot_stored_by_tier[tier_index];
+            }
+            // The module for the most likely recipe, stored before the entry is announced as
+            // seeded. Only vertex-B and fragment stages without legacy varyings (recorded the
+            // same way).
+            // Insert may return an entry stored before for the same key and queries: emit only
+            // against metadata equal to this translation's.
+            if (entry && aot_emit_variants && !TC::InfoEqual(entry->meta.info, program.info)) {
+                ++aot_variant_meta_differs;
+            } else if (entry && aot_emit_variants &&
+                (program.stage == Shader::Stage::VertexB ||
+                 program.stage == Shader::Stage::Fragment) &&
+                !program.info.loads.Legacy() && !program.info.stores.Legacy()) {
+                const auto emit_begin = std::chrono::steady_clock::now();
+                bool class_match = false;
+                if (auto recipe = BestRecipe(program.stage, program.info, class_match)) {
+                    try {
+                        // A stage-level recipe comes from a program with other inputs.
+                        CanonicalizeRuntimeInfo(recipe->runtime_info, program.info, program.stage);
+                        Shader::Backend::Bindings binding = recipe->binding_in;
+                        std::vector<u32> code =
+                            EmitSPIRV(profile, recipe->runtime_info, program, binding);
+                        translation_cache.InsertVariant(
+                            *entry,
+                            TC::MakeVariantKey(entry->id,
+                                               TC::DigestRuntimeInfo(recipe->runtime_info),
+                                               recipe->binding_in),
+                            TC::Variant{binding, program.info, std::move(code)});
+                        ++(class_match ? aot_variants_class : aot_variants_stage);
+                        if (!class_match) {
+                            ParkSeed(owned, entry, program.stage, program.info, job_bytes,
+                                     generation);
+                        }
+                    } catch (const Shader::Exception&) {
+                        ++aot_variants_failed;
+                    }
+                } else {
+                    ++aot_variants_none;
+                    ParkSeed(owned, entry, program.stage, program.info, job_bytes, generation);
+                }
+                aot_variant_ns += static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - emit_begin)
+                        .count());
+            }
+            if (stored) {
+                std::scoped_lock lock{aot_mutex};
+                aot_keys.emplace(stage_key, static_cast<u8>(tier_index));
+            }
+        } catch (const Shader::Exception&) {
+            if (const auto kind = owned->FirstMissing()) {
+                ++aot_needs_query[static_cast<size_t>(*kind) % aot_needs_query.size()];
+            } else {
+                ++aot_failed;
+                LOG_DEBUG(Render_Vulkan, "Shader AOT: {:016x} failed to translate", unique_hash);
+            }
+        }
+        aot_translate_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 std::chrono::steady_clock::now() - translate_begin)
+                                                 .count());
+        if (!stored) {
+            --aot_reserved;
+        }
+        {
+            std::scoped_lock lock{aot_mutex};
+            aot_in_flight.erase(stage_key);
+        }
+        aot_bytes -= job_bytes;
+        --aot_pending;
+    });
+    return true;
+}
+
+void PipelineCache::CountStageOutcome(StageOutcome outcome, Shader::Stage stage, u64 ns) {
+    const bool mesh = stage == Shader::Stage::Task || stage == Shader::Stage::Mesh;
+    auto& counter = stage_outcomes[static_cast<size_t>(outcome)][mesh ? 0 : 1];
+    counter.stages.fetch_add(1, std::memory_order::relaxed);
+    counter.ns.fetch_add(ns, std::memory_order::relaxed);
+}
+
+void PipelineCache::LogStageOutcomes(std::string_view when) {
+    if (!aot_translation) {
+        return;
+    }
+    static constexpr std::array names{"from the cache", "not cacheable", "new stage key",
+                                      "known key, different answers", "entry hit, new variant",
+                                      "entry hit, new variant on a worker"};
+    std::string text;
+    for (size_t outcome = 0; outcome < names.size(); ++outcome) {
+        for (size_t kind = 0; kind < 2; ++kind) {
+            const auto& counter = stage_outcomes[outcome][kind];
+            const u64 stages = counter.stages.load(std::memory_order::relaxed);
+            if (stages == 0) {
+                continue;
+            }
+            text += fmt::format("; {} {}: {} in {:.1f} ms", kind == 0 ? "task/mesh" : "other",
+                                names[outcome], stages,
+                                static_cast<double>(counter.ns.load(std::memory_order::relaxed)) /
+                                    1e6);
+        }
+    }
+    std::string needs;
+    for (size_t kind = 0; kind < aot_needs_query.size(); ++kind) {
+        if (const u64 count = aot_needs_query[kind].load(); count != 0) {
+            needs += fmt::format(" {}:{}", kind, count);
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "Shader AOT ({}): {} candidates, {} stored with guessed answers, {} needed an exact "
+             "word (by kind:{}), {} failed; skipped {} known, {} uncacheable, {} over budget; {} "
+             "pending; {} stored entries used by a draw; {} candidates had their bank-1 "
+             "constants; GPU thread {:.1f} ms, worker {:.1f} ms",
+             when, aot_candidates.load(), aot_completed.load(),
+             [&] {
+                 u64 total = 0;
+                 for (const auto& count : aot_needs_query) {
+                     total += count.load();
+                 }
+                 return total;
+             }(),
+             needs.empty() ? " none" : needs, aot_failed.load(), aot_skipped_known.load(),
+             aot_skipped_uncacheable.load(), aot_skipped_full.load(), aot_pending.load(),
+             aot_entry_hits.load(), aot_with_constants.load(),
+             static_cast<double>(aot_capture_ns.load()) / 1e6,
+             static_cast<double>(aot_translate_ns.load()) / 1e6);
+    const auto tiers = [](const auto& counts) {
+        return fmt::format("{}/{}/{}/{}", counts[0].load(), counts[1].load(), counts[2].load(),
+                           counts[3].load());
+    };
+    LOG_INFO(Render_Vulkan,
+             "Shader AOT ({}): {} workers; by tier 1/2/3/other: stored {}, used by a draw {}; "
+             "{} draws needed a stage whose seed was still queued or translating; {} modules "
+             "refused for metadata that differs from their entry; seeded "
+             "programs whose first draw missed: {} other stage key, {} answers differed, {} not "
+             "stored; job bytes peak {}",
+             when, aot_worker_count, tiers(aot_stored_by_tier), tiers(aot_hits_by_tier),
+             aot_late.load(), aot_variant_meta_differs.load(), aot_miss_key_differs.load(),
+             aot_miss_replay_failed.load(), aot_miss_not_stored.load(), aot_bytes_peak.load());
+    LOG_INFO(Render_Vulkan,
+             "Shader AOT ({}): seeded variants {} with the class's recipe, {} with the stage's, {} "
+             "without a recipe, {} failed, {:.1f} ms on workers; seeded stages at their first draw: "
+             "{} full hits (module from the cache), {} emitted; deferred stages: {} modules "
+             "found by the worker, {} found with another info",
+             when, aot_variants_class.load(), aot_variants_stage.load(), aot_variants_none.load(),
+             aot_variants_failed.load(), static_cast<double>(aot_variant_ns.load()) / 1e6,
+             aot_full_hits.load(), aot_emitted_at_draw.load(), worker_variant_hits.load(),
+             worker_variant_info_differs.load());
+    LOG_INFO(Render_Vulkan,
+             "Shader AOT ({}): run-time pipelines / ms of draws held, all modules from the cache "
+             "{} / {:.1f}, a seeded stage's module made on a worker {} / {:.1f}, a known "
+             "program's module made on a worker {} / {:.1f}, a stage translated at the draw {} / "
+             "{:.1f}; other pipelines (boot, background) held {:.1f} ms",
+             when, pipelines_by_class[0].load(), GraphicsPipeline::HoldNsOfClass(0) / 1e6,
+             pipelines_by_class[1].load(), GraphicsPipeline::HoldNsOfClass(1) / 1e6,
+             pipelines_by_class[2].load(), GraphicsPipeline::HoldNsOfClass(2) / 1e6,
+             pipelines_by_class[3].load(), GraphicsPipeline::HoldNsOfClass(3) / 1e6,
+             GraphicsPipeline::HoldNsOfClass(4) / 1e6);
+    {
+        std::scoped_lock lock{recipe_mutex};
+        LOG_INFO(Render_Vulkan,
+                 "Shader AOT ({}): seeds parked for their class's recipe {}, {} still waiting, "
+                 "{} dropped; modules emitted once the class's recipe was seen {}, {} retranslated "
+                 "with another info",
+                 when, aot_parked.load(), waiting_count, aot_waiting_dropped.load(),
+                 aot_late_variants.load(), aot_late_info_differs.load());
+    }
+    if (translation_cache_verify) {
+        LOG_INFO(Render_Vulkan,
+                 "Shader AOT ({}): {} stages emitted with the canonical and the full runtime "
+                 "info, {} differed",
+                 when, canonical_verified.load(), canonical_mismatches.load());
+    }
+    std::string mismatches;
+    for (size_t kind = 0; kind < translation_cache.first_mismatch.size(); ++kind) {
+        if (const u64 count = translation_cache.first_mismatch[kind].load(); count != 0) {
+            mismatches += fmt::format(" {}:{}", kind, count);
+        }
+    }
+    LOG_INFO(Render_Vulkan, "Translation cache ({}): known stage keys whose answers differed, by "
+             "first differing query kind:{}",
+             when, mismatches.empty() ? " none" : mismatches);
+    LOG_INFO(Render_Vulkan, "Graphics stages ({}){}; {} translated on workers from entries in "
+             "{:.1f} ms, {} differed",
+             when, text.empty() ? "; none" : text, replay_translations.load(),
+             static_cast<double>(replay_translation_ns.load()) / 1e6,
+             replay_translation_mismatches.load());
+}
+
 PipelineCache::~PipelineCache() {
     background_pipelines.Stop();
     workers.WaitForRequests();
+    // After the pipeline workers: their jobs record recipes, which can queue AOT re-emission.
+    // AOT jobs queue only AOT jobs, and WaitForRequests covers work queued while it waits.
+    if (aot_workers) {
+        aot_workers->WaitForRequests();
+    }
     serialization_thread.WaitForRequests();
     translation_cache.LogStatistics("run time");
+    LogStageOutcomes("run time");
     if (translation_cache_verify) {
         LOG_INFO(Render_Vulkan,
                  "Translation cache: {} cached stages compared with a fresh translation, {} differed",
@@ -1108,6 +1607,18 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             }
             auto pipeline{CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs),
                                                  state.statistics.get(), false)};
+            if (aot_translation) {
+                const bool mesh = std::ranges::any_of(envs_, [](const FileEnvironment& env) {
+                    return env.ShaderStage() == Shader::Stage::Task ||
+                           env.ShaderStage() == Shader::Stage::Mesh;
+                });
+                boot_mesh_pipelines += mesh ? 1 : 0;
+                if (!pipeline) {
+                    ++boot_pipelines_failed;
+                    LOG_INFO(Render_Vulkan, "Cached pipeline {:016x}{} was not built at boot",
+                             key.Hash(), mesh ? " (task/mesh)" : "");
+                }
+            }
 
             std::scoped_lock lock{state.mutex};
             if (pipeline) {
@@ -1139,6 +1650,17 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     workers.WaitForRequests(stop_loading);
 
     translation_cache.LogStatistics("boot");
+    if (aot_translation) {
+        LOG_INFO(Render_Vulkan, "Boot preload: {} task/mesh pipelines queued, {} pipelines failed",
+                 boot_mesh_pipelines.load(), boot_pipelines_failed.load());
+        LogStageOutcomes("boot");
+        for (auto& outcome : stage_outcomes) {
+            for (auto& counter : outcome) {
+                counter.stages = 0;
+                counter.ns = 0;
+            }
+        }
+    }
     if (translation_cache_verify) {
         LOG_INFO(Render_Vulkan,
                  "Translation cache: {} cached stages compared with a fresh translation, {} differed",
@@ -1388,9 +1910,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     using Clock = std::chrono::steady_clock;
     const bool use_translation_cache = translation_cache.Enabled() && !uses_vertex_a;
     std::array<std::shared_ptr<const TC::Entry>, Maxwell::MaxShaderProgram> cached_entries{};
+    /// AOT translation: the live answers of each matched entry (class-level replay).
+    std::array<TC::LiveAnswers, Maxwell::MaxShaderProgram> live_answers{};
     std::array<bool, Maxwell::MaxShaderProgram> from_cache{};
     std::array<Shader::Environment*, Maxwell::MaxShaderProgram> stage_envs{};
     std::array<Clock::duration, Maxwell::MaxShaderProgram> stage_time{};
+    std::array<StageOutcome, Maxwell::MaxShaderProgram> outcomes{};
+    /// AOT: stages whose entry a seed stored, at their first draw.
+    std::array<bool, Maxwell::MaxShaderProgram> seeded{};
 
     // Layer passthrough generation for devices without VK_EXT_shader_viewport_index_layer
     Shader::IR::Program* layer_source_program{};
@@ -1434,8 +1961,42 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if (cacheable) {
             stage_key = TC::MakeStageKey(env, key.unique_hashes[index], static_cast<u32>(index),
                                          translation_config);
-            cached_entries[index] = translation_cache.FindEntry(stage_key, env);
+            cached_entries[index] = translation_cache.FindEntry(
+                stage_key, env, aot_translation ? &live_answers[index] : nullptr);
             from_cache[index] = cached_entries[index] != nullptr;
+        }
+        if (aot_translation && cacheable) {
+            std::scoped_lock lock{aot_mutex};
+            if (from_cache[index]) {
+                aot_seeded_programs.erase(key.unique_hashes[index] * 8 + index);
+                if (const auto it = aot_keys.find(stage_key); it != aot_keys.end()) {
+                    ++aot_entry_hits;
+                    ++aot_hits_by_tier[it->second];
+                    aot_keys.erase(it);
+                    seeded[index] = true;
+                }
+            } else if (aot_in_flight.contains(stage_key)) {
+                // Its seed was queued or translating when the draw needed it.
+                ++aot_late;
+            } else if (const auto seeded_program =
+                           aot_seeded_programs.find(key.unique_hashes[index] * 8 + index);
+                       seeded_program != aot_seeded_programs.end()) {
+                // A seeded program whose first draw did not take the seed: why.
+                if (seeded_program->second != stage_key) {
+                    ++aot_miss_key_differs;
+                } else if (translation_cache.HasStageKey(stage_key)) {
+                    ++aot_miss_replay_failed;
+                } else {
+                    ++aot_miss_not_stored;
+                }
+                aot_seeded_programs.erase(seeded_program);
+            }
+        }
+        if (aot_translation) {
+            outcomes[index] = !cacheable                ? StageOutcome::Uncacheable
+                              : from_cache[index]       ? StageOutcome::Hit
+                              : translation_cache.HasStageKey(stage_key) ? StageOutcome::ReplayFailed
+                                                                         : StageOutcome::NewKey;
         }
         if (from_cache[index]) {
             // Only the program's metadata: the IR is translated again if no module fits.
@@ -1445,7 +2006,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             // later use of its result.
             std::optional<TC::RecordingEnvironment> recording;
             if (cacheable) {
-                recording.emplace(env);
+                recording.emplace(env, aot_translation);
             }
             Shader::Environment& translate_env =
                 recording ? static_cast<Shader::Environment&>(*recording) : env;
@@ -1525,11 +2086,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     std::array<std::optional<Shader::RuntimeInfo>, Maxwell::MaxShaderStage> deferred_runtime_infos;
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
     std::array<std::shared_ptr<const TC::Entry>, Maxwell::MaxShaderStage> deferred_entries;
+    std::array<std::unique_ptr<VideoCommon::ReplayEnvironment>, Maxwell::MaxShaderStage>
+        replay_envs;
     Shader::Backend::Bindings deferred_binding{};
     bool deferring = false;
 
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
+    // A vertex-B + fragment pipeline: its stages' recipes are what seeded variants guess.
+    const bool plain_pipeline = aot_emit_variants && key.unique_hashes[0] == 0 &&
+                                key.unique_hashes[1] != 0 && key.unique_hashes[2] == 0 &&
+                                key.unique_hashes[3] == 0 && key.unique_hashes[4] == 0 &&
+                                layer_source_program == nullptr;
     for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0; index < Maxwell::MaxShaderProgram;
          ++index) {
         const bool is_emulated_stage = layer_source_program != nullptr &&
@@ -1544,7 +2112,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         infos[stage_index] = &program.info;
 
         const auto stage_begin = Clock::now();
-        const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        const Shader::RuntimeInfo full_runtime_info{
+            MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        Shader::RuntimeInfo canonical_runtime_info{full_runtime_info};
+        const bool canonical =
+            aot_translation && !is_emulated_stage && layer_source_program == nullptr &&
+            CanonicalizeRuntimeInfo(canonical_runtime_info, program.info, program.stage);
+        const Shader::RuntimeInfo& runtime_info =
+            canonical ? canonical_runtime_info : full_runtime_info;
+        const Shader::Backend::Bindings binding_in = binding;
         // Modules of a layer-emulating pipeline depend on the generated geometry stage.
         const std::shared_ptr<const TC::Entry> entry =
             is_emulated_stage || layer_source_program != nullptr ? nullptr
@@ -1557,6 +2133,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             variant_key =
                 TC::MakeVariantKey(entry->id, TC::DigestRuntimeInfo(runtime_info), binding);
             variant = translation_cache.FindVariant(variant_key);
+            // AOT translation: a module is used only with the info the layout is built from
+            // (without legacy varyings the variant's info is the entry's).
+            if (variant && aot_translation && !program.info.loads.Legacy() &&
+                !program.info.stores.Legacy() && !TC::InfoEqual(variant->info, program.info)) {
+                ++aot_variant_meta_differs;
+                variant.reset();
+            }
         }
         // #184 native async pipelines: the SPIR-V of a stage the translation cache does not
         // supply is emitted on the worker that builds the pipeline. Not while verifying the
@@ -1565,7 +2148,24 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                            (deferring || !variant);
         std::vector<u32> code;
         if (defer || !variant || translation_cache_verify) {
-            if (from_cache[index]) {
+            // With AOT translation on, a stage whose entry matched but has no module for this
+            // runtime info is translated again on the worker, from an owned copy of its
+            // environment that answers with the entry's queries (the replay just showed the live
+            // environment gives the same answers). Not for legacy varyings: their conversion
+            // changes the info the next stage's runtime info reads.
+            if (from_cache[index] && defer && aot_translation && !VideoCommon::Nx2Perf::Verify() &&
+                !program.info.stores.Legacy() && !program.info.loads.Legacy()) {
+                // Only the run-time path defers (emit_pools), and its environments are
+                // GraphicsEnvironments; boot builds use FileEnvironments and never defer.
+                const auto& generic =
+                    *static_cast<const VideoCommon::GenericEnvironment*>(stage_envs[index]);
+                // The live answers: with class-level replay the entry holds handle recipes,
+                // and the live words and handles are what the translation will ask about.
+                replay_envs[stage_index] = std::make_unique<VideoCommon::ReplayEnvironment>(
+                    generic, live_answers[index]);
+                outcomes[index] = StageOutcome::VariantDeferred;
+            }
+            if (from_cache[index] && !replay_envs[stage_index]) {
                 // The stage's entry matched but no module for this runtime info: translate.
                 Shader::Environment& env{*stage_envs[index]};
                 const u32 cfg_offset{
@@ -1573,8 +2173,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
                 program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
                 from_cache[index] = false;
+                outcomes[index] = StageOutcome::VariantMiss;
             }
-            ConvertLegacyToGeneric(program, runtime_info);
+            if (!replay_envs[stage_index]) {
+                ConvertLegacyToGeneric(program, runtime_info);
+            }
             if (defer) {
                 if (!deferring) {
                     deferring = true;
@@ -1587,8 +2190,34 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                         EmitSPIRV(profile, runtime_info, program, binding);
                 }
             } else {
+                std::vector<u32> full_code;
+                Shader::Backend::Bindings full_binding = binding;
+                if (canonical && translation_cache_verify) {
+                    // Emission writes SPIR-V ids into the IR: the full runtime info's module
+                    // is emitted from a fresh translation of the stage, never from `program`
+                    // a second time (that emits stale ids).
+                    Shader::Environment& verify_env{*stage_envs[index]};
+                    const u32 cfg_offset{static_cast<u32>(verify_env.StartAddress() +
+                                                          sizeof(Shader::ProgramHeader))};
+                    Shader::Maxwell::Flow::CFG cfg(verify_env, pools.flow_block, cfg_offset,
+                                                   index == 0);
+                    Shader::IR::Program fresh =
+                        TranslateProgram(pools.inst, pools.block, verify_env, cfg, host_info);
+                    full_code = EmitSPIRV(profile, full_runtime_info, fresh, full_binding);
+                }
                 const auto begin = std::chrono::steady_clock::now();
                 code = EmitSPIRV(profile, runtime_info, program, binding);
+                if (canonical && translation_cache_verify) {
+                    ++canonical_verified;
+                    if (full_code != code ||
+                        std::memcmp(&full_binding, &binding, sizeof(binding)) != 0) {
+                        ++canonical_mismatches;
+                        LOG_ERROR(Render_Vulkan,
+                                  "Shader AOT: stage {} of shader {:016x} emits differently "
+                                  "with the canonical runtime info",
+                                  index, key.unique_hashes[index]);
+                    }
+                }
                 if (build_in_parallel) {
                     AddRuntimeSpirvTime(0, begin);
                 }
@@ -1615,6 +2244,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             program.info = std::move(variant->info);
             binding = variant->binding_out;
             code = std::move(variant->spirv);
+            if (seeded[index]) {
+                ++aot_full_hits;
+            }
+        }
+        if (seeded[index] && !defer && !variant) {
+            ++aot_emitted_at_draw;
+        }
+        if (plain_pipeline && !defer && (index == 1 || index == 5)) {
+            RecordRecipe(program.stage, program.info, runtime_info, binding_in);
         }
         stage_time[index] += Clock::now() - stage_begin;
         if (use_translation_cache && !is_emulated_stage) {
@@ -1626,6 +2264,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             } else {
                 ++translation_cache.stage_misses;
                 translation_cache.miss_ns += ns;
+            }
+            if (aot_translation) {
+                CountStageOutcome(outcomes[index], program.stage, ns);
             }
         }
         LogUntrackedGlobal(key.unique_hashes[index], program.stage, program.info);
@@ -1645,7 +2286,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         job->reference_spirv = std::move(reference_spirv);
         job->modules = std::move(modules);
         job->entries = std::move(deferred_entries);
+        job->replay_envs = std::move(replay_envs);
         job->binding = deferred_binding;
+        for (size_t stage = 0; stage < job->seeded.size(); ++stage) {
+            job->seeded[stage] = seeded[stage + 1];
+        }
+        job->plain = plain_pipeline;
         for (size_t stage = 0; stage < infos.size(); ++stage) {
             if (infos[stage]) {
                 infos[stage] = &job->programs[stage + 1].info;
@@ -1662,8 +2308,72 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 }
                 const Shader::RuntimeInfo& stage_runtime_info = *job->runtime_infos[stage];
                 Shader::IR::Program& stage_program = job->programs[stage + 1];
-                TC::Digest stage_variant_key{};
                 const auto& stage_entry = job->entries[stage];
+                // A stage deferred only because an earlier one was: its module may be in the
+                // cache for the bindings known now (a seeded variant, or one stored by another
+                // pipeline). The info must be the one the layout was built from.
+                if (stage_entry && aot_translation && !VideoCommon::Nx2Perf::Verify()) {
+                    const TC::Digest lookup_key = TC::MakeVariantKey(
+                        stage_entry->id, TC::DigestRuntimeInfo(stage_runtime_info), stage_binding);
+                    if (auto cached = translation_cache.FindVariant(lookup_key)) {
+                        if (TC::InfoEqual(cached->info, stage_program.info)) {
+                            ++worker_variant_hits;
+                            if (job->seeded[stage]) {
+                                ++aot_full_hits;
+                            }
+                            if (job->plain && (stage == 0 || stage == 4)) {
+                                RecordRecipe(stage_program.stage, stage_program.info,
+                                             stage_runtime_info, stage_binding);
+                            }
+                            job->replay_envs[stage].reset();
+                            stage_binding = cached->binding_out;
+                            stage_modules[stage] =
+                                BuildStageModule(device, cached->spirv, hashes[stage + 1], stage);
+                            continue;
+                        }
+                        ++worker_variant_info_differs;
+                    }
+                }
+                if (job->seeded[stage]) {
+                    ++aot_emitted_at_draw;
+                }
+                if (job->plain && (stage == 0 || stage == 4)) {
+                    RecordRecipe(stage_program.stage, stage_program.info, stage_runtime_info,
+                                 stage_binding);
+                }
+                if (auto& replay_env = job->replay_envs[stage]) {
+                    const auto translate_begin = std::chrono::steady_clock::now();
+                    const u32 cfg_offset{static_cast<u32>(replay_env->StartAddress() +
+                                                          sizeof(Shader::ProgramHeader))};
+                    Shader::Maxwell::Flow::CFG cfg(*replay_env, job->pools->flow_block, cfg_offset,
+                                                   false);
+                    Shader::IR::Program fresh = TranslateProgram(
+                        job->pools->inst, job->pools->block, *replay_env, cfg, host_info);
+                    // The translation is deterministic: the info must be the one the GPU thread
+                    // built the pipeline layout and the next stages' runtime info from.
+                    // A difference fails the build closed (its draws are skipped) instead of
+                    // emitting a module that disagrees with that layout.
+                    if (!TC::InfoEqual(fresh.info, stage_program.info) ||
+                        !std::ranges::equal(fresh.mesh.vertex_lines,
+                                            stage_program.mesh.vertex_lines) ||
+                        !std::ranges::equal(fresh.mesh.primitive_lines,
+                                            stage_program.mesh.primitive_lines)) {
+                        ++replay_translation_mismatches;
+                        throw Shader::LogicError(
+                            "Shader AOT: stage {} of shader {:016x} translated on a worker "
+                            "differs from its cache entry",
+                            stage + 1, hashes[stage + 1]);
+                    }
+                    stage_program = std::move(fresh);
+                    ConvertLegacyToGeneric(stage_program, stage_runtime_info);
+                    replay_env.reset();
+                    ++replay_translations;
+                    replay_translation_ns += static_cast<u64>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - translate_begin)
+                            .count());
+                }
+                TC::Digest stage_variant_key{};
                 if (stage_entry) {
                     stage_variant_key = TC::MakeVariantKey(
                         stage_entry->id, TC::DigestRuntimeInfo(stage_runtime_info), stage_binding);
@@ -1696,10 +2406,31 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     // Without a deferred stage (all from the translation cache, or verifying it), the
     // reservation and emit_pools are released when this returns.
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
-    return std::make_unique<GraphicsPipeline>(
+    // AOT statistics, per run-time pipeline: 3 a stage was translated at the draw (new program,
+    // or its answers differed), else 1 a seeded stage's module was made on the worker, else 2 a
+    // known program's module was made on the worker, else 0 every module came from the cache.
+    u8 aot_class = GraphicsPipeline::AotClasses - 1;
+    if (aot_translation && build_in_parallel) {
+        bool translated = false, seeded_deferred = false, deferred_or_missed = deferring;
+        for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+            if (key.unique_hashes[index] == 0) {
+                continue;
+            }
+            translated |= outcomes[index] == StageOutcome::NewKey ||
+                          outcomes[index] == StageOutcome::ReplayFailed ||
+                          outcomes[index] == StageOutcome::Uncacheable;
+            deferred_or_missed |= outcomes[index] == StageOutcome::VariantMiss;
+            seeded_deferred |= seeded[index] && deferring;
+        }
+        aot_class = translated ? 3 : seeded_deferred ? 1 : deferred_or_missed ? 2 : 0;
+        ++pipelines_by_class[aot_class];
+    }
+    auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
         render_pass_cache, key, std::move(modules), infos, std::move(emit_stages));
+    pipeline->SetAotClass(aot_class);
+    return pipeline;
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();
@@ -1766,6 +2497,9 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     const auto begin = std::chrono::steady_clock::now();
+    // With AOT translation on, the log says whether the pipeline was in the disk cache (and so
+    // should have been built at boot).
+    const bool was_on_disk = aot_translation && disk_pipelines.contains(graphics_key.Hash());
     SCOPE_EXIT {
         std::string shaders = fmt::format("pipeline={:016x}", graphics_key.Hash());
         for (size_t stage = 0; stage < graphics_key.unique_hashes.size(); ++stage) {
@@ -1773,12 +2507,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
                 shaders += fmt::format(" s{}:{:016x}", stage, graphics_key.unique_hashes[stage]);
             }
         }
+        if (was_on_disk) {
+            shaders += " (in the disk cache)";
+        }
         ReportRuntimePipeline("Graphics", begin, shaders);
     };
     if (translation_cache.Enabled() &&
         begin - translation_cache_logged > std::chrono::seconds{30}) {
         translation_cache_logged = begin;
         translation_cache.LogStatistics("run time so far");
+        LogStageOutcomes("run time so far");
     }
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);

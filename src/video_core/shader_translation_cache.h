@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/common_types.h"
@@ -76,6 +77,10 @@ enum class QueryKind : u8 {
     CbufStorageBufferPointer,
     ReplaceConstBuffer,
     CbufIndirectStorageBufferPointer,
+    /// The texture handle built from constant buffer words (class-level replay only): a, b and c
+    /// pack the ConstBufferAddr (PackHandleAddress), the answer is the handle. Replay computes
+    /// the live handle and compares the texture queries made with it, not the words.
+    TextureHandle,
 };
 
 struct Query {
@@ -91,8 +96,14 @@ struct Query {
 /// Forwards to a live environment and records each query the translator makes with its answer.
 class RecordingEnvironment final : public Shader::Environment {
 public:
-    explicit RecordingEnvironment(Shader::Environment& inner);
+    /// With class_replay, a constant buffer word consumed only as part of a texture handle is
+    /// recorded as the handle (QueryKind::TextureHandle) instead of its raw value.
+    explicit RecordingEnvironment(Shader::Environment& inner, bool class_replay = false);
     ~RecordingEnvironment() override = default;
+
+    void BeginTextureHandle() override;
+    void EndTextureHandle(const Shader::ConstBufferAddr& cbuf, u32 handle) override;
+    void NoteExactCbufWord(u32 index, u32 offset) override;
 
     u64 ReadInstruction(u32 address) override;
     u32 TranslateProgramAddress(u32 address) const override;
@@ -114,18 +125,29 @@ public:
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override;
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
-    [[nodiscard]] std::vector<Query> TakeQueries() {
-        return std::move(queries);
-    }
+    [[nodiscard]] std::vector<Query> TakeQueries();
 
 private:
     Shader::Environment& inner;
     std::vector<Query> queries;
+    bool class_replay{};
+    u32 handle_depth{};
+    std::unordered_set<u64> handle_words;
+    std::unordered_set<u64> exact_words;
 };
+
+/// Live answers gathered by a class-level replay, for retranslating the stage elsewhere: the
+/// queries with the live environment's words, handles and answers.
+using LiveAnswers = std::vector<Query>;
 
 /// Asks the live environment the recorded queries in order; true when every answer matches.
 /// Stops at the first mismatch, so it never makes a query the translation would not make.
 [[nodiscard]] bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env);
+/// ReplayQueries that also says where it stopped: the index of the first query answered
+/// differently (queries.size() when all matched).
+[[nodiscard]] size_t ReplayQueriesUntilMismatch(std::span<const Query> queries,
+                                                Shader::Environment& env,
+                                                LiveAnswers* live = nullptr);
 
 /// Key of a stage: its hash and the environment values the translator reads besides queries.
 [[nodiscard]] Digest MakeStageKey(Shader::Environment& env, u64 unique_hash, u32 slot,
@@ -169,6 +191,7 @@ struct ProgramMeta {
     u32 shared_memory_size{};
     bool is_geometry_passthrough{};
     Shader::Info info;
+    Shader::MeshInfo mesh;
 
     [[nodiscard]] static ProgramMeta From(const Shader::IR::Program& program);
     /// A program with these fields and no IR blocks.
@@ -218,17 +241,37 @@ public:
     }
 
     /// The entry of a stage whose recorded queries the environment answers the same way.
+    /// With `live`, TextureHandle queries are replayed by class and the live answers of the
+    /// matching entry are returned there. Without it, an entry holding them never matches.
     [[nodiscard]] std::shared_ptr<const Entry> FindEntry(const Digest& stage_key,
-                                                         Shader::Environment& env);
+                                                         Shader::Environment& env,
+                                                         LiveAnswers* live = nullptr);
+    /// True when entries exist for the stage key (whether or not the environment matches them).
+    [[nodiscard]] bool HasStageKey(const Digest& stage_key);
     /// The variant, decompressed.
     [[nodiscard]] std::optional<Variant> FindVariant(const Digest& variant_key);
 
-    /// Adds an entry (when new) and a variant, and appends both to the file.
+    /// Adds an entry (when new) and appends it to the file. With `expected_generation`, nothing
+    /// is added unless the store is still the one opened then (checked under the store mutex).
     std::shared_ptr<const Entry> Insert(const Digest& stage_key, std::vector<Query> queries,
-                                        const ProgramMeta& meta);
-    void InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant);
+                                        const ProgramMeta& meta,
+                                        std::optional<u64> expected_generation = std::nullopt);
+    /// Adds a variant of `entry`, which must be an entry of this store (one from before a
+    /// reopen is refused); returns whether it was taken.
+    bool InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant);
+    /// Changes whenever the store is closed (and so on every Open).
+    [[nodiscard]] u64 Generation() const noexcept {
+        return generation.load();
+    }
+    std::atomic<u64> rejected_variants{};
 
     void LogStatistics(std::string_view when);
+
+    /// With count_mismatches set (use_shader_aot_translation), FindEntry misses on a known
+    /// stage key are counted by the kind of the first query answered differently, taken from the
+    /// candidate whose replay got furthest.
+    bool count_mismatches{};
+    std::array<std::atomic<u64>, 16> first_mismatch{};
 
     // Statistics
     std::atomic<u64> stage_hits{};
@@ -250,6 +293,7 @@ private:
 
     std::mutex mutex;
     bool enabled{};
+    std::atomic<u64> generation{};
     std::unordered_map<Digest, std::vector<std::shared_ptr<const Entry>>, DigestHash> entries;
     std::unordered_map<Digest, std::shared_ptr<const StoredVariant>, DigestHash> variants;
     std::filesystem::path filename;

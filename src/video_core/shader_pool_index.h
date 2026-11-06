@@ -1,0 +1,195 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include <array>
+#include <chrono>
+#include <deque>
+#include <filesystem>
+#include <future>
+#include <memory>
+#include <string>
+#include <span>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#include "common/common_types.h"
+
+namespace Tegra {
+class MemoryManager;
+}
+
+namespace VideoCommon {
+
+/// Recognises the game's shader code pools in GPU memory (use_shader_aot_translation with
+/// EDEN_NX2_AOT_INDEX=<index file>, written by tools/oot/container/aot_index.py from the user's own
+/// game files). When a native graphics program is used for the first time, its first bytes are
+/// looked up in the index; if they identify a container, every other program of that container is
+/// expected at the same offset from the pool and is checked byte for byte (by fingerprint). It
+/// translates nothing: it measures how many programs could be known before their first draw.
+///
+/// With EDEN_NX2_AOT_MANIFEST=<manifest-<Scene>.json, or a directory of them> (static scene
+/// manifests built from the game's files, kept outside the repository), the programs a scene's
+/// materials use are offered first, main material pass (tier 1) to tier 3, and the other
+/// siblings only when no manifest program is waiting. Every manifest in the directory is loaded
+/// and their rows are united.
+class ShaderPoolIndex {
+public:
+    /// The index named by EDEN_NX2_AOT_INDEX, or null when unset or unreadable.
+    [[nodiscard]] static std::unique_ptr<ShaderPoolIndex> Open();
+    ~ShaderPoolIndex();
+
+    /// A native graphics program at `address` is used for the first time.
+    void OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr address);
+
+    /// Candidate priority: manifest tiers 1-3, then the siblings no manifest names.
+    static constexpr size_t PriorityCount = 4;
+    static constexpr u8 NoTier = PriorityCount;
+
+    /// A verified program of a recognised pool, not used yet, to translate ahead of time.
+    struct Candidate {
+        GPUVAddr address;
+        u8 stage; ///< Container stage slot (0 vertex, 4 pixel; others are not offered)
+        u8 tier;  ///< Manifest tier 1-3, NoTier when no manifest names the program
+        u32 constants_offset;
+        u16 constants_size;
+        u32 manifest_bank1; ///< Index of the manifest's bank-1 words, ~0 if none
+    };
+    /// Up to `count` candidates, highest priority first and oldest first within a priority,
+    /// skipping programs used since they were found. `manifest_only` takes manifest programs
+    /// only.
+    [[nodiscard]] std::vector<Candidate> TakeCandidates(size_t count, bool manifest_only = false);
+    /// Whether a manifest program waits for translation (cheap, for every draw).
+    [[nodiscard]] bool HasManifestCandidates() const noexcept {
+        return manifest_queued != 0;
+    }
+    /// Compares a candidate's bank-1 section read from its pool (authoritative) with the
+    /// manifest's words, for the statistics.
+    void CheckBank1(const Candidate& candidate, std::span<const u8> constants);
+    /// A seeded candidate left the GPU thread for a worker (statistics by tier).
+    void CountSeeded(const Candidate& candidate) {
+        ++seeded[(std::min<size_t>)(candidate.tier, NoTier) - 1];
+    }
+    /// GPU-thread time spent building candidate environments, for the statistics.
+    void AddSeedTime(std::chrono::steady_clock::duration duration) {
+        seed_time += duration;
+    }
+
+    struct Program {
+        u32 offset;
+        u32 size;
+        u8 stage;
+        u64 fingerprint;
+        u32 constants_offset; ///< Bank-1 constant section from the program start, ~0 if none
+        u16 constants_size;
+        u8 tier{NoTier};          ///< Lowest manifest tier naming the program
+        u32 manifest_bank1{~0U}; ///< Index into manifest_bank1_words
+    };
+    struct Container {
+        std::vector<Program> programs;
+    };
+
+    /// Index parsing and the fingerprint, exposed for tests.
+    [[nodiscard]] static bool Parse(std::span<const u8> data, std::vector<Container>& out);
+    [[nodiscard]] static u64 Fingerprint(std::span<const u8> bytes);
+
+    /// One row of a scene manifest (oot-aot-static-manifest-1): a stage program keyed like the
+    /// index (fingerprint, pool offset, padded size, stage slot).
+    struct ManifestRow {
+        u64 fingerprint;
+        u32 pool_offset;
+        u32 size;
+        u8 stage; ///< Container stage slot, as in the index
+        u8 tier;
+        u32 bank1_offset{~0U};
+        std::vector<u32> bank1_words;
+    };
+    /// Manifest parsing, exposed for tests. Rows of tier 4 and of unknown stages are skipped.
+    [[nodiscard]] static bool ParseManifest(std::string_view json, std::vector<ManifestRow>& out);
+    /// Marks the indexed programs a manifest names (lowest tier wins); returns the rows matched.
+    size_t ApplyManifest(std::span<const ManifestRow> rows);
+    /// An index over `containers` without a file or manifests, for tests.
+    [[nodiscard]] static std::unique_ptr<ShaderPoolIndex> ForTesting(
+        std::vector<Container> containers) {
+        return std::unique_ptr<ShaderPoolIndex>(new ShaderPoolIndex(std::move(containers)));
+    }
+    [[nodiscard]] const std::vector<Container>& Containers() const noexcept {
+        return containers;
+    }
+
+private:
+    explicit ShaderPoolIndex(std::vector<Container> containers);
+    void LogStatistics(const char* when) const;
+
+    static constexpr size_t FingerprintBytes = 256;
+    /// A program found in more containers than this does not identify one (shared effects).
+    static constexpr size_t MaxCandidates = 16;
+
+    std::vector<Container> containers;
+    /// Fingerprint -> (container, program) of every indexed program.
+    std::unordered_multimap<u64, std::pair<u32, u32>> by_fingerprint;
+    /// Program sizes under FingerprintBytes (their fingerprints cover fewer bytes).
+    std::vector<u32> short_sizes;
+    /// (container, pool address) pairs already checked.
+    std::unordered_set<u64> checked;
+    /// Addresses of programs verified in a recognised pool and not used yet, with their tier.
+    std::unordered_map<GPUVAddr, u8> predicted;
+    /// Addresses of programs already used.
+    std::unordered_set<GPUVAddr> used;
+    /// Candidates waiting for translation by priority, bounded by MaxCandidatesQueued together.
+    std::array<std::deque<Candidate>, PriorityCount> candidates_queues;
+    size_t candidates_queued{};
+    size_t manifest_queued{};
+    static constexpr size_t MaxCandidatesQueued = 4096;
+    u64 candidates_offered{};
+    u64 candidates_dropped{};
+    size_t candidates_queued_peak{};
+
+    /// Scene manifests (EDEN_NX2_AOT_MANIFEST).
+    struct LoadedManifests {
+        size_t files{};
+        std::vector<ManifestRow> rows;
+        std::chrono::steady_clock::duration time{};
+    };
+    static LoadedManifests ReadManifests(std::string path);
+    void StartManifestLoad();
+    /// Applies the manifests once loaded; false while they are still being read.
+    bool PollManifest();
+    std::future<LoadedManifests> manifest_load;
+    bool manifest_pending{};
+    std::vector<GPUVAddr> deferred_first_uses;
+    std::vector<std::vector<u32>> manifest_bank1_words;
+    size_t manifest_files{};
+    bool offer_others{true}; ///< Offer siblings no manifest names (EDEN_NX2_AOT_OTHERS=1)
+    size_t manifest_rows{};
+    size_t manifest_rows_matched{};
+    size_t manifest_bytes{};
+    std::chrono::steady_clock::duration manifest_time{};
+    std::array<u64, PriorityCount> offered_by_tier{};
+    std::array<u64, PriorityCount> seeded{};
+    /// First uses of verified programs by tier: all, and those still waiting in the queue.
+    std::array<u64, PriorityCount> first_uses_by_tier{};
+    std::array<u64, PriorityCount> first_uses_still_queued{};
+    /// Addresses of queued candidates (to tell a first use that came before its translation).
+    std::unordered_map<GPUVAddr, u8> queued_tier;
+    u64 bank1_agreed{};
+    u64 bank1_disagreed{};
+    u64 bank1_unchecked{};
+
+    u64 first_uses{};
+    u64 first_uses_indexed{};
+    u64 first_uses_predicted{};
+    u64 ambiguous{};
+    u64 containers_recognised{};
+    u64 containers_rejected{};
+    u64 siblings_verified{};
+    u64 siblings_mismatched{};
+    u64 siblings_unmapped{};
+    std::chrono::steady_clock::duration time{};
+    std::chrono::steady_clock::duration seed_time{};
+};
+
+} // namespace VideoCommon
