@@ -245,7 +245,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                                 entry->meta.info, entry->meta.stage);
                             const auto variant_key = TC::MakeVariantKey(entry->id,
                                 TC::DigestRuntimeInfo(runtime), recipe.bindings);
-                            if (!store.FindVariant(variant_key)) break;
+                            if (!store.HasVariant(variant_key)) break;
                             ++candidate;
                         }
                         if (candidate == selected.size()) break;
@@ -277,7 +277,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                     recipe.runtime = TC::CanonicalRuntimeInfo(recipe.runtime, program.info, program.stage);
                     const auto variant_key = TC::MakeVariantKey(entry->id,
                         TC::DigestRuntimeInfo(recipe.runtime), recipe.bindings);
-                    if (store.FindVariant(variant_key)) continue;
+                    if (store.HasVariant(variant_key)) continue;
                     Shader::Maxwell::ConvertLegacyToGeneric(program, recipe.runtime);
                     auto bindings = recipe.bindings;
                     const auto code = Shader::Backend::SPIRV::EmitSPIRV(profile, recipe.runtime, program, bindings);

@@ -230,15 +230,6 @@ public:
         in = in.subspan(sizeof(T));
         return true;
     }
-    bool GetBytes(std::vector<u8>& bytes) {
-        u32 size{};
-        if (!Get(size) || in.size() < size) {
-            return false;
-        }
-        bytes.assign(in.begin(), in.begin() + size);
-        in = in.subspan(size);
-        return true;
-    }
     template <typename Container>
     bool GetVector(Container& values, size_t capacity) {
         u32 size{};
@@ -1394,14 +1385,18 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
             Digest key{};
             auto stored = std::make_shared<StoredVariant>();
             ok = reader.Get(key) && reader.Get(stored->entry_id) && reader.Get(stored->fallback_recipe) &&
-                 reader.Get(stored->binding_out) &&
-                 ReadInfo(record, stored->info) && reader.Get(stored->spirv_words) &&
-                 reader.GetBytes(stored->compressed_spirv);
-            if (ok && !stored->compressed_spirv.empty()) {
+                 reader.Get(stored->binding_out);
+            stored->info_offset = offset + 8 + length - record.size();
+            const auto info_begin = record.size();
+            Shader::Info info;
+            ok = ok && ReadInfo(record, info);
+            stored->info_size = static_cast<u32>(info_begin - record.size());
+            ok = ok && reader.Get(stored->spirv_words) && reader.Get(stored->compressed_size) &&
+                 stored->compressed_size <= record.size();
+            if (ok) {
                 stored->source = path;
-                stored->compressed_size = static_cast<u32>(stored->compressed_spirv.size());
-                stored->compressed_offset = offset + 8 + length - record.size() - stored->compressed_size;
-                std::vector<u8>{}.swap(stored->compressed_spirv);
+                stored->compressed_offset = offset + 8 + length - record.size();
+                record = record.subspan(stored->compressed_size);
             }
             bool has_recipe{};
             Shader::Stage stage{};
@@ -1422,7 +1417,7 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
                     entry_recipes[stored->entry_id].push_back(std::move(recipe));
                 ++loaded_variants;
             } else if (ok) {
-                if (has_recipe && !variants.contains(key)) {
+                if (!writable && has_recipe && !variants.contains(key)) {
                     CountRecipe(stage, recipe);
                 }
                 if (stored->spirv_words && (stored->compressed_size || !stored->compressed_spirv.empty()))
@@ -1524,6 +1519,12 @@ bool Store::HasStageKey(const Digest& stage_key) {
     return entries.contains(stage_key);
 }
 
+bool Store::HasVariant(const Digest& variant_key) {
+    std::scoped_lock lock{mutex};
+    const auto it = variants.find(variant_key);
+    return it != variants.end() && !dropped_entries.contains(it->second->entry_id);
+}
+
 std::map<u64, u64> Store::VariantMultiplicity() {
     std::scoped_lock lock{mutex};
     std::unordered_map<Digest, u64, DigestHash> counts;
@@ -1552,7 +1553,7 @@ std::optional<Variant> Store::FindVariant(const Digest& variant_key) {
     }
     Variant variant{
         .binding_out = stored->binding_out,
-        .info = stored->info,
+        .info = stored->info ? *stored->info : Shader::Info{},
         .spirv = std::vector<u32>(stored->spirv_words),
         .fallback_recipe = stored->fallback_recipe,
     };
@@ -1560,10 +1561,13 @@ std::optional<Variant> Store::FindVariant(const Digest& variant_key) {
     std::span<const u8> compressed = stored->compressed_spirv;
     if (!stored->source.empty()) {
         std::ifstream input(stored->source, std::ios::binary);
-        input.seekg(static_cast<std::streamoff>(stored->compressed_offset));
-        loaded.resize(stored->compressed_size);
+        input.seekg(static_cast<std::streamoff>(stored->info_offset));
+        const auto prefix_size = stored->compressed_offset - stored->info_offset;
+        loaded.resize(prefix_size + stored->compressed_size);
         if (!input.read(reinterpret_cast<char*>(loaded.data()), loaded.size())) return std::nullopt;
-        compressed = loaded;
+        auto info_bytes = std::span<const u8>{loaded}.first(stored->info_size);
+        if (!ReadInfo(info_bytes, variant.info) || !info_bytes.empty()) return std::nullopt;
+        compressed = std::span<const u8>{loaded}.subspan(prefix_size);
     }
     const size_t bytes = Common::Compression::DecompressDataZSTD(
         compressed,
@@ -1611,7 +1615,7 @@ bool Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
     stored->entry_id = entry.id;
     stored->fallback_recipe = variant.fallback_recipe;
     stored->binding_out = variant.binding_out;
-    stored->info = variant.info;
+    stored->info = std::make_unique<Shader::Info>(variant.info);
     stored->spirv_words = static_cast<u32>(variant.spirv.size());
     stored->compressed_spirv = Common::Compression::CompressDataZSTD(
         reinterpret_cast<const u8*>(variant.spirv.data()), variant.spirv.size() * sizeof(u32), 3);
@@ -1623,7 +1627,7 @@ bool Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
         writer.Put(entry.id);
         writer.Put(stored->fallback_recipe);
         writer.Put(stored->binding_out);
-        WriteInfo(record, stored->info);
+        WriteInfo(record, *stored->info);
         writer.Put(stored->spirv_words);
         writer.PutBytes(stored->compressed_spirv.data(), stored->compressed_spirv.size());
         writer.Put(recipe != nullptr);
@@ -1650,7 +1654,6 @@ bool Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
     if (dropped_entries.contains(entry.id)) return false;
     if (variants.try_emplace(variant_key, std::move(stored)).second) {
         if (!variant.spirv.empty()) entries_with_modules.insert(entry.id);
-        if (recipe) CountRecipe(entry.meta.stage, *recipe);
         lock.unlock();
         Append(record);
     }

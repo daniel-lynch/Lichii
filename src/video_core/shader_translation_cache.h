@@ -302,6 +302,7 @@ public:
     /// Current non-dropped entries grouped by their number of stored modules.
     [[nodiscard]] std::map<u64, u64> VariantMultiplicity();
     /// The variant, decompressed.
+    [[nodiscard]] bool HasVariant(const Digest& variant_key);
     [[nodiscard]] std::optional<Variant> FindVariant(const Digest& variant_key);
 
     /// Adds an entry (when new) and appends it to the file. With `expected_generation`, nothing
@@ -358,7 +359,9 @@ private:
         Digest entry_id{};
         bool fallback_recipe{};
         Shader::Backend::Bindings binding_out{};
-        Shader::Info info;
+        std::unique_ptr<Shader::Info> info;
+        u64 info_offset{};
+        u32 info_size{};
         u32 spirv_words{};
         std::vector<u8> compressed_spirv;
         std::filesystem::path source;
