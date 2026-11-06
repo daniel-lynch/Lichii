@@ -366,6 +366,10 @@ class Run:
         a = self.a
         if a.refresh_profile or not prof.exists(a.profile):
             prof.refresh(a.profile, log=self.say)
+        if a.cold_shader_cache:
+            a.profile = prof.cold_copy(a.profile, self.dir / "profile", log=self.say)
+            self.info["profile"] = str(a.profile)
+            self.info["cold_shader_cache"] = True
         qt_extra = [("Debugging", "use_gdbstub", "true"), ("Debugging", "gdbstub_port", str(a.gdb_port))] \
             if a.gdb else [("Debugging", "use_gdbstub", "false")]
         self.user = prof.prepare_run(a.profile, padmod.sdl_guid(), keep_save=a.keep_save,
@@ -849,6 +853,10 @@ def build_parser():
     ap.add_argument("--headless", action="store_true", help="gamescope headless backend (no window)")
     ap.add_argument("--refresh-profile", action="store_true", help="recopy config/save/caches from the live dirs")
     ap.add_argument("--keep-save", action="store_true", help="do not restore the seed save before the run")
+    ap.add_argument("--cold-shader-cache", action="store_true",
+                    help="run from a private copy of the profile inside the run folder whose shader "
+                         "cache directory is empty (no pipeline or translation cache); the shared "
+                         "profile is only read")
     ap.add_argument("--env", action="append", default=[], metavar="K=V",
                     help="emulator env (repeatable; K= removes a default). EDEN_NX2_* from the caller's env pass through")
     ap.add_argument("--pin", action="append", default=[], metavar="KEY=VAL",
