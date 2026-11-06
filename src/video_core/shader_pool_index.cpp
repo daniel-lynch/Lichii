@@ -110,11 +110,13 @@ void ShaderPoolIndex::LogStatistics(const char* when) const {
              "AOT pool index ({}): {} first uses, {} found in the index, {} predicted before first "
              "use; {} ambiguous; pools {} recognised, {} rejected; siblings {} verified, {} "
              "differed, {} unmapped; {} still predicted unused; candidates {} offered, {} "
-             "dropped, {} queued; {:.1f} ms",
+             "dropped, {} queued; recognition {:.1f} ms, candidate environments {:.1f} ms on the "
+             "GPU thread",
              when, first_uses, first_uses_indexed, first_uses_predicted, ambiguous,
              containers_recognised, containers_rejected, siblings_verified, siblings_mismatched,
              siblings_unmapped, predicted.size(), candidates_offered, candidates_dropped,
-             candidates_queue.size(), std::chrono::duration<double, std::milli>(time).count());
+             candidates_queue.size(), std::chrono::duration<double, std::milli>(time).count(),
+             std::chrono::duration<double, std::milli>(seed_time).count());
 }
 
 std::vector<ShaderPoolIndex::Candidate> ShaderPoolIndex::TakeCandidates(size_t count) {
@@ -177,7 +179,33 @@ void ShaderPoolIndex::OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr addr
     for (const auto [container_index, program_index] : candidates) {
         const Container& container = containers[container_index];
         const GPUVAddr pool = address - container.programs[program_index].offset;
-        if (!checked.insert((u64{container_index} << 40) ^ pool).second) {
+        // A decided (container, pool) pair is not checked again. A pair that failed only because
+        // part of the pool was not mapped yet stays undecided and is checked on a later use.
+        const u64 pair_key = (u64{container_index} << 40) ^ pool;
+        if (checked.contains(pair_key)) {
+            continue;
+        }
+        bool sample_unmapped = false;
+        const auto matches = [&](const Program& program) {
+            const size_t length = (std::min)(size_t{program.size}, FingerprintBytes);
+            if (!read(pool + program.offset, length)) {
+                sample_unmapped = true;
+                return false;
+            }
+            return Fingerprint(std::span{bytes.data(), length}) == program.fingerprint;
+        };
+        // A container the program only shares (a common effect program) fails at once: check a
+        // few spread-out programs before reading all of them.
+        const size_t total_programs = container.programs.size();
+        bool sample_ok = true;
+        for (size_t probe = 1; probe <= 8 && sample_ok; ++probe) {
+            sample_ok = matches(container.programs[(total_programs - 1) * probe / 8]);
+        }
+        if (!sample_ok) {
+            ++containers_rejected;
+            if (!sample_unmapped) {
+                checked.insert(pair_key);
+            }
             continue;
         }
         size_t verified = 0, mismatched = 0, unmapped = 0;
@@ -195,6 +223,10 @@ void ShaderPoolIndex::OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr addr
             }
         }
         const size_t total = container.programs.size();
+        if (unmapped == 0 ||
+            static_cast<double>(verified) >= RecogniseShare * static_cast<double>(total)) {
+            checked.insert(pair_key);
+        }
         if (static_cast<double>(verified) >= RecogniseShare * static_cast<double>(total)) {
             ++containers_recognised;
             siblings_verified += verified;

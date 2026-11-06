@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <exception>
@@ -180,8 +181,16 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                     }
                     if (pool_index) {
                         pool_index->OnFirstUse(*gpu_memory, shader_addr);
-                        if (seed_stage && !mesh) {
+                        // Query-free seeding stored 11 of 2674 OOT candidates (run
+                        // 20261105-231202): opt-in with EDEN_NX2_AOT_SEED=1.
+                        static const bool seed = [] {
+                            const char* value = std::getenv("EDEN_NX2_AOT_SEED");
+                            return value != nullptr && value[0] == '1';
+                        }();
+                        if (seed && seed_stage && !mesh) {
+                            const auto seed_begin = std::chrono::steady_clock::now();
                             SeedPoolCandidates();
+                            pool_index->AddSeedTime(std::chrono::steady_clock::now() - seed_begin);
                         }
                     }
                 }
@@ -273,7 +282,13 @@ void ShaderCache::SeedPoolCandidates() {
     // A few per first use, so a recognised pool is fed to the workers over many draws instead
     // of building thousands of environments on one.
     static constexpr size_t PerFirstUse = 4;
+    if (seed_has_room && !seed_has_room()) {
+        return;
+    }
     for (const auto& candidate : pool_index->TakeCandidates(PerFirstUse)) {
+        if (seed_has_room && !seed_has_room()) {
+            break;
+        }
         const std::optional<VAddr> cpu_addr{gpu_memory->GpuToCpuAddress(candidate.address)};
         if (!cpu_addr || TryGet(*cpu_addr) || IsRejected(*cpu_addr)) {
             continue;

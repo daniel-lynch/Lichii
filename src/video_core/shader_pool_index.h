@@ -43,6 +43,10 @@ public:
     };
     /// Up to `count` candidates, oldest first, skipping programs used since they were found.
     [[nodiscard]] std::vector<Candidate> TakeCandidates(size_t count);
+    /// GPU-thread time spent building candidate environments, for the statistics.
+    void AddSeedTime(std::chrono::steady_clock::duration duration) {
+        seed_time += duration;
+    }
 
     struct Program {
         u32 offset;
@@ -93,6 +97,7 @@ private:
     u64 siblings_mismatched{};
     u64 siblings_unmapped{};
     std::chrono::steady_clock::duration time{};
+    std::chrono::steady_clock::duration seed_time{};
 };
 
 } // namespace VideoCommon

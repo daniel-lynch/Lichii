@@ -210,6 +210,8 @@ protected:
     /// thread with a program's environment (built as at first use), its unique hash and its
     /// pipeline slot.
     std::function<void(GenericEnvironment& env, u64 unique_hash, size_t slot)> seed_stage;
+    /// Whether seed_stage would take another program now (checked before building one).
+    std::function<bool()> seed_has_room;
 };
 
 } // namespace VideoCommon

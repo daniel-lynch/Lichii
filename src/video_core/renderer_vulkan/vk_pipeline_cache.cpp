@@ -531,11 +531,11 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       workers(num_pipeline_workers,
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {},
-                           Common::ThreadPlacement::Background),
-      aot_workers(1, "VkAotTranslate", {}, Common::ThreadPlacement::Background) {
+                           Common::ThreadPlacement::Background) {
     seed_stage = [this](VideoCommon::GenericEnvironment& env, u64 unique_hash, size_t slot) {
         SeedStage(env, unique_hash, slot);
     };
+    seed_has_room = [this] { return AotHasRoom(); };
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -834,7 +834,10 @@ void PipelineCache::OpenTranslationCache(const std::filesystem::path& filename) 
     if (aot_translation) {
         LOG_INFO(Render_Vulkan, "Shader AOT translation on: task and mesh stages are cached");
     }
+    // AOT jobs queued for the previous file must not store into this one.
+    ++aot_generation;
     translation_cache.Open(filename, translation_config);
+    translation_cache.count_mismatches = aot_translation;
     translation_cache_logged = std::chrono::steady_clock::now();
 }
 
@@ -864,7 +867,7 @@ void PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
         ++aot_skipped_uncacheable;
         return;
     }
-    if (aot_pending.load() >= MaxAotPending || aot_completed.load() >= MaxAotEntries) {
+    if (aot_pending.load() >= MaxAotPending) {
         ++aot_skipped_full;
         return;
     }
@@ -880,9 +883,21 @@ void PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
     aot_capture_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                            std::chrono::steady_clock::now() - begin)
                                            .count());
+    // Reserve the entry at admission so jobs in flight cannot take the store past the cap.
+    if (aot_reserved.fetch_add(1) >= MaxAotEntries) {
+        --aot_reserved;
+        ++aot_skipped_full;
+        return;
+    }
     ++aot_pending;
-    aot_workers.QueueWork([this, owned = std::move(owned), stage_key, unique_hash] {
+    if (!aot_workers) {
+        aot_workers.reset(new Common::ThreadWorker(1, "VkAotTranslate", {},
+                                                   Common::ThreadPlacement::Background));
+    }
+    aot_workers->QueueWork([this, owned = std::move(owned), stage_key, unique_hash,
+                            generation = aot_generation.load()] {
         const auto translate_begin = std::chrono::steady_clock::now();
+        bool stored = false;
         try {
             ShaderPools pools;
             const u32 cfg_offset{
@@ -894,7 +909,9 @@ void PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
                                 Shader::Optimization::HasBrokenPattern(program);
             if (program.info.requires_layer_emulation || broken) {
                 ++aot_failed;
-            } else if (translation_cache.Insert(stage_key, {}, TC::ProgramMeta::From(program))) {
+            } else if (generation == aot_generation.load() &&
+                       translation_cache.Insert(stage_key, {}, TC::ProgramMeta::From(program))) {
+                stored = true;
                 ++aot_completed;
                 std::scoped_lock lock{aot_mutex};
                 aot_keys.insert(stage_key);
@@ -910,6 +927,9 @@ void PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
         aot_translate_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                  std::chrono::steady_clock::now() - translate_begin)
                                                  .count());
+        if (!stored) {
+            --aot_reserved;
+        }
         --aot_pending;
     });
 }
@@ -964,6 +984,15 @@ void PipelineCache::LogStageOutcomes(std::string_view when) {
              aot_skipped_uncacheable.load(), aot_skipped_full.load(), aot_pending.load(),
              aot_entry_hits.load(), static_cast<double>(aot_capture_ns.load()) / 1e6,
              static_cast<double>(aot_translate_ns.load()) / 1e6);
+    std::string mismatches;
+    for (size_t kind = 0; kind < translation_cache.first_mismatch.size(); ++kind) {
+        if (const u64 count = translation_cache.first_mismatch[kind].load(); count != 0) {
+            mismatches += fmt::format(" {}:{}", kind, count);
+        }
+    }
+    LOG_INFO(Render_Vulkan, "Translation cache ({}): known stage keys whose answers differed, by "
+             "first differing query kind:{}",
+             when, mismatches.empty() ? " none" : mismatches);
     LOG_INFO(Render_Vulkan, "Graphics stages ({}){}; {} translated on workers from entries in "
              "{:.1f} ms, {} differed",
              when, text.empty() ? "; none" : text, replay_translations.load(),
@@ -972,7 +1001,9 @@ void PipelineCache::LogStageOutcomes(std::string_view when) {
 }
 
 PipelineCache::~PipelineCache() {
-    aot_workers.WaitForRequests();
+    if (aot_workers) {
+        aot_workers->WaitForRequests();
+    }
     workers.WaitForRequests();
     serialization_thread.WaitForRequests();
     translation_cache.LogStatistics("run time");
@@ -1795,13 +1826,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                         job->pools->inst, job->pools->block, *replay_env, cfg, host_info);
                     // The translation is deterministic: the info must be the one the GPU thread
                     // built the pipeline layout and the next stages' runtime info from.
+                    // A difference fails the build closed (its draws are skipped) instead of
+                    // emitting a module that disagrees with that layout.
                     if (!TC::InfoEqual(fresh.info, stage_program.info) ||
-                        fresh.mesh.vertex_lines.size() != stage_program.mesh.vertex_lines.size()) {
+                        !std::ranges::equal(fresh.mesh.vertex_lines,
+                                            stage_program.mesh.vertex_lines) ||
+                        !std::ranges::equal(fresh.mesh.primitive_lines,
+                                            stage_program.mesh.primitive_lines)) {
                         ++replay_translation_mismatches;
-                        LOG_ERROR(Render_Vulkan,
-                                  "Shader AOT: stage {} of shader {:016x} translated on a worker "
-                                  "differs from its cache entry",
-                                  stage + 1, hashes[stage + 1]);
+                        throw Shader::LogicError(
+                            "Shader AOT: stage {} of shader {:016x} translated on a worker "
+                            "differs from its cache entry",
+                            stage + 1, hashes[stage + 1]);
                     }
                     stage_program = std::move(fresh);
                     ConvertLegacyToGeneric(stage_program, stage_runtime_info);
