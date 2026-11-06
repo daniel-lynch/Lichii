@@ -1156,6 +1156,12 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
                  reader.Get(stored->binding_out) &&
                  ReadInfo(record, stored->info) && reader.Get(stored->spirv_words) &&
                  reader.GetBytes(stored->compressed_spirv);
+            if (ok && !stored->compressed_spirv.empty()) {
+                stored->source = path;
+                stored->compressed_size = static_cast<u32>(stored->compressed_spirv.size());
+                stored->compressed_offset = offset + 8 + length - record.size() - stored->compressed_size;
+                std::vector<u8>{}.swap(stored->compressed_spirv);
+            }
             bool has_recipe{};
             Shader::Stage stage{};
             EmissionRecipe recipe;
@@ -1166,7 +1172,7 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
             ok = ok && record.empty();
             if (ok) {
                 if (has_recipe && !variants.contains(key)) CountRecipe(stage, recipe);
-                if (stored->spirv_words && !stored->compressed_spirv.empty())
+                if (stored->spirv_words && (stored->compressed_size || !stored->compressed_spirv.empty()))
                     entries_with_modules.insert(stored->entry_id);
                 variants.insert_or_assign(key, std::move(stored));
                 ++loaded_variants;
@@ -1269,8 +1275,17 @@ std::optional<Variant> Store::FindVariant(const Digest& variant_key) {
         .spirv = std::vector<u32>(stored->spirv_words),
         .fallback_recipe = stored->fallback_recipe,
     };
+    std::vector<u8> loaded;
+    std::span<const u8> compressed = stored->compressed_spirv;
+    if (!stored->source.empty()) {
+        std::ifstream input(stored->source, std::ios::binary);
+        input.seekg(static_cast<std::streamoff>(stored->compressed_offset));
+        loaded.resize(stored->compressed_size);
+        if (!input.read(reinterpret_cast<char*>(loaded.data()), loaded.size())) return std::nullopt;
+        compressed = loaded;
+    }
     const size_t bytes = Common::Compression::DecompressDataZSTD(
-        stored->compressed_spirv,
+        compressed,
         std::span<u8>{reinterpret_cast<u8*>(variant.spirv.data()),
                       variant.spirv.size() * sizeof(u32)});
     if (bytes != variant.spirv.size() * sizeof(u32)) {

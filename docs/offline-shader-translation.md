@@ -39,10 +39,10 @@ Repeat `--source TITLE_ID=PATH` for more archives, or use the extractor's existi
 loaded application's program ID; this prevents accidental cross-title population.
 
 Optionally add `--shader-recipe-cache /absolute/path/to/vulkan_translations.TAG.fork-vN.bin`
-to the CLI command. That input must be a format-9 cache with the **same translator,
+to the CLI command. That input must be a format-10 cache with the **same translator,
 GPU and settings configuration**. It is opened read-only, including when its tail
-is incomplete. It can be the destination cache. Format-8 and earlier inputs are
-rejected because their records or keys are incompatible. Run gameplay with this build to collect format-9 recipes first.
+is incomplete. It can be the destination cache. Format-9 and earlier inputs are
+rejected because their records or keys are incompatible. Run gameplay with this build to collect format-10 recipes first.
 The shared command parser exposes the options, but archive production is an
 **eden-cli** feature, not a GUI precompile operation.
 
@@ -105,7 +105,7 @@ of rows. `--shader-workers N` accepts 1..64. An atomic row cursor admits at most
 allocation per worker, with independent IR pools; there is no unbounded work queue.
 Striped stage locks prevent duplicate candidates racing through lookup and append.
 This bounds concurrent allocations, **not total process memory**: IR expansion,
-loaded cache entries and retained compressed modules still lack a global memory
+loaded metadata and newly emitted compressed modules still lack a global memory
 budget and eviction policy. The earlier proposed `--shader-memory-mib` flag is not
 implemented.
 
@@ -132,7 +132,7 @@ early Z, alpha test, point-size override, transform feedback or dual-source blen
 Other fields are value-initialized. Geometry uses triangle input topology; other
 stages keep the value-initialized topology. These are speculative variants, not a
 promise to cover the game's pipeline state. Emission performs the same legacy-to-
-generic conversion as the renderer. First draw checks query replay, translates live metadata, and requires an exact canonical variant key. A miss emits from the live IR. Stage-level recipes are marked as fallback modules; their misses confer no metadata trust.
+generic conversion as the renderer. First draw checks query replay and reuses metadata on a match. An exact canonical variant key also skips emission; a variant miss reconstructs live IR and emits on the existing worker path. Reconstructed metadata disagreement drops the entry. Stage-level recipes remain marked as fallback modules.
 
 The producer uses `TranslationCache::Store` and `Shader::TranslatorIdentity()` via
 the normal Vulkan configuration digest. New producer sources are included in that
@@ -192,7 +192,7 @@ these recipes, scalar recipes for the unsupported stages, programs with more tha
 256 bank-1 bytes, and a total memory budget covering the cache and IR.
 
 
-## Runtime safety revision (round 3)
+## Runtime safety revision (round 3, historical behavior)
 
 Format 9 records offline provenance, module ownership, stage-level fallback recipe
 provenance, and persistent metadata rejections. Reproduce the product with this
@@ -287,3 +287,100 @@ logs: `/tmp/offline-build3.log` and `/tmp/offline-build3-final.log`. No emulator
 was performed for validation; no user Eden configuration or cache was accessed.
 The six incremental patches/messages (06–11) and the executable commit plan are
 in `/tmp/offline-translation-commits/commit-plan3.sh`. No commit was attempted.
+
+## Round 4 memory and remaining work
+
+Loaded SPIR-V payloads are indexed by file offset and read on variant lookup, rather than retaining
+all compressed modules in RAM. Entry queries, program metadata, variant metadata, and newly emitted
+modules remain resident. Loading still uses one temporary record buffer; this is not a fully lazy
+entry store. A read-only inventory of product3 found 609,645,979 bytes (581.4 MiB)
+of compressed SPIR-V across 36,546 variants; these payloads are no longer retained on load.
+This is an allocation inventory, not a measured reduction in peak RSS. Keep the cache file in place and unmodified while a process uses it.
+
+The round-3 product run peaked at 13.7 GB versus 11.9 GB control for a 720 MB product file. No new
+runtime memory measurement has been made by the patch author. Re-measure peak RSS using the same
+300-second scene. The next memory item is offset-backed entry and variant metadata with a bounded
+hot-entry cache; measure the remaining metadata cost before implementing that larger change.
+
+A matching offline module now reuses metadata after query replay without translation or emission.
+A different variant still needs Maxwell translation to reconstruct IR, which is not persisted by
+this format; emission runs on the existing worker path. The counters label this as a variant miss,
+not an emission-only hit. Persisted IR (or a safely reusable in-memory IR cache) is a separate item.
+
+## Round 4 coordinator revalidation
+
+Rebuild products and recipe caches with format 10; do not reuse format-9 files under a renamed tag.
+The serialized storage write-extent padding is now deterministic, and the format/config digest
+change deliberately prevents trusting old products. Use fresh isolated portable profiles with the
+same settings/save as round 3, never the default user config/cache. Preserve product4 before any
+runtime run adds entries or drops.
+
+1. Collect new recipes if desired, then repeat the round-3 producer arguments with the rebuilt
+   binary and a fresh product4 profile. Repeat production against the completed destination;
+   require `translated=0`, `modules=0`, and identical file size and SHA-256. Check replay-compatible
+   supported rows are resumed; unsupported/skipped rows can still be counted as skipped.
+2. In a separate fresh producer profile, send SIGTERM to the producer PID after records begin.
+   Require exit 143 and the record-boundary cancellation log. Resume that destination and compare
+   its module inventory with an uninterrupted run. SIGINT must exit 130. In-flight workers may
+   finish one record each; cancellation does not discard completed records.
+3. Repeat the product, empty-cache control and product+verify 300-second harness runs, each with
+   its own equivalent isolated profile. From this repository run the following for each profile:
+
+   ```sh
+   python3 -I tools/oot/harness/run.py \
+     --binary /home/dlynch/dev/Lichii-offline/build-offline/bin/lichii \
+     --profile /absolute/path/to/isolated-round4-profile --headless --duration 300 \
+     --env EDEN_NX2_GFX_STORAGE_SIZE_LIKE_COMPUTE=0 \
+     --env EDEN_NX2_UNIFORM_BANK_REUPLOAD=0 \
+     --env EDEN_NX2_NATIVE_PREFLUSH=1
+   ```
+
+   Add `--env EDEN_NX2_TRANSLATION_CACHE_VERIFY=1` for verify. Require correct geometry in actual
+   screenshots and zero real fresh-translation mismatches; canonical difference diagnostics are
+   allowed. Record full hits, variant misses, replay misses, metadata drops, GPU-thread and worker
+   times, and peak RSS. Compare with 3,421/3,691 ms and 13.7/11.9 GB from round 3. An emission-only
+   counter of zero is expected with this metadata/SPIR-V-only format.
+
+## Round 4 paired-data findings
+
+The differing Info bytes are padding in `storage_buffers_descriptors[].write_extent`, after
+`bounded` and `guarded`, not `constant_buffer_mask`. Format 10 writes deterministic descriptor
+representations. All 331 replay-compatible paired entries have equal semantic Info. Twenty-one
+other entry pairs fail handle-alias replay, and six pairs across five keys fail texture-class
+replay (2D versus array-2D); these remain misses. The actual live entries are in
+`runs3-aside/verify`, while the product run retained 277 persistent drops.
+
+The audit recovers all 679 live stage digests from the saved pipeline environments before
+classifying missing keys. Of these, 303 exist exactly offline (47 vertex, 256 fragment).
+Changing only texture cbuf bank 0 to the old archive default 2 finds offline counterparts for
+all 265 missing graphics keys (245 vertex, 20 fragment). The remaining 111 are unsupported
+compute stages. Hash, header, other scalar and unresolved mismatch counts are zero in this
+sample. The archive now starts with bank 0, matching the native graphics state; lowered bound
+texture instructions still select their encoded bank, including bank 2.
+
+The read-only audit tool reports named Info fields, replay failures and each live key. Build its
+small CityHash/ABI helper under the shared lock, then reproduce the round-3 audit:
+
+```sh
+flock /home/dlynch/Downloads/OOT/harness-runs/.emulator.lock nice -n 19 \
+  python3 -I tools/nx2/translation_cache_audit.py \
+  --build-helper build-offline --hash-helper /tmp/translation-cache-audit.so
+python3 -I tools/nx2/translation_cache_audit.py \
+  /home/dlynch/Downloads/OOT/offline-translate/product3/vulkan_translations.cdfc0fe46a82146c.fork-v53.bin \
+  /home/dlynch/Downloads/OOT/offline-translate/runs3-aside/verify/vulkan_translations.cdfc0fe46a82146c.fork-v53.bin \
+  --pipeline /home/dlynch/Downloads/OOT/offline-translate/runs3-aside/verify/vulkan.fork-v53.bin \
+  --hash-helper /tmp/translation-cache-audit.so --details /tmp/cache-audit4.jsonl
+```
+
+The tool supports x86-64 translation formats 9/10 and pipeline format 53. Without a matching
+pipeline file it reports exact-key coverage and metadata differences, but cannot recover missing
+key components from digests alone. Private inputs and detailed reports stay outside the repository.
+
+Round-4 validation: both locked builds of `lichii`, `eden-cli`, and `tests` succeeded. The final
+`bin/tests '[translation_cache],[video_core]'` run had 418 cases: 415 passed, the two known
+`nx2_video_render.cpp` assertions at lines 151/210 failed, and one Vulkan case was skipped.
+All new tests passed; 62,836,884 assertions included only the two known failures. Logs and six
+reviewable patches/messages are in `/tmp/offline-translation-commits/`; the unexecuted commit
+script is `commit-plan4.sh`. Its cached patch sequence was verified in an isolated index against
+HEAD `120d0078ee`. The audit helper was built under the shared lock and reproduced the histogram.
+No emulator or eden-cli was run, no default user config/cache was touched, and no commits were made.

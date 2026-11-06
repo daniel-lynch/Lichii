@@ -281,6 +281,9 @@ private:
         Shader::Info info;
         u32 spirv_words{};
         std::vector<u8> compressed_spirv;
+        std::filesystem::path source;
+        u64 compressed_offset{};
+        u32 compressed_size{};
     };
 
     std::shared_ptr<const Entry> InsertLocked(Entry entry);
