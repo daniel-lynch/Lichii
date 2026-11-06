@@ -80,8 +80,8 @@ def parse_cache(data):
             code = data[cursor:cursor + code_size]
             cursor += code_size + textures * 8 + formats * 8 + constants * 12
             cursor += pointers * 9 + replacements * 12
-            if stage in (7, 8) and version < 53:
-                raise CacheError("task/mesh environments require cache version 53")
+            if stage in (7, 8) and version < 52:
+                raise CacheError("task/mesh environments require cache version 52")
             cursor += 16 if stage == 5 else 80 + (32 if stage == 3 else 0)
             if stage in (7, 8):
                 cursor += 92  # Three mesh registers and the primitive program header.

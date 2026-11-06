@@ -190,8 +190,8 @@ public:
             if (stage == Stage::Geometry)
                 gp_passthrough_mask = reader.Read<std::array<u32, 8>>();
             if (stage == Stage::Task || stage == Stage::Mesh) {
-                if (version < 53)
-                    throw std::runtime_error("Task/mesh environments require cache version 53");
+                if (version < 52)
+                    throw std::runtime_error("Task/mesh environments require cache version 52");
                 mesh_registers = reader.Read<std::array<u32, 3>>();
                 mesh_primitive_header = reader.Read<Shader::ProgramHeader>();
             }
@@ -803,7 +803,8 @@ int main(int argc, char** argv) {
         }
         if (env.ShaderStage() == Stage::Task || env.ShaderStage() == Stage::Mesh) {
             if (env.captured) {
-                throw MissingContext("Task and mesh cache records lack the mesh registers");
+                throw MissingContext(
+                    "Captured task and mesh programs require additional pipeline stage context");
             }
             if (!mesh_registers) {
                 // Triangles, 64 vertices, 126 primitives, 32 threads per stage, one payload line

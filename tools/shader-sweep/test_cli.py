@@ -44,7 +44,7 @@ def environment(version, stage, instructions=(MAXWELL_EXIT,), formats=()):
     record += struct.pack("<4I", 1, 1, 1, 0) if stage == 5 else header(stage)
     if stage == 3:
         record += bytes(32)
-    if version >= 53 and stage in (7, 8):
+    if version >= 52 and stage in (7, 8):
         record += struct.pack("<3I", 32, 64, 128) + header(0)
     return record
 

@@ -17,7 +17,7 @@ def environment(version, stage):
     header = struct.pack("<" + "Q" * len(counts) + "7I", *counts, 0, 2, 0, 0, 80, 1, stage)
     context = bytes(8 + 8 + 12 + (9 if version >= 47 else 0) + 12)
     tail = bytes(16 if stage == 5 else 80 + (32 if stage == 3 else 0))
-    if version >= 53 and stage in (7, 8):
+    if version >= 52 and stage in (7, 8):
         tail += struct.pack("<3I", 32, 64, 128) + bytes(range(80))
     return header + code + context + tail
 
@@ -57,9 +57,16 @@ class CacheTests(unittest.TestCase):
             list(sweep.parse_cache(truncated))
 
     def test_legacy_mesh_records_without_context_are_rejected(self):
-        data = b"yuzucach" + struct.pack("<II", 52, 1) + environment(52, 8) + bytes(1056)
-        with self.assertRaisesRegex(sweep.CacheError, "require cache version 53"):
+        data = b"yuzucach" + struct.pack("<II", 51, 1) + environment(51, 8) + bytes(1056)
+        with self.assertRaisesRegex(sweep.CacheError, "require cache version 52"):
             list(sweep.parse_cache(data))
+
+    def test_v52_mesh_records_carry_the_mesh_context(self):
+        # This fork's v52 (ceaec0a519) saves task/mesh environments with the v53 tail.
+        data = b"yuzucach" + struct.pack("<II", 52, 1) + environment(52, 8) + bytes(1056)
+        records = list(sweep.parse_cache(data))
+        self.assertEqual([r["stage"] for r in records], ["mesh"])
+        self.assertEqual(records[0]["bytes"], environment(52, 8))
 
     def test_truncation_is_not_an_empty_success(self):
         data = pipeline_cache(47)
