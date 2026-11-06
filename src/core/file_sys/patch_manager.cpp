@@ -123,7 +123,7 @@ constexpr std::array BUILTIN_PATCHES{
     // Ocarina of Time's frame delta comes from the measured frame time, so it doesn't run in slow
     // motion below 60 fps: see nx2_oot_time.h.
     BuiltinPatch{
-        .name = "Real-time speed (built-in)",
+        .name = Service::Nx2OotTime::RealTimePatchName,
         .title_id = Service::Nx2OotTime::ProgramId,
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
@@ -140,7 +140,7 @@ constexpr std::array BUILTIN_PATCHES{
         .records = DYNAMIC_FPS_RECORDS,
         .state_offset = 0x4E9FE00,
         .state_size = 16,
-        .yields_to = "Real-time speed (built-in)",
+        .yields_to = Service::Nx2OotTime::RealTimePatchName,
     },
 };
 
@@ -500,7 +500,11 @@ std::vector<VirtualFile> PatchManager::CollectPatches(const std::vector<VirtualD
     return out;
 }
 
-std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::string& name) const {
+std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::string& name,
+                                       std::vector<std::string_view>* applied) const {
+    if (applied != nullptr) {
+        applied->clear();
+    }
     if (nso.size() < sizeof(Loader::NSOHeader)) {
         return nso;
     }
@@ -666,6 +670,9 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
     }
 
     std::memcpy(out.data(), &header, sizeof(header));
+    if (applied != nullptr) {
+        *applied = std::move(applied_builtins);
+    }
     return out;
 }
 

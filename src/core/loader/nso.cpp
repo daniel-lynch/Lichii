@@ -168,6 +168,9 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 
     // Apply patches if necessary
     const auto name = nso_file.GetName();
+    // Whether "Real-time speed (built-in)" was written into this module: not when it was disabled,
+    // rejected (build id, original bytes), pre-empted by a user mod, or when only Dark's applied.
+    bool oot_real_time_applied = false;
     if (pm && (pm->HasNSOPatch(nso_header.build_id, name) || Settings::values.dump_nso)) {
         std::span<u8> patchable_section(codeset.memory.data() + module_start, codeset.memory.size() - module_start);
         std::vector<u8> pi_header(sizeof(NSOHeader) + patchable_section.size());
@@ -175,7 +178,11 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         std::memcpy(pi_header.data() + sizeof(NSOHeader), patchable_section.data(),
                     patchable_section.size());
 
-        pi_header = pm->PatchNSO(pi_header, name);
+        std::vector<std::string_view> applied_builtins;
+        pi_header = pm->PatchNSO(pi_header, name, &applied_builtins);
+        oot_real_time_applied =
+            std::ranges::find(applied_builtins, Service::Nx2OotTime::RealTimePatchName) !=
+            applied_builtins.end();
 
         std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(), patchable_section.data());
     }
@@ -330,8 +337,9 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     }
     LOG_INFO(Loader, "Module {} loaded at {:#x} (size {:#x})", nso_file.GetName(), load_base, image_size);
     if (name == "main" && process.GetProgramId() == Service::Nx2OotTime::ProgramId) {
-        // Write the delta only into the built-in's own stub: the branch and both stub words, so
-        // a mod that reuses the hook with its own cave gets no host writes.
+        // Write the delta only into the built-in's own stub: only when PatchNSO applied the
+        // real-time patch (all of its records), and the branch and both stub words are still its
+        // own, so a user mod at the hook, or Dark's Dynamic FPS call there, gets no host writes.
         const auto word_at = [&](size_t offset) -> u32 {
             u32 word = 0;
             if (codeset.memory.size() >= module_start + offset + sizeof(word)) {
@@ -340,7 +348,8 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
             return word;
         };
         namespace OotTime = Service::Nx2OotTime;
-        const bool hooked = word_at(OotTime::HookOffset) == OotTime::HookInstruction &&
+        const bool hooked = oot_real_time_applied &&
+                            word_at(OotTime::HookOffset) == OotTime::HookInstruction &&
                             word_at(OotTime::LoadDeltaOffset) == OotTime::LoadDeltaInstruction &&
                             word_at(OotTime::ReturnOffset) == OotTime::ReturnInstruction;
         process.SetOotDeltaAddress(hooked ? load_base + module_start + OotTime::DeltaOffset : 0);
