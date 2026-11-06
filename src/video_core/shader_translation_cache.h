@@ -257,6 +257,7 @@ public:
     void LogStatistics(std::string_view when);
 
     // Statistics
+    std::atomic<u64> offline_entry_only_rejected{};
     std::atomic<u64> stage_hits{};
     std::atomic<u64> stage_misses{};
     std::atomic<u64> hit_ns{};
@@ -264,6 +265,7 @@ public:
 
 private:
     struct StoredVariant {
+        Digest entry_id{};
         Shader::Backend::Bindings binding_out{};
         Shader::Info info;
         u32 spirv_words{};
@@ -287,6 +289,7 @@ private:
     std::unordered_map<Digest, std::vector<std::shared_ptr<const Entry>>, DigestHash> entries;
     std::unordered_map<Digest, std::shared_ptr<const StoredVariant>, DigestHash> variants;
     std::unordered_set<Digest, DigestHash> dropped_entries;
+    std::unordered_set<Digest, DigestHash> entries_with_modules;
     std::filesystem::path filename;
     std::ofstream file;
     u64 loaded_entries{};

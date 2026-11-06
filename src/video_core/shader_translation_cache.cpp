@@ -991,6 +991,8 @@ void Store::Close() {
     variants.clear();
     recipes.clear();
     dropped_entries.clear();
+    entries_with_modules.clear();
+    offline_entry_only_rejected = 0;
     enabled = false;
 }
 
@@ -1080,7 +1082,7 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
         } else if (ok && type == RecordVariant) {
             Digest key{};
             auto stored = std::make_shared<StoredVariant>();
-            ok = reader.Get(key) && reader.Get(stored->binding_out) &&
+            ok = reader.Get(key) && reader.Get(stored->entry_id) && reader.Get(stored->binding_out) &&
                  ReadInfo(record, stored->info) && reader.Get(stored->spirv_words) &&
                  reader.GetBytes(stored->compressed_spirv);
             bool has_recipe{};
@@ -1093,6 +1095,8 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
             ok = ok && record.empty();
             if (ok) {
                 if (has_recipe && !variants.contains(key)) CountRecipe(stage, recipe);
+                if (stored->spirv_words && !stored->compressed_spirv.empty())
+                    entries_with_modules.insert(stored->entry_id);
                 variants.insert_or_assign(key, std::move(stored));
                 ++loaded_variants;
             }
@@ -1107,6 +1111,16 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
             break;
         }
         offset += 8 + length;
+    }
+    for (auto it = entries.begin(); it != entries.end();) {
+        std::erase_if(it->second, [&](const auto& entry) {
+            if (!entry->offline || entries_with_modules.contains(entry->id)) return false;
+            ++offline_entry_only_rejected;
+            --loaded_entries;
+            return true;
+        });
+        if (it->second.empty()) it = entries.erase(it);
+        else ++it;
     }
     if (!writable) return true;
     if (offset != size) {
@@ -1146,7 +1160,9 @@ std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::E
             return nullptr;
         }
         for (const auto& entry : it->second) {
-            if (!dropped_entries.contains(entry->id)) candidates.push_back(entry);
+            if (!dropped_entries.contains(entry->id) &&
+                (!entry->offline || entries_with_modules.contains(entry->id)))
+                candidates.push_back(entry);
         }
     }
     for (const auto& candidate : candidates) {
@@ -1167,7 +1183,7 @@ std::optional<Variant> Store::FindVariant(const Digest& variant_key) {
     {
         std::scoped_lock lock{mutex};
         const auto it = variants.find(variant_key);
-        if (it == variants.end()) {
+        if (it == variants.end() || dropped_entries.contains(it->second->entry_id)) {
             return std::nullopt;
         }
         stored = it->second;
@@ -1218,6 +1234,7 @@ void Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
         throw std::runtime_error("Translation cache: invalid recipe");
     }
     auto stored = std::make_shared<StoredVariant>();
+    stored->entry_id = entry.id;
     stored->binding_out = variant.binding_out;
     stored->info = variant.info;
     stored->spirv_words = static_cast<u32>(variant.spirv.size());
@@ -1228,6 +1245,7 @@ void Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
         Writer writer{record};
         writer.Put(RecordVariant);
         writer.Put(variant_key);
+        writer.Put(entry.id);
         writer.Put(stored->binding_out);
         WriteInfo(record, stored->info);
         writer.Put(stored->spirv_words);
@@ -1242,7 +1260,9 @@ void Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
     if (!enabled) {
         return;
     }
+    if (dropped_entries.contains(entry.id)) return;
     if (variants.try_emplace(variant_key, std::move(stored)).second) {
+        if (!variant.spirv.empty()) entries_with_modules.insert(entry.id);
         if (recipe) CountRecipe(entry.meta.stage, *recipe);
         Append(record);
     }
@@ -1280,6 +1300,8 @@ bool Store::ValidateOfflineEntry(const Entry& entry, const Shader::IR::Program& 
 }
 
 void Store::LogStatistics(std::string_view when) {
+    LOG_INFO(Render_Vulkan, "Translation cache ({}): offline entry-only records rejected={}",
+             when, offline_entry_only_rejected.load());
     const u64 hits = stage_hits.load();
     const u64 misses = stage_misses.load();
     if (hits + misses == 0) {
