@@ -1707,9 +1707,14 @@ bool Maxwell3D::FrontDmaReadQueued(VideoCommon::GpuSplit& split, FrontState& fs,
             return false;
         }
     }
-    if (const u64 async_position = split.HasAsyncWrite(*device, read_bytes);
-        async_position != 0 && (async_position > split.ConsumedNow() ||
-                                !Tegra::Nx2AsyncReportsSettled(*device, read_bytes))) {
+    // A report the front noted that the back hasn't run yet, or any report in the range whose
+    // host result hasn't landed. The settled counts are checked for every slot, not only those
+    // the front noted as async: the query cache counts the reports macros run on the back issue
+    // (the front never sees those), and fence releases whose callback waits for the fence (GPU
+    // accuracy High, or a delayed fence behaviour), which the front notes as known words only.
+    // Those are the reads #215's QueryDma::FlushPending waits for on the drained path.
+    if (split.HasAsyncWrite(*device, read_bytes) > split.ConsumedNow() ||
+        !Tegra::Nx2AsyncReportsSettled(*device, read_bytes)) {
         return false;
     }
     thread_local std::vector<u32> fast;
