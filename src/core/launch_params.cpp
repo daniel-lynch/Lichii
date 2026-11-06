@@ -57,6 +57,7 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
         {"shader-recipe-cache", required_argument, 0, 0x10b},
         {"shader-recipe-count", required_argument, 0, 0x10c},
         {"shader-recipe-limit", required_argument, 0, 0x10d},
+        {"shader-recipe-baseline", required_argument, 0, 0x10f},
         {"shader-report", required_argument, 0, 0x10e},
         {0, 0, 0, 0},
         // clang-format on
@@ -153,6 +154,14 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                 }
                 break;
             }
+            case 0x10f:
+                p.shader_recipe_baseline = optarg;
+                if (p.shader_recipe_baseline != "auto" && p.shader_recipe_baseline != "always" &&
+                    p.shader_recipe_baseline != "never") {
+                    LOG_ERROR(Frontend, "--shader-recipe-baseline must be auto, always or never");
+                    p.print_help = true;
+                }
+                break;
             case 0x10e:
                 p.shader_report = optarg;
                 break;
@@ -303,8 +312,9 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             "--shader-workers N    Archive workers, 1..64 (default: hardware threads / 2)\n"
             "--shader-recipe-cache FILE  Read exact-stage and class recipes from a gameplay translation cache\n"
             "--shader-recipe-limit N     Cap imported catalog entries (default 200000; 256 MiB import budget)\n"
+            "--shader-recipe-baseline auto|always|never  Baseline policy (default auto: omit with exact recipes)\n"
             "--shader-report FILE        Write per-run production statistics as JSON\n"
-            "--shader-recipe-count N     Emit up to N exact/class recipes per stage plus baseline (default 3)\n"
+            "--shader-recipe-count N     Emit up to N exact/class recipes per stage (default 2)\n"
             "--precompile-shaders  Build every cached pipeline of the game, save the pipeline"
             " caches and exit before the game runs\n",
             lp.argv0

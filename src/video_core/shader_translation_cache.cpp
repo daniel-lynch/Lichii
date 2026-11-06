@@ -943,8 +943,9 @@ u64 RecipeClass(Shader::Stage stage, const Shader::Info* info) {
     return key;
 }
 
-std::vector<SelectedRecipe> RecipeCatalog::SelectWithSources(const Digest& stage_key, Shader::Stage stage,
-                                                 const Shader::Info& info, u32 top_k) const {
+std::vector<SelectedRecipe> RecipeCatalog::SelectWithSources(
+    const Digest& stage_key, Shader::Stage stage, const Shader::Info& info, u32 top_k,
+    RecipeBaseline baseline) const {
     std::vector<SelectedRecipe> result;
     std::unordered_set<Digest, DigestHash> seen;
     auto add = [&](const EmissionRecipe& recipe, RecipeSource source) {
@@ -961,15 +962,18 @@ std::vector<SelectedRecipe> RecipeCatalog::SelectWithSources(const Digest& stage
     auto it = classes.find(RecipeClass(stage, &info));
     if (it == classes.end()) it = classes.find(RecipeClass(stage, nullptr));
     if (it != classes.end()) add_top(it->second, RecipeSource::Class);
-    // Keep the baseline coverage even when observed recipes fill the class budget.
-    add(DefaultEmissionRecipe(stage), RecipeSource::Baseline);
+    const auto exact_it = exact.find(stage_key);
+    const bool has_exact = exact_it != exact.end() && !exact_it->second.empty();
+    if (baseline == RecipeBaseline::Always || (baseline == RecipeBaseline::Auto && !has_exact))
+        add(DefaultEmissionRecipe(stage), RecipeSource::Baseline);
     return result;
 }
 
 std::vector<EmissionRecipe> RecipeCatalog::Select(const Digest& stage_key, Shader::Stage stage,
-                                                 const Shader::Info& info, u32 top_k) const {
+                                                 const Shader::Info& info, u32 top_k,
+                                                 RecipeBaseline baseline) const {
     std::vector<EmissionRecipe> result;
-    for (const auto& selected : SelectWithSources(stage_key, stage, info, top_k))
+    for (const auto& selected : SelectWithSources(stage_key, stage, info, top_k, baseline))
         result.push_back(selected.recipe);
     return result;
 }

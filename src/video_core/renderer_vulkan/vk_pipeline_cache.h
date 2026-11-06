@@ -126,7 +126,9 @@ struct ComputePipelineCacheEntry {
 class PipelineCache : public VideoCommon::ShaderCache {
 public:
     bool PrecompileArchiveShaders(const std::filesystem::path& input, u64 title_id, u32 workers,
-                                  const std::filesystem::path& recipes, u32 recipe_count, u32 recipe_limit, const std::filesystem::path& report);
+                                  const std::filesystem::path& recipes, u32 recipe_count,
+                                  u32 recipe_limit, const std::filesystem::path& report,
+                                  std::string_view baseline);
     explicit PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, const Device& device,
                            Scheduler& scheduler, DescriptorPool& descriptor_pool,
                            GuestDescriptorQueue& guest_descriptor_queue,

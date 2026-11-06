@@ -260,7 +260,8 @@ public:
                                    const DiskResourceLoadCallback& callback) {}
 
     virtual bool PrecompileArchiveShaders(const std::filesystem::path&, u64, u32,
-                                         const std::filesystem::path&, u32, u32, const std::filesystem::path&) { return false; }
+                                         const std::filesystem::path&, u32, u32,
+                                         const std::filesystem::path&, std::string_view) { return false; }
 
     virtual void InitializeChannel(Tegra::Control::ChannelState& channel) {}
 

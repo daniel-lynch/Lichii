@@ -44,7 +44,8 @@ struct LaunchParams {
     std::string shader_recipe_cache;
     std::string shader_report;
     u32 shader_workers = 0;
-    u32 shader_recipe_count = 3;
+    u32 shader_recipe_count = 2;
+    std::string shader_recipe_baseline = "auto";
     u32 shader_recipe_limit = 200000;
     // print
     bool print_version = false;

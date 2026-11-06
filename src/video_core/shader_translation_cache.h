@@ -247,6 +247,8 @@ struct EmissionRecipe {
 constexpr u32 DefaultRecipeLimit = 200000;
 constexpr u64 DefaultRecipeImportBytes = 256ULL * 1024 * 1024;
 
+constexpr u32 DefaultRecipeCount = 2;
+enum class RecipeBaseline { Auto, Always, Never };
 enum class RecipeSource { ExactStage, Class, Baseline };
 struct SelectedRecipe {
     EmissionRecipe recipe;
@@ -264,9 +266,12 @@ struct RecipeCatalog {
     std::unordered_map<Digest, std::vector<CountedRecipe>, DigestHash> exact;
     std::unordered_map<u64, std::vector<CountedRecipe>> classes;
     [[nodiscard]] std::vector<SelectedRecipe> SelectWithSources(
-        const Digest& stage_key, Shader::Stage stage, const Shader::Info& info, u32 top_k) const;
-    [[nodiscard]] std::vector<EmissionRecipe> Select(const Digest& stage_key, Shader::Stage stage,
-                                                    const Shader::Info& info, u32 top_k) const;
+        const Digest& stage_key, Shader::Stage stage, const Shader::Info& info, u32 top_k = DefaultRecipeCount,
+        RecipeBaseline baseline = RecipeBaseline::Auto) const;
+    [[nodiscard]] std::vector<EmissionRecipe> Select(
+        const Digest& stage_key, Shader::Stage stage, const Shader::Info& info,
+        u32 top_k = DefaultRecipeCount,
+        RecipeBaseline baseline = RecipeBaseline::Auto) const;
 };
 
 enum class OfflineOutcome { VariantHit, VariantMiss, MetaMismatch, FullHit };

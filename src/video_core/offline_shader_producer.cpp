@@ -166,7 +166,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
             const std::filesystem::path& recipe_cache, const Shader::Profile& profile,
             const Shader::HostTranslateInfo& host, const TranslationCache::Digest& config,
             TranslationCache::Store& store, u32 recipe_count, u32 recipe_limit,
-            const std::filesystem::path& report) {
+            const std::filesystem::path& report, TranslationCache::RecipeBaseline baseline) {
     namespace TC = TranslationCache;
     const auto begin = std::chrono::steady_clock::now();
     const auto index_size = std::filesystem::file_size(input);
@@ -232,7 +232,9 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                 TC::RecordingEnvironment resume(env, true);
                 auto entry = store.FindEntry(key, resume);
                 std::vector<TC::SelectedRecipe> selected;
-                if (entry) selected = recipes.SelectWithSources(recipe_key, row.stage, entry->meta.info, recipe_count);
+                if (entry)
+                    selected = recipes.SelectWithSources(recipe_key, row.stage, entry->meta.info,
+                                                         recipe_count, baseline);
                 size_t candidate{};
                 bool translated{};
                 while (!StopSignal()) {
@@ -266,8 +268,10 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                     if (!entry) {
                         entry = store.Insert(key, recording.TakeQueries(), TC::ProgramMeta::From(program), true);
                         if (!entry) throw std::runtime_error("cache_disabled");
-                        selected = recipes.SelectWithSources(recipe_key, row.stage, program.info, recipe_count);
+                        selected = recipes.SelectWithSources(recipe_key, row.stage, program.info,
+                                                             recipe_count, baseline);
                     }
+                    if (selected.empty()) break;
                     const auto selection = selected[candidate++];
                     auto recipe = selection.recipe;
                     recipe.runtime = TC::CanonicalRuntimeInfo(recipe.runtime, program.info, program.stage);
