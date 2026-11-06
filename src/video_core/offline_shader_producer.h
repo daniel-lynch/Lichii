@@ -48,15 +48,26 @@ private:
     Handler previous_term;
 };
 [[nodiscard]] int StopSignal();
+struct SourceSummary {
+    u64 modules{}, module_bytes{};
+};
 struct Summary {
     u64 seen{}, translated{}, resumed{}, modules{}, module_bytes{};
+    u64 entries{}, product_modules{};
     bool cancelled{};
+    std::array<SourceSummary, 3> sources{};
+    // Entire current product, including modules retained from previous runs.
+    std::map<u64, u64> multiplicity;
+    u64 import_entries{}, import_truncated_entries{}, import_skipped_records{},
+        import_bytes{}, import_invalid_recipes{};
     std::map<std::string, u64> skipped;
 };
+void WriteReport(const std::filesystem::path& path, const Summary& summary);
 [[nodiscard]] Input ParseInput(std::string_view json, const std::filesystem::path& directory);
 [[nodiscard]] Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                           const std::filesystem::path& recipe_cache,
                           const Shader::Profile& profile, const Shader::HostTranslateInfo& host,
                           const TranslationCache::Digest& config, TranslationCache::Store& store,
-                          u32 recipe_count = 3, u32 recipe_limit = TranslationCache::DefaultRecipeLimit);
+                          u32 recipe_count = 3, u32 recipe_limit = TranslationCache::DefaultRecipeLimit,
+                          const std::filesystem::path& report = {});
 } // namespace VideoCommon::OfflineShaders

@@ -943,26 +943,34 @@ u64 RecipeClass(Shader::Stage stage, const Shader::Info* info) {
     return key;
 }
 
+std::vector<SelectedRecipe> RecipeCatalog::SelectWithSources(const Digest& stage_key, Shader::Stage stage,
+                                                 const Shader::Info& info, u32 top_k) const {
+    std::vector<SelectedRecipe> result;
+    std::unordered_set<Digest, DigestHash> seen;
+    auto add = [&](const EmissionRecipe& recipe, RecipeSource source) {
+        const auto runtime = CanonicalRuntimeInfo(recipe.runtime, info, stage);
+        if (seen.insert(MakeVariantKey({}, DigestRuntimeInfo(runtime), recipe.bindings)).second)
+            result.push_back({recipe, source});
+    };
+    auto add_top = [&](const auto& list, RecipeSource source) {
+        for (size_t i = 0; i < std::min<size_t>(top_k, list.size()) && result.size() < top_k; ++i) {
+            add(list[i].recipe, source);
+        }
+    };
+    if (const auto it = exact.find(stage_key); it != exact.end()) add_top(it->second, RecipeSource::ExactStage);
+    auto it = classes.find(RecipeClass(stage, &info));
+    if (it == classes.end()) it = classes.find(RecipeClass(stage, nullptr));
+    if (it != classes.end()) add_top(it->second, RecipeSource::Class);
+    // Keep the baseline coverage even when observed recipes fill the class budget.
+    add(DefaultEmissionRecipe(stage), RecipeSource::Baseline);
+    return result;
+}
+
 std::vector<EmissionRecipe> RecipeCatalog::Select(const Digest& stage_key, Shader::Stage stage,
                                                  const Shader::Info& info, u32 top_k) const {
     std::vector<EmissionRecipe> result;
-    std::unordered_set<Digest, DigestHash> seen;
-    auto add = [&](const EmissionRecipe& recipe) {
-        const auto runtime = CanonicalRuntimeInfo(recipe.runtime, info, stage);
-        if (seen.insert(MakeVariantKey({}, DigestRuntimeInfo(runtime), recipe.bindings)).second)
-            result.push_back(recipe);
-    };
-    auto add_top = [&](const auto& list) {
-        for (size_t i = 0; i < std::min<size_t>(top_k, list.size()) && result.size() < top_k; ++i) {
-            add(list[i].recipe);
-        }
-    };
-    if (const auto it = exact.find(stage_key); it != exact.end()) add_top(it->second);
-    auto it = classes.find(RecipeClass(stage, &info));
-    if (it == classes.end()) it = classes.find(RecipeClass(stage, nullptr));
-    if (it != classes.end()) add_top(it->second);
-    // Keep the baseline coverage even when observed recipes fill the class budget.
-    add(DefaultEmissionRecipe(stage));
+    for (const auto& selected : SelectWithSources(stage_key, stage, info, top_k))
+        result.push_back(selected.recipe);
     return result;
 }
 
@@ -1510,6 +1518,22 @@ std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::E
 bool Store::HasStageKey(const Digest& stage_key) {
     std::scoped_lock lock{mutex};
     return entries.contains(stage_key);
+}
+
+std::map<u64, u64> Store::VariantMultiplicity() {
+    std::scoped_lock lock{mutex};
+    std::unordered_map<Digest, u64, DigestHash> counts;
+    for (const auto& [key, list] : entries)
+        for (const auto& entry : list)
+            if (!dropped_entries.contains(entry->id)) counts.try_emplace(entry->id, 0);
+    for (const auto& [key, variant] : variants) {
+        const auto it = counts.find(variant->entry_id);
+        if (it != counts.end() && variant->spirv_words &&
+            (variant->compressed_size || !variant->compressed_spirv.empty())) ++it->second;
+    }
+    std::map<u64, u64> result;
+    for (const auto& [id, count] : counts) ++result[count];
+    return result;
 }
 
 std::optional<Variant> Store::FindVariant(const Digest& variant_key) {

@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -246,6 +247,12 @@ struct EmissionRecipe {
 constexpr u32 DefaultRecipeLimit = 200000;
 constexpr u64 DefaultRecipeImportBytes = 256ULL * 1024 * 1024;
 
+enum class RecipeSource { ExactStage, Class, Baseline };
+struct SelectedRecipe {
+    EmissionRecipe recipe;
+    RecipeSource source;
+};
+
 struct RecipeCatalog {
     struct CountedRecipe {
         EmissionRecipe recipe;
@@ -256,6 +263,8 @@ struct RecipeCatalog {
     u64 entries{}, truncated_entries{}, skipped_records{}, imported_bytes{}, invalid_recipes{};
     std::unordered_map<Digest, std::vector<CountedRecipe>, DigestHash> exact;
     std::unordered_map<u64, std::vector<CountedRecipe>> classes;
+    [[nodiscard]] std::vector<SelectedRecipe> SelectWithSources(
+        const Digest& stage_key, Shader::Stage stage, const Shader::Info& info, u32 top_k) const;
     [[nodiscard]] std::vector<EmissionRecipe> Select(const Digest& stage_key, Shader::Stage stage,
                                                     const Shader::Info& info, u32 top_k) const;
 };
@@ -285,6 +294,8 @@ public:
                                                          LiveAnswers* live = nullptr);
     /// True when entries exist for the stage key (whether or not the environment matches them).
     [[nodiscard]] bool HasStageKey(const Digest& stage_key);
+    /// Current non-dropped entries grouped by their number of stored modules.
+    [[nodiscard]] std::map<u64, u64> VariantMultiplicity();
     /// The variant, decompressed.
     [[nodiscard]] std::optional<Variant> FindVariant(const Digest& variant_key);
 

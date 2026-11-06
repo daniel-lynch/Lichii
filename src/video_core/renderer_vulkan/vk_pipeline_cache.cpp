@@ -814,13 +814,13 @@ bool PreloadAllPipelines() {
 
 bool PipelineCache::PrecompileArchiveShaders(const std::filesystem::path& input, u64 title_id,
                                              u32 workers, const std::filesystem::path& recipes,
-                                             u32 recipe_count, u32 recipe_limit) {
+                                             u32 recipe_count, u32 recipe_limit, const std::filesystem::path& report) {
     try {
         if (pipeline_cache_filename.empty() || !translation_cache.Persistent()) {
             throw std::runtime_error("Disk shader cache must be enabled and initialized");
         }
         (void)VideoCommon::OfflineShaders::Run(input, title_id, workers, recipes, profile, host_info,
-                                               translation_config, translation_cache, recipe_count, recipe_limit);
+                                               translation_config, translation_cache, recipe_count, recipe_limit, report);
         if (!translation_cache.Persistent()) throw std::runtime_error("Translation cache write failed");
         return true;
     } catch (const std::exception& error) {

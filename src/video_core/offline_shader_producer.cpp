@@ -88,6 +88,33 @@ int StopSignal() {
     return stop_signal.load(std::memory_order_relaxed);
 }
 
+void WriteReport(const std::filesystem::path& path, const Summary& summary) {
+    Json sources = Json::object();
+    constexpr std::array names{"exact_stage", "class", "baseline"};
+    for (size_t i = 0; i < names.size(); ++i)
+        sources[names[i]] = {{"modules", summary.sources[i].modules},
+                            {"module_bytes", summary.sources[i].module_bytes}};
+    Json histogram = Json::object();
+    for (const auto& [modules, entries] : summary.multiplicity)
+        histogram[std::to_string(modules)] = entries;
+    const Json report{{"schema_version", 1}, {"seen", summary.seen},
+        {"entries", summary.entries}, {"translated", summary.translated},
+        {"resumed", summary.resumed}, {"modules", summary.modules},
+        {"module_bytes", summary.module_bytes}, {"module_bytes_encoding", "uncompressed_spirv"},
+        {"cancelled", summary.cancelled},
+        {"skips", summary.skipped}, {"sources", sources},
+        {"product_entry_multiplicity", histogram}, {"product_modules", summary.product_modules},
+        {"import", {{"entries", summary.import_entries},
+                    {"truncated_entries", summary.import_truncated_entries},
+                    {"skipped_records", summary.import_skipped_records},
+                    {"bytes", summary.import_bytes},
+                    {"invalid_recipes", summary.import_invalid_recipes}}}};
+    std::ofstream file(path, std::ios::trunc);
+    file << report.dump(2) << '\n';
+    file.close();
+    if (!file) throw std::runtime_error("Cannot write shader report");
+}
+
 Input ParseInput(std::string_view text, const std::filesystem::path& directory) {
     if (text.size() > MaxIndexBytes) throw std::runtime_error("index too large");
     const auto json = Json::parse(text);
@@ -138,7 +165,8 @@ Input ParseInput(std::string_view text, const std::filesystem::path& directory) 
 Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
             const std::filesystem::path& recipe_cache, const Shader::Profile& profile,
             const Shader::HostTranslateInfo& host, const TranslationCache::Digest& config,
-            TranslationCache::Store& store, u32 recipe_count, u32 recipe_limit) {
+            TranslationCache::Store& store, u32 recipe_count, u32 recipe_limit,
+            const std::filesystem::path& report) {
     namespace TC = TranslationCache;
     const auto begin = std::chrono::steady_clock::now();
     const auto index_size = std::filesystem::file_size(input);
@@ -164,6 +192,11 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
     workers = std::min({workers, 64U, std::max(1U, static_cast<u32>(parsed.programs.size()))});
     Summary summary;
     summary.seen = parsed.programs.size();
+    summary.import_entries = recipes.entries;
+    summary.import_truncated_entries = recipes.truncated_entries;
+    summary.import_skipped_records = recipes.skipped_records;
+    summary.import_bytes = recipes.imported_bytes;
+    summary.import_invalid_recipes = recipes.invalid_recipes;
     std::mutex results;
     // Serialize duplicate stage candidates through lookup and append, without serializing all work.
     std::array<std::mutex, 64> stage_locks;
@@ -198,18 +231,19 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                 if (StopSignal()) break;
                 TC::RecordingEnvironment resume(env, true);
                 auto entry = store.FindEntry(key, resume);
-                std::vector<TC::EmissionRecipe> selected;
-                if (entry) selected = recipes.Select(recipe_key, row.stage, entry->meta.info, recipe_count);
+                std::vector<TC::SelectedRecipe> selected;
+                if (entry) selected = recipes.SelectWithSources(recipe_key, row.stage, entry->meta.info, recipe_count);
                 size_t candidate{};
                 bool translated{};
                 while (!StopSignal()) {
                     if (entry) {
                         while (candidate < selected.size()) {
-                            const auto& recipe = selected[candidate];
+                            const auto& recipe = selected[candidate].recipe;
                             const auto runtime = TC::CanonicalRuntimeInfo(recipe.runtime,
                                 entry->meta.info, entry->meta.stage);
-                            if (!store.FindVariant(TC::MakeVariantKey(entry->id,
-                                    TC::DigestRuntimeInfo(runtime), recipe.bindings))) break;
+                            const auto variant_key = TC::MakeVariantKey(entry->id,
+                                TC::DigestRuntimeInfo(runtime), recipe.bindings);
+                            if (!store.FindVariant(variant_key)) break;
                             ++candidate;
                         }
                         if (candidate == selected.size()) break;
@@ -232,9 +266,10 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                     if (!entry) {
                         entry = store.Insert(key, recording.TakeQueries(), TC::ProgramMeta::From(program), true);
                         if (!entry) throw std::runtime_error("cache_disabled");
-                        selected = recipes.Select(recipe_key, row.stage, program.info, recipe_count);
+                        selected = recipes.SelectWithSources(recipe_key, row.stage, program.info, recipe_count);
                     }
-                    auto recipe = selected[candidate++];
+                    const auto selection = selected[candidate++];
+                    auto recipe = selection.recipe;
                     recipe.runtime = TC::CanonicalRuntimeInfo(recipe.runtime, program.info, program.stage);
                     const auto variant_key = TC::MakeVariantKey(entry->id,
                         TC::DigestRuntimeInfo(recipe.runtime), recipe.bindings);
@@ -248,6 +283,9 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                                              {bindings, program.info, code, true}, &recipe))
                         throw std::runtime_error("cache_disabled");
                     std::scoped_lock lock(results);
+                    auto& source = summary.sources[static_cast<size_t>(selection.source)];
+                    ++source.modules;
+                    source.module_bytes += code.size() * sizeof(u32);
                     ++summary.modules;
                     summary.module_bytes += code.size() * sizeof(u32);
                 }
@@ -266,7 +304,20 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
         std::vector<std::jthread> threads;
         for (u32 i = 0; i < workers; ++i) threads.emplace_back(work);
     }
+    summary.multiplicity = store.VariantMultiplicity();
+    for (const auto& [modules, entries] : summary.multiplicity) {
+        summary.entries += entries;
+        summary.product_modules += modules * entries;
+    }
     summary.cancelled = StopSignal() != 0;
+    constexpr std::array names{"exact_stage", "class", "baseline"};
+    for (size_t i = 0; i < names.size(); ++i)
+        LOG_INFO(Render_Vulkan, "Offline translation: source={} modules={} module_bytes={}",
+                 names[i], summary.sources[i].modules, summary.sources[i].module_bytes);
+    for (const auto& [modules, entries] : summary.multiplicity)
+        LOG_INFO(Render_Vulkan, "Offline translation: multiplicity={} entries={}", modules, entries);
+    LOG_INFO(Render_Vulkan, "Offline translation: product_entries={} product_modules={}",
+             summary.entries, summary.product_modules);
     if (summary.cancelled) {
         LOG_INFO(Render_Vulkan, "Offline translation: stopped at record boundary signal={}", StopSignal());
     }
@@ -275,9 +326,10 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
         skipped += count;
         LOG_INFO(Render_Vulkan, "Offline translation: skipped reason={} count={}", reason, count);
     }
-    LOG_INFO(Render_Vulkan, "Offline translation: seen={} translated={} resumed={} skipped={} modules={} module_bytes={} elapsed_ms={}",
-             summary.seen, summary.translated, summary.resumed, skipped, summary.modules, summary.module_bytes,
+    LOG_INFO(Render_Vulkan, "Offline translation: seen={} entries={} translated={} resumed={} skipped={} modules={} module_bytes={} elapsed_ms={}",
+             summary.seen, summary.entries, summary.translated, summary.resumed, skipped, summary.modules, summary.module_bytes,
              std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count());
+    if (!report.empty()) WriteReport(report, summary);
     return summary;
 }
 } // namespace VideoCommon::OfflineShaders

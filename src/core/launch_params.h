@@ -42,6 +42,7 @@ struct LaunchParams {
     bool precompile_shaders = false;
     std::string shader_archive_index;
     std::string shader_recipe_cache;
+    std::string shader_report;
     u32 shader_workers = 0;
     u32 shader_recipe_count = 3;
     u32 shader_recipe_limit = 200000;

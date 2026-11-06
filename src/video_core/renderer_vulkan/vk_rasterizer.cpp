@@ -2831,8 +2831,8 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
 }
 
 bool RasterizerVulkan::PrecompileArchiveShaders(const std::filesystem::path& input, u64 title_id,
-                                               u32 workers, const std::filesystem::path& recipes, u32 recipe_count, u32 recipe_limit) {
-    return pipeline_cache.PrecompileArchiveShaders(input, title_id, workers, recipes, recipe_count, recipe_limit);
+                                               u32 workers, const std::filesystem::path& recipes, u32 recipe_count, u32 recipe_limit, const std::filesystem::path& report) {
+    return pipeline_cache.PrecompileArchiveShaders(input, title_id, workers, recipes, recipe_count, recipe_limit, report);
 }
 
 void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
