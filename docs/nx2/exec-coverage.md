@@ -118,3 +118,18 @@ Limits:
   event runs it, so it cannot answer "what ran just now".
 - **Host sampling (`EDEN_NX2_SAMPLE_PROFILE`).** It sees JIT code only as `[jit]`, without guest
   PCs, and is statistical like the gdb sampler.
+
+## Measured (OoT, 2026-11-05)
+
+Harness run 20261105-182752 (`EDEN_NX2_COVERAGE=1`, debug server on, the two #150 switches off):
+
+- `main` at 0x804f8000, size 0x4ea0000: a 2516 KiB bitmap.
+- Title: 289,268 blocks hit, 51,033 ranges, 6.96 MB of code. In game: 588,256 blocks, 93,010
+  ranges, 13.5 MB. Title -> in-game: 49,379 newly hit ranges, 6.55 MB. A snapshot takes 0.1 s
+  and is 0.7-1.3 MB of JSON.
+- In both snapshots hit blocks equal compiled blocks: dynarmic compiles a block on its first
+  entry, so before any reset the map equals the compiled set; the reset is what makes "what ran
+  just now" answerable.
+- fps median 30.8 over the 300 s window against 38.1 for run 20261105-162259 (another binary,
+  coverage off). That run started while the host was busy with builds (load 18.6), so the drop is
+  not yet attributed: a same-binary A/B (`EDEN_NX2_COVERAGE=0` vs `1`) is still to be run.
