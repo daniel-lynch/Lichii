@@ -486,12 +486,15 @@ class Run:
             a.gdb_port = int(m.group(1))
         self.say(f"gdb stub listening on 0.0.0.0:{a.gdb_port} (all interfaces) for this run")
         # A `c` sent before the process is suspended is lost and the guest never starts (run
-        # 20261106-065922: peer accepted at 1.52 s, suspended at 1.54 s, title never shown). The
-        # suspension follows the server by ~0.1 s, but the log is flushed late: wait for the line
-        # or 10 s.
+        # 20261106-065922: peer accepted at 1.52 s, suspended at 1.54 s, title never shown).
+        # The suspension follows the server line by 0.10 s in every run so far (065922, 072438,
+        # 072835, 083109), but the profile's live log (self.emu_log) is flushed only per block
+        # (Info lines are not flushed unless log_flush_line is set), so the line is usually not
+        # visible yet: wait for it, at most 3 s, then continue.
         if not gdbkit.wait_log(self.emu_log, re.compile(r"suspending guest process until a debugger"),
-                               10, alive):
-            self.say("gdb stub: no 'suspending guest process' line in the log after 10 s; continuing")
+                               3, alive):
+            self.say("gdb stub: 'suspending guest process' not in the log yet (it is flushed per "
+                     "block); continuing after 3 s")
         if self.kit["rsp_probe"]:
             rc, secs = gdbkit.probe(a.kit, a.gdb_port, None, ["resume"], self.dir / "gdb-boot.txt", 90)
             err = None if rc == 0 else f"rsp_probe resume exit {rc} (gdb-boot.txt)"
