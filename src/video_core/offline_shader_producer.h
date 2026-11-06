@@ -58,5 +58,5 @@ struct Summary {
                           const std::filesystem::path& recipe_cache,
                           const Shader::Profile& profile, const Shader::HostTranslateInfo& host,
                           const TranslationCache::Digest& config, TranslationCache::Store& store,
-                          u32 recipe_count = 3);
+                          u32 recipe_count = 3, u32 recipe_limit = TranslationCache::DefaultRecipeLimit);
 } // namespace VideoCommon::OfflineShaders

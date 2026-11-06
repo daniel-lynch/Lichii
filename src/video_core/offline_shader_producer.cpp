@@ -138,7 +138,7 @@ Input ParseInput(std::string_view text, const std::filesystem::path& directory) 
 Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
             const std::filesystem::path& recipe_cache, const Shader::Profile& profile,
             const Shader::HostTranslateInfo& host, const TranslationCache::Digest& config,
-            TranslationCache::Store& store, u32 recipe_count) {
+            TranslationCache::Store& store, u32 recipe_count, u32 recipe_limit) {
     namespace TC = TranslationCache;
     const auto begin = std::chrono::steady_clock::now();
     const auto index_size = std::filesystem::file_size(input);
@@ -159,7 +159,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
     if (recipe_count == 0 || recipe_count > 64)
         throw std::runtime_error("Recipe count must be between 1 and 64");
     TC::RecipeCatalog recipes;
-    if (!recipe_cache.empty()) recipes = TC::Store::ReadRecipeCatalog(recipe_cache, config);
+    if (!recipe_cache.empty()) recipes = TC::Store::ReadRecipeCatalog(recipe_cache, config, recipe_limit);
     if (workers == 0) workers = std::max(1U, std::thread::hardware_concurrency() / 2);
     workers = std::min({workers, 64U, std::max(1U, static_cast<u32>(parsed.programs.size()))});
     Summary summary;

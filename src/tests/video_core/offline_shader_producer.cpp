@@ -217,10 +217,9 @@ TEST_CASE("Recipe catalogs retain exact variants and rank runtime recipes by cla
     REQUIRE(catalog.source_config == source_config);
     REQUIRE(std::filesystem::file_size(path) == size + 7);
     const auto exact = catalog.Select({3, 1}, meta.stage, meta.info, 1);
-    REQUIRE(exact.size() == 3);
+    REQUIRE(exact.size() == 2);
     REQUIRE(exact[0].bindings.texture == 3);
-    REQUIRE(exact[1].bindings.texture == 2);
-    REQUIRE(exact[2].bindings.texture == 0);
+    REQUIRE(exact[1].bindings.texture == 0);
     const auto ranked = catalog.Select({99, 1}, meta.stage, meta.info, 3);
     REQUIRE(ranked.size() == 3);
     REQUIRE(ranked[0].bindings.texture == 2);

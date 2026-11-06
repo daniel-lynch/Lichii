@@ -261,8 +261,8 @@ TEST_CASE("Offline producer resumes complete modules and repairs interrupted app
         store.Open(directory / "multi.bin", config);
         const auto first = Offline::Run(input, 0x0400000000000000ULL, 2, recipes_path,
                                         profile, {}, config, store, 1);
-        REQUIRE(first.modules == 4);
-        REQUIRE(first.translated == 4);
+        REQUIRE(first.modules == 2);
+        REQUIRE(first.translated == 2);
         REQUIRE(first.module_bytes >= first.modules * 20);
         REQUIRE(first.skipped.empty());
         const auto size = std::filesystem::file_size(directory / "multi.bin");

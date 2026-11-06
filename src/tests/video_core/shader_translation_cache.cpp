@@ -1037,3 +1037,56 @@ TEST_CASE("Read-only translation caches retain usable records without throwing",
                line.text.find(std::make_error_code(std::errc::permission_denied).message()) != std::string::npos;
     }) == 1);
 }
+
+TEST_CASE("Recipe catalogs cap exact selection and total import size",
+          "[video_core][translation_cache]") {
+    const auto path = TempPath("lichii_recipe_limits.bin");
+    std::filesystem::remove(path);
+    const Digest config{71, 72}, key{73, 74};
+    const auto stage = Shader::Stage::Fragment;
+    {
+        Store source;
+        source.Open(path, config);
+        for (u32 id = 0; id < 3; ++id) {
+            const auto entry = source.Insert(key, {{QueryKind::CbufValue, 0, id, id}}, {.stage = stage});
+            for (u32 texture = 1; texture <= (id == 0 ? 6 : 1); ++texture) {
+                auto recipe = DefaultEmissionRecipe(stage);
+                recipe.bindings.texture = texture;
+                REQUIRE(source.InsertVariant(*entry,
+                    MakeVariantKey(entry->id, DigestRuntimeInfo(recipe.runtime), recipe.bindings),
+                    {.spirv = {0x07230203, 1, 2}}, &recipe));
+            }
+        }
+    }
+    const auto catalog = Store::ReadRecipeCatalog(path, config);
+    REQUIRE(catalog.exact.at(key).size() == 6);
+    REQUIRE(catalog.exact.at(key).front().recipe.bindings.texture == 1);
+    REQUIRE(catalog.exact.at(key).front().count == 3);
+    REQUIRE(catalog.entries == 18);
+    REQUIRE(catalog.truncated_entries == 0);
+    const auto selected = catalog.Select(key, stage, {}, 2);
+    REQUIRE(selected.size() == 3);
+    REQUIRE(selected.front().bindings.texture == 1);
+    REQUIRE(selected.back().bindings.texture == 0);
+    Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, path.parent_path());
+    Common::Log::Initialize();
+    Common::Log::SetGlobalFilter(Common::Log::Filter{Common::Log::Level::Info});
+    Common::Log::SetRingCapacity(64);
+    const auto capped = Store::ReadRecipeCatalog(path, config, 3);
+    REQUIRE(capped.entries == 3);
+    REQUIRE(capped.truncated_entries == 15);
+    REQUIRE(capped.exact.at(key).size() == 1);
+    const auto budgeted = Store::ReadRecipeCatalog(path, config, 200000, 1);
+    REQUIRE(budgeted.entries == 0);
+    REQUIRE(budgeted.imported_bytes == 0);
+    REQUIRE(budgeted.skipped_records == 11);
+    const auto lines = Common::Log::ReadRing(0);
+    REQUIRE(std::ranges::any_of(lines, [](const auto& line) {
+        return line.text.find("3 catalog entries; 15 recipe references truncated by entry limit 3") != std::string::npos;
+    }));
+    REQUIRE(std::ranges::any_of(lines, [](const auto& line) {
+        return line.text.find("11 records skipped by byte budget 1; 0 bytes imported") != std::string::npos;
+    }));
+    Common::Log::SetRingCapacity(0);
+    std::filesystem::remove(path);
+}

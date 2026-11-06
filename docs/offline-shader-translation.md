@@ -47,10 +47,15 @@ source metadata and SPIR-V are never reused. It can be the destination cache.
 Format-9 and earlier inputs are rejected. Use the round-4 product-run cache to capture
 runtime variants; untouched offline fallback modules do not count as observed recipes.
 
-`--shader-recipe-count N` selects the most frequent N recipes for each stage's input
-class (stage kind if that class has no observations); default 3, allowed range 1–64.
-All exact-stage recipes and the baseline default are included in addition to this
-limit, preserving default coverage when observed recipes fill the class budget. Canonical duplicate
+`--shader-recipe-count N` selects at most N observed recipes per stage (default 3, allowed range 1–64),
+with most-frequent exact-stage recipes first, then class recipes filling remaining slots.
+The baseline default is included in addition to this limit. `--shader-recipe-limit N`
+caps the total catalog entries across exact and class groups (default 200000).
+Import reads at most 256 MiB of record payloads and framing; records beyond that budget
+are skipped without allocating their payload. Logs report admitted catalog entries,
+recipe references omitted by the entry cap, records skipped by the byte budget, and
+imported bytes. The temporary source store is released before emission starts.
+Canonical duplicate
 variants are emitted only once, and every emission uses fresh IR. Class frequencies
 count distinct recorded runtime variants, not repeated gameplay draw invocations.
 The producer reports uncompressed emitted SPIR-V bytes as `module_bytes`; `translated`

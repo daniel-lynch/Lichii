@@ -243,6 +243,9 @@ struct EmissionRecipe {
 
 [[nodiscard]] u64 RecipeClass(Shader::Stage stage, const Shader::Info* info);
 
+constexpr u32 DefaultRecipeLimit = 200000;
+constexpr u64 DefaultRecipeImportBytes = 256ULL * 1024 * 1024;
+
 struct RecipeCatalog {
     struct CountedRecipe {
         EmissionRecipe recipe;
@@ -250,7 +253,8 @@ struct RecipeCatalog {
         u64 count{};
     };
     Digest source_config{};
-    std::unordered_map<Digest, std::vector<EmissionRecipe>, DigestHash> exact;
+    u64 entries{}, truncated_entries{}, skipped_records{}, imported_bytes{};
+    std::unordered_map<Digest, std::vector<CountedRecipe>, DigestHash> exact;
     std::unordered_map<u64, std::vector<CountedRecipe>> classes;
     [[nodiscard]] std::vector<EmissionRecipe> Select(const Digest& stage_key, Shader::Stage stage,
                                                     const Shader::Info& info, u32 top_k) const;
@@ -307,7 +311,9 @@ public:
 
     /// Read only recipes from any compatible format-10 configuration; never reuse its modules.
     [[nodiscard]] static RecipeCatalog ReadRecipeCatalog(const std::filesystem::path& path,
-                                                        const Digest& config);
+                                                        const Digest& config,
+                                                        u32 entry_limit = DefaultRecipeLimit,
+                                                        u64 byte_budget = DefaultRecipeImportBytes);
 
     /// Reject speculative metadata before any pipeline state is derived from it.
     [[nodiscard]] bool ValidateOfflineEntry(const Entry& entry, const Shader::IR::Program& live);
@@ -347,7 +353,8 @@ private:
     std::shared_ptr<const Entry> InsertLocked(Entry entry);
     void Append(const std::vector<u8>& record);
     void DisablePersistence(const std::error_code& error);
-    bool LoadFile(const std::filesystem::path& path, const Digest& config, bool writable = true);
+    bool LoadFile(const std::filesystem::path& path, const Digest& config, bool writable = true,
+                  u64 byte_budget = UINT64_MAX);
 
     struct RecipeCount {
         EmissionRecipe recipe;
@@ -358,6 +365,7 @@ private:
     std::unordered_map<Digest, RecipeCount, DigestHash> recipes;
 
     bool collect_recipe_entries{};
+    u64 skipped_import_records{}, imported_bytes{};
     std::unordered_map<Digest, std::vector<EmissionRecipe>, DigestHash> entry_recipes;
 
     // Writers serialize publication and append; readers never wait for file I/O.

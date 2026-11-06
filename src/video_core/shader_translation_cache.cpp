@@ -890,19 +890,22 @@ std::vector<EmissionRecipe> RecipeCatalog::Select(const Digest& stage_key, Shade
         if (seen.insert(MakeVariantKey({}, DigestRuntimeInfo(runtime), recipe.bindings)).second)
             result.push_back(recipe);
     };
-    if (const auto it = exact.find(stage_key); it != exact.end())
-        for (const auto& recipe : it->second) add(recipe);
+    auto add_top = [&](const auto& list) {
+        for (size_t i = 0; i < std::min<size_t>(top_k, list.size()) && result.size() < top_k; ++i) {
+            add(list[i].recipe);
+        }
+    };
+    if (const auto it = exact.find(stage_key); it != exact.end()) add_top(it->second);
     auto it = classes.find(RecipeClass(stage, &info));
     if (it == classes.end()) it = classes.find(RecipeClass(stage, nullptr));
-    if (it != classes.end())
-        for (size_t i = 0; i < std::min<size_t>(top_k, it->second.size()); ++i)
-            add(it->second[i].recipe);
+    if (it != classes.end()) add_top(it->second);
     // Keep the baseline coverage even when observed recipes fill the class budget.
     add(DefaultEmissionRecipe(stage));
     return result;
 }
 
-RecipeCatalog Store::ReadRecipeCatalog(const std::filesystem::path& path, const Digest& config) {
+RecipeCatalog Store::ReadRecipeCatalog(const std::filesystem::path& path, const Digest& config,
+                                      u32 entry_limit, u64 byte_budget) {
     RecipeCatalog result;
     // The source config is used only to recover exact-stage keys from the current archive.
     // All emitted programs, metadata, and variant keys use the destination configuration.
@@ -913,35 +916,67 @@ RecipeCatalog Store::ReadRecipeCatalog(const std::filesystem::path& path, const 
     header.close();
     Store source;
     source.collect_recipe_entries = true;
-    if (!source.LoadFile(path, result.source_config, false))
+    if (!source.LoadFile(path, result.source_config, false, byte_budget))
         throw std::runtime_error("Recipe cache is missing or has an incompatible format");
     if (result.source_config != config)
         LOG_INFO(Render_Vulkan, "Offline recipes: importing recipes from another configuration; modules are not reused");
-    auto add = [&](u64 class_key, const EmissionRecipe& recipe) {
-        auto& list = result.classes[class_key];
+    using Positions = std::unordered_map<Digest, size_t, DigestHash>;
+    std::unordered_map<Digest, Positions, DigestHash> exact_positions;
+    std::unordered_map<u64, Positions> class_positions;
+    auto add = [&](auto& lists, auto& positions, const auto& group,
+                   const EmissionRecipe& recipe) {
         const auto key = MakeVariantKey({}, DigestRuntimeInfo(recipe.runtime), recipe.bindings);
-        const auto it = std::ranges::find(list, key, &RecipeCatalog::CountedRecipe::key);
-        if (it == list.end()) list.push_back({recipe, key, 1});
-        else ++it->count;
-    };
-    for (const auto& [stage_key, entries] : source.entries) {
-        for (const auto& entry : entries) {
-            if (source.dropped_entries.contains(entry->id)) continue;
-            const auto it = source.entry_recipes.find(entry->id);
-            if (it == source.entry_recipes.end()) continue;
-            auto& exact = result.exact[stage_key];
-            for (const auto& recipe : it->second) {
-                exact.push_back(recipe);
-                add(RecipeClass(entry->meta.stage, &entry->meta.info), recipe);
-                add(RecipeClass(entry->meta.stage, nullptr), recipe);
+        if (const auto pos = positions.find(group); pos != positions.end()) {
+            if (const auto it = pos->second.find(key); it != pos->second.end()) {
+                ++lists.at(group)[it->second].count;
+                return;
             }
         }
+        if (result.entries >= entry_limit) {
+            ++result.truncated_entries;
+            return;
+        }
+        auto& list = lists[group];
+        positions[group].emplace(key, list.size());
+        list.push_back({recipe, key, 1});
+        ++result.entries;
+    };
+    // Sort the source keys so a capped import is reproducible across hash-map implementations.
+    std::vector<Digest> keys;
+    keys.reserve(source.entries.size());
+    for (const auto& [key, entries] : source.entries) keys.push_back(key);
+    std::ranges::sort(keys, [](const auto& a, const auto& b) {
+        return std::tie(a.lo, a.hi) < std::tie(b.lo, b.hi);
+    });
+    for (const auto& stage_key : keys) {
+        for (const auto& entry : source.entries.at(stage_key)) {
+            const auto it = source.entry_recipes.find(entry->id);
+            if (it == source.entry_recipes.end()) continue;
+            if (!source.dropped_entries.contains(entry->id)) {
+                for (const auto& recipe : it->second) {
+                    add(result.exact, exact_positions, stage_key, recipe);
+                    add(result.classes, class_positions, RecipeClass(entry->meta.stage, &entry->meta.info), recipe);
+                    add(result.classes, class_positions, RecipeClass(entry->meta.stage, nullptr), recipe);
+                }
+            }
+            source.entry_recipes.erase(it);
+        }
     }
-    for (auto& [key, recipes] : result.classes)
-        std::ranges::sort(recipes, [](const auto& a, const auto& b) {
-            if (a.count != b.count) return a.count > b.count;
-            return std::tie(a.key.lo, a.key.hi) < std::tie(b.key.lo, b.key.hi);
-        });
+    result.skipped_records = source.skipped_import_records;
+    result.imported_bytes = source.imported_bytes;
+    source.Close();
+    const auto sort = [](auto& groups) {
+        for (auto& [key, recipes] : groups)
+            std::ranges::sort(recipes, [](const auto& a, const auto& b) {
+                if (a.count != b.count) return a.count > b.count;
+                return std::tie(a.key.lo, a.key.hi) < std::tie(b.key.lo, b.key.hi);
+            });
+    };
+    sort(result.exact);
+    sort(result.classes);
+    LOG_INFO(Render_Vulkan, "Offline recipes: {} catalog entries; {} recipe references truncated by entry limit {}; {} records skipped by byte budget {}; {} bytes imported",
+             result.entries, result.truncated_entries, entry_limit, result.skipped_records,
+             byte_budget, result.imported_bytes);
     return result;
 }
 
@@ -1167,6 +1202,7 @@ void Store::Close() {
     entries.clear();
     variants.clear();
     recipes.clear();
+    entry_recipes.clear();
     dropped_entries.clear();
     entries_with_modules.clear();
     offline_entry_only_rejected = 0;
@@ -1216,7 +1252,8 @@ void Store::Open(const std::filesystem::path& path, const Digest& config) {
                  .count());
 }
 
-bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bool writable) {
+bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bool writable,
+                     u64 byte_budget) {
     loaded_entries = 0;
     loaded_variants = 0;
     std::ifstream in{path, std::ios::binary | std::ios::ate};
@@ -1240,12 +1277,23 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
                  "Translation cache: written by another build or configuration, starting over");
         return false;
     }
+    skipped_import_records = 0;
+    imported_bytes = 0;
+    std::unordered_set<Digest, DigestHash> imported_entries;
+    std::unordered_set<Digest, DigestHash> imported_variants;
     size_t offset = HeaderSize;
     while (offset + 8 <= size) {
         u32 magic{}, length{};
         if (!in.read(reinterpret_cast<char*>(&magic), sizeof(magic)) ||
             !in.read(reinterpret_cast<char*>(&length), sizeof(length)) ||
             magic != RecordMagic || length > size - offset - 8) break;
+        if (collect_recipe_entries && length + u64{8} > byte_budget - imported_bytes) {
+            ++skipped_import_records;
+            in.seekg(length, std::ios::cur);
+            offset += 8 + length;
+            continue;
+        }
+        imported_bytes += u64{8} + length;
         std::vector<u8> data(length);
         if (!in.read(reinterpret_cast<char*>(data.data()), length)) break;
         std::span<const u8> record{data};
@@ -1257,7 +1305,13 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
             ok = reader.Get(entry.stage_key) && ReadQueries(reader, entry.queries) &&
                  ReadMeta(record, entry.meta) && reader.Get(entry.offline) && record.empty();
             if (ok) {
-                InsertLocked(std::move(entry));
+                if (collect_recipe_entries) {
+                    entry.id = EntryId(entry.stage_key, entry.queries, entry.offline);
+                    if (imported_entries.insert(entry.id).second)
+                        entries[entry.stage_key].push_back(std::make_shared<const Entry>(std::move(entry)));
+                } else {
+                    InsertLocked(std::move(entry));
+                }
                 ++loaded_entries;
             }
         } else if (ok && type == RecordVariant) {
@@ -1281,11 +1335,13 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
                 ok = reader.Get(stage) && ReadRecipe(reader, recipe);
             }
             ok = ok && record.empty();
-            if (ok) {
+            if (ok && collect_recipe_entries) {
+                if (imported_variants.insert(key).second && has_recipe && !stored->fallback_recipe)
+                    entry_recipes[stored->entry_id].push_back(std::move(recipe));
+                ++loaded_variants;
+            } else if (ok) {
                 if (has_recipe && !variants.contains(key)) {
                     CountRecipe(stage, recipe);
-                    if (collect_recipe_entries && !stored->fallback_recipe)
-                        entry_recipes[stored->entry_id].push_back(recipe);
                 }
                 if (stored->spirv_words && (stored->compressed_size || !stored->compressed_spirv.empty()))
                     entries_with_modules.insert(stored->entry_id);
