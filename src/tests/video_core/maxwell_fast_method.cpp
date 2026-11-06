@@ -26,6 +26,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/renderer_null/null_rasterizer.h"
 
 namespace VideoCommon {
@@ -777,4 +778,79 @@ TEST_CASE("Split restart resets writer positions without replaying old releases"
         REQUIRE_FALSE(split.BackRunning());
         REQUIRE(Access::End(split) == 0);
     }
+}
+
+// #243: what the split's front remembers of the guest memory writes it queued, for its early
+// macro DMA reads. The back thread doesn't run: everything sent stays queued.
+TEST_CASE("Split front overlays queued known writes and declines unknown ones",
+          "[video_core][gpu_split_dma_read]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    const u64 since = split.ConsumedNow();
+    const auto send = [&split] { split.Defer([] {}); };
+    constexpr u64 base = 0x10000;
+
+    send();
+    const std::array<u32, 2> fence{0x11, 0x22};
+    split.NoteMemoryWriteData(base + 4, fence.data(), 2);
+    send();
+    const u32 newer = 0x33;
+    split.NoteMemoryWriteData(base + 8, &newer, 1);
+    std::array<u32, 4> words{1, 2, 3, 4};
+    REQUIRE(split.OverlayQueuedWrites(since, base, words.data(), 4));
+    REQUIRE(words == std::array<u32, 4>{1, 0x11, 0x33, 4});
+
+    // Writes the back already ran (at or before `since`) are in memory: not overlaid.
+    std::array<u32, 4> later{1, 2, 3, 4};
+    REQUIRE(split.OverlayQueuedWrites(Access::End(split), base, later.data(), 4));
+    REQUIRE(later == std::array<u32, 4>{1, 2, 3, 4});
+
+    // A queued write whose words are unknown declines the overlay where it overlaps.
+    send();
+    split.NoteMemoryWrite(base + 0x20, 16, "test");
+    std::array<u32, 4> unknown{};
+    REQUIRE_FALSE(split.OverlayQueuedWrites(since, base + 0x1c, unknown.data(), 4));
+    REQUIRE(split.OverlayQueuedWrites(since, base + 0x40, unknown.data(), 4));
+    REQUIRE(split.HasQueuedWritesTo(base + 0x24, 4));
+    REQUIRE_FALSE(split.HasQueuedWritesTo(base + 0x40, 4));
+
+    // A write to everything (2D, I2M) overlaps every read.
+    send();
+    split.NoteMemoryWrite(0, ~u64{0}, "test everything");
+    REQUIRE_FALSE(split.OverlayQueuedWrites(since, base + 0x40, unknown.data(), 4));
+}
+
+TEST_CASE("Split front tracks report pages and async report slots",
+          "[video_core][gpu_split_dma_read]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    constexpr u64 pool = 0x7654000;
+    REQUIRE_FALSE(split.IsReportMemory(pool, 16));
+    REQUIRE(split.HasAsyncWrite(pool, 16) == 0);
+    split.Defer([] {});
+    split.NoteAsyncWrite(pool + 0x20, 16);
+    const u64 position = Access::End(split);
+    REQUIRE(split.IsReportMemory(pool, 0x1000));
+    REQUIRE_FALSE(split.IsReportMemory(pool + 0xff0, 0x20)); // runs onto the next page
+    REQUIRE(split.HasAsyncWrite(pool + 0x20, 4) == position);
+    REQUIRE(split.HasAsyncWrite(pool + 0x10, 0x20) == position);
+    REQUIRE(split.HasAsyncWrite(pool + 0x30, 16) == 0);
+    REQUIRE(position > split.ConsumedNow()); // FrontDmaReadQueued declines: not run yet
+
+    // The query cache's counts per 16-byte slot: equal means the reports there have landed.
+    constexpr u64 slot_address = 0x7655040;
+    auto& issued = Tegra::g_nx2_async_reports_issued[Tegra::Nx2AsyncReportSlot(slot_address)];
+    auto& completed =
+        Tegra::g_nx2_async_reports_completed[Tegra::Nx2AsyncReportSlot(slot_address)];
+    REQUIRE(Tegra::Nx2AsyncReportsSettled(slot_address, 16));
+    issued.fetch_add(1);
+    REQUIRE_FALSE(Tegra::Nx2AsyncReportsSettled(slot_address, 4));
+    REQUIRE_FALSE(Tegra::Nx2AsyncReportsSettled(slot_address - 8, 16)); // straddles the slot
+    REQUIRE(Tegra::Nx2AsyncReportsSettled(slot_address + 16, 16));
+    completed.fetch_add(1);
+    REQUIRE(Tegra::Nx2AsyncReportsSettled(slot_address - 8, 16));
 }
