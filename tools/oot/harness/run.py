@@ -119,6 +119,16 @@ def host_load():
     return load1, builders
 
 
+def gpu_mem_used_mib():
+    """nvidia-smi memory.used of GPU 0 in MiB, or None when unavailable."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits", "-i", "0"],
+                             capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+        return int(out[0]) if out else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
 def emu_pids():
     out = subprocess.run(["pgrep", "-f", EMU_PATTERN], capture_output=True, text=True).stdout.split()
     # The harness's own ancestors (a `bash -c ... --binary .../bin/lichii` wrapper) match the
@@ -302,6 +312,18 @@ class Run:
                 time.sleep(5)
         os.ftruncate(self.lock_fd, 0)
         os.write(self.lock_fd, f"{os.getpid()} {self.dir}\n".encode())
+        # The previous run released the lock at process exit, but the driver can take seconds to
+        # free that instance's VRAM; launching into that window dies at vkCreateDevice with
+        # std::bad_alloc (2026-11-05 20:54, two runs in a row). Wait for the GPU to settle.
+        settle_end = time.time() + 90
+        while time.time() < settle_end:
+            used = gpu_mem_used_mib()
+            if not emu_pids() and (used is None or used < self.a.gpu_settle_mib):
+                break
+            time.sleep(2)
+        else:
+            self.say(f"GPU did not settle (used {gpu_mem_used_mib()} MiB); launching anyway")
+        time.sleep(3)
         others = emu_pids()
         if others and self.a.wait_idle:
             self.say(f"another emulator instance is running ({others}); waiting up to {self.a.wait_idle}s")
@@ -802,6 +824,7 @@ def build_parser():
     ap.add_argument("--shutdown-timeout", type=float, default=60)
     ap.add_argument("--wait-idle", type=float, default=0, help="wait up to N s for another instance to exit")
     ap.add_argument("--max-load", type=float, default=10.0, help="refuse (or, with --wait-idle, wait) while the 1-minute load average exceeds this or any compiler/JVM runs; -1 disables")
+    ap.add_argument("--gpu-settle-mib", type=int, default=4096, help="after taking the run lock, wait (up to 90 s) until no emulator runs and GPU memory used is below this, so the previous instance's VRAM is released before vkCreateDevice")
     ap.add_argument("--min-mem-gib", type=float, default=40)
     ap.add_argument("--keep-cores", action="store_true", help="allow core dumps of the emulator")
     ap.add_argument("--keep-poll-shots", action="store_true")
