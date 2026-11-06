@@ -78,7 +78,14 @@ constexpr std::array<u8, 4> REAL_TIME_LOAD{0xE8, 0xFF, 0xFF, 0x1C};   // ldr s8,
 constexpr std::array<u8, 4> REAL_TIME_RETURN{0xB8, 0x82, 0x2A, 0x17}; // b 0x6e6cc8
 constexpr std::array<u8, 4> REAL_TIME_FDIV{0x28, 0x18, 0x20, 0x1E};   // fdiv s8, s1, s0
 constexpr std::array<u8, 4> REAL_TIME_HOOK{0x48, 0x7D, 0xD5, 0x14};   // b 0x3c461e4
-static_assert(Service::Nx2OotTime::HookInstruction == 0x14D57D48);
+// The loader checks these words in the loaded main before it enables the delta write: keep the
+// records and Nx2OotTime's constants the same instructions.
+constexpr u32 LittleEndianWord(const std::array<u8, 4>& bytes) {
+    return u32{bytes[0]} | u32{bytes[1]} << 8 | u32{bytes[2]} << 16 | u32{bytes[3]} << 24;
+}
+static_assert(LittleEndianWord(REAL_TIME_HOOK) == Service::Nx2OotTime::HookInstruction);
+static_assert(LittleEndianWord(REAL_TIME_LOAD) == Service::Nx2OotTime::LoadDeltaInstruction);
+static_assert(LittleEndianWord(REAL_TIME_RETURN) == Service::Nx2OotTime::ReturnInstruction);
 constexpr std::array REAL_TIME_RECORDS{
     BuiltinPatchRecord{Service::Nx2OotTime::DeltaOffset, REAL_TIME_DELTA, REAL_TIME_ZERO},
     BuiltinPatchRecord{Service::Nx2OotTime::LoadDeltaOffset, REAL_TIME_LOAD, REAL_TIME_ZERO},
@@ -116,7 +123,7 @@ constexpr std::array BUILTIN_PATCHES{
     // Ocarina of Time's frame delta comes from the measured frame time, so it doesn't run in slow
     // motion below 60 fps: see nx2_oot_time.h.
     BuiltinPatch{
-        .name = "Real-time speed (built-in)",
+        .name = Service::Nx2OotTime::RealTimePatchName,
         .title_id = Service::Nx2OotTime::ProgramId,
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
@@ -133,7 +140,7 @@ constexpr std::array BUILTIN_PATCHES{
         .records = DYNAMIC_FPS_RECORDS,
         .state_offset = 0x4E9FE00,
         .state_size = 16,
-        .yields_to = "Real-time speed (built-in)",
+        .yields_to = Service::Nx2OotTime::RealTimePatchName,
     },
 };
 
@@ -493,7 +500,11 @@ std::vector<VirtualFile> PatchManager::CollectPatches(const std::vector<VirtualD
     return out;
 }
 
-std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::string& name) const {
+std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::string& name,
+                                       std::vector<std::string_view>* applied) const {
+    if (applied != nullptr) {
+        applied->clear();
+    }
     if (nso.size() < sizeof(Loader::NSOHeader)) {
         return nso;
     }
@@ -659,6 +670,9 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
     }
 
     std::memcpy(out.data(), &header, sizeof(header));
+    if (applied != nullptr) {
+        *applied = std::move(applied_builtins);
+    }
     return out;
 }
 

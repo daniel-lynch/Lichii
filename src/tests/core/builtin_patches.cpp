@@ -447,3 +447,54 @@ TEST_CASE("Built-in Dynamic FPS leaves both records alone when a user mod change
     std::memcpy(expected.data() + offset, &mod_word, sizeof(mod_word));
     REQUIRE(context.Manager().PatchNSO(nso, "main") == expected);
 }
+
+// Lichii: the loader enables Ocarina's host delta write only when PatchNSO reports "Real-time
+// speed (built-in)" applied (src/core/loader/nso.cpp). The hook word alone can't tell: a user mod
+// can write the very same branch.
+TEST_CASE("PatchNSO reports which built-in patches applied", "[patch_manager]") {
+    const auto applied_by = [](PatchManagerTestContext& context, const std::vector<u8>& nso) {
+        std::vector<std::string_view> applied{"stale"};
+        const auto patched = context.Manager().PatchNSO(nso, "main", &applied);
+        return std::pair{applied, WordAt(patched, DynamicCallOffset)};
+    };
+    const auto has = [](const std::vector<std::string_view>& applied, std::string_view name) {
+        return std::ranges::find(applied, name) != applied.end();
+    };
+    auto nso = MakeDynamicMain();
+
+    SECTION("By default the real-time patch applies and Dark's yields") {
+        PatchManagerTestContext context;
+        const auto [applied, hook] = applied_by(context, nso);
+        REQUIRE(hook == RealTimeHookInstruction);
+        REQUIRE(has(applied, RealTime));
+        REQUIRE(has(applied, MaxResolution));
+        REQUIRE_FALSE(has(applied, DynamicFps));
+        REQUIRE_FALSE(has(applied, "stale"));
+    }
+
+    SECTION("Only Dark's applies when the real-time patch is off") {
+        PatchManagerTestContext context;
+        Settings::values.disabled_addons[OcarinaTitleId] = {std::string{RealTime}};
+        const auto [applied, hook] = applied_by(context, nso);
+        REQUIRE(hook == DynamicCallInstruction);
+        REQUIRE(has(applied, DynamicFps));
+        REQUIRE_FALSE(has(applied, RealTime));
+    }
+
+    SECTION("A rejected real-time patch is not reported") {
+        PatchManagerTestContext context;
+        Settings::values.disabled_addons[OcarinaTitleId] = {std::string{DynamicFps}};
+        nso[sizeof(Loader::NSOHeader) + 0x3C461E4] = 1;
+        const auto [applied, hook] = applied_by(context, nso);
+        REQUIRE(hook == DynamicOriginalInstruction);
+        REQUIRE_FALSE(has(applied, RealTime));
+    }
+
+    SECTION("A user mod with the same hook word takes precedence and is not reported") {
+        PatchManagerTestContext context{RealTimeHookInstruction, DynamicCallOffset};
+        const auto [applied, hook] = applied_by(context, nso);
+        REQUIRE(hook == RealTimeHookInstruction);
+        REQUIRE_FALSE(has(applied, RealTime));
+        REQUIRE_FALSE(has(applied, DynamicFps));
+    }
+}
