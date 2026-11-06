@@ -15,6 +15,8 @@ ReplayEnvironment::ReplayEnvironment(const GenericEnvironment& live,
                                      bool guess_, std::span<const u8> constants_)
     : GenericEnvironment(live), guess{guess_}, constants(constants_.begin(), constants_.end()) {
     gpu_memory = nullptr;
+    // Guessing needs to know which words build texture handles.
+    tracks_texture_handles = guess;
     for (const auto& query : queries) {
         answers.emplace(std::tuple{static_cast<u8>(query.kind), query.a, query.b, query.c},
                         query.answer);

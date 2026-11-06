@@ -338,11 +338,15 @@ static inline u32 GetTextureHandleCached(Environment& env, const ConstBufferAddr
         return it->second;
     const u32 sec_idx = cbuf.has_secondary ? cbuf.secondary_index  : cbuf.index;
     const u32 sec_off = cbuf.has_secondary ? cbuf.secondary_offset : cbuf.offset;
-    env.BeginTextureHandle();
+    if (env.tracks_texture_handles) {
+        env.BeginTextureHandle();
+    }
     const u32 lhs = ReadCbufCached(env, cbuf.index, cbuf.offset) << cbuf.shift_left;
     const u32 rhs = ReadCbufCached(env, sec_idx, sec_off) << cbuf.secondary_shift_left;
     const u32 handle = lhs | rhs;
-    env.EndTextureHandle(cbuf, handle);
+    if (env.tracks_texture_handles) {
+        env.EndTextureHandle(cbuf, handle);
+    }
     env.handle_cache.emplace(hk, handle);
     return handle;
 }
@@ -792,7 +796,9 @@ std::optional<u32> TryGetConstant(IR::Value& value, Environment& env) {
         return std::nullopt;
     }
     const auto offset_number = offset.U32();
-    env.NoteExactCbufWord(index_number, offset_number);
+    if (env.tracks_texture_handles) {
+        env.NoteExactCbufWord(index_number, offset_number);
+    }
     return ReadCbufCached(env, index_number, offset_number);
 }
 
@@ -993,11 +999,15 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
 u32 GetTextureHandle(Environment& env, const ConstBufferAddr& cbuf) {
     const u32 secondary_index{cbuf.has_secondary ? cbuf.secondary_index : cbuf.index};
     const u32 secondary_offset{cbuf.has_secondary ? cbuf.secondary_offset : cbuf.offset};
-    env.BeginTextureHandle();
+    if (env.tracks_texture_handles) {
+        env.BeginTextureHandle();
+    }
     const u32 lhs_raw{env.ReadCbufValue(cbuf.index, cbuf.offset) << cbuf.shift_left};
     const u32 rhs_raw{env.ReadCbufValue(secondary_index, secondary_offset)
                       << cbuf.secondary_shift_left};
-    env.EndTextureHandle(cbuf, lhs_raw | rhs_raw);
+    if (env.tracks_texture_handles) {
+        env.EndTextureHandle(cbuf, lhs_raw | rhs_raw);
+    }
     return lhs_raw | rhs_raw;
 }
 

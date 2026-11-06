@@ -383,6 +383,7 @@ HandleAddress UnpackHandleAddress(const Query& query) {
 
 RecordingEnvironment::RecordingEnvironment(Shader::Environment& inner_, bool class_replay_)
     : inner{inner_}, class_replay{class_replay_} {
+    tracks_texture_handles = class_replay || inner.tracks_texture_handles;
     sph = inner.SPH();
     gp_passthrough_mask = inner.GpPassthroughMask();
     mesh_registers = inner.MeshRegisters();
@@ -419,22 +420,26 @@ bool RecordingEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 off
 }
 
 void RecordingEnvironment::BeginTextureHandle() {
-    ++handle_depth;
+    if (class_replay) {
+        ++handle_depth;
+    }
     inner.BeginTextureHandle();
 }
 
 void RecordingEnvironment::EndTextureHandle(const Shader::ConstBufferAddr& cbuf, u32 handle) {
-    if (handle_depth != 0) {
-        --handle_depth;
-    }
-    inner.EndTextureHandle(cbuf, handle);
     if (class_replay) {
+        if (handle_depth != 0) {
+            --handle_depth;
+        }
         queries.push_back(PackHandleAddress(cbuf, handle));
     }
+    inner.EndTextureHandle(cbuf, handle);
 }
 
 void RecordingEnvironment::NoteExactCbufWord(u32 index, u32 offset) {
-    exact_words.insert(WordKey(index, offset));
+    if (class_replay) {
+        exact_words.insert(WordKey(index, offset));
+    }
     inner.NoteExactCbufWord(index, offset);
 }
 
@@ -452,7 +457,9 @@ std::vector<Query> RecordingEnvironment::TakeQueries() {
 }
 
 u32 RecordingEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
-    (handle_depth != 0 ? handle_words : exact_words).insert(WordKey(cbuf_index, cbuf_offset));
+    if (class_replay) {
+        (handle_depth != 0 ? handle_words : exact_words).insert(WordKey(cbuf_index, cbuf_offset));
+    }
     const u32 answer = inner.ReadCbufValue(cbuf_index, cbuf_offset);
     queries.push_back({QueryKind::CbufValue, cbuf_index, cbuf_offset, answer});
     return answer;

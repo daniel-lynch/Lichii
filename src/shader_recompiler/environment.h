@@ -132,6 +132,9 @@ public:
                                   [[maybe_unused]] u32 handle) {}
     /// A constant buffer word the texture pass consumes by value (served from its word cache).
     virtual void NoteExactCbufWord([[maybe_unused]] u32 index, [[maybe_unused]] u32 offset) {}
+    /// Whether the three calls above are wanted (class-level replay, AOT guessing): the texture
+    /// pass makes none of them otherwise.
+    bool tracks_texture_handles{};
 
     [[nodiscard]] const ProgramHeader& SPH() const noexcept {
         return sph;
