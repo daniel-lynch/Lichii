@@ -88,7 +88,8 @@ public:
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
-        std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {});
+        std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {},
+        bool runtime_build = false);
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
 
@@ -322,6 +323,9 @@ private:
     u64 last_descriptor_buffer_generation{};
 
     const bool worker_only_build;
+    const bool runtime_build;
+    bool reported_hold{};
+    std::chrono::steady_clock::duration driver_time{};
     u8 aot_class{AotClasses - 1};
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};

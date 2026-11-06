@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
@@ -107,6 +108,7 @@ enum class ThreadPlacement : u32 {
 
 void SetCurrentThreadPriority(ThreadPriority new_priority);
 void SetCurrentThreadName(const char* name);
+std::string_view GetCurrentThreadName();
 void SetCurrentThreadToPerformanceCores();
 void SetCurrentThreadToEfficiencyCores();
 void SetCurrentThreadToBackgroundWork();

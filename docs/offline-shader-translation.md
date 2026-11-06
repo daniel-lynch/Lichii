@@ -493,3 +493,35 @@ are outside this budget. Lookups release the store mutex before disk reads or
 decompression; append still serializes writers, without holding the reader's
 store mutex. The on-disk format is unchanged. These cache source files participate in the
 translator source hash, so rebuilding produces a new identity tag.
+
+## Paired recipes (pass 14)
+
+The extractor now preserves each program's `origins` (`source`, `member`,
+`variation`), including aliases of deduplicated code. Re-export older indexes
+with `write_offline_inputs(manifest, output_directory)` from
+`tools/nx2/extract_static_shaders.py`; their allocation files need no re-extraction.
+Indexes without origins remain supported but cannot infer partners or member layouts.
+
+The producer emits each indexed vertex partner once with zero incoming bindings,
+using the target profile's SPIR-V emitter to obtain its outgoing bindings and
+varyings. Fragment recipes use the highest-ranked recorded draw state and replace the descriptor
+base and preceding varyings with those outputs. Same-variation partners are tried
+first, then other vertex variations in the same source/member; `--shader-recipe-count`
+bounds the number of partner variants (default 2), one per distinct partner output,
+in addition to ordinary recipes.
+Duplicate canonical variants are emitted only once. Unsupported partners are skipped.
+Mesh/task partners remain unsupported.
+
+Vertex recipes additionally use every distinct layout from exact recorded vertex
+recipes associated with the same source/member, subject to the recipe import budget.
+A donor recipe is shared only when its program observed every generic input consumed
+by the target: canonical recipes erase unused fields, so those fields cannot supply
+a different program's layout. The archive schema does not expose FVTX/shape attribute records yet. No layout is
+inferred from shader code alone. Reports attribute new modules to `partner_stage`
+and `input_layout`; existing exact/class/baseline counts retain precedence on duplicates.
+
+For Effect `.vsetb` containers the archive environment's class replay answer is
+`ColorArray2D`; other containers retain `Color2D`. This is a container-class guess,
+not a decoded sampler dimension: the current index has no sampler metadata. It is
+recorded as a replay query and checked against the live answer before reuse.
+Float format, direct/indirect pointer and viewport guesses are unchanged.

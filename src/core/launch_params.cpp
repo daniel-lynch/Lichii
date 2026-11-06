@@ -314,7 +314,7 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             "--shader-recipe-limit N     Cap imported catalog entries (default 200000; 256 MiB import budget)\n"
             "--shader-recipe-baseline auto|always|never  Baseline policy (default auto: omit with exact recipes)\n"
             "--shader-report FILE        Write per-run production statistics as JSON\n"
-            "--shader-recipe-count N     Emit up to N exact/class recipes per stage (default 2)\n"
+            "--shader-recipe-count N     Emit up to N exact/class recipes and N partner variants (default 2)\n"
             "--precompile-shaders  Build every cached pipeline of the game, save the pipeline"
             " caches and exit before the game runs\n",
             lp.argv0

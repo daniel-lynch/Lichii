@@ -118,7 +118,9 @@ def write_offline_inputs(result, output):
                "offset": 0, "size": len(code), "control_offset": 0,
                "constants_offset": int.from_bytes(control[0x40:0x44], "little"),
                "constants_size": int.from_bytes(control[0x3c:0x40], "little"),
-               "stage": program["stage"], "fingerprint": f"{fingerprint:016x}"}
+               "stage": program["stage"], "fingerprint": f"{fingerprint:016x}",
+               "origins": [{key: origin[key] for key in ("source", "member", "variation")}
+                           for origin in program["origins"] if "variation" in origin]}
         titles.setdefault(program["title_id"], []).append(row)
     for title, rows in titles.items():
         # Compact: a whole title's index is read in one piece by the producer, and the
