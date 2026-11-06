@@ -3,7 +3,7 @@
 # then keep this run's emulator log next to the frametime CSV.
 set -u
 OOT="$HOME/Downloads/OOT"
-BIN="${BIN:-$HOME/dev/Lichii/build/bin/lichii}"
+BIN="${BIN:-$HOME/dev/Lichii/build-test/bin/lichii}"  # the dev play binary (build-test is built from the dev worktree); BIN=… overrides
 STAMP=$(date +%Y%m%d-%H%M%S)
 export EDEN_NX2_SHADER_DUMP="$OOT/shaders"
 # OoT fps: upstream #150's two unswitched commits cost ~10 % here (harness A/B 2026-11-05:
