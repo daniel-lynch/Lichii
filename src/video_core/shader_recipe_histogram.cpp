@@ -239,6 +239,24 @@ bool RecipeHistogram::Record(Shader::Stage stage, const std::bitset<512>& loads,
             first = first || (list.size() == 1 && class_key == own_class);
         } else if (const auto victim = Victim(list); victim != list.end()) {
             *victim = Recipe{runtime_info, binding_in, digest, 1, true};
+        } else {
+            // Every resident was seen this session more than once: the newcomer is tallied
+            // aside, and promoted over the weakest resident once its tally is higher.
+            auto& shadow = it->second.shadow;
+            auto tally = std::ranges::find(shadow, digest, &Recipe::digest);
+            if (tally != shadow.end()) {
+                ++tally->count;
+            } else if (shadow.size() < MaxShadow) {
+                tally = shadow.insert(shadow.end(), Recipe{runtime_info, binding_in, digest, 1, true});
+            } else {
+                tally = std::ranges::min_element(shadow, {}, &Recipe::count);
+                *tally = Recipe{runtime_info, binding_in, digest, 1, true};
+            }
+            const auto weakest = std::ranges::min_element(list, {}, &Recipe::count);
+            if (tally->count > weakest->count) {
+                *weakest = std::move(*tally);
+                shadow.erase(tally);
+            }
         }
     }
     return first;

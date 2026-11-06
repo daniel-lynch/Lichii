@@ -30,6 +30,8 @@ namespace VideoCommon {
 class RecipeHistogram {
 public:
     static constexpr size_t MaxPerClass = 8;
+    /// Recipes a full class turned away, tallied per class (not written to the file).
+    static constexpr size_t MaxShadow = 4;
     static constexpr size_t MaxClasses = 4096;
     /// Recipes whose runtime info maps more legacy varyings are not kept (a format bound).
     static constexpr size_t MaxLegacyMappings = 64;
@@ -49,7 +51,9 @@ public:
 
     /// A run-time stage was emitted with this recipe. Returns whether its class (by loads) got
     /// its first recipe. A full class replaces its weakest recipe not seen this session (from
-    /// the file), else a recipe seen only once, so a new dominant recipe always gets in.
+    /// the file), else a recipe seen only once; otherwise the newcomer is tallied aside and
+    /// replaces the weakest resident once its tally exceeds that resident's count, so a new
+    /// dominant recipe always gets in.
     bool Record(Shader::Stage stage, const std::bitset<512>& loads,
                 const Shader::RuntimeInfo& runtime_info,
                 const Shader::Backend::Bindings& binding_in);
@@ -87,6 +91,7 @@ private:
         bool by_loads{};
         std::bitset<512> loads{};
         std::vector<Recipe> recipes;
+        std::vector<Recipe> shadow; ///< Turned away while full, with their tallies
     };
     static std::vector<Recipe>::iterator Victim(std::vector<Recipe>& list);
     std::unordered_map<u64, Class> classes;

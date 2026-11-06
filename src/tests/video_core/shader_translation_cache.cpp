@@ -1043,3 +1043,32 @@ TEST_CASE("AOT candidates without room go back to the queue in order",
     REQUIRE(again[0].address == taken[1].address);
     REQUIRE(again[2].address == taken[3].address);
 }
+
+TEST_CASE("AOT recipe histogram: a ninth recipe overtakes eight residents seen more than once",
+          "[video_core][translation_cache]") {
+    using VideoCommon::RecipeHistogram;
+    std::bitset<512> loads;
+    loads.set(13);
+    RecipeHistogram histogram;
+    for (u32 variant = 0; variant < RecipeHistogram::MaxPerClass; ++variant) {
+        for (int i = 0; i < 2; ++i) {
+            histogram.Record(Shader::Stage::Fragment, loads, RecipeInfo(variant),
+                             RecipeBindings(variant));
+        }
+    }
+    const u32 fresh = 200;
+    bool class_match = false;
+    // Twice: tallied aside (2 is not above the residents' 2), still not chosen.
+    for (int i = 0; i < 2; ++i) {
+        histogram.Record(Shader::Stage::Fragment, loads, RecipeInfo(fresh), RecipeBindings(fresh));
+    }
+    REQUIRE(histogram.Best(Shader::Stage::Fragment, loads, class_match)->binding_in.uniform_buffer !=
+            fresh);
+    // The third observation promotes it over the weakest resident; it is now the best.
+    histogram.Record(Shader::Stage::Fragment, loads, RecipeInfo(fresh), RecipeBindings(fresh));
+    REQUIRE(histogram.Recipes() == 2 * RecipeHistogram::MaxPerClass);
+    const auto best = histogram.Best(Shader::Stage::Fragment, loads, class_match);
+    REQUIRE(class_match);
+    REQUIRE(best->binding_in.uniform_buffer == fresh);
+    REQUIRE(best->count == 3);
+}
