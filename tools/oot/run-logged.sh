@@ -1,3 +1,22 @@
+# OOT_PRODUCT: offline shader product (a translation cache written by eden-cli --precompile-shaders).
+# Every vulkan_translations.*.bin under $OOT/offline-translate/product-live/ is copied (reflink when
+# the filesystem allows, else a real copy) into the live shader cache dir if a file of that name is
+# not there yet; the runtime uses the one whose translator tag matches this build and logs the tags
+# it ignores. OOT_PRODUCT=0 skips the step.
+if [ "${OOT_PRODUCT:-1}" = "1" ]; then
+  PRODUCT_DIR="$OOT/offline-translate/product-live"
+  LIVE_SHADER_DIR="$HOME/.cache/eden/shader/0400486024dec000"
+  if [ -d "$PRODUCT_DIR" ] && [ -d "$LIVE_SHADER_DIR" ]; then
+    for f in "$PRODUCT_DIR"/vulkan_translations.*.bin; do
+      [ -f "$f" ] || continue
+      b=$(basename "$f")
+      if [ ! -e "$LIVE_SHADER_DIR/$b" ]; then
+        cp --reflink=auto "$f" "$LIVE_SHADER_DIR/$b" && echo "offline shader product installed: $b" >&2
+      fi
+    done
+  fi
+fi
+
 #!/bin/bash
 # Launch the locally built Lichii with the shader dump on and MangoHud frametime logging,
 # then keep this run's emulator log next to the frametime CSV.
