@@ -200,6 +200,8 @@ add_library(shader_recompiler STATIC
     runtime_info.h
     shader_info.h
     storage_write_extent.h
+    translator_identity.cpp
+    translator_identity.h
     varying_state.h)
 
 if (ENABLE_OPENGL)
@@ -274,3 +276,8 @@ else()
 endif()
 
 create_target_directory_groups(shader_recompiler)
+
+# The translator's identity for translation caches (CMakeModules/TranslatorIdentity.cmake): a hash
+# of this directory's source and the build facts, shared by the emulator and the offline tools.
+include(TranslatorIdentity)
+lichii_translator_identity(TARGET shader_recompiler)

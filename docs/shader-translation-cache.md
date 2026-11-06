@@ -10,7 +10,8 @@ cached stage is checked against the live environment before it is used.
 
 Setting: **Graphics > Advanced > Cache translated shaders**
 (`use_shader_translation_cache`, per game, default on). File:
-`<shader dir>/<title id>/vulkan_translations.fork-v50.bin`, next to `vulkan.fork-v50.bin`.
+`<shader dir>/<title id>/vulkan_translations.<tag>.fork-v50.bin`, next to
+`vulkan.fork-v50.bin`, where `<tag>` names the translator (see Translator identity).
 
 ## The problem, from four play sessions
 
@@ -103,7 +104,8 @@ Each stage is looked up in two steps.
 
 The configuration digest covers:
 
-- the build: commit, compiler, and the size and modification time of the executable;
+- the translator's identity (below): by default a hash of the translator's source and
+  build facts, or the commit and executable with `EDEN_NX2_TRANSLATION_CACHE_KEY=exe`;
 - every `Shader::Profile` and `HostTranslateInfo` field;
 - device model, driver and limits;
 - `resolution_info`, `disable_shader_loop_safety_checks`, `renderer_debug` and
@@ -111,9 +113,84 @@ The configuration digest covers:
 - `EDEN_NX2_UNDEF_ZERO` and `EDEN_NX2_NO_TENSOR`;
 - `VulkanPipelineCacheVersion`, which also appears in the file name.
 
-A file written by another build or configuration is discarded and rewritten. Records
+A file written by another translator or configuration is discarded and rewritten. Records
 are appended. A record cut short at the end of the file is dropped and the records
 before it are kept.
+
+### Translator identity
+
+A cached stage may only be used by a build whose translator would produce the same output.
+Until format 7 the key was the build itself (commit, executable size and modification
+time), so every rebuild started a new file, even one that only touched the UI. With daily
+rebuilds the first session after each build re-translated hundreds of stages: the warm run
+after a rebuild built 108 pipelines in its first 10 s of play, against 0 with a warm cache.
+
+The key is now the translator's identity, computed at build time by
+`CMakeModules/TranslatorIdentity.cmake` into the generated
+`shader_recompiler/translator_source_hash.h` and read through
+`Shader::TranslatorIdentity()` (`src/shader_recompiler/translator_identity.h`). It lives in the
+`shader_recompiler` library, which the emulator and the offline tools (shader-sweep) both link,
+and it holds nothing about the running process, so two executables built from the same source
+with the same facts agree on it. That is what an offline producer of translation caches needs.
+It is a SHA-256 over a manifest (`<build>/translator_identity/translator_identity.manifest`)
+of:
+
+- every file under `src/shader_recompiler` (frontend, IR passes, SPIR-V backend, native
+  lowering, its `CMakeLists.txt`), globbed when the hash runs;
+- the video_core files that drive translation or store its result:
+  `shader_environment.*`, `shader_translation_cache.*`, `shader_cache.*` and
+  `renderer_vulkan/vk_pipeline_cache.*`, plus the module itself;
+- every `common/...` header those files reach through `#include`, followed transitively;
+- build facts: system and processor, compiler id and version, C++ standard, build type,
+  `CMAKE_CXX_FLAGS` and the per-configuration flags, LTO, the compile options and definitions
+  of the `shader_recompiler` target and directory, and the sirit and SPIRV-Headers packages
+  (url and version or hash).
+
+`translator_identity.cpp`, compiled as part of the translator, adds its own predefined
+macros: compiler and standard library version, `NDEBUG`, `_DEBUG`, `__OPTIMIZE__`, fast-math
+and FMA flags and the target instruction set. Debug and Release builds therefore never share a file, and neither do
+two configurations of a multi-config generator.
+
+A file's content is hashed, not its time stamp, so touching a file or rebuilding from another
+worktree of the same source keeps the identity. Undoing an edit brings the old identity back.
+The hash runs whenever one of those files changes (a fraction of a second for about 290
+files), and the header is only rewritten when the hash changes, so an unrelated rebuild
+recompiles nothing. A file listed by name that no longer exists fails the build, so a rename
+has to update the list instead of silently dropping out of the key.
+
+Inputs that vary at run time (profile, host info, device, settings, environment variables) stay
+in the configuration digest as before; the identity replaces only the build part.
+
+The identity reaches the file in two places, and the file layout does not change
+(`FormatVersion` stays 5, so it merges with branches that bump the version for layout
+changes):
+
+- the configuration digest in the header, as the build identity did before;
+- the file name: `vulkan_translations.<tag>.fork-v50.bin`, where `<tag>` is 16 hexadecimal
+  digits of a digest of `Shader::TranslatorIdentity()`. Builds with different translators keep
+  separate files, so switching between two builds for an A/B does not throw away either
+  cache. A file of an older translator, and the `vulkan_translations.fork-v50.bin` of
+  earlier builds, are left in place and never read or deleted; remove them by hand to reclaim
+  the space (about 24 MB each for OOT).
+
+`EDEN_NX2_TRANSLATION_CACHE_KEY=exe` restores the old key: commit, executable size and
+modification time, and the old file name `vulkan_translations.fork-v50.bin`. Unset or
+`source` uses the source hash; any other value keeps the source hash and says so in the log.
+The log line at boot names the identity in use: `Translation cache: translator identity
+source <16 digits of the hash> (293 translator files, file tag <tag>)` or `Translation
+cache: translator identity exe (EDEN_NX2_TRANSLATION_CACHE_KEY=exe, commit …)`.
+
+What the identity does not cover:
+
+- Code outside the hashed set that changes translation output without changing any digested
+  input. `vk_pipeline_cache.cpp` is hashed because the steps between translation and emission
+  live there; other video_core code feeds translation only through environment answers, which
+  are recorded and replayed, and through the profile, host info and runtime info, which are
+  digested by value.
+- Headers outside `src/common` (boost containers, fmt, the standard library) other than through
+  the compiler and standard library version.
+- A file the translator compiles that lives outside the hashed directories. A new translator
+  directory must be added to `TRANSLATOR_IDENTITY_DIRS`.
 
 The following are never cached and are translated exactly as before:
 
@@ -245,11 +322,14 @@ bring back an evicted pipeline, apart from building the environments.
   GPU thread, which costs a fraction of a millisecond next to the translation itself.
 - A cached stage costs 0.1 ms (replay, decompression, info copy) plus
   `vkCreateShaderModule`.
-- Every new build starts a new file, because the executable is part of the key. The
-  first boot after an update translates as before.
+- A build that changes the translator, its build flags or the compiler starts a new file,
+  and its first boot translates as before. Other rebuilds keep the file (see Translator
+  identity). Files of older translators are not pruned.
 - The file is append-only and never pruned, like `vulkan.fork-v50.bin`.
 - Programs never seen before are still translated on the GPU thread. In the sessions
   above, that is 25% to 58% of the runtime pipeline time.
 - Not yet measured: runtime GPU-thread time in real play, other GPUs and drivers, and
-  the Windows and macOS builds. Windows reads the executable with
-  `GetModuleFileNameW`. Other non-Linux platforms keep the cache in memory only.
+  the Windows and macOS builds. The source identity needs no executable, so every platform
+  now keeps the file on disk. With `EDEN_NX2_TRANSLATION_CACHE_KEY=exe`, Windows reads the
+  executable with `GetModuleFileNameW` and other non-Linux platforms keep the cache in memory
+  only.

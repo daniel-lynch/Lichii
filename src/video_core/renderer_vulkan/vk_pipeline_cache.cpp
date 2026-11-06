@@ -960,8 +960,16 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used", CACHE_VERSION);
     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
     used_pipelines_saved = std::chrono::steady_clock::now();
+    // Each translator has its own file (vulkan_translations.<tag>.fork-vN.bin), so a rebuild that
+    // keeps the translator keeps the cache, and switching between builds does not overwrite the
+    // other build's file. Files of older translators are left in place.
+    const std::string translation_tag =
+        VideoCommon::TranslationCache::CurrentCacheIdentity().file_tag;
+    const std::string translation_stem =
+        translation_tag.empty() ? std::string{"vulkan_translations"}
+                                : fmt::format("vulkan_translations.{}", translation_tag);
     OpenTranslationCache(
-        VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_translations", CACHE_VERSION));
+        VideoCommon::VersionedPipelineCachePath(base_dir, translation_stem, CACHE_VERSION));
     size_t skipped_pipelines = 0;
     size_t queued_graphics = 0;
     const bool preload_all = PreloadAllPipelines();

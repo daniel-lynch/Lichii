@@ -18,6 +18,7 @@
 #include "common/settings.h"
 #include "common/zstd_compression.h"
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/translator_identity.h"
 #include "video_core/shader_translation_cache.h"
 
 #ifdef _WIN32
@@ -33,6 +34,8 @@ namespace {
 // 4: StorageBufferDescriptor gained indirect_offset (upstream nx2 #150, merged at 27226d2568).
 // 5: IsCbufIndirectStorageBufferPointer is recorded and replayed (queries gained a third
 //    argument); before, the recording environment answered it with the base class's `true`.
+// The translator's identity (CurrentCacheIdentity) is not part of the layout: it is folded into
+// the configuration digest and named in the file name, so it needs no version of its own.
 constexpr u32 FormatVersion = 5;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
@@ -219,9 +222,9 @@ size_t CapacityOf(const T& container) {
     return std::min<size_t>(container.max_size(), MaxElements);
 }
 
-// Identity of the running build: the commit and the executable's size and modification time,
-// so a rebuild with a changed translator never reads modules the old one wrote.
-std::string BuildIdentity() {
+// The old identity of the running build: the commit and the executable's size and modification
+// time. Every build starts a new cache. Selected with EDEN_NX2_TRANSLATION_CACHE_KEY=exe.
+std::string ExecutableIdentity() {
     std::string identity = fmt::format("{}|{}|{}", Common::g_scm_rev, Common::g_build_fullname,
                                        Common::g_compiler_id);
     std::filesystem::path exe;
@@ -495,11 +498,41 @@ Digest MakeStageKey(Shader::Environment& env, u64 unique_hash, u32 slot, const D
     return hasher.Finish();
 }
 
+CacheIdentity CurrentCacheIdentity() {
+    const char* const variable = std::getenv("EDEN_NX2_TRANSLATION_CACHE_KEY");
+    const std::string_view requested = variable != nullptr ? variable : "";
+    if (requested == "exe") {
+        std::string executable = ExecutableIdentity();
+        if (executable.empty()) {
+            return {"exe", {}, {},
+                    "exe (EDEN_NX2_TRANSLATION_CACHE_KEY=exe), but the executable cannot be read"};
+        }
+        return {"exe", "exe|" + executable, {},
+                fmt::format("exe (EDEN_NX2_TRANSLATION_CACHE_KEY=exe, commit {}): every build "
+                            "starts a new cache",
+                            Common::g_scm_rev)};
+    }
+    std::string value = Shader::TranslatorIdentity();
+    Hasher hasher;
+    hasher.AddString(value);
+    const Digest digest = hasher.Finish();
+    std::string file_tag = fmt::format("{:016x}", digest.lo);
+    std::string description = fmt::format("source {} ({} translator files, file tag {})",
+                                          Shader::TranslatorSourceHash().substr(0, 16),
+                                          Shader::TranslatorSourceFileCount(), file_tag);
+    if (!requested.empty() && requested != "source") {
+        description += fmt::format(" (EDEN_NX2_TRANSLATION_CACHE_KEY={} not recognised; use exe "
+                                   "or source)",
+                                   requested);
+    }
+    return {"source", std::move(value), std::move(file_tag), std::move(description)};
+}
+
 Digest MakeConfigDigest(const Shader::Profile& profile, const Shader::HostTranslateInfo& host_info,
                         u64 extra) {
     Hasher hasher;
     hasher.Add(FormatVersion);
-    hasher.AddString(BuildIdentity());
+    hasher.AddString(CurrentCacheIdentity().value);
 #define TRANSLATION_CACHE_ADD(field) hasher.Add(profile.field);
     TRANSLATION_CACHE_PROFILE_FIELDS(TRANSLATION_CACHE_ADD)
 #undef TRANSLATION_CACHE_ADD
@@ -753,11 +786,14 @@ void Store::Open(const std::filesystem::path& path, const Digest& config) {
     if (path.empty()) {
         return;
     }
-    if (BuildIdentity().empty()) {
+    const CacheIdentity identity = CurrentCacheIdentity();
+    if (identity.value.empty()) {
         LOG_WARNING(Render_Vulkan,
-                    "Translation cache kept in memory only: the build cannot be identified");
+                    "Translation cache kept in memory only: the build cannot be identified ({})",
+                    identity.description);
         return;
     }
+    LOG_INFO(Render_Vulkan, "Translation cache: translator identity {}", identity.description);
     filename = path;
     const auto begin = std::chrono::steady_clock::now();
     const bool loaded = LoadFile(path, config);
