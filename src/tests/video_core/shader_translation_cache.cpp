@@ -1026,7 +1026,7 @@ TEST_CASE("Read-only translation caches retain usable records without throwing",
     Common::Log::SetGlobalFilter(Common::Log::Filter{Common::Log::Level::Info});
     Common::Log::SetRingCapacity(64);
     const auto size = std::filesystem::file_size(path);
-    Store store;
+    Store store{0};
     REQUIRE_NOTHROW(store.Open(path, config));
     REQUIRE(store.Enabled());
     REQUIRE_FALSE(store.Persistent());
@@ -1038,7 +1038,10 @@ TEST_CASE("Read-only translation caches retain usable records without throwing",
     const Variant new_variant{.binding_out = {.unified = 7, .texture = 9},
                               .info = SampleInfo(), .spirv = {0x07230203, 4, 5, 6}};
     REQUIRE(store.InsertVariant(*new_entry, new_key, new_variant));
+    const auto reads_before = store.variant_disk_reads.load();
     const auto found = store.FindVariant(new_key);
+    REQUIRE(store.variant_disk_reads == reads_before);
+    REQUIRE(store.ResidentBytes() > 0);
     REQUIRE(found);
     REQUIRE(InfoEqual(found->info, new_variant.info));
     REQUIRE(MakeVariantKey({}, {}, found->binding_out) ==
@@ -1332,4 +1335,106 @@ TEST_CASE("Translation cache open names other translator tags once",
     }) == 1);
     Common::Log::SetRingCapacity(0);
     std::filesystem::remove_all(directory);
+}
+
+TEST_CASE("Translation cache keeps appended variants resident and promotes loaded variants",
+          "[video_core][translation_cache]") {
+    const auto path = TempPath("lichii_translation_resident_test.bin");
+    std::filesystem::remove(path);
+    const Digest config{11, 12}, key{13, 14};
+    const Variant variant{.info = SampleInfo(), .spirv = {0x07230203, 1, 2, 3}};
+    {
+        Store store;
+        store.Open(path, config);
+        REQUIRE(store.Persistent());
+        const auto entry = store.Insert({15, 16}, {}, ProgramMeta{});
+        REQUIRE(entry);
+        REQUIRE(store.InsertVariant(*entry, key, variant));
+        REQUIRE(store.ResidentBytes() > 0);
+        for (int i = 0; i < 2; ++i) {
+            const auto found = store.FindVariant(key);
+            REQUIRE(found);
+            REQUIRE(InfoEqual(found->info, variant.info));
+            REQUIRE(found->spirv == variant.spirv);
+        }
+        REQUIRE(store.variant_disk_reads == 0);
+    }
+    {
+        Store store;
+        store.Open(path, config);
+        REQUIRE(store.ResidentBytes() == 0);
+        const auto first = store.FindVariant(key);
+        REQUIRE(first);
+        REQUIRE(InfoEqual(first->info, variant.info));
+        REQUIRE(first->spirv == variant.spirv);
+        REQUIRE(store.variant_disk_reads == 1);
+        REQUIRE(store.ResidentBytes() > 0);
+        const auto second = store.FindVariant(key);
+        REQUIRE(second);
+        REQUIRE(InfoEqual(second->info, variant.info));
+        REQUIRE(second->spirv == variant.spirv);
+        REQUIRE(store.variant_disk_reads == 1);
+    }
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("Translation cache evicts oldest resident variants only with a disk copy",
+          "[video_core][translation_cache]") {
+    const auto path = TempPath("lichii_translation_resident_budget_test.bin");
+    std::filesystem::remove(path);
+    const Digest config{21, 22}, first_key{23, 24}, second_key{25, 26};
+    const Variant variant{.info = SampleInfo(), .spirv = {0x07230203, 1, 2, 3}};
+    u64 one_variant_bytes{};
+    {
+        Store memory;
+        memory.Open({}, config);
+        const auto entry = memory.Insert({27, 28}, {}, ProgramMeta{});
+        REQUIRE(entry);
+        REQUIRE(memory.InsertVariant(*entry, first_key, variant));
+        one_variant_bytes = memory.ResidentBytes();
+    }
+    REQUIRE(one_variant_bytes > 0);
+    {
+        Store store{one_variant_bytes};
+        store.Open(path, config);
+        REQUIRE(store.Persistent());
+        const auto entry = store.Insert({27, 28}, {}, ProgramMeta{});
+        REQUIRE(entry);
+        REQUIRE(store.InsertVariant(*entry, first_key, variant));
+        REQUIRE(store.InsertVariant(*entry, second_key, variant));
+        REQUIRE(store.ResidentBytes() <= one_variant_bytes);
+        REQUIRE(store.FindVariant(second_key));
+        REQUIRE(store.variant_disk_reads == 0);
+        const auto first = store.FindVariant(first_key);
+        REQUIRE(first);
+        REQUIRE(InfoEqual(first->info, variant.info));
+        REQUIRE(first->spirv == variant.spirv);
+        REQUIRE(store.variant_disk_reads == 1);
+        REQUIRE(store.ResidentBytes() <= one_variant_bytes);
+        REQUIRE(store.FindVariant(first_key));
+        REQUIRE(store.variant_disk_reads == 1);
+        REQUIRE(store.FindVariant(second_key));
+        REQUIRE(store.variant_disk_reads == 2);
+    }
+    {
+        Store store{0};
+        store.Open(path, config);
+        REQUIRE(store.FindVariant(first_key));
+        REQUIRE(store.ResidentBytes() == 0);
+        REQUIRE(store.FindVariant(first_key));
+        REQUIRE(store.variant_disk_reads == 2);
+    }
+    {
+        Store memory{0};
+        memory.Open({}, config);
+        const auto entry = memory.Insert({27, 28}, {}, ProgramMeta{});
+        REQUIRE(entry);
+        REQUIRE(memory.InsertVariant(*entry, first_key, variant));
+        REQUIRE(memory.ResidentBytes() > 0);
+        REQUIRE(memory.FindVariant(first_key));
+        REQUIRE(memory.variant_disk_reads == 0);
+        memory.Close();
+        REQUIRE(memory.ResidentBytes() == 0);
+    }
+    std::filesystem::remove(path);
 }

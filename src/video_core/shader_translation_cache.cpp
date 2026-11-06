@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <charconv>
 #include <stdexcept>
 #include <tuple>
 #include <bit>
@@ -1316,6 +1317,59 @@ bool LayoutIsCovered() {
            CountFields<Shader::Backend::Bindings>() == BindingsFields;
 }
 
+namespace {
+u64 ResidentBudget() {
+    constexpr u64 mib = 1024 * 1024;
+    if (const char* value = std::getenv("EDEN_NX2_TRANSLATION_RESIDENT_MIB")) {
+        u64 count{};
+        const auto end = value + std::strlen(value);
+        const auto result = std::from_chars(value, end, count);
+        if (result.ec == std::errc{} && result.ptr == end && count <= UINT64_MAX / mib)
+            return count * mib;
+    }
+    return 512 * mib;
+}
+} // namespace
+
+Store::Store(std::optional<u64> resident_budget_bytes)
+    : resident_budget{resident_budget_bytes.value_or(ResidentBudget())} {}
+
+u64 Store::ResidentVariant::Bytes() const {
+    // Conservatively include small-vector capacity even when its storage is inline.
+    u64 bytes = sizeof(*this) + compressed_spirv.capacity();
+    const auto count = [&bytes](const auto& values) {
+        bytes += values.capacity() * sizeof(typename std::decay_t<decltype(values)>::value_type);
+    };
+    count(info.texture_buffer_descriptors);
+    count(info.image_buffer_descriptors);
+    count(info.texture_descriptors);
+    count(info.image_descriptors);
+    count(info.handle_programs);
+    for (const auto& program : info.handle_programs) count(program);
+    return bytes;
+}
+
+u64 Store::ResidentBytes() {
+    std::scoped_lock lock{mutex};
+    return resident_bytes;
+}
+
+void Store::AdmitResident(const std::shared_ptr<const StoredVariant>& stored,
+                          std::shared_ptr<const ResidentVariant> resident) {
+    if (stored->resident) return;
+    resident_bytes += resident->Bytes();
+    stored->resident = std::move(resident);
+    // Memory-only/failed appends have no recoverable copy: retain them even above budget.
+    if (!stored->source.empty()) resident_order.push_back(stored);
+    while (resident_bytes > resident_budget && !resident_order.empty()) {
+        auto oldest = resident_order.front().lock();
+        resident_order.pop_front();
+        if (!oldest || !oldest->resident) continue;
+        resident_bytes -= oldest->resident->Bytes();
+        oldest->resident.reset();
+    }
+}
+
 Store::~Store() {
     Close();
 }
@@ -1334,6 +1388,9 @@ void Store::Close() {
     }
     entries.clear();
     variants.clear();
+    resident_order.clear();
+    resident_bytes = 0;
+    variant_disk_reads = 0;
     recipes.clear();
     entry_recipes.clear();
     dropped_entries.clear();
@@ -1342,6 +1399,7 @@ void Store::Close() {
     enabled = false;
     persistence_failed = false;
     file.clear();
+    append_offset = FileMagic.size() + sizeof(u32) + sizeof(Digest);
     ++generation;
 }
 
@@ -1620,7 +1678,7 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
                 if (!writable && has_recipe && !variants.contains(key)) {
                     CountRecipe(stage, recipe);
                 }
-                if (stored->spirv_words && (stored->compressed_size || !stored->compressed_spirv.empty()))
+                if (stored->spirv_words && stored->compressed_size)
                     entries_with_modules.insert(stored->entry_id);
                 variants.insert_or_assign(key, std::move(stored));
                 ++loaded_variants;
@@ -1653,6 +1711,7 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
             return false;
         }
     }
+    append_offset = offset;
     file.open(path, std::ios::binary | std::ios::app);
     if (!file.is_open()) {
         DisablePersistence(std::error_code(errno, std::generic_category()));
@@ -1756,7 +1815,7 @@ std::map<u64, u64> Store::VariantMultiplicity() {
     for (const auto& [key, variant] : variants) {
         const auto it = counts.find(variant->entry_id);
         if (it != counts.end() && variant->spirv_words &&
-            (variant->compressed_size || !variant->compressed_spirv.empty())) ++it->second;
+            variant->compressed_size) ++it->second;
     }
     std::map<u64, u64> result;
     for (const auto& [id, count] : counts) ++result[count];
@@ -1765,6 +1824,7 @@ std::map<u64, u64> Store::VariantMultiplicity() {
 
 std::optional<Variant> Store::FindVariant(const Digest& variant_key) {
     std::shared_ptr<const StoredVariant> stored;
+    std::shared_ptr<const ResidentVariant> resident;
     {
         std::scoped_lock lock{mutex};
         const auto it = variants.find(variant_key);
@@ -1772,16 +1832,19 @@ std::optional<Variant> Store::FindVariant(const Digest& variant_key) {
             return std::nullopt;
         }
         stored = it->second;
+        resident = stored->resident;
     }
     Variant variant{
         .binding_out = stored->binding_out,
-        .info = stored->info ? *stored->info : Shader::Info{},
+        .info = resident ? resident->info : Shader::Info{},
         .spirv = std::vector<u32>(stored->spirv_words),
         .fallback_recipe = stored->fallback_recipe,
     };
     std::vector<u8> loaded;
-    std::span<const u8> compressed = stored->compressed_spirv;
-    if (!stored->source.empty()) {
+    std::span<const u8> compressed = resident ? std::span<const u8>{resident->compressed_spirv}
+                                              : std::span<const u8>{};
+    if (!resident) {
+        ++variant_disk_reads;
         std::ifstream input(stored->source, std::ios::binary);
         input.seekg(static_cast<std::streamoff>(stored->info_offset));
         const auto prefix_size = stored->compressed_offset - stored->info_offset;
@@ -1797,6 +1860,17 @@ std::optional<Variant> Store::FindVariant(const Digest& variant_key) {
                       variant.spirv.size() * sizeof(u32)});
     if (bytes != variant.spirv.size() * sizeof(u32)) {
         return std::nullopt;
+    }
+    if (!resident) {
+        auto promoted = std::make_shared<ResidentVariant>();
+        promoted->info = variant.info;
+        promoted->compressed_spirv.assign(compressed.begin(), compressed.end());
+        std::scoped_lock lock{mutex};
+        const auto it = variants.find(variant_key);
+        if (it != variants.end() && it->second == stored &&
+            !dropped_entries.contains(stored->entry_id)) {
+            AdmitResident(stored, std::move(promoted));
+        }
     }
     return variant;
 }
@@ -1837,9 +1911,11 @@ bool Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
     stored->entry_id = entry.id;
     stored->fallback_recipe = variant.fallback_recipe;
     stored->binding_out = variant.binding_out;
-    stored->info = std::make_unique<Shader::Info>(variant.info);
+    auto resident = std::make_shared<ResidentVariant>();
+    resident->info = variant.info;
+    stored->resume_validated = true;
     stored->spirv_words = static_cast<u32>(variant.spirv.size());
-    stored->compressed_spirv = Common::Compression::CompressDataZSTD(
+    resident->compressed_spirv = Common::Compression::CompressDataZSTD(
         reinterpret_cast<const u8*>(variant.spirv.data()), variant.spirv.size() * sizeof(u32), 3);
     std::vector<u8> record;
     {
@@ -1849,9 +1925,13 @@ bool Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
         writer.Put(entry.id);
         writer.Put(stored->fallback_recipe);
         writer.Put(stored->binding_out);
-        WriteInfo(record, *stored->info);
+        stored->info_offset = record.size();
+        WriteInfo(record, resident->info);
+        stored->info_size = static_cast<u32>(record.size() - stored->info_offset);
         writer.Put(stored->spirv_words);
-        writer.PutBytes(stored->compressed_spirv.data(), stored->compressed_spirv.size());
+        stored->compressed_size = static_cast<u32>(resident->compressed_spirv.size());
+        stored->compressed_offset = record.size() + sizeof(u32);
+        writer.PutBytes(resident->compressed_spirv.data(), resident->compressed_spirv.size());
         writer.Put(recipe != nullptr);
         if (recipe) {
             writer.Put(entry.meta.stage);
@@ -1874,11 +1954,22 @@ bool Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
         return false;
     }
     if (dropped_entries.contains(entry.id)) return false;
-    if (variants.try_emplace(variant_key, std::move(stored)).second) {
-        if (!variant.spirv.empty()) entries_with_modules.insert(entry.id);
-        lock.unlock();
-        Append(record);
+    if (variants.contains(variant_key)) return true;
+    // Publish before the flush so readers can use the module while its append is in flight.
+    stored->resident = resident;
+    variants.emplace(variant_key, stored);
+    if (!variant.spirv.empty()) entries_with_modules.insert(entry.id);
+    lock.unlock();
+    const auto offset = Append(record);
+    lock.lock();
+    if (offset) {
+        stored->source = filename;
+        stored->info_offset += *offset + 8;
+        stored->compressed_offset += *offset + 8;
     }
+    // Until now this payload was pinned by the writer, outside the evictable budget.
+    stored->resident.reset();
+    AdmitResident(stored, std::move(resident));
     return true;
 }
 
@@ -1892,10 +1983,11 @@ void Store::DisablePersistence(const std::error_code& error) {
     if (file.is_open()) file.close();
 }
 
-void Store::Append(const std::vector<u8>& record) {
+std::optional<u64> Store::Append(const std::vector<u8>& record) {
     if (!file.is_open()) {
-        return;
+        return std::nullopt;
     }
+    const u64 offset = append_offset;
     const u32 length = static_cast<u32>(record.size());
     file.write(reinterpret_cast<const char*>(&RecordMagic), sizeof(RecordMagic));
     file.write(reinterpret_cast<const char*>(&length), sizeof(length));
@@ -1903,7 +1995,10 @@ void Store::Append(const std::vector<u8>& record) {
     file.flush();
     if (!file.good()) {
         DisablePersistence(std::error_code(errno, std::generic_category()));
+        return std::nullopt;
     }
+    append_offset += 8 + record.size();
+    return offset;
 }
 
 bool Store::ValidateOfflineEntry(const Entry& entry, const Shader::IR::Program& live) {

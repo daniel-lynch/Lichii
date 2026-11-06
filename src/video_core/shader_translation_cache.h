@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -279,7 +280,8 @@ enum class OfflineOutcome { VariantHit, VariantMiss, MetaMismatch, FullHit };
 
 class Store {
 public:
-    Store() = default;
+    /// Override the environment budget in bytes (primarily for deterministic tests).
+    explicit Store(std::optional<u64> resident_budget_bytes = std::nullopt);
     ~Store();
 
     /// Loads the cache file of a title, or starts a new one when its build or configuration
@@ -326,6 +328,8 @@ public:
         return generation.load();
     }
     std::atomic<u64> rejected_variants{};
+    std::atomic<u64> variant_disk_reads{};
+    [[nodiscard]] u64 ResidentBytes();
 
     /// Reads recipes without modifying the source cache, including an incomplete tail.
     [[nodiscard]] static std::array<EmissionRecipe, Shader::MaxStageTypes> ReadRecipes(
@@ -360,23 +364,33 @@ public:
     std::atomic<u64> miss_ns{};
 
 private:
+    struct ResidentVariant {
+        Shader::Info info;
+        std::vector<u8> compressed_spirv;
+        [[nodiscard]] u64 Bytes() const;
+    };
     struct StoredVariant {
         Digest entry_id{};
         mutable bool resume_validated{}; // Guarded by mutex.
         bool fallback_recipe{};
         Shader::Backend::Bindings binding_out{};
-        std::unique_ptr<Shader::Info> info;
+        mutable std::shared_ptr<const ResidentVariant> resident; // Guarded by mutex.
+        // Backing locations are finalized under mutex before residency can be evicted.
         u64 info_offset{};
         u32 info_size{};
         u32 spirv_words{};
-        std::vector<u8> compressed_spirv;
         std::filesystem::path source;
         u64 compressed_offset{};
         u32 compressed_size{};
     };
 
     std::shared_ptr<const Entry> InsertLocked(Entry entry);
-    void Append(const std::vector<u8>& record);
+    std::optional<u64> Append(const std::vector<u8>& record);
+    void AdmitResident(const std::shared_ptr<const StoredVariant>& stored,
+                       std::shared_ptr<const ResidentVariant> resident);
+    const u64 resident_budget;
+    u64 resident_bytes{};
+    std::deque<std::weak_ptr<const StoredVariant>> resident_order;
     void DisablePersistence(const std::error_code& error);
     bool LoadFile(const std::filesystem::path& path, const Digest& config, bool writable = true,
                   u64 byte_budget = UINT64_MAX);
@@ -408,6 +422,7 @@ private:
     std::unordered_set<Digest, DigestHash> entries_with_modules;
     std::filesystem::path filename;
     std::ofstream file;
+    u64 append_offset{};
     u64 loaded_entries{};
     u64 loaded_variants{};
 };

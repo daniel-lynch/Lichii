@@ -470,3 +470,24 @@ patches and the owner-run commit/revalidation scripts are under
 `commit-plan5.sh`, `revalidate-plan5.sh`). The real Git metadata was read-only in
 this session, so conflict resolution used temporary Git metadata; the commit
 script performs the real merge before installing the reviewed resolution.
+
+
+## Pass 10 variant residency
+
+`EDEN_NX2_TRANSLATION_RESIDENT_MIB` sets the per-store variant residency budget
+(default 512 MiB; zero disables retention of disk-backed payloads). Runtime
+insertions retain decoded `Shader::Info` and compressed SPIR-V, including after
+append. Loaded variants retain neither until the first successful lookup, which
+promotes both. Repeated resident lookups copy Info and decompress in memory;
+they do not open or read the cache file.
+
+Oldest admissions are evicted first when the budget is exceeded; hits do not
+refresh their age. Accounting includes the payload object and container capacity
+(conservatively counting inline small-vector capacity too), not total process
+RSS or allocator overhead. In-flight reader snapshots can temporarily retain
+an evicted payload. Memory-only variants and failed appends retain their sole
+usable copy even above budget. Entries, translator IR and worker allocations
+are outside this budget. Lookups release the store mutex before disk reads or
+decompression; append still serializes writers, without holding the reader's
+store mutex. The on-disk format is unchanged. These cache source files participate in the
+translator source hash, so rebuilding produces a new identity tag.
