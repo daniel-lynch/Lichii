@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -27,6 +28,12 @@ namespace VideoCommon {
 /// looked up in the index; if they identify a container, every other program of that container is
 /// expected at the same offset from the pool and is checked byte for byte (by fingerprint). It
 /// translates nothing: it measures how many programs could be known before their first draw.
+///
+/// With EDEN_NX2_AOT_MANIFEST=<manifest-<Scene>.json, or a directory of them> (static scene
+/// manifests built from the game's files, kept outside the repository), the programs a scene's
+/// materials use are offered first, main material pass (tier 1) to tier 3, and the other
+/// siblings only when no manifest program is waiting. Every manifest in the directory is loaded
+/// and their rows are united.
 class ShaderPoolIndex {
 public:
     /// The index named by EDEN_NX2_AOT_INDEX, or null when unset or unreadable.
@@ -36,15 +43,34 @@ public:
     /// A native graphics program at `address` is used for the first time.
     void OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr address);
 
+    /// Candidate priority: manifest tiers 1-3, then the siblings no manifest names.
+    static constexpr size_t PriorityCount = 4;
+    static constexpr u8 NoTier = PriorityCount;
+
     /// A verified program of a recognised pool, not used yet, to translate ahead of time.
     struct Candidate {
         GPUVAddr address;
         u8 stage; ///< Container stage slot (0 vertex, 4 pixel; others are not offered)
+        u8 tier;  ///< Manifest tier 1-3, NoTier when no manifest names the program
         u32 constants_offset;
         u16 constants_size;
+        u32 manifest_bank1; ///< Index of the manifest's bank-1 words, ~0 if none
     };
-    /// Up to `count` candidates, oldest first, skipping programs used since they were found.
-    [[nodiscard]] std::vector<Candidate> TakeCandidates(size_t count);
+    /// Up to `count` candidates, highest priority first and oldest first within a priority,
+    /// skipping programs used since they were found. `manifest_only` takes manifest programs
+    /// only.
+    [[nodiscard]] std::vector<Candidate> TakeCandidates(size_t count, bool manifest_only = false);
+    /// Whether a manifest program waits for translation (cheap, for every draw).
+    [[nodiscard]] bool HasManifestCandidates() const noexcept {
+        return manifest_queued != 0;
+    }
+    /// Compares a candidate's bank-1 section read from its pool (authoritative) with the
+    /// manifest's words, for the statistics.
+    void CheckBank1(const Candidate& candidate, std::span<const u8> constants);
+    /// A seeded candidate left the GPU thread for a worker (statistics by tier).
+    void CountSeeded(const Candidate& candidate) {
+        ++seeded[(std::min<size_t>)(candidate.tier, NoTier) - 1];
+    }
     /// GPU-thread time spent building candidate environments, for the statistics.
     void AddSeedTime(std::chrono::steady_clock::duration duration) {
         seed_time += duration;
@@ -57,6 +83,8 @@ public:
         u64 fingerprint;
         u32 constants_offset; ///< Bank-1 constant section from the program start, ~0 if none
         u16 constants_size;
+        u8 tier{NoTier};          ///< Lowest manifest tier naming the program
+        u32 manifest_bank1{~0U}; ///< Index into manifest_bank1_words
     };
     struct Container {
         std::vector<Program> programs;
@@ -65,6 +93,30 @@ public:
     /// Index parsing and the fingerprint, exposed for tests.
     [[nodiscard]] static bool Parse(std::span<const u8> data, std::vector<Container>& out);
     [[nodiscard]] static u64 Fingerprint(std::span<const u8> bytes);
+
+    /// One row of a scene manifest (oot-aot-static-manifest-1): a stage program keyed like the
+    /// index (fingerprint, pool offset, padded size, stage slot).
+    struct ManifestRow {
+        u64 fingerprint;
+        u32 pool_offset;
+        u32 size;
+        u8 stage; ///< Container stage slot, as in the index
+        u8 tier;
+        u32 bank1_offset{~0U};
+        std::vector<u32> bank1_words;
+    };
+    /// Manifest parsing, exposed for tests. Rows of tier 4 and of unknown stages are skipped.
+    [[nodiscard]] static bool ParseManifest(std::string_view json, std::vector<ManifestRow>& out);
+    /// Marks the indexed programs a manifest names (lowest tier wins); returns the rows matched.
+    size_t ApplyManifest(std::span<const ManifestRow> rows);
+    /// An index over `containers` without a file or manifests, for tests.
+    [[nodiscard]] static std::unique_ptr<ShaderPoolIndex> ForTesting(
+        std::vector<Container> containers) {
+        return std::unique_ptr<ShaderPoolIndex>(new ShaderPoolIndex(std::move(containers)));
+    }
+    [[nodiscard]] const std::vector<Container>& Containers() const noexcept {
+        return containers;
+    }
 
 private:
     explicit ShaderPoolIndex(std::vector<Container> containers);
@@ -81,15 +133,37 @@ private:
     std::vector<u32> short_sizes;
     /// (container, pool address) pairs already checked.
     std::unordered_set<u64> checked;
-    /// Addresses of programs verified in a recognised pool and not used yet.
-    std::unordered_set<GPUVAddr> predicted;
+    /// Addresses of programs verified in a recognised pool and not used yet, with their tier.
+    std::unordered_map<GPUVAddr, u8> predicted;
     /// Addresses of programs already used.
     std::unordered_set<GPUVAddr> used;
-    /// Candidates waiting for translation, bounded by MaxCandidatesQueued.
-    std::deque<Candidate> candidates_queue;
+    /// Candidates waiting for translation by priority, bounded by MaxCandidatesQueued together.
+    std::array<std::deque<Candidate>, PriorityCount> candidates_queues;
+    size_t candidates_queued{};
+    size_t manifest_queued{};
     static constexpr size_t MaxCandidatesQueued = 4096;
     u64 candidates_offered{};
     u64 candidates_dropped{};
+    size_t candidates_queued_peak{};
+
+    /// Scene manifests (EDEN_NX2_AOT_MANIFEST).
+    void LoadManifests();
+    std::vector<std::vector<u32>> manifest_bank1_words;
+    size_t manifest_files{};
+    size_t manifest_rows{};
+    size_t manifest_rows_matched{};
+    size_t manifest_bytes{};
+    std::chrono::steady_clock::duration manifest_time{};
+    std::array<u64, PriorityCount> offered_by_tier{};
+    std::array<u64, PriorityCount> seeded{};
+    /// First uses of verified programs by tier: all, and those still waiting in the queue.
+    std::array<u64, PriorityCount> first_uses_by_tier{};
+    std::array<u64, PriorityCount> first_uses_still_queued{};
+    /// Addresses of queued candidates (to tell a first use that came before its translation).
+    std::unordered_map<GPUVAddr, u8> queued_tier;
+    u64 bank1_agreed{};
+    u64 bank1_disagreed{};
+    u64 bank1_unchecked{};
 
     u64 first_uses{};
     u64 first_uses_indexed{};

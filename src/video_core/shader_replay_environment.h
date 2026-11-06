@@ -47,6 +47,17 @@ public:
         }
     }
 
+    /// Approximate heap bytes this copy owns (code, lowered program, answers, constants).
+    [[nodiscard]] size_t OwnedBytes() const noexcept {
+        size_t bytes = sizeof(*this) + code.capacity() * sizeof(u64) + constants.capacity() +
+                       answers.size() * 64;
+        if (lowered_native) {
+            bytes += lowered_native->code.capacity() * sizeof(u64) +
+                     lowered_native->trap_prefix.capacity() * sizeof(Shader::Ampere::Instruction);
+        }
+        return bytes;
+    }
+
     /// The kind of the first query the recorded answers did not cover.
     [[nodiscard]] std::optional<TranslationCache::QueryKind> FirstMissing() const noexcept {
         return first_missing;

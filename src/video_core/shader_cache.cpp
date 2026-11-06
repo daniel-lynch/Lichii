@@ -119,6 +119,15 @@ u64 ShaderCache::MeshStateHash() const {
 }
 
 bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
+    // Scene-manifest programs of recognised pools are fed to the AOT workers as fast as they take
+    // them, not only when a new program is used: a loading screen or a stretch of known draws
+    // would otherwise leave the workers idle while the scene's programs wait.
+    if (seed_enabled && pool_index && pool_index->HasManifestCandidates() && seed_has_room &&
+        seed_has_room()) {
+        const auto seed_begin = std::chrono::steady_clock::now();
+        SeedPoolCandidates(true);
+        pool_index->AddSeedTime(std::chrono::steady_clock::now() - seed_begin);
+    }
     auto& dirty{maxwell3d->dirty.flags};
     if (!dirty[VideoCommon::Dirty::Shaders]) {
         return last_shaders_valid;
@@ -177,20 +186,18 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                         if (Settings::values.use_shader_aot_translation.GetValue() ||
                             (aot != nullptr && aot[0] == '1')) {
                             pool_index = ShaderPoolIndex::Open();
+                            // Seeding costs GPU-thread time to build candidate environments
+                            // (329 ms in cold run 20261106-001156): opt-in with
+                            // EDEN_NX2_AOT_SEED=1 until it is shown to pay for itself.
+                            const char* seed = std::getenv("EDEN_NX2_AOT_SEED");
+                            seed_enabled = pool_index && seed != nullptr && seed[0] == '1';
                         }
                     }
                     if (pool_index) {
                         pool_index->OnFirstUse(*gpu_memory, shader_addr);
-                        // Seeding costs GPU-thread time to build candidate environments
-                        // (329 ms in cold run 20261106-001156): opt-in with
-                        // EDEN_NX2_AOT_SEED=1 until it is shown to pay for itself.
-                        static const bool seed = [] {
-                            const char* value = std::getenv("EDEN_NX2_AOT_SEED");
-                            return value != nullptr && value[0] == '1';
-                        }();
-                        if (seed && seed_stage && !mesh) {
+                        if (seed_enabled && seed_stage && !mesh) {
                             const auto seed_begin = std::chrono::steady_clock::now();
-                            SeedPoolCandidates();
+                            SeedPoolCandidates(false);
                             pool_index->AddSeedTime(std::chrono::steady_clock::now() - seed_begin);
                         }
                     }
@@ -279,14 +286,14 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     return false;
 }
 
-void ShaderCache::SeedPoolCandidates() {
-    // A few per first use, so a recognised pool is fed to the workers over many draws instead
-    // of building thousands of environments on one.
-    static constexpr size_t PerFirstUse = 4;
+void ShaderCache::SeedPoolCandidates(bool manifest_only) {
+    // A few per call, so a recognised pool is fed to the workers over many draws instead of
+    // building thousands of environments on one.
+    static constexpr size_t PerCall = 4;
     if (seed_has_room && !seed_has_room()) {
         return;
     }
-    for (const auto& candidate : pool_index->TakeCandidates(PerFirstUse)) {
+    for (const auto& candidate : pool_index->TakeCandidates(PerCall, manifest_only)) {
         if (seed_has_room && !seed_has_room()) {
             break;
         }
@@ -312,7 +319,11 @@ void ShaderCache::SeedPoolCandidates() {
                 gpu_memory->ReadBlockUnsafe(candidate.address + candidate.constants_offset,
                                             constants.data(), constants.size());
             }
-            seed_stage(env, *hash, static_cast<size_t>(program), constants);
+            // The pool is authoritative; the manifest's copy of the words is only checked.
+            pool_index->CheckBank1(candidate, constants);
+            if (seed_stage(env, *hash, static_cast<size_t>(program), constants, candidate.tier)) {
+                pool_index->CountSeeded(candidate);
+            }
         } catch (const Shader::Exception&) {
             // Rejected or not lowerable: its first use will say so.
         }

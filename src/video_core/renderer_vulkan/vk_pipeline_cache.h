@@ -28,7 +28,9 @@
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/object_pool.h"
+#include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/profile.h"
+#include "shader_recompiler/runtime_info.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
@@ -239,8 +241,10 @@ private:
     /// Ahead-of-time translation of recognised pool programs (ShaderCache::seed_stage): the
     /// GPU thread builds the environment and an owned copy of it; a worker translates the copy,
     /// which answers no queries, and stores programs that needed none as ordinary entries.
-    void SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_hash, size_t slot,
-                   std::span<const u8> constants);
+    bool SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_hash, size_t slot,
+                   std::span<const u8> constants, u8 tier);
+    [[nodiscard]] static size_t AotWorkerCount();
+    size_t aot_worker_count{};
     static constexpr u64 MaxAotPending = 32;
     static constexpr u64 MaxAotEntries = 4096;
     std::atomic<u64> aot_pending{};
@@ -262,8 +266,54 @@ private:
     std::atomic<u64> aot_entry_hits{};
     std::atomic<u64> aot_with_constants{};
     std::mutex aot_mutex;
+    /// Stage keys of entries the workers stored, not yet used by a draw, with their tier index.
+    std::unordered_map<VideoCommon::TranslationCache::Digest, u8,
+                       VideoCommon::TranslationCache::DigestHash>
+        aot_keys;
+    /// Stage keys of jobs queued or running.
     std::unordered_set<VideoCommon::TranslationCache::Digest, VideoCommon::TranslationCache::DigestHash>
-        aot_keys; ///< Stage keys of entries the workers stored, not yet used by a draw
+        aot_in_flight;
+    std::array<std::atomic<u64>, 4> aot_stored_by_tier{}; ///< Tiers 1-3, then no manifest tier
+    std::array<std::atomic<u64>, 4> aot_hits_by_tier{};
+    std::atomic<u64> aot_late{};
+
+    /// Seeded variants: a seeded entry also gets the SPIR-V module of the emission recipe
+    /// (runtime info and bindings in) most often seen at run time for stages of its class (stage
+    /// and loaded varyings), so its first draw neither translates nor emits. A wrong guess is
+    /// never used: the variant key holds the runtime info and the bindings. Off with
+    /// EDEN_NX2_AOT_EMIT=0.
+    struct EmissionRecipe {
+        Shader::RuntimeInfo runtime_info;
+        Shader::Backend::Bindings binding_in{};
+        VideoCommon::TranslationCache::Digest digest{};
+        u64 count{};
+    };
+    bool aot_emit_variants{};
+    std::mutex recipe_mutex;
+    /// Class key -> recipes seen (a few per class; key 0 of a stage holds the stage's recipes).
+    std::unordered_map<u64, std::vector<EmissionRecipe>> recipes;
+    [[nodiscard]] static u64 RecipeClass(Shader::Stage stage, const Shader::Info* info);
+    /// A plain vertex-B + fragment pipeline's stage was emitted (or taken from the cache) with
+    /// this runtime info and these bindings in.
+    void RecordRecipe(Shader::Stage stage, const Shader::Info& info,
+                      const Shader::RuntimeInfo& runtime_info,
+                      const Shader::Backend::Bindings& binding_in);
+    /// The most common recipe of the program's class, else of its stage; `class_match` says
+    /// which.
+    [[nodiscard]] std::optional<EmissionRecipe> BestRecipe(Shader::Stage stage,
+                                                           const Shader::Info& info,
+                                                           bool& class_match);
+    std::atomic<u64> aot_variants_class{};      ///< Emitted with the class's recipe
+    std::atomic<u64> aot_variants_stage{};      ///< Emitted with the stage's recipe
+    std::atomic<u64> aot_variants_none{};       ///< No recipe seen yet for the stage
+    std::atomic<u64> aot_variants_failed{};
+    std::atomic<u64> aot_variant_ns{};
+    std::atomic<u64> aot_full_hits{};           ///< Seeded stages whose first draw found the module
+    std::atomic<u64> aot_emitted_at_draw{};     ///< Seeded stages emitted at their first draw
+    std::atomic<u64> worker_variant_hits{};     ///< Deferred stages whose module the worker found
+    std::atomic<u64> worker_variant_info_differs{};
+    std::atomic<u64> aot_bytes{};
+    std::atomic<u64> aot_bytes_peak{};
 
     std::filesystem::path pipeline_cache_filename;
 

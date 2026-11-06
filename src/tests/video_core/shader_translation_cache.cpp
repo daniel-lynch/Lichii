@@ -416,6 +416,50 @@ TEST_CASE("AOT pool index parses the index file and fingerprints like the tool",
     REQUIRE_FALSE(ShaderPoolIndex::Parse(data, containers));
 }
 
+TEST_CASE("AOT scene manifest marks indexed programs by tier and keeps the bank-1 words",
+          "[video_core][translation_cache]") {
+    using VideoCommon::ShaderPoolIndex;
+    // Rows as build_manifest.py writes them (made-up values, not game data).
+    const std::string_view json = R"({"scene": "Test", "schema": "oot-aot-static-manifest-1",
+      "programs": [
+        {"fingerprint": "00000000000000aa", "pool_offset": 256, "size": 896, "stage": "fragment",
+         "tier": 3, "bank1": {"offset": 768, "size": 8, "words": [1, 2]}},
+        {"fingerprint": "00000000000000aa", "pool_offset": 256, "size": 896, "stage": "fragment",
+         "tier": 1, "bank1": null},
+        {"fingerprint": "0000000000000007", "pool_offset": 1152, "size": 128, "stage": "vertex",
+         "tier": 4},
+        {"fingerprint": "0000000000000009", "pool_offset": 64, "size": 128, "stage": "vertex",
+         "tier": 2},
+        {"fingerprint": "0000000000000007", "pool_offset": 1152, "size": 128, "stage": "mesh",
+         "tier": 2}
+      ]})";
+    std::vector<ShaderPoolIndex::ManifestRow> rows;
+    REQUIRE(ShaderPoolIndex::ParseManifest(json, rows));
+    // Tier 4 is off.
+    REQUIRE(rows.size() == 4);
+    REQUIRE(rows[0].fingerprint == 0xaa);
+    REQUIRE(rows[0].stage == 4);
+    REQUIRE(rows[0].bank1_offset == 768);
+    REQUIRE(rows[0].bank1_words == std::vector<u32>{1, 2});
+    REQUIRE(rows[3].stage == 8);
+
+    std::vector<ShaderPoolIndex::Container> containers(1);
+    containers[0].programs.push_back({0x100, 0x380, 4, 0xaa, 768, 8});
+    containers[0].programs.push_back({0x480, 0x80, 0, 7, ~0U, 0});
+    auto index = ShaderPoolIndex::ForTesting(std::move(containers));
+    // Rows 0 and 1 match program 0 (the lowest tier wins, the bank-1 words are kept); row 2
+    // names no indexed program; row 3 names program 1's key with another stage.
+    REQUIRE(index->ApplyManifest(rows) == 2);
+    const auto& programs = index->Containers()[0].programs;
+    REQUIRE(programs[0].tier == 1);
+    REQUIRE(programs[0].manifest_bank1 == 0);
+    REQUIRE(programs[1].tier == ShaderPoolIndex::NoTier);
+
+    REQUIRE_FALSE(ShaderPoolIndex::ParseManifest("{\"programs\": [{\"fingerprint\": \"zz\"}]}",
+                                                 rows));
+    REQUIRE_FALSE(ShaderPoolIndex::ParseManifest("not json", rows));
+}
+
 namespace {
 // What the texture pass does for one handle: Begin, the two word reads, End.
 u32 ReadHandle(Shader::Environment& env, const Shader::ConstBufferAddr& cbuf) {
