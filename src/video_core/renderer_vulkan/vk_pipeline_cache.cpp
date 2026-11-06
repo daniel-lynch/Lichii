@@ -1069,6 +1069,14 @@ bool PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
         ++aot_skipped_known;
         return false;
     }
+    {
+        // A job for the same stage key queued or running: translating it twice stores nothing.
+        std::scoped_lock lock{aot_mutex};
+        if (aot_in_flight.contains(stage_key)) {
+            ++aot_skipped_known;
+            return false;
+        }
+    }
     // No recorded answers: the worker answers with the common case (guess mode) and records
     // what it answered; the draw's class-level replay keeps the entry only if the live
     // environment agrees. A word consumed by value cannot be guessed and aborts the job.
@@ -1132,7 +1140,11 @@ bool PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
             // The module for the most likely recipe, stored before the entry is announced as
             // seeded. Only vertex-B and fragment stages without legacy varyings (recorded the
             // same way).
-            if (entry && aot_emit_variants &&
+            // Insert may return an entry stored before for the same key and queries: emit only
+            // against metadata equal to this translation's.
+            if (entry && aot_emit_variants && !TC::InfoEqual(entry->meta.info, program.info)) {
+                ++aot_variant_meta_differs;
+            } else if (entry && aot_emit_variants &&
                 (program.stage == Shader::Stage::VertexB ||
                  program.stage == Shader::Stage::Fragment) &&
                 !program.info.loads.Legacy() && !program.info.stores.Legacy()) {
@@ -1254,12 +1266,13 @@ void PipelineCache::LogStageOutcomes(std::string_view when) {
     };
     LOG_INFO(Render_Vulkan,
              "Shader AOT ({}): {} workers; by tier 1/2/3/other: stored {}, used by a draw {}; "
-             "{} draws needed a stage whose seed was still queued or translating; seeded "
+             "{} draws needed a stage whose seed was still queued or translating; {} modules "
+             "refused for metadata that differs from their entry; seeded "
              "programs whose first draw missed: {} other stage key, {} answers differed, {} not "
              "stored; job bytes peak {}",
              when, aot_worker_count, tiers(aot_stored_by_tier), tiers(aot_hits_by_tier),
-             aot_late.load(), aot_miss_key_differs.load(), aot_miss_replay_failed.load(),
-             aot_miss_not_stored.load(), aot_bytes_peak.load());
+             aot_late.load(), aot_variant_meta_differs.load(), aot_miss_key_differs.load(),
+             aot_miss_replay_failed.load(), aot_miss_not_stored.load(), aot_bytes_peak.load());
     LOG_INFO(Render_Vulkan,
              "Shader AOT ({}): seeded variants {} with the class's recipe, {} with the stage's, {} "
              "without a recipe, {} failed, {:.1f} ms on workers; seeded stages at their first draw: "
@@ -2109,6 +2122,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             variant_key =
                 TC::MakeVariantKey(entry->id, TC::DigestRuntimeInfo(runtime_info), binding);
             variant = translation_cache.FindVariant(variant_key);
+            // AOT translation: a module is used only with the info the layout is built from
+            // (without legacy varyings the variant's info is the entry's).
+            if (variant && aot_translation && !program.info.loads.Legacy() &&
+                !program.info.stores.Legacy() && !TC::InfoEqual(variant->info, program.info)) {
+                ++aot_variant_meta_differs;
+                variant.reset();
+            }
         }
         // #184 native async pipelines: the SPIR-V of a stage the translation cache does not
         // supply is emitted on the worker that builds the pipeline. Not while verifying the
