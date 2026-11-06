@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
+    video_core/unswizzle_workers.cpp
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp
     video_core/gpu_timestamp.cpp
@@ -54,10 +55,13 @@ add_executable(tests
     video_core/ampere_async_copy.cpp
     video_core/ampere_trap_guards.cpp
     video_core/async_draw_policy.cpp
+    video_core/async_shader_emission.cpp
+    video_core/pipeline_build.cpp
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
     video_core/command_snapshot_suspensions.cpp
     video_core/pending_maps.cpp
+    video_core/maxwell_fast_method.cpp
     hid_core/sensor_info.cpp
     common/paged_scalar.cpp
     common/queue_lifetime.cpp
@@ -110,6 +114,9 @@ add_executable(tests
     core/priority_queue.cpp
     core/internal_network/network.cpp
     video_core/memory_tracker.cpp
+    video_core/memory_manager_runs.cpp
+    video_core/nx2_perf_draw_binds.cpp
+    video_core/nx2_perf_texture_writes.cpp
     video_core/h264_packet.cpp
     video_core/nx2_gpu_mapping.cpp
     video_core/vertex_repack.cpp

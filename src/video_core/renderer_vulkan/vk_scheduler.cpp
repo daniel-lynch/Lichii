@@ -187,7 +187,10 @@ bool Scheduler::DeferFlush() {
     // for about 5%.
     static const s64 interval_us = [] {
         const char* value = std::getenv("EDEN_NX2_FENCE_FLUSH_US");
-        return value == nullptr ? s64{500} : static_cast<s64>(std::atoll(value));
+        if (value != nullptr) {
+            return static_cast<s64>(std::atoll(value));
+        }
+        return s64{5000};
     }();
     if (interval_us <= 0 || !VideoCommon::GpuSplit::OnBackThread() ||
         std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
@@ -838,6 +841,7 @@ void Scheduler::AllocateNewContext() {
 }
 
 void Scheduler::InvalidateState() {
+    ++recording_epoch;
     state.graphics_pipeline = nullptr;
     state.rescaling_defined = false;
     state.descriptor_buffer_bound = false;
@@ -857,7 +861,8 @@ void Scheduler::EndRenderPass()
         if (!state.renderpass) {
             return;
         }
-        fragment_barrier_pending = false;
+        ++recording_epoch;
+        fragment_barrier.Reset();
         render_pass_has_stores = false;
 
         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);

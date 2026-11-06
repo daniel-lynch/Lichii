@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <tuple>
 #include <set>
+#include <span>
 #include <fstream>
 #include <mutex>
 #include <string_view>
@@ -60,6 +61,7 @@
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
 
@@ -71,6 +73,40 @@ using VideoCommon::ImageViewType;
 
 
 namespace {
+
+/// read_gpu_memory: the first address space (the bound channel's first) that maps the whole range,
+/// read as the GPU reads it, without flushing GPU caches.
+VideoCore::Nx2Debug::GpuReadResult ReadGpuMemory(std::span<Tegra::MemoryManager* const> spaces,
+                                                 GPUVAddr address, u64 size) {
+    VideoCore::Nx2Debug::GpuReadResult result{};
+    if (spaces.empty()) {
+        result.error = "no GPU address space is bound yet";
+        return result;
+    }
+    for (Tegra::MemoryManager* const space : spaces) {
+        if (space->IsFullyMappedRange(address, size)) {
+            result.bytes.resize(size);
+            space->ReadBlockUnsafe(address, result.bytes.data(), size);
+            result.address_space = space->GetID();
+            return result;
+        }
+    }
+    constexpr u64 page_mask = 0xfff;
+    const GPUVAddr end = address + size;
+    GPUVAddr first = address;
+    while (first < end) {
+        const GPUVAddr next = (std::min)((first | page_mask) + 1, end);
+        if (!spaces.front()->IsFullyMappedRange(first, next - first)) {
+            break;
+        }
+        first = next;
+    }
+    result.error = fmt::format("GPU address {:#x} is not mapped (the first unmapped byte in the "
+                               "bound channel's address space; {} address spaces checked)",
+                               first, spaces.size());
+    return result;
+}
+
 struct DrawParams {
     u32 base_instance;
     u32 num_instances;
@@ -439,14 +475,20 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     if (frame_dump.Capturing()) {
         FrameDumpPass(texture_cache.GetFramebuffer());
         frame_dump.NoteDraw(pipeline->ShaderHashes());
+        bool recorded = false;
         if (frame_dump.CapturingSampled()) {
             boost::container::small_vector<FrameDump::Sampled, 16> sampled;
             for (const auto& image : pipeline->SampledImages()) {
-                sampled.push_back({image.stage, image.tic, &texture_cache.GetImageView(image.id)});
+                sampled.push_back({image.stage, image.tic, &texture_cache.GetImageView(image.id),
+                                   &texture_cache.GetSampler(image.sampler)});
             }
-            if (frame_dump.NoteSampled(sampled)) {
-                scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
-            }
+            recorded = frame_dump.NoteSampled(sampled);
+        }
+        if (frame_dump.CapturingBuffers()) {
+            recorded |= FrameDumpBuffers(false, pipeline->ShaderHashes());
+        }
+        if (recorded) {
+            scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
         }
     }
     if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
@@ -1358,13 +1400,29 @@ void RasterizerVulkan::DispatchCompute() {
     if (frame_dump.CapturingSampled()) {
         boost::container::small_vector<FrameDump::Sampled, 16> sampled;
         for (const auto& image : pipeline->SampledImages()) {
-            sampled.push_back({5, image.tic, &texture_cache.GetImageView(image.id)});
+            sampled.push_back({5, image.tic, &texture_cache.GetImageView(image.id),
+                               &texture_cache.GetSampler(image.sampler)});
         }
         frame_dump.NoteDispatchSampled(pipeline->ShaderHash(), sampled);
+    }
+    if (frame_dump.CapturingBuffers()) {
+        FrameDumpBuffers(true, std::array{pipeline->ShaderHash()});
     }
 
     const auto& qmd{kepler_compute->launch_description};
     auto indirect_address = kepler_compute->GetIndirectComputeAddress();
+    if (frame_dump.CapturingBuffers()) {
+        std::optional<std::array<u32, 3>> indirect_grid;
+        if (indirect_address) {
+            indirect_grid = std::array{gpu_memory->Read<u32>(*indirect_address),
+                                       gpu_memory->Read<u32>(*indirect_address + 4),
+                                       gpu_memory->Read<u32>(*indirect_address + 8)};
+        }
+        frame_dump.NoteLaunch(pipeline->ShaderHash(),
+                              {qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z},
+                              {qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z},
+                              indirect_address, indirect_grid);
+    }
     if (indirect_address) {
         // DispatchIndirect
         static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
@@ -1456,7 +1514,9 @@ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 in
 void RasterizerVulkan::FlushAll() {}
 
 void RasterizerVulkan::SubmitNx2ListCopies() {
-    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) && !scheduler.DeferFlush()) {
+    // Submitted at once: ReadGpuWrittenCommands waits on these copies, so they can't sit out
+    // the longer DeferFlush interval (#161).
+    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
         scheduler.Flush();
     }
 }
@@ -1727,12 +1787,9 @@ void RasterizerVulkan::WaitForIdle() {
 }
 
 void RasterizerVulkan::FragmentBarrier() {
-    if (device.IsMoltenVK()) {
-        scheduler.DeferFragmentBarrier();
-        return;
-    }
-    // We already put barriers when a render pass finishes
-    scheduler.RequestOutsideRenderPassOperationContext();
+    // The next draw breaks the render pass only if it reads what this one wrote (#161): Ocarina
+    // ended ~5,900 render passes a second here.
+    scheduler.DeferFragmentBarrier();
 }
 
 void RasterizerVulkan::TiledCacheBarrier() {
@@ -1852,6 +1909,36 @@ void RasterizerVulkan::TracePendingCpuWrites(bool compute, std::span<const u64> 
     });
 }
 
+bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes) {
+    static constexpr u32 BUFFER_CAP = 4U << 20;
+    std::vector<FrameDump::BoundBuffer> buffers;
+    buffer_cache.ForEachBoundBuffer(compute, [&](u32 stage, bool storage, u32 index, bool written,
+                                                 const auto& binding, u32 bound_size,
+                                                 const auto* host, u32 host_offset) {
+        const u32 size = std::min(bound_size, BUFFER_CAP);
+        const bool gpu_modified = buffer_cache.IsRegionGpuModified(binding.device_addr, size);
+        FrameDump::BoundBuffer& buffer = buffers.emplace_back(FrameDump::BoundBuffer{
+            .stage = stage,
+            .storage = storage,
+            .index = index,
+            .written = written,
+            .gpu_addr = binding.gpu_addr,
+            .device_addr = binding.device_addr,
+            .bound_size = bound_size,
+            .size = size,
+            .gpu_modified = gpu_modified,
+            .host = host ? host->Handle() : VK_NULL_HANDLE,
+            .host_offset = host_offset,
+            .guest = {},
+        });
+        if (!gpu_modified || !host) {
+            buffer.guest.resize(size);
+            device_memory.ReadBlockUnsafe(binding.device_addr, buffer.guest.data(), size);
+        }
+    });
+    return frame_dump.NoteBuffers(compute, shader_hashes, buffers);
+}
+
 void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
     std::array<ImageView*, VideoCommon::NUM_RT> colors{};
     const auto& ids = texture_cache.GetRenderTargets().color_buffer_ids;
@@ -1868,11 +1955,28 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 void RasterizerVulkan::TickFrame() {
     if (VideoCore::Nx2Debug::HasRequests()) {
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
-            frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->id);
+            frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,
+                           capture->id);
         }
         if (const auto change = VideoCore::Nx2Debug::TakeRejectChange()) {
             pipeline_cache.RefreshDebugRejections(change->unrejected);
             VideoCore::Nx2Debug::NoteRejectApplied(change->generation);
+        }
+        while (const auto read = VideoCore::Nx2Debug::TakeGpuRead()) {
+            std::vector<Tegra::MemoryManager*> spaces;
+            if (gpu_memory != nullptr) {
+                spaces.push_back(gpu_memory);
+            }
+            {
+                std::scoped_lock lock{config_mutex};
+                for (const auto& [id, space] : address_spaces) {
+                    if (space.gpu_memory != gpu_memory) {
+                        spaces.push_back(space.gpu_memory);
+                    }
+                }
+            }
+            VideoCore::Nx2Debug::FinishGpuRead(read->id,
+                                               ReadGpuMemory(spaces, read->gpu_address, read->size));
         }
     }
     frame_dump.TickFrame();
@@ -2098,21 +2202,23 @@ void RasterizerVulkan::FlushWork() {
     static constexpr bool android = false;
 #endif // __ANDROID__
     const bool native = gpu_memory->UsesNativeTiling();
-    u32 budget = SubmissionPolicy::DefaultNativeBudget;
+    // The 128-draw native budget is tuned for MoltenVK; desktop Vulkan takes the legacy 4096 (#161).
+    const u32 default_native_budget =
+        !device.IsMoltenVK() ? 4096U : SubmissionPolicy::DefaultNativeBudget;
+    u32 budget = default_native_budget;
     if (native && !android) {
-        static const u32 configured_budget = [] {
+        static const std::optional<u32> configured_budget = []() -> std::optional<u32> {
             if (const char* value = std::getenv("EDEN_NX2_FLUSH_DRAWS")) {
                 if (const auto parsed = SubmissionPolicy::ParseBudget(value)) {
-                    return *parsed;
+                    return parsed;
                 }
                 LOG_WARNING(Render_Vulkan,
-                            "Invalid EDEN_NX2_FLUSH_DRAWS; expected an integer from 1 to {}, "
-                            "using {}",
-                            (std::numeric_limits<u32>::max)(), SubmissionPolicy::DefaultNativeBudget);
+                            "Invalid EDEN_NX2_FLUSH_DRAWS; expected an integer from 1 to {}",
+                            (std::numeric_limits<u32>::max)());
             }
-            return SubmissionPolicy::DefaultNativeBudget;
+            return std::nullopt;
         }();
-        budget = configured_budget;
+        budget = configured_budget.value_or(default_native_budget);
     }
     u32 legacy_budget = 4096;
     if (!native && !android) {
