@@ -180,6 +180,9 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                     }
                     if (pool_index) {
                         pool_index->OnFirstUse(*gpu_memory, shader_addr);
+                        if (seed_stage && !mesh) {
+                            SeedPoolCandidates();
+                        }
                     }
                 }
             } catch (const Shader::Exception&) {
@@ -264,6 +267,30 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
         }
     }
     return false;
+}
+
+void ShaderCache::SeedPoolCandidates() {
+    // A few per first use, so a recognised pool is fed to the workers over many draws instead
+    // of building thousands of environments on one.
+    static constexpr size_t PerFirstUse = 4;
+    for (const auto& candidate : pool_index->TakeCandidates(PerFirstUse)) {
+        const std::optional<VAddr> cpu_addr{gpu_memory->GpuToCpuAddress(candidate.address)};
+        if (!cpu_addr || TryGet(*cpu_addr) || IsRejected(*cpu_addr)) {
+            continue;
+        }
+        const auto program = candidate.stage == 0 ? Tegra::Engines::Maxwell3D::Regs::ShaderType::VertexB
+                                                  : Tegra::Engines::Maxwell3D::Regs::ShaderType::Pixel;
+        try {
+            GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, candidate.address, 0};
+            const std::optional<u64> hash{env.Analyze()};
+            if (!hash) {
+                continue;
+            }
+            seed_stage(env, *hash, static_cast<size_t>(program));
+        } catch (const Shader::Exception&) {
+            // Rejected or not lowerable: its first use will say so.
+        }
+    }
 }
 
 const ShaderInfo* ShaderCache::ComputeShader() {

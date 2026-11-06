@@ -109,11 +109,24 @@ void ShaderPoolIndex::LogStatistics(const char* when) const {
     LOG_INFO(HW_GPU,
              "AOT pool index ({}): {} first uses, {} found in the index, {} predicted before first "
              "use; {} ambiguous; pools {} recognised, {} rejected; siblings {} verified, {} "
-             "differed, {} unmapped; {} still predicted unused; {:.1f} ms",
+             "differed, {} unmapped; {} still predicted unused; candidates {} offered, {} "
+             "dropped, {} queued; {:.1f} ms",
              when, first_uses, first_uses_indexed, first_uses_predicted, ambiguous,
              containers_recognised, containers_rejected, siblings_verified, siblings_mismatched,
-             siblings_unmapped, predicted.size(),
-             std::chrono::duration<double, std::milli>(time).count());
+             siblings_unmapped, predicted.size(), candidates_offered, candidates_dropped,
+             candidates_queue.size(), std::chrono::duration<double, std::milli>(time).count());
+}
+
+std::vector<ShaderPoolIndex::Candidate> ShaderPoolIndex::TakeCandidates(size_t count) {
+    std::vector<Candidate> result;
+    while (result.size() < count && !candidates_queue.empty()) {
+        const Candidate candidate = candidates_queue.front();
+        candidates_queue.pop_front();
+        if (!used.contains(candidate.address)) {
+            result.push_back(candidate);
+        }
+    }
+    return result;
 }
 
 void ShaderPoolIndex::OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr address) {
@@ -168,7 +181,7 @@ void ShaderPoolIndex::OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr addr
             continue;
         }
         size_t verified = 0, mismatched = 0, unmapped = 0;
-        std::vector<GPUVAddr> found;
+        std::vector<std::pair<GPUVAddr, u8>> found;
         for (const Program& program : container.programs) {
             const GPUVAddr where = pool + program.offset;
             const size_t length = (std::min)(size_t{program.size}, FingerprintBytes);
@@ -178,7 +191,7 @@ void ShaderPoolIndex::OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr addr
                 ++mismatched;
             } else {
                 ++verified;
-                found.push_back(where);
+                found.emplace_back(where, program.stage);
             }
         }
         const size_t total = container.programs.size();
@@ -187,9 +200,20 @@ void ShaderPoolIndex::OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr addr
             siblings_verified += verified;
             siblings_mismatched += mismatched;
             siblings_unmapped += unmapped;
-            for (const GPUVAddr where : found) {
-                if (!used.contains(where)) {
-                    predicted.insert(where);
+            for (const auto& [where, stage] : found) {
+                if (used.contains(where)) {
+                    continue;
+                }
+                predicted.insert(where);
+                // Vertex and pixel programs only: their container slot maps to one pipeline slot.
+                if (stage != 0 && stage != 4) {
+                    continue;
+                }
+                if (candidates_queue.size() < MaxCandidatesQueued) {
+                    candidates_queue.push_back({where, stage});
+                    ++candidates_offered;
+                } else {
+                    ++candidates_dropped;
                 }
             }
         } else {

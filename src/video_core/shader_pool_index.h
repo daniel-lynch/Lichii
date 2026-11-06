@@ -5,6 +5,7 @@
 
 #include <array>
 #include <chrono>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -34,6 +35,14 @@ public:
 
     /// A native graphics program at `address` is used for the first time.
     void OnFirstUse(Tegra::MemoryManager& gpu_memory, GPUVAddr address);
+
+    /// A verified program of a recognised pool, not used yet, to translate ahead of time.
+    struct Candidate {
+        GPUVAddr address;
+        u8 stage; ///< Container stage slot (0 vertex, 4 pixel; others are not offered)
+    };
+    /// Up to `count` candidates, oldest first, skipping programs used since they were found.
+    [[nodiscard]] std::vector<Candidate> TakeCandidates(size_t count);
 
     struct Program {
         u32 offset;
@@ -68,6 +77,11 @@ private:
     std::unordered_set<GPUVAddr> predicted;
     /// Addresses of programs already used.
     std::unordered_set<GPUVAddr> used;
+    /// Candidates waiting for translation, bounded by MaxCandidatesQueued.
+    std::deque<Candidate> candidates_queue;
+    static constexpr size_t MaxCandidatesQueued = 4096;
+    u64 candidates_offered{};
+    u64 candidates_dropped{};
 
     u64 first_uses{};
     u64 first_uses_indexed{};

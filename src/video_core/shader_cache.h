@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -202,6 +203,13 @@ private:
     /// use_shader_aot_translation with EDEN_NX2_AOT_INDEX: recognises shader pools at first use.
     std::unique_ptr<ShaderPoolIndex> pool_index;
     bool pool_index_opened{};
+    void SeedPoolCandidates();
+
+protected:
+    /// Set by a renderer that translates recognised programs ahead of time: called on the GPU
+    /// thread with a program's environment (built as at first use), its unique hash and its
+    /// pipeline slot.
+    std::function<void(GenericEnvironment& env, u64 unique_hash, size_t slot)> seed_stage;
 };
 
 } // namespace VideoCommon
