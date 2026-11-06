@@ -1072,3 +1072,31 @@ TEST_CASE("AOT recipe histogram: a ninth recipe overtakes eight residents seen m
     REQUIRE(best->binding_in.uniform_buffer == fresh);
     REQUIRE(best->count == 3);
 }
+
+TEST_CASE("AOT candidates at unmapped addresses are retried a bounded number of times",
+          "[video_core][translation_cache]") {
+    using VideoCommon::ShaderPoolIndex;
+    auto index = ShaderPoolIndex::ForTesting({});
+    const ShaderPoolIndex::Candidate candidate{0x2000, 4, 1, ~0U, 0, ~0U};
+    index->QueueForTesting(candidate);
+    auto now = std::chrono::steady_clock::now();
+    for (u32 attempt = 1; attempt <= ShaderPoolIndex::MaxRetries; ++attempt) {
+        auto taken = index->TakeCandidates(4);
+        REQUIRE(taken.size() == 1);
+        index->Defer(taken[0]); // unmapped when taken
+        now = std::chrono::steady_clock::now();
+        REQUIRE(index->QueuedCandidates() == 0);
+        REQUIRE(index->DeferredCandidates() == 1);
+        index->RequeueDeferred(now); // not yet: it waits for its retry time
+        REQUIRE(index->QueuedCandidates() == 0);
+        index->RequeueDeferred(now + ShaderPoolIndex::RetryInterval * attempt);
+        REQUIRE(index->QueuedCandidates() == 1);
+        REQUIRE(index->DeferredCandidates() == 0);
+    }
+    // One retry too many: dropped (a scene change can still offer it).
+    auto taken = index->TakeCandidates(4);
+    index->Defer(taken[0]);
+    REQUIRE(index->DeferredCandidates() == 0);
+    index->RequeueDeferred(now + std::chrono::hours{1});
+    REQUIRE(index->QueuedCandidates() == 0);
+}

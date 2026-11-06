@@ -458,6 +458,35 @@ std::vector<ShaderPoolIndex::Candidate> ShaderPoolIndex::TakeCandidates(size_t c
 
 void ShaderPoolIndex::Acknowledge(const Candidate& candidate) {
     taken.insert(candidate.address);
+    retries.erase(candidate.address);
+}
+
+void ShaderPoolIndex::Defer(const Candidate& candidate) {
+    u32& attempts = retries[candidate.address];
+    if (++attempts > MaxRetries) {
+        ++deferred_dropped;
+        return;
+    }
+    deferred.push_back({candidate, std::chrono::steady_clock::now() + RetryInterval * attempts});
+}
+
+void ShaderPoolIndex::RequeueDeferred(std::chrono::steady_clock::time_point now) {
+    for (auto it = deferred.begin(); it != deferred.end();) {
+        if (it->retry_at > now) {
+            ++it;
+            continue;
+        }
+        const Candidate& candidate = it->candidate;
+        if (!used.contains(candidate.address) && !taken.contains(candidate.address) &&
+            !queued_tier.contains(candidate.address) &&
+            candidates_queued < MaxCandidatesQueued) {
+            candidates_queues[(std::min<size_t>)(candidate.tier, NoTier) - 1].push_back(candidate);
+            queued_tier.emplace(candidate.address, candidate.tier);
+            ++candidates_queued;
+            manifest_queued += candidate.tier != NoTier ? 1 : 0;
+        }
+        it = deferred.erase(it);
+    }
 }
 
 void ShaderPoolIndex::ReturnCandidates(std::span<const Candidate> returned) {

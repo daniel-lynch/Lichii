@@ -83,6 +83,21 @@ public:
     /// Candidates taken but not handled (no room now) go back to the front of their queues, in
     /// order.
     void ReturnCandidates(std::span<const Candidate> candidates);
+    /// The candidate's address is not mapped now: it is offered again after RetryInterval, at
+    /// most MaxRetries times (then dropped until a scene change offers it).
+    void Defer(const Candidate& candidate);
+    /// Requeues deferred candidates whose retry time has come (cheap, for every draw).
+    void PollDeferred() {
+        if (!deferred.empty() && ++deferred_polls % 64 == 0) {
+            RequeueDeferred(std::chrono::steady_clock::now());
+        }
+    }
+    void RequeueDeferred(std::chrono::steady_clock::time_point now);
+    static constexpr u32 MaxRetries = 8;
+    static constexpr std::chrono::seconds RetryInterval{2};
+    [[nodiscard]] size_t DeferredCandidates() const noexcept {
+        return deferred.size();
+    }
     /// Candidates waiting (for tests and statistics).
     [[nodiscard]] size_t QueuedCandidates() const noexcept {
         return candidates_queued;
@@ -212,6 +227,15 @@ private:
     size_t global_bank1_count{};
     /// Pools recognised so far: (container, pool address), to offer a new scene's programs.
     std::vector<std::pair<u32, GPUVAddr>> recognised_pools;
+    /// Candidates whose address was unmapped when taken, with their retry time.
+    struct Deferred {
+        Candidate candidate;
+        std::chrono::steady_clock::time_point retry_at;
+    };
+    std::deque<Deferred> deferred;
+    std::unordered_map<GPUVAddr, u32> retries;
+    u64 deferred_polls{};
+    u64 deferred_dropped{};
     /// Addresses acknowledged (seeded, or never seedable), not offered again.
     std::unordered_set<GPUVAddr> taken;
     u64 scenes_applied{};

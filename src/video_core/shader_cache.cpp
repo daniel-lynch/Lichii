@@ -124,6 +124,7 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     // would otherwise leave the workers idle while the scene's programs wait.
     if (pool_index) {
         pool_index->PollScene(*gpu_memory);
+        pool_index->PollDeferred();
     }
     if (seed_enabled && pool_index && pool_index->HasManifestCandidates() && seed_has_room &&
         seed_has_room()) {
@@ -307,7 +308,8 @@ void ShaderCache::SeedPoolCandidates(bool manifest_only) {
         }
         const std::optional<VAddr> cpu_addr{gpu_memory->GpuToCpuAddress(candidate.address)};
         if (!cpu_addr) {
-            // Unmapped now: dropped, not acknowledged, so a later scene can offer it again.
+            // Unmapped now: offered again in a while (a few times), not acknowledged.
+            pool_index->Defer(candidate);
             continue;
         }
         if (TryGet(*cpu_addr) || IsRejected(*cpu_addr)) {
