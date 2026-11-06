@@ -41,11 +41,13 @@ namespace {
 // 6 is used by the sibling AOT branch (also stores mesh metadata).
 // 7: Class-level texture replay without the sibling branch's mesh metadata layout.
 // 8: Variants optionally carry their emission recipe for archive producers.
-constexpr u32 FormatVersion = 8;
+// 9: Offline provenance and persistent rejection of speculative metadata.
+constexpr u32 FormatVersion = 9;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
 constexpr u8 RecordVariant = 1;
+constexpr u8 RecordDrop = 2;
 
 // The number of fields of an aggregate, to notice a structure gaining a field this file does not
 // serialize or digest yet.
@@ -303,8 +305,9 @@ bool ReadMeta(std::span<const u8>& in, ProgramMeta& meta) {
            ReadInfo(in, meta.info);
 }
 
-Digest EntryId(const Digest& stage_key, std::span<const Query> queries) {
+Digest EntryId(const Digest& stage_key, std::span<const Query> queries, bool offline) {
     Hasher hasher;
+    hasher.Add(offline);
     hasher.Add(stage_key.lo);
     hasher.Add(stage_key.hi);
     for (const Query& query : queries) {
@@ -987,6 +990,7 @@ void Store::Close() {
     entries.clear();
     variants.clear();
     recipes.clear();
+    dropped_entries.clear();
     enabled = false;
 }
 
@@ -1068,7 +1072,7 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
         if (ok && type == RecordEntry) {
             Entry entry;
             ok = reader.Get(entry.stage_key) && ReadQueries(reader, entry.queries) &&
-                 ReadMeta(record, entry.meta) && record.empty();
+                 ReadMeta(record, entry.meta) && reader.Get(entry.offline) && record.empty();
             if (ok) {
                 InsertLocked(std::move(entry));
                 ++loaded_entries;
@@ -1092,6 +1096,10 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
                 variants.insert_or_assign(key, std::move(stored));
                 ++loaded_variants;
             }
+        } else if (ok && type == RecordDrop) {
+            Digest id{};
+            ok = reader.Get(id) && record.empty();
+            if (ok) dropped_entries.insert(id);
         } else {
             ok = false;
         }
@@ -1117,7 +1125,7 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
 }
 
 std::shared_ptr<const Entry> Store::InsertLocked(Entry entry) {
-    entry.id = EntryId(entry.stage_key, entry.queries);
+    entry.id = EntryId(entry.stage_key, entry.queries, entry.offline);
     auto& list = entries[entry.stage_key];
     for (const auto& existing : list) {
         if (existing->id == entry.id && existing->queries == entry.queries) {
@@ -1137,7 +1145,9 @@ std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::E
         if (it == entries.end()) {
             return nullptr;
         }
-        candidates = it->second;
+        for (const auto& entry : it->second) {
+            if (!dropped_entries.contains(entry->id)) candidates.push_back(entry);
+        }
     }
     for (const auto& candidate : candidates) {
         try {
@@ -1178,8 +1188,9 @@ std::optional<Variant> Store::FindVariant(const Digest& variant_key) {
 }
 
 std::shared_ptr<const Entry> Store::Insert(const Digest& stage_key, std::vector<Query> queries,
-                                           const ProgramMeta& meta) {
-    Entry entry{.stage_key = stage_key, .queries = std::move(queries), .meta = meta};
+                                           const ProgramMeta& meta, bool offline) {
+    Entry entry{.stage_key = stage_key, .queries = std::move(queries), .meta = meta,
+                .offline = offline};
     std::vector<u8> record;
     {
         Writer writer{record};
@@ -1187,6 +1198,7 @@ std::shared_ptr<const Entry> Store::Insert(const Digest& stage_key, std::vector<
         writer.Put(entry.stage_key);
         WriteQueries(writer, entry.queries);
         WriteMeta(record, entry.meta);
+        writer.Put(entry.offline);
     }
     std::scoped_lock lock{mutex};
     if (!enabled) {
@@ -1250,6 +1262,21 @@ void Store::Append(const std::vector<u8>& record) {
                   Common::FS::PathToUTF8String(filename));
         file.close();
     }
+}
+
+bool Store::ValidateOfflineEntry(const Entry& entry, const Shader::IR::Program& live) {
+    if (!entry.offline) return true;
+    std::vector<u8> expected, actual;
+    WriteMeta(expected, entry.meta);
+    WriteMeta(actual, ProgramMeta::From(live));
+    if (expected == actual) return true;
+    std::vector<u8> record;
+    Writer writer{record};
+    writer.Put(RecordDrop);
+    writer.Put(entry.id);
+    std::scoped_lock lock{mutex};
+    if (dropped_entries.insert(entry.id).second) Append(record);
+    return false;
 }
 
 void Store::LogStatistics(std::string_view when) {

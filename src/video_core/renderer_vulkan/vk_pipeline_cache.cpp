@@ -1402,7 +1402,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             cached_entries[index] = translation_cache.FindEntry(stage_key, env);
             from_cache[index] = cached_entries[index] != nullptr;
         }
-        if (from_cache[index]) {
+        if (from_cache[index] && cached_entries[index]->CanReuseMetadata() &&
+            !translation_cache_verify) {
             // Only the program's metadata: the IR is translated again if no module fits.
             programs[index] = cached_entries[index]->meta.ToProgram();
         } else {
@@ -1433,7 +1434,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 LOG_WARNING(Render_Vulkan, "0x{:016x}: Skipping shader with known issues", key.unique_hashes[index]);
                 return nullptr;
             }
-            if (recording && !programs[index].info.requires_layer_emulation &&
+            // Archive guesses must never supply pipeline state, even while emission is deferred.
+            // Keep an offline entry only for an exact module lookup after live translation.
+            if (cached_entries[index] && cached_entries[index]->offline &&
+                !translation_cache.ValidateOfflineEntry(*cached_entries[index], programs[index])) {
+                cached_entries[index].reset();
+            }
+            from_cache[index] = false;
+            if (!cached_entries[index] && recording && !programs[index].info.requires_layer_emulation &&
                 IsTranslationCacheable(env)) {
                 cached_entries[index] = translation_cache.Insert(
                     stage_key, recording->TakeQueries(), TC::ProgramMeta::From(programs[index]));
@@ -1537,7 +1545,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 const u32 cfg_offset{
                     static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
                 Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
-                program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+                auto fresh = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+                if (!TC::InfoEqual(fresh.info, program.info) ||
+                    !std::ranges::equal(fresh.mesh.vertex_lines, program.mesh.vertex_lines) ||
+                    !std::ranges::equal(fresh.mesh.primitive_lines, program.mesh.primitive_lines)) {
+                    throw Shader::LogicError("Translation cache: retranslated stage {} metadata differs", index);
+                }
+                program = std::move(fresh);
                 from_cache[index] = false;
             }
             ConvertLegacyToGeneric(program, runtime_info);

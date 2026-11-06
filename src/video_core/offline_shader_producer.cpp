@@ -199,7 +199,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                 const auto code = Shader::Backend::SPIRV::EmitSPIRV(profile, recipe.runtime, program, bindings);
                 if (code.size() < 5 || code.front() != 0x07230203)
                     throw std::runtime_error("lowering_or_emission_rejected");
-                const auto entry = store.Insert(key, recording.TakeQueries(), meta);
+                const auto entry = store.Insert(key, recording.TakeQueries(), meta, true);
                 if (!entry) throw std::runtime_error("cache_disabled");
                 store.InsertVariant(*entry, TC::MakeVariantKey(entry->id, runtime, recipe.bindings),
                                     {bindings, program.info, code}, &recipe);

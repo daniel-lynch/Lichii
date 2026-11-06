@@ -188,6 +188,9 @@ struct Entry {
     ProgramMeta meta;
     /// Digest of the stage key and the queries: identifies the program the entry translates.
     Digest id;
+    bool offline{};
+
+    [[nodiscard]] bool CanReuseMetadata() const { return !offline; }
 };
 
 struct Variant {
@@ -240,13 +243,16 @@ public:
 
     /// Adds an entry (when new) and a variant, and appends both to the file.
     std::shared_ptr<const Entry> Insert(const Digest& stage_key, std::vector<Query> queries,
-                                        const ProgramMeta& meta);
+                                        const ProgramMeta& meta, bool offline = false);
     void InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant,
                        const EmissionRecipe* recipe = nullptr);
 
     /// Reads recipes without modifying the source cache, including an incomplete tail.
     [[nodiscard]] static std::array<EmissionRecipe, Shader::MaxStageTypes> ReadRecipes(
         const std::filesystem::path& path, const Digest& config);
+
+    /// Reject speculative metadata before any pipeline state is derived from it.
+    [[nodiscard]] bool ValidateOfflineEntry(const Entry& entry, const Shader::IR::Program& live);
 
     void LogStatistics(std::string_view when);
 
@@ -280,6 +286,7 @@ private:
     bool enabled{};
     std::unordered_map<Digest, std::vector<std::shared_ptr<const Entry>>, DigestHash> entries;
     std::unordered_map<Digest, std::shared_ptr<const StoredVariant>, DigestHash> variants;
+    std::unordered_set<Digest, DigestHash> dropped_entries;
     std::filesystem::path filename;
     std::ofstream file;
     u64 loaded_entries{};
