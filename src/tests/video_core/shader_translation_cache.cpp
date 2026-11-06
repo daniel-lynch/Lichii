@@ -616,6 +616,8 @@ TEST_CASE("Class-level replay covers two-word handles and rejects one-to-many ma
     // The two recorded-equal handles now differ live: one recorded handle, two live ones.
     env.cbufs[(u64{2} << 32) | 0x30] = 6;
     REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) < queries.size());
+}
+
 namespace {
 // Sets an environment variable for one scope and restores it afterwards.
 class ScopedEnvironmentVariable {
