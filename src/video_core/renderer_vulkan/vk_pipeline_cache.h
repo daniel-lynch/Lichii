@@ -304,7 +304,10 @@ private:
     /// start. Loaded when the translation file is opened, written every 30 s when it changed
     /// and at shutdown.
     std::filesystem::path recipes_filename;
-    bool recipes_dirty{}; ///< Under recipe_mutex
+    /// The histogram revision last written (or loaded), under recipe_mutex. A save that fails
+    /// leaves it behind, so the next save retries; a successful one records only the revision
+    /// of its snapshot.
+    u64 recipes_saved_revision{};
     size_t recipes_loaded{};
     size_t recipe_classes_loaded{};
     void LoadRecipes();

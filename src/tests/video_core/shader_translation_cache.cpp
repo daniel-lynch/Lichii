@@ -958,3 +958,24 @@ TEST_CASE("AOT recipe file: oversized, repeated classes and repeated recipes are
     REQUIRE_FALSE(loaded.Load(repeated, config, why));
     REQUIRE(why == "a recipe repeated in its class");
 }
+
+TEST_CASE("AOT recipe histogram revisions tell a pending save",
+          "[video_core][translation_cache]") {
+    using VideoCommon::RecipeHistogram;
+    std::bitset<512> loads;
+    loads.set(9);
+    RecipeHistogram histogram;
+    const u64 empty = histogram.Revision();
+    histogram.Record(Shader::Stage::VertexB, loads, RecipeInfo(1), RecipeBindings(1));
+    const u64 snapshot = histogram.Revision();
+    REQUIRE(snapshot != empty);
+    // A recording made while the snapshot is written leaves a newer revision pending.
+    histogram.Record(Shader::Stage::VertexB, loads, RecipeInfo(1), RecipeBindings(1));
+    REQUIRE(histogram.Revision() > snapshot);
+    // A failed write (here: into a missing directory) reports it, so the caller keeps the
+    // revision pending.
+    std::string why;
+    REQUIRE_FALSE(VideoCommon::WriteFileAtomically(
+        TempPath("eden-aot-missing-dir") / "x" / "recipes.bin",
+        histogram.Serialize(VideoCommon::TranslationCache::Digest{}), why));
+}

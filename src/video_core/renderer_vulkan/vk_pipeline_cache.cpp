@@ -905,7 +905,10 @@ void PipelineCache::LoadRecipes() {
     recipe_histogram.Clear();
     recipes_loaded = 0;
     recipe_classes_loaded = 0;
-    recipes_dirty = false;
+    // What is loaded (or nothing) is what the file holds: nothing to write until it changes.
+    SCOPE_EXIT {
+        recipes_saved_revision = recipe_histogram.Revision();
+    };
     if (recipes_filename.empty()) {
         return;
     }
@@ -934,12 +937,13 @@ void PipelineCache::LoadRecipes() {
 void PipelineCache::SaveRecipes() {
     std::vector<u8> data;
     size_t classes = 0, written = 0;
+    u64 revision = 0;
     {
         std::scoped_lock lock{recipe_mutex};
-        if (recipes_filename.empty() || !recipes_dirty) {
+        revision = recipe_histogram.Revision();
+        if (recipes_filename.empty() || revision == recipes_saved_revision) {
             return;
         }
-        recipes_dirty = false;
         data = recipe_histogram.Serialize(translation_config);
         classes = recipe_histogram.Classes();
         written = recipe_histogram.Recipes();
@@ -948,8 +952,14 @@ void PipelineCache::SaveRecipes() {
     // second instance on the same profile leaves an intact histogram.
     std::string why;
     if (!VideoCommon::WriteFileAtomically(recipes_filename, data, why)) {
+        // The saved revision stays behind: the next save (at the latest at shutdown) retries.
         LOG_WARNING(Render_Vulkan, "Shader AOT: recipes not written: {}", why);
         return;
+    }
+    {
+        // Only the snapshot's revision is saved: recordings made while writing stay pending.
+        std::scoped_lock lock{recipe_mutex};
+        recipes_saved_revision = (std::max)(recipes_saved_revision, revision);
     }
     LOG_INFO(Render_Vulkan, "Shader AOT: {} emission recipes of {} classes written", written,
              classes);
@@ -964,7 +974,6 @@ void PipelineCache::RecordRecipe(Shader::Stage stage, const Shader::Info& info,
     std::vector<WaitingSeed> ready;
     {
         std::scoped_lock lock{recipe_mutex};
-        recipes_dirty = true;
         // The class's first recipe: seeds of the class emitted with a stage-level guess get a
         // module for it now, usually before their own first draw.
         if (recipe_histogram.Record(stage, info.loads.mask, runtime_info, binding_in)) {
