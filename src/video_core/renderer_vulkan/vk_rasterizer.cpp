@@ -36,6 +36,7 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/native_query_trace.h"
 #include "video_core/native_indirect_reset.h"
+#include "video_core/query_wait.h"
 #include "video_core/render_trace.h"
 #include "video_core/indirect_reset.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -2253,18 +2254,34 @@ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
     // Below High GPU accuracy a fence runs its own callback at once, so wait for an operation
     // queued behind the pending report writes instead. On the split's back the fence's
     // submission may be deferred, and the fencing thread would wait for this thread to submit it.
-    std::mutex wait_mutex;
-    std::condition_variable wait_cv;
-    bool written{};
-    fence_manager.SyncOperation([&] {
-        std::scoped_lock lock{wait_mutex};
-        written = true;
-        wait_cv.notify_all();
-    });
+    // The operation owns the completion state, so it stays valid if the wait below gives up and
+    // the operation runs (or is destroyed unrun) later.
+    const auto written = std::make_shared<VideoCommon::QueryWait::Completion>();
+    fence_manager.SyncOperation([written] { written->Signal(); });
     fence_manager.SignalFence([] {});
     scheduler.FlushDeferred();
-    std::unique_lock lock{wait_mutex};
-    wait_cv.wait(lock, [&written] { return written; });
+    // Wait in slices, submitting deferred work between them: the fencing thread may be waiting
+    // for a submission only this thread makes (WaitSubmitted asks the back's idle hook, which
+    // does not run while the back blocks here). A lost fence, device loss or a shutdown race
+    // would otherwise hang the GPU front for good: on timeout the read goes ahead on guest
+    // memory as it is, the pre-#215 behaviour, a possibly stale count, never a hang.
+    // EDEN_NX2_QUERY_WAIT_MS=0 waits without a bound (still submitting between slices).
+    const auto timeout = VideoCommon::QueryWait::Timeout();
+    const auto start = std::chrono::steady_clock::now();
+    if (VideoCommon::QueryWait::WaitSliced(*written, timeout, VideoCommon::QueryWait::Slice,
+                                           [this] { scheduler.FlushDeferred(); })) {
+        return;
+    }
+    static std::atomic<u64> timeouts{};
+    if (const auto note = VideoCommon::QueryWait::NoteTimeout(timeouts); note.log) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+        LOG_WARNING(HW_GPU,
+                    "Query result wait timed out after {} ms (limit {} ms) at {:#x}+{:#x}; "
+                    "reading reports as they are ({} timeouts so far, logged every {})",
+                    elapsed.count(), timeout.count(), addr, size, note.count,
+                    VideoCommon::QueryWait::LogEvery);
+    }
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
