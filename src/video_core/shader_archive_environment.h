@@ -14,7 +14,7 @@ public:
     // Program includes the 128-byte native graphics header; control is its archive control
     // section. Initially only vertex, fragment and geometry have supported scalar recipes.
     ArchiveEnvironment(std::span<const u8> program, std::span<const u8> control,
-                       Shader::Stage shader_stage, u32 texture_buffer = 2);
+                       Shader::Stage shader_stage, u32 texture_buffer = 0);
 
     u32 ReadCbufValue(u32 index, u32 offset) override;
     Shader::TextureType ReadTextureType(u32) override;

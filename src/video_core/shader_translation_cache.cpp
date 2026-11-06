@@ -42,7 +42,8 @@ namespace {
 // 7: Class-level texture replay without the sibling branch's mesh metadata layout.
 // 8: Variants optionally carry their emission recipe for archive producers.
 // 9: Offline provenance and persistent rejection of speculative metadata.
-constexpr u32 FormatVersion = 9;
+// 10: Canonical descriptor padding; old speculative entries and drops must be rebuilt.
+constexpr u32 FormatVersion = 10;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
@@ -155,7 +156,39 @@ public:
         static_assert(std::is_trivially_copyable_v<T>);
         const size_t offset = out.size();
         out.resize(offset + sizeof(T));
-        std::memcpy(out.data() + offset, &value, sizeof(T));
+        // Preserve the ABI layout, but never persist indeterminate structure padding.
+        // In particular StorageWriteExtent has two padding bytes after its bools.
+        std::array<u8, sizeof(T)> bytes{};
+        const auto member = [&](const auto& field) {
+            const auto position = reinterpret_cast<const u8*>(&field) -
+                                  reinterpret_cast<const u8*>(&value);
+            std::memcpy(bytes.data() + position, &field, sizeof(field));
+        };
+#define FIELD(name) member(value.name)
+        if constexpr (std::is_same_v<T, Shader::StorageBufferDescriptor>) {
+            FIELD(cbuf_index); FIELD(cbuf_offset); FIELD(count); FIELD(is_written);
+            FIELD(native_indirect); FIELD(indirect_offset);
+            FIELD(write_extent.bounded); FIELD(write_extent.guarded);
+            FIELD(write_extent.const_end); FIELD(write_extent.local_stride);
+            FIELD(write_extent.group_stride); FIELD(write_extent.guard_const);
+            FIELD(write_extent.guard_local_stride); FIELD(write_extent.guard_group_stride);
+        } else if constexpr (std::is_same_v<T, Shader::TextureBufferDescriptor>) {
+            FIELD(has_secondary); FIELD(cbuf_index); FIELD(cbuf_offset); FIELD(shift_left);
+            FIELD(secondary_cbuf_index); FIELD(secondary_cbuf_offset); FIELD(secondary_shift_left);
+            FIELD(count); FIELD(size_shift); FIELD(handle_program);
+        } else if constexpr (std::is_same_v<T, Shader::ImageBufferDescriptor>) {
+            FIELD(format); FIELD(is_written); FIELD(is_read); FIELD(is_integer);
+            FIELD(cbuf_index); FIELD(cbuf_offset); FIELD(count); FIELD(size_shift);
+            FIELD(handle_program);
+        } else if constexpr (std::is_same_v<T, Shader::ImageDescriptor>) {
+            FIELD(type); FIELD(format); FIELD(is_written); FIELD(is_read); FIELD(is_integer);
+            FIELD(cbuf_index); FIELD(cbuf_offset); FIELD(count); FIELD(size_shift);
+            FIELD(is_byte_addressed); FIELD(handle_program);
+        } else {
+            std::memcpy(bytes.data(), &value, sizeof(T));
+        }
+#undef FIELD
+        std::memcpy(out.data() + offset, bytes.data(), bytes.size());
     }
     void PutBytes(const void* data, size_t size) {
         Put(static_cast<u32>(size));

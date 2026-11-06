@@ -227,3 +227,112 @@ TEST_CASE("Offline producer resumes complete modules and repairs interrupted app
     }
     std::filesystem::remove_all(directory);
 }
+
+namespace {
+// Mirrors GraphicsEnvironment's native, non-mesh draw inputs without a GPU or guest memory.
+class NativeDrawEnvironment final : public VideoCommon::GenericEnvironment {
+public:
+    NativeDrawEnvironment(const SyntheticProgram& source,
+                          std::shared_ptr<const VideoCommon::LoweredNativeCode> lowered) {
+        std::memcpy(&sph, source.bytes.data(), sizeof(sph));
+        stage = Shader::Stage::VertexB;
+        initial_offset = sizeof(sph);
+        texture_bound = 0;
+        InitializeNativeCode(std::move(lowered), 128, false);
+        local_memory_size = static_cast<u32>(sph.LocalMemorySize()) +
+                            sph.common3.shader_local_memory_crs_size;
+        is_proprietary_driver = true;
+    }
+    u32 ReadCbufValue(u32 index, u32 offset) override {
+        REQUIRE(index == 1);
+        REQUIRE(offset == 0);
+        return 0x12345678;
+    }
+    Shader::TextureType ReadTextureType(u32) override { return Shader::TextureType::Color2D; }
+    Shader::TexturePixelFormat ReadTexturePixelFormat(u32) override {
+        return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
+    }
+    bool IsTexturePixelFormatInteger(u32) override { return false; }
+    u32 ReadViewportTransformState() override { return 1; }
+    std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
+        return std::nullopt;
+    }
+};
+} // namespace
+
+TEST_CASE("Archive and native draw inputs yield identical keys and serialized metadata",
+          "[video_core][translation_cache][archive_environment]") {
+    SyntheticProgram source;
+    auto archive = source.Make();
+    NativeDrawEnvironment live(source, archive.LoweredNative());
+    const Digest config{11, 22};
+    REQUIRE(archive.Analyze() == live.Analyze());
+    REQUIRE(MakeStageKey(archive, *archive.Analyze(), 1, config) ==
+            MakeStageKey(live, *live.Analyze(), 1, config));
+    const auto translate = [](Shader::Environment& env) {
+        Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow;
+        Shader::ObjectPool<Shader::IR::Inst> inst;
+        Shader::ObjectPool<Shader::IR::Block> blocks;
+        Shader::Maxwell::Flow::CFG cfg(env, flow, Shader::Maxwell::Location{0x50});
+        auto program = Shader::Maxwell::TranslateProgram(inst, blocks, env, cfg, {});
+        std::vector<u8> bytes;
+        WriteInfo(bytes, program.info);
+        return bytes;
+    };
+    RecordingEnvironment recording(archive, true);
+    REQUIRE(translate(recording) == translate(live));
+    REQUIRE(ReplayQueries(recording.TakeQueries(), live));
+}
+
+TEST_CASE("Info serialization excludes descriptor padding and preserves real differences",
+          "[video_core][translation_cache][archive_environment]") {
+    Shader::Info first{}, second{};
+    Shader::StorageBufferDescriptor descriptor{};
+    descriptor.cbuf_index = 0;
+    descriptor.cbuf_offset = 0x570;
+    descriptor.count = 1;
+    first.storage_buffers_descriptors.push_back(descriptor);
+    second.storage_buffers_descriptors.push_back(descriptor);
+    auto& left = first.storage_buffers_descriptors.front();
+    auto& right = second.storage_buffers_descriptors.front();
+    const size_t begin = offsetof(Shader::StorageWriteExtent, guarded) + sizeof(bool);
+    const size_t end = offsetof(Shader::StorageWriteExtent, const_end);
+    REQUIRE(end > begin);
+    for (size_t i = begin; i < end; ++i) {
+        reinterpret_cast<u8*>(&left.write_extent)[i] = 0x34;
+        reinterpret_cast<u8*>(&right.write_extent)[i] = 0xd4;
+    }
+    REQUIRE(InfoEqual(first, second));
+    std::vector<u8> a, b;
+    WriteInfo(a, first);
+    WriteInfo(b, second);
+    REQUIRE(a == b);
+    right.write_extent.const_end = 4;
+    b.clear();
+    WriteInfo(b, second);
+    REQUIRE(a != b);
+    REQUIRE_FALSE(InfoEqual(first, second));
+}
+
+TEST_CASE("Native archive texture bank starts at zero and follows bound instructions",
+          "[video_core][translation_cache][archive_environment]") {
+    SyntheticProgram source;
+    SECTION("no bound texture instruction") {
+        const auto env = source.Make();
+        REQUIRE(env.TextureBoundBuffer() == 0);
+        REQUIRE(env.IsProprietaryDriver());
+    }
+    SECTION("bound texture LOD query selects bank two") {
+        // TMML R0, R0, RZ, descriptor 0 in bank 2, 2D, one component.
+        SyntheticProgram::Put(source.bytes, 0x80, 0x00007b69);
+        SyntheticProgram::Put(source.bytes, 0x84, 0x208000ff);
+        SyntheticProgram::Put(source.bytes, 0x88, 0x000001ff);
+        SyntheticProgram::Put(source.bytes, 0x90, 0x0000794d);
+        SyntheticProgram::Put(source.bytes, 0x98, 0x03800000);
+        SyntheticProgram::Put(source.control, 0x38, 0xa0);
+        const auto env = source.Make();
+        REQUIRE(env.LoweredNative()->texture_bound == 2);
+        REQUIRE(env.TextureBoundBuffer() == 2);
+        REQUIRE(env.IsProprietaryDriver());
+    }
+}
