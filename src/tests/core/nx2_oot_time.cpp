@@ -34,7 +34,11 @@ TEST_CASE("NX2 Ocarina delta follows the measured frame time", "[core][nx2_oot_t
     }
 
     SECTION("Small jitter around 60 fps keeps the game's fixed step") {
-        REQUIRE(Run(delta, now, 18ms, 120) == 1.0f);
+        REQUIRE(Run(delta, now, 17ms, 120) == 1.0f);
+    }
+
+    SECTION("55 fps runs at real speed") {
+        REQUIRE(Run(delta, now, 18ms, 120) == Catch::Approx(1.08f).margin(0.01f));
     }
 
     SECTION("30 fps is a delta of 2") {

@@ -40,10 +40,10 @@ inline constexpr u32 ReturnInstruction = 0x172A82B8;    // b 0x6e6cc8
     return enabled;
 }
 
-inline constexpr float DefaultSnapBelow = 1.1f;
+inline constexpr float DefaultSnapBelow = 1.03f;
 
 /// EDEN_NX2_OOT_REAL_TIME_SNAP=<float>, read once: deltas below it are delivered as the fixed 1.0.
-/// Default 1.1 (54.5 fps), clamped to [1.0, 1.5].
+/// Default 1.03 (58.3 fps), clamped to [1.0, 1.5].
 inline float SnapFromEnv() {
     static const float snap = [] {
         const char* value = std::getenv("EDEN_NX2_OOT_REAL_TIME_SNAP");
