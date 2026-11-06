@@ -1535,7 +1535,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 TC::MakeVariantKey(entry->id, TC::DigestRuntimeInfo(runtime_info), binding);
             variant = translation_cache.FindVariant(variant_key);
         }
-        if (entry && entry->offline) {
+        if (entry && entry->offline && (variant || !emit_pools || translation_cache_verify)) {
             translation_cache.LogOfflineOutcome(program.stage, key.unique_hashes[index],
                 variant ? TC::OfflineOutcome::VariantHit : TC::OfflineOutcome::VariantMiss);
         }
@@ -1667,10 +1667,28 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                         stage_entry->id, TC::DigestRuntimeInfo(stage_runtime_info), stage_binding);
                 }
                 const TC::EmissionRecipe emission_recipe{stage_runtime_info, stage_binding};
-                const std::vector<u32> stage_code =
-                    EmitPipelineShader(profile, stage_runtime_info, stage_program, stage_binding,
-                                       hashes[stage + 1], job->reference_spirv[stage]);
-                if (stage_entry) {
+                // Earlier deferred stages have now resolved the incoming bindings. Look up
+                // this exact variant instead of emitting every subsequent stage unconditionally.
+                auto variant = stage_entry ? translation_cache.FindVariant(stage_variant_key)
+                                           : std::nullopt;
+                if (variant && !TC::InfoEqual(variant->info, stage_program.info)) {
+                    // Pipeline layout construction already consumed the live program's info.
+                    variant.reset();
+                }
+                if (stage_entry && stage_entry->offline) {
+                    translation_cache.LogOfflineOutcome(stage_program.stage, hashes[stage + 1],
+                        variant ? TC::OfflineOutcome::VariantHit : TC::OfflineOutcome::VariantMiss);
+                }
+                std::vector<u32> stage_code;
+                if (variant) {
+                    stage_binding = variant->binding_out;
+                    stage_code = std::move(variant->spirv);
+                } else {
+                    stage_code = EmitPipelineShader(profile, stage_runtime_info, stage_program,
+                                                    stage_binding, hashes[stage + 1],
+                                                    job->reference_spirv[stage]);
+                }
+                if (stage_entry && !variant) {
                     // The store takes its own lock: the GPU thread may look variants up meanwhile.
                     translation_cache.InsertVariant(
                         *stage_entry, stage_variant_key,

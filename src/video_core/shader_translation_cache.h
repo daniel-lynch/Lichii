@@ -293,6 +293,8 @@ private:
     void CountRecipe(Shader::Stage stage, const EmissionRecipe& recipe);
     std::unordered_map<Digest, RecipeCount, DigestHash> recipes;
 
+    // Writers serialize publication and append; readers never wait for file I/O.
+    std::mutex writer_mutex;
     std::mutex mutex;
     bool enabled{};
     std::unordered_map<Digest, std::vector<std::shared_ptr<const Entry>>, DigestHash> entries;

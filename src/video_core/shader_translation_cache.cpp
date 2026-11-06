@@ -997,11 +997,12 @@ Store::~Store() {
 }
 
 bool Store::Persistent() {
-    std::scoped_lock lock{mutex};
+    std::scoped_lock lock{writer_mutex};
     return file.is_open() && file.good();
 }
 
 void Store::Close() {
+    std::scoped_lock writer_lock{writer_mutex};
     std::scoped_lock lock{mutex};
     if (file.is_open()) {
         file.flush();
@@ -1024,6 +1025,7 @@ void Store::Open(const std::filesystem::path& path, const Digest& config) {
                     "(update shader_translation_cache.cpp)");
         return;
     }
+    std::scoped_lock writer_lock{writer_mutex};
     std::scoped_lock lock{mutex};
     enabled = true;
     if (path.empty()) {
@@ -1062,18 +1064,17 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
         return false;
     }
     const auto size = static_cast<size_t>(in.tellg());
-    std::vector<u8> data(size);
-    in.seekg(0);
-    in.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(size));
-    in.close();
     constexpr size_t HeaderSize = FileMagic.size() + sizeof(u32) + sizeof(Digest);
-    if (size < HeaderSize || std::memcmp(data.data(), FileMagic.data(), FileMagic.size()) != 0) {
+    std::array<u8, HeaderSize> header{};
+    in.seekg(0);
+    if (size < HeaderSize || !in.read(reinterpret_cast<char*>(header.data()), header.size()) ||
+        std::memcmp(header.data(), FileMagic.data(), FileMagic.size()) != 0) {
         return false;
     }
     u32 version{};
     Digest file_config{};
-    std::memcpy(&version, data.data() + FileMagic.size(), sizeof(version));
-    std::memcpy(&file_config, data.data() + FileMagic.size() + sizeof(version), sizeof(Digest));
+    std::memcpy(&version, header.data() + FileMagic.size(), sizeof(version));
+    std::memcpy(&file_config, header.data() + FileMagic.size() + sizeof(version), sizeof(Digest));
     if (version != FormatVersion || file_config != config) {
         LOG_INFO(Render_Vulkan,
                  "Translation cache: written by another build or configuration, starting over");
@@ -1082,12 +1083,12 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
     size_t offset = HeaderSize;
     while (offset + 8 <= size) {
         u32 magic{}, length{};
-        std::memcpy(&magic, data.data() + offset, sizeof(magic));
-        std::memcpy(&length, data.data() + offset + 4, sizeof(length));
-        if (magic != RecordMagic || offset + 8 + length > size) {
-            break;
-        }
-        std::span<const u8> record{data.data() + offset + 8, length};
+        if (!in.read(reinterpret_cast<char*>(&magic), sizeof(magic)) ||
+            !in.read(reinterpret_cast<char*>(&length), sizeof(length)) ||
+            magic != RecordMagic || length > size - offset - 8) break;
+        std::vector<u8> data(length);
+        if (!in.read(reinterpret_cast<char*>(data.data()), length)) break;
+        std::span<const u8> record{data};
         Reader reader{record};
         u8 type{};
         bool ok = reader.Get(type);
@@ -1143,6 +1144,7 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
         if (it->second.empty()) it = entries.erase(it);
         else ++it;
     }
+    in.close();
     if (!writable) return true;
     if (offset != size) {
         // A record cut short (the emulator stopped while writing) or damaged: keep what precedes.
@@ -1238,15 +1240,16 @@ std::shared_ptr<const Entry> Store::Insert(const Digest& stage_key, std::vector<
         WriteMeta(record, entry.meta);
         writer.Put(entry.offline);
     }
-    std::scoped_lock lock{mutex};
+    std::scoped_lock writer_lock{writer_mutex};
+    std::unique_lock lock{mutex};
     if (!enabled) {
         return nullptr;
     }
     const size_t before = entries.contains(stage_key) ? entries[stage_key].size() : 0;
     auto shared = InsertLocked(std::move(entry));
-    if (entries[stage_key].size() != before) {
-        Append(record);
-    }
+    const bool inserted = entries[stage_key].size() != before;
+    lock.unlock();
+    if (inserted) Append(record);
     return shared;
 }
 
@@ -1280,7 +1283,8 @@ void Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
             WriteRecipe(writer, *recipe);
         }
     }
-    std::scoped_lock lock{mutex};
+    std::scoped_lock writer_lock{writer_mutex};
+    std::unique_lock lock{mutex};
     if (!enabled) {
         return;
     }
@@ -1288,6 +1292,7 @@ void Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
     if (variants.try_emplace(variant_key, std::move(stored)).second) {
         if (!variant.spirv.empty()) entries_with_modules.insert(entry.id);
         if (recipe) CountRecipe(entry.meta.stage, *recipe);
+        lock.unlock();
         Append(record);
     }
 }
@@ -1318,8 +1323,11 @@ bool Store::ValidateOfflineEntry(const Entry& entry, const Shader::IR::Program& 
     Writer writer{record};
     writer.Put(RecordDrop);
     writer.Put(entry.id);
-    std::scoped_lock lock{mutex};
-    if (dropped_entries.insert(entry.id).second) Append(record);
+    std::scoped_lock writer_lock{writer_mutex};
+    std::unique_lock lock{mutex};
+    const bool inserted = dropped_entries.insert(entry.id).second;
+    lock.unlock();
+    if (inserted) Append(record);
     return false;
 }
 
