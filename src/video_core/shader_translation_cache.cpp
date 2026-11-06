@@ -133,9 +133,9 @@ constexpr size_t InfoFields = 88;
     X(has_gl_component_indexing_bug) X(has_gl_precise_bug) X(has_gl_cbuf_ftou_bug) \
     X(has_gl_bool_ref_bug) X(ignore_nan_fp_comparisons) \
     X(has_broken_spirv_subgroup_mask_vector_extract_dynamic) \
-    X(has_broken_spirv_subgroup_shuffle) X(max_subgroup_size) X(gl_max_compute_smem_size) \
+    X(has_broken_spirv_subgroup_shuffle) X(has_broken_spirv_fragment_shuffle) X(max_subgroup_size) X(gl_max_compute_smem_size) \
     X(has_broken_robust) X(min_ssbo_alignment) X(max_user_clip_distances)
-constexpr size_t ProfileFields = 75;
+constexpr size_t ProfileFields = 76;
 
 constexpr size_t HostFields = 22;
 constexpr size_t RuntimeInfoFields = 19;
