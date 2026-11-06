@@ -87,8 +87,17 @@ if [ "${OOT_PRODUCT:-1}" = "1" ]; then
     for f in "$PRODUCT_DIR"/vulkan_translations.*.bin; do
       [ -f "$f" ] || continue
       b=$(basename "$f")
+      # A product can be re-produced under the same name (same build, more recipes): the
+      # producer writes <name>.sha256 beside it and the install records it in <name>.installed;
+      # a changed sha replaces the live copy (its runtime records are already in the new product).
+      want=$(cat "$f.sha256" 2>/dev/null | cut -c1-64)
+      have=$(cat "$LIVE_SHADER_DIR/$b.installed" 2>/dev/null | cut -c1-64)
       if [ ! -e "$LIVE_SHADER_DIR/$b" ]; then
-        cp --reflink=auto "$f" "$LIVE_SHADER_DIR/$b" && echo "offline shader product installed: $b" >&2
+        cp --reflink=auto "$f" "$LIVE_SHADER_DIR/$b" && echo "offline shader product installed: $b" >&2 \
+          && [ -n "$want" ] && echo "$want" > "$LIVE_SHADER_DIR/$b.installed"
+      elif [ -n "$want" ] && [ "$want" != "$have" ]; then
+        cp --reflink=auto "$f" "$LIVE_SHADER_DIR/$b.new" && mv -f "$LIVE_SHADER_DIR/$b.new" "$LIVE_SHADER_DIR/$b" \
+          && echo "$want" > "$LIVE_SHADER_DIR/$b.installed" && echo "offline shader product updated: $b" >&2
       fi
     done
   fi
