@@ -516,3 +516,65 @@ TEST_CASE("Native archive texture bank starts at zero and follows bound instruct
         REQUIRE(env.IsProprietaryDriver());
     }
 }
+
+TEST_CASE("Producer emits and resumes a fragment recipe from its archive vertex partner",
+          "[video_core][translation_cache][archive_environment]") {
+    namespace Offline = VideoCommon::OfflineShaders;
+    const auto directory = std::filesystem::temp_directory_path() / "lichii_offline_pair_test";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    SyntheticProgram vertex, fragment;
+    SyntheticProgram::Put(fragment.bytes, 0, 5 << 10);
+    fragment.control[0x56] = 1;
+    nlohmann::json rows = nlohmann::json::array();
+    for (const auto stage : {Shader::Stage::VertexB, Shader::Stage::Fragment}) {
+        const auto& source = stage == Shader::Stage::VertexB ? vertex : fragment;
+        const std::string name = stage == Shader::Stage::VertexB ? "vertex" : "fragment";
+        for (const auto& [suffix, bytes] : std::array{
+                 std::pair{".bin", &source.bytes}, std::pair{".control", &source.control}}) {
+            std::ofstream file(directory / (name + suffix), std::ios::binary);
+            file.write(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+        }
+        u64 fingerprint = 0xcbf29ce484222325ULL;
+        for (const auto byte : std::span(source.bytes).first(256))
+            fingerprint = (fingerprint ^ byte) * 0x100000001b3ULL;
+        rows.push_back({{"container", name + ".bin"}, {"control", name + ".control"},
+            {"offset", 0}, {"size", source.bytes.size()}, {"control_offset", 0},
+            {"constants_offset", 256}, {"constants_size", 4}, {"stage", name},
+            {"fingerprint", fmt::format("{:016x}", fingerprint)},
+            {"origins", {{{"source", "synthetic.bfsha"}, {"member", "BNSH@100"}, {"variation", 0}}}}});
+    }
+    const auto input = directory / "index.json";
+    {
+        std::ofstream file(input);
+        file << nlohmann::json{{"schema_version", 1}, {"title_id", "0400000000000000"},
+                               {"programs", rows}};
+    }
+    Shader::Profile profile{};
+    profile.supported_spirv = 0x00010300;
+    const auto config = MakeConfigDigest(profile, {}, 0);
+    const auto recipes = directory / "recipes.bin";
+    {
+        Store recorded;
+        recorded.Open(recipes, config);
+        ProgramMeta meta{};
+        meta.stage = Shader::Stage::Fragment;
+        const auto entry = recorded.Insert({91, 92}, {}, meta);
+        auto recipe = DefaultEmissionRecipe(meta.stage);
+        recipe.bindings.unified = 19;
+        const auto key = MakeVariantKey(entry->id, DigestRuntimeInfo(recipe.runtime), recipe.bindings);
+        REQUIRE(recorded.InsertVariant(*entry, key, {.spirv = {0x07230203, 0x10000, 0, 1, 0}}, &recipe));
+    }
+    Store product;
+    product.Open(directory / "product.bin", config);
+    const auto first = Offline::Run(input, 0x0400000000000000ULL, 2, recipes, profile, {}, config,
+                                    product, 2, DefaultRecipeLimit, {}, RecipeBaseline::Never);
+    REQUIRE(first.skipped.empty());
+    REQUIRE(first.sources[static_cast<size_t>(RecipeSource::PartnerStage)].modules == 1);
+    REQUIRE(first.sources[static_cast<size_t>(RecipeSource::Class)].modules == 1);
+    const auto second = Offline::Run(input, 0x0400000000000000ULL, 2, recipes, profile, {}, config,
+                                     product, 2, DefaultRecipeLimit, {}, RecipeBaseline::Never);
+    REQUIRE(second.modules == 0);
+    REQUIRE(second.resumed == 2);
+    std::filesystem::remove_all(directory);
+}

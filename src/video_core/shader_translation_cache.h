@@ -250,7 +250,7 @@ constexpr u64 DefaultRecipeImportBytes = 256ULL * 1024 * 1024;
 
 constexpr u32 DefaultRecipeCount = 2;
 enum class RecipeBaseline { Auto, Always, Never };
-enum class RecipeSource { ExactStage, Class, Baseline };
+enum class RecipeSource { ExactStage, Class, Baseline, PartnerStage, InputLayout };
 struct SelectedRecipe {
     EmissionRecipe recipe;
     RecipeSource source;

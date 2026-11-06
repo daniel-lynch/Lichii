@@ -89,9 +89,56 @@ int StopSignal() {
     return stop_signal.load(std::memory_order_relaxed);
 }
 
+bool CanShareInputLayout(const Shader::Info& target, const Shader::VaryingState& observed_inputs) {
+    if (target.loads.Legacy() || observed_inputs.Legacy()) return false;
+    for (size_t input = 0; input < Shader::IR::NUM_GENERICS; ++input)
+        if ((target.loads.Generic(input) || target.passthrough.Generic(input)) &&
+            !observed_inputs.Generic(input)) return false;
+    return true;
+}
+
+std::vector<TranslationCache::SelectedRecipe> ExpandRecipes(
+    std::vector<TranslationCache::SelectedRecipe> selected, Shader::Stage stage,
+    const Shader::Info& info, std::span<const PartnerStage> partners,
+    std::span<const TranslationCache::EmissionRecipe> layouts) {
+    namespace TC = TranslationCache;
+    std::unordered_set<TC::Digest, TC::DigestHash> seen;
+    auto key = [&](const TC::EmissionRecipe& recipe) {
+        return TC::MakeVariantKey({}, TC::DigestRuntimeInfo(
+            TC::CanonicalRuntimeInfo(recipe.runtime, info, stage)), recipe.bindings);
+    };
+    for (const auto& selection : selected) seen.insert(key(selection.recipe));
+    auto add = [&](TC::EmissionRecipe recipe, TC::RecipeSource source) {
+        if (seen.insert(key(recipe)).second) selected.push_back({std::move(recipe), source});
+    };
+    // Keep recorded draw state (including early Z), replacing only partner/layout inputs.
+    auto bases = selected;
+    if (bases.empty()) bases.push_back({TC::DefaultEmissionRecipe(stage), TC::RecipeSource::Baseline});
+    if (stage == Shader::Stage::Fragment) {
+        for (const auto& partner : partners) {
+            // One recipe per partner, using the highest-ranked recorded draw state.
+            auto recipe = bases.front().recipe;
+            recipe.bindings = partner.bindings;
+            recipe.runtime.previous_stage_stores = partner.info.stores;
+            recipe.runtime.previous_stage_legacy_stores_mapping = partner.info.legacy_stores_mapping;
+            add(std::move(recipe), TC::RecipeSource::PartnerStage);
+        }
+    } else if (stage == Shader::Stage::VertexB) {
+        for (const auto& base : bases) {
+            for (const auto& layout : layouts) {
+                auto recipe = base.recipe;
+                recipe.runtime.generic_input_types = layout.runtime.generic_input_types;
+                recipe.runtime.previous_stage_stores = layout.runtime.previous_stage_stores;
+                add(std::move(recipe), TC::RecipeSource::InputLayout);
+            }
+        }
+    }
+    return selected;
+}
+
 void WriteReport(const std::filesystem::path& path, const Summary& summary) {
     Json sources = Json::object();
-    constexpr std::array names{"exact_stage", "class", "baseline"};
+    constexpr std::array names{"exact_stage", "class", "baseline", "partner_stage", "input_layout"};
     for (size_t i = 0; i < names.size(); ++i)
         sources[names[i]] = {{"modules", summary.sources[i].modules},
                             {"module_bytes", summary.sources[i].module_bytes}};
@@ -132,6 +179,14 @@ Input ParseInput(std::string_view text, const std::filesystem::path& directory) 
     if (!rows.is_array() || rows.size() > 100000) throw std::runtime_error("Invalid program list");
     for (const auto& row : rows) {
         Program program;
+        if (row.contains("origins")) {
+            const auto& origins = row.at("origins");
+            if (!origins.is_array() || origins.size() > 100000)
+                throw std::runtime_error("Invalid origin list");
+            for (const auto& origin : origins)
+                program.origins.push_back({origin.at("source").get<std::string>(),
+                    origin.at("member").get<std::string>(), SmallUnsigned(origin.at("variation"))});
+        }
         program.container = directory / row.at("container").get<std::string>();
         program.control = directory / row.at("control").get<std::string>();
         program.offset = Unsigned(row.at("offset"));
@@ -209,6 +264,117 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
     summary.import_admitted_records = recipes.admitted_records;
     summary.import_framing_skipped_bytes = recipes.framing_skipped_bytes;
     summary.import_invalid_recipes = recipes.invalid_recipes;
+    auto environment = [](const Program& row) {
+        const auto program_bytes = Read(row.container, row.offset, row.size);
+        const auto control = Read(row.control, row.control_offset, 0x58);
+        u64 fingerprint = 0xcbf29ce484222325ULL;
+        for (const auto byte : std::span(program_bytes).first(std::min<size_t>(256, row.size)))
+            fingerprint = (fingerprint ^ byte) * 0x100000001b3ULL;
+        if (fingerprint != row.fingerprint) throw std::runtime_error("fingerprint_mismatch");
+        if (Word(control, 0x40) != row.constants_offset || Word(control, 0x3c) != row.constants_size)
+            throw std::runtime_error("constants_mismatch");
+        for (size_t i = 0; i < row.bank1_words.size(); ++i)
+            if (Word(program_bytes, row.constants_offset + i * 4) != row.bank1_words[i])
+                throw std::runtime_error("constants_mismatch");
+        return ArchiveEnvironment(program_bytes, control, row.stage);
+    };
+    using Member = std::pair<std::string, std::string>;
+    std::map<Member, std::vector<std::pair<u32, size_t>>> members;
+    std::vector<std::optional<PartnerStage>> partner_outputs(parsed.programs.size());
+    std::vector<Shader::VaryingState> observed_inputs(parsed.programs.size());
+    std::vector<std::vector<const TC::EmissionRecipe*>> recorded_layouts(parsed.programs.size());
+    for (size_t i = 0; i < parsed.programs.size(); ++i) {
+        const auto& row = parsed.programs[i];
+        if (row.stage == Shader::Stage::VertexB)
+            for (const auto& origin : row.origins)
+                members[{origin.source, origin.member}].emplace_back(origin.variation, i);
+    }
+    // Prepare each vertex once. EmitSPIRV determines descriptor allocation, including profile-
+    // dependent bindings; counting descriptors by hand would disagree with the runtime emitter.
+    std::atomic<size_t> prepare_next{};
+    std::atomic<u64> partner_translated{};
+    auto prepare = [&] {
+        while (!StopSignal()) {
+            const size_t i = prepare_next.fetch_add(1);
+            if (i >= parsed.programs.size()) break;
+            const auto& row = parsed.programs[i];
+            if (row.stage != Shader::Stage::VertexB || row.origins.empty()) continue;
+            try {
+                if (!row.skip_reason.empty()) continue;
+                auto env = environment(row);
+                const auto hash = env.Analyze();
+                if (!hash) continue;
+                const auto key = TC::MakeStageKey(env, *hash, static_cast<u32>(row.stage) + 1,
+                                                 recipes.source_config);
+                if (const auto it = recipes.exact.find(key); it != recipes.exact.end())
+                    for (const auto& recipe : it->second) recorded_layouts[i].push_back(&recipe.recipe);
+                TC::RecordingEnvironment recording(env, true);
+                Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+                Shader::ObjectPool<Shader::IR::Inst> inst_pool;
+                Shader::ObjectPool<Shader::IR::Block> block_pool;
+                Shader::Maxwell::Flow::CFG cfg(recording, flow_pool,
+                    Shader::Maxwell::Location{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))});
+                auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, recording, cfg, host);
+                ++partner_translated;
+                if (!env.CanCacheTranslation() || program.info.requires_layer_emulation) continue;
+                observed_inputs[i].mask = program.info.loads.mask | program.info.passthrough.mask;
+                auto recipe = TC::DefaultEmissionRecipe(row.stage);
+                recipe.runtime = TC::CanonicalRuntimeInfo(recipe.runtime, program.info, program.stage);
+                Shader::Maxwell::ConvertLegacyToGeneric(program, recipe.runtime);
+                auto bindings = recipe.bindings;
+                const auto code = Shader::Backend::SPIRV::EmitSPIRV(profile, recipe.runtime, program, bindings);
+                if (code.size() >= 5 && code.front() == 0x07230203)
+                    partner_outputs[i] = PartnerStage{bindings, program.info};
+            } catch (const std::exception& error) {
+                LOG_DEBUG(Render_Vulkan, "Offline partner {}: {}", i, error.what());
+            }
+        }
+    };
+    {
+        std::vector<std::jthread> threads;
+        for (u32 i = 0; i < workers; ++i) threads.emplace_back(prepare);
+    }
+    summary.translated = partner_translated.load();
+    auto select = [&](size_t index, const TC::Digest& key, const Shader::Info& info) {
+        const auto& row = parsed.programs[index];
+        std::vector<PartnerStage> partners;
+        std::vector<TC::EmissionRecipe> layouts;
+        std::unordered_set<size_t> seen;
+        std::unordered_set<TC::Digest, TC::DigestHash> seen_layouts, seen_partners;
+        // Prefer the exact variation across all aliases before trying other variations.
+        for (const bool same : {true, false}) {
+            for (const auto& origin : row.origins) {
+                const auto it = members.find({origin.source, origin.member});
+                if (it == members.end()) continue;
+                for (const auto& [variation, vertex] : it->second) {
+                    if ((variation == origin.variation) != same || !seen.insert(vertex).second) continue;
+                    if (row.stage == Shader::Stage::VertexB &&
+                        (vertex == index || CanShareInputLayout(info, observed_inputs[vertex]))) {
+                        for (const auto* recorded : recorded_layouts[vertex]) {
+                            TC::EmissionRecipe layout;
+                            layout.runtime.generic_input_types = recorded->runtime.generic_input_types;
+                            layout.runtime.previous_stage_stores = recorded->runtime.previous_stage_stores;
+                            const auto digest = TC::DigestRuntimeInfo(
+                                TC::CanonicalRuntimeInfo(layout.runtime, info, row.stage));
+                            if (seen_layouts.insert(digest).second) layouts.push_back(std::move(layout));
+                        }
+                    }
+                    if (row.stage == Shader::Stage::Fragment && partner_outputs[vertex] &&
+                        partners.size() < recipe_count) {
+                        const auto& partner = *partner_outputs[vertex];
+                        Shader::RuntimeInfo runtime;
+                        runtime.previous_stage_stores = partner.info.stores;
+                        runtime.previous_stage_legacy_stores_mapping = partner.info.legacy_stores_mapping;
+                        const auto digest = TC::MakeVariantKey({}, TC::DigestRuntimeInfo(
+                            TC::CanonicalRuntimeInfo(runtime, info, row.stage)), partner.bindings);
+                        if (seen_partners.insert(digest).second) partners.push_back(partner);
+                    }
+                }
+            }
+        }
+        return ExpandRecipes(recipes.SelectWithSources(key, row.stage, info, recipe_count, baseline),
+                             row.stage, info, partners, layouts);
+    };
     std::mutex results;
     // Serialize duplicate stage candidates through lookup and append, without serializing all work.
     std::array<std::mutex, 64> stage_locks;
@@ -223,18 +389,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                 if (row.stage != Shader::Stage::VertexB && row.stage != Shader::Stage::Fragment &&
                     row.stage != Shader::Stage::Geometry) throw std::runtime_error("unsupported_stage");
                 if (!row.skip_reason.empty()) throw std::runtime_error(row.skip_reason);
-                const auto program_bytes = Read(row.container, row.offset, row.size);
-                const auto control = Read(row.control, row.control_offset, 0x58);
-                u64 fingerprint = 0xcbf29ce484222325ULL;
-                for (const auto byte : std::span(program_bytes).first(std::min<size_t>(256, row.size)))
-                    fingerprint = (fingerprint ^ byte) * 0x100000001b3ULL;
-                if (fingerprint != row.fingerprint) throw std::runtime_error("fingerprint_mismatch");
-                if (Word(control, 0x40) != row.constants_offset || Word(control, 0x3c) != row.constants_size)
-                    throw std::runtime_error("constants_mismatch");
-                for (size_t i = 0; i < row.bank1_words.size(); ++i)
-                    if (Word(program_bytes, row.constants_offset + i * 4) != row.bank1_words[i])
-                        throw std::runtime_error("constants_mismatch");
-                ArchiveEnvironment env(program_bytes, control, row.stage);
+                auto env = environment(row);
                 const auto hash = env.Analyze();
                 if (!hash) throw std::runtime_error("unsupported_lowering");
                 const auto key = TC::MakeStageKey(env, *hash, static_cast<u32>(row.stage) + 1, config);
@@ -258,8 +413,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                 auto entry = store.FindEntry(key, resume);
                 std::vector<TC::SelectedRecipe> selected;
                 if (entry)
-                    selected = recipes.SelectWithSources(recipe_key, row.stage, entry->meta.info,
-                                                         recipe_count, baseline);
+                    selected = select(index, recipe_key, entry->meta.info);
                 size_t candidate{};
                 bool translated{};
                 while (!StopSignal()) {
@@ -293,8 +447,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                     if (!entry) {
                         entry = store.Insert(key, recording.TakeQueries(), TC::ProgramMeta::From(program), true);
                         if (!entry) throw std::runtime_error("cache_disabled");
-                        selected = recipes.SelectWithSources(recipe_key, row.stage, program.info,
-                                                             recipe_count, baseline);
+                        selected = select(index, recipe_key, program.info);
                     }
                     if (selected.empty()) break;
                     const auto selection = selected[candidate++];
@@ -340,7 +493,7 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
         summary.product_modules += modules * entries;
     }
     summary.cancelled = StopSignal() != 0;
-    constexpr std::array names{"exact_stage", "class", "baseline"};
+    constexpr std::array names{"exact_stage", "class", "baseline", "partner_stage", "input_layout"};
     for (size_t i = 0; i < names.size(); ++i)
         LOG_INFO(Render_Vulkan, "Offline translation: source={} modules={} module_bytes={}",
                  names[i], summary.sources[i].modules, summary.sources[i].module_bytes);
