@@ -188,6 +188,7 @@ public:
 
 template <class P>
 class BufferCache : public VideoCommon::ChannelSetupCaches<BufferCacheChannelInfo> {
+    friend struct BufferCacheTestAccess;
     // Page size for caching purposes.
     // This is unrelated to the CPU page size and it can be changed as it seems optimal.
 #ifdef YUZU_LEGACY
@@ -265,9 +266,6 @@ public:
     bool OnCPUWrite(DAddr device_addr, u64 size);
 
     void DownloadMemory(DAddr device_addr, u64 size);
-
-    /// DownloadMemory for each range, waiting for the GPU once.
-    void DownloadMemoryRanges(std::span<const std::pair<DAddr, u64>> ranges);
 
     /// The area a guest CPU read of [device_addr, device_addr + size) flushes and the core then
     /// skips later reads in.
@@ -631,6 +629,8 @@ private:
     /// Downloads the GPU-written data of several buffers with one wait for the GPU.
     void DownloadBuffersMemory(std::span<const BufferId> buffer_ids);
 
+    /// DownloadMemory for each range, waiting for the GPU once (mapped buffers read in place
+    /// after a host-read barrier).
     void DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges);
 
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
