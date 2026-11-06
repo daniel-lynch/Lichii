@@ -16,6 +16,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "memory_manager.h"
 #include "video_core/guest_memory.h"
+#include "video_core/gpu_split.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/host1x/host1x.h"
@@ -598,6 +599,17 @@ void MemoryManager::FlushRegion(GPUVAddr gpu_addr, size_t size,
         MemoryOperation(base, copy_amount, false, mapped_normal, do_nothing, do_nothing);
     };
     MemoryOperation(gpu_addr, size, true, mapped_big, do_nothing, flush_short_pages);
+}
+
+void MemoryManager::FlushRegionForRead(GPUVAddr gpu_addr, size_t size) const {
+    // A CPU-side (safe) read has to see the writes the GPU has already made. Under the GPU split
+    // those writes sit in the rasterizer's caches, which belong to the back thread, so the flush is
+    // queued there and this call waits for it rather than the front touching back-owned state.
+    // Run() already does exactly the right thing in the other two cases: with no split, and when
+    // the caller is the back thread itself, it just calls the lambda here.
+    VideoCommon::GpuSplit::Get().Run(
+        [this, gpu_addr, size] { FlushRegion(gpu_addr, size); },
+        VideoCommon::DrainSite::SafeReadFlush);
 }
 
 bool MemoryManager::IsMemoryDirty(GPUVAddr gpu_addr, size_t size,

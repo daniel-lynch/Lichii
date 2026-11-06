@@ -58,6 +58,9 @@ public:
     bool IsShuttingDown() const;
 
     static constexpr bool HAS_FLUSH_INVALIDATION = true;
+    /// The video memory manager can route a CPU-side (safe) read's flush to the GPU split's back
+    /// thread, where the caches live, instead of touching them on the front. See FlushRegionForRead.
+    static constexpr bool HAS_SPLIT_AWARE_FLUSH = true;
 
     inline size_t GetID() const noexcept {
         return unique_identifier;
@@ -152,6 +155,12 @@ public:
 
     void FlushRegion(GPUVAddr gpu_addr, size_t size,
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) const;
+
+    /// Flush for a CPU-side (safe) read of guest memory. Under the GPU split the rasterizer's
+    /// caches belong to the back thread, so the flush is queued there and this call waits for it,
+    /// instead of the front touching back-owned state. With no split, or when already on the back,
+    /// this is exactly FlushRegion.
+    void FlushRegionForRead(GPUVAddr gpu_addr, size_t size) const;
 
     void InvalidateRegion(GPUVAddr gpu_addr, size_t size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) const;

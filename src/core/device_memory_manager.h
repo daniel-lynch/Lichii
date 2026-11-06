@@ -50,6 +50,9 @@ public:
     ~DeviceMemoryManager();
 
     static constexpr bool HAS_FLUSH_INVALIDATION = true;
+    /// The CPU-side memory manager has no GPU split to route a flush to; see the video memory
+    /// manager's FlushRegionForRead.
+    static constexpr bool HAS_SPLIT_AWARE_FLUSH = false;
     static constexpr size_t AS_BITS = Traits::device_virtual_bits;
 
     void BindInterface(DeviceInterface* device_inter);
