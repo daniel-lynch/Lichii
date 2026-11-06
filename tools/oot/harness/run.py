@@ -275,6 +275,26 @@ class Run:
 
     # -- launch
     def preflight(self):
+        # One emulator at a time, enforced with a lock held for the whole run: polling emu_pids()
+        # alone let every waiting harness launch at the same instant when the previous run
+        # exited (2026-11-05 19:05: three emulators at once faulted the GPU, Xid 51 / reset required).
+        self.lock_path = Path.home() / "Downloads/OOT/harness-runs/.emulator.lock"
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock_fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        import fcntl
+        deadline = time.time() + max(self.a.wait_idle, 0)
+        while True:
+            try:
+                fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    self.say("refusing to start: another harness holds the emulator lock")
+                    shutil.rmtree(self.dir, ignore_errors=True)
+                    sys.exit(3)
+                time.sleep(5)
+        os.ftruncate(self.lock_fd, 0)
+        os.write(self.lock_fd, f"{os.getpid()} {self.dir}\n".encode())
         others = emu_pids()
         if others and self.a.wait_idle:
             self.say(f"another emulator instance is running ({others}); waiting up to {self.a.wait_idle}s")
