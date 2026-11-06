@@ -978,8 +978,10 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     }
     using DefPtr = Id StorageDefinitions::*;
     const Id zero{u32_zero_value};
+    // tail_words: the word-split accesses (#295) index words (shift 2); the bounded pick checks
+    // their last word, so the whole access lies inside the buffer as on the vector path.
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
-                               bool writes, auto&& callback) {
+                               bool writes, auto&& callback, u32 tail_words = 0) {
         AddLabel();
         const size_t num_buffers{info.storage_buffers_descriptors.size()};
         const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
@@ -1025,7 +1027,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             const Id ssbo_offset{OpUConvert(U32[1], OpISub(U64, addr, ssbo_addr))};
             const Id ssbo_index{OpShiftRightLogical(U32[1], ssbo_offset, Const(shift))};
             const Id ssbo_pointer{OpAccessChain(element_pointer, ssbo_id, zero, ssbo_index)};
-            callback(ssbo_pointer);
+            callback(ssbo_pointer, ssbo_id, ssbo_index);
             AddLabel(else_label);
         }};
         if (info.native_global_bounds) {
@@ -1050,7 +1052,10 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
                 const Id distance{OpISub(U64, addr, bases[index])};
                 Id inside{OpUGreaterThanEqual(U1, addr, bases[index])};
                 if (bounded_pick) {
-                    const Id element{OpShiftRightLogical(U64, distance, Const(shift))};
+                    Id element{OpShiftRightLogical(U64, distance, Const(shift))};
+                    if (tail_words != 0) {
+                        element = OpIAdd(U64, element, Constant(U64, u64{tail_words}));
+                    }
                     const Id length{OpUConvert(U64, ArrayLength(ssbos[index].*ssbo_member))};
                     inside = OpLogicalAnd(U1, inside, OpULessThan(U1, element, length));
                 }
@@ -1099,8 +1104,31 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             OpFunctionEnd();
             return func_id;
         }
+        // Buffers are bound at the device's storage buffer alignment (4 bytes on AMD), so an
+        // aligned 8 or 16 byte guest access can start at any word of the binding and the vector
+        // view (offset >> shift) would read the vector before it. Those accesses read the words
+        // of the buffer found for the address.
+        if (shift > 2 && profile.min_ssbo_alignment < (1U << shift)) {
+            const u32 count = 1U << (shift - 2);
+            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2, false,
+                        [&](Id, Id ssbo_id, Id word_index) {
+                            std::array<Id, 4> words;
+                            for (u32 i = 0; i < count; ++i) {
+                                const Id index{i == 0 ? word_index
+                                                      : OpIAdd(U32[1], word_index, Const(i))};
+                                words[i] = OpLoad(U32[1], OpAccessChain(storage_types.U32.element,
+                                                                         ssbo_id, zero, index));
+                            }
+                            OpReturnValue(
+                                OpCompositeConstruct(type, std::span{words}.first(count)));
+                        },
+                        count - 1);
+            OpReturnValue(ConstantNull(type));
+            OpFunctionEnd();
+            return func_id;
+        }
         define_body(ssbo_member, addr, element_pointer, shift, false,
-                    [&](Id ssbo_pointer) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
+                    [&](Id ssbo_pointer, Id, Id) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
         OpReturnValue(ConstantNull(type));
         OpFunctionEnd();
         return func_id;
@@ -1122,10 +1150,29 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             OpFunctionEnd();
             return func_id;
         }
-        define_body(ssbo_member, addr, element_pointer, shift, true, [&](Id ssbo_pointer) {
-            OpStore(ssbo_pointer, data);
+        if (shift > 2 && profile.min_ssbo_alignment < (1U << shift)) {
+            const u32 count = 1U << (shift - 2);
+            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2, true,
+                        [&](Id, Id ssbo_id, Id word_index) {
+                            for (u32 i = 0; i < count; ++i) {
+                                const Id index{i == 0 ? word_index
+                                                      : OpIAdd(U32[1], word_index, Const(i))};
+                                OpStore(OpAccessChain(storage_types.U32.element, ssbo_id, zero,
+                                                      index),
+                                        OpCompositeExtract(U32[1], data, i));
+                            }
+                            OpReturn();
+                        },
+                        count - 1);
             OpReturn();
-        });
+            OpFunctionEnd();
+            return func_id;
+        }
+        define_body(ssbo_member, addr, element_pointer, shift, true,
+                    [&](Id ssbo_pointer, Id, Id) {
+                        OpStore(ssbo_pointer, data);
+                        OpReturn();
+                    });
         OpReturn();
         OpFunctionEnd();
         return func_id;
@@ -1169,7 +1216,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const Id value{OpFunctionParameter(U32[1])};
         const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
         define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2, true,
-                    [&](Id pointer) {
+                    [&](Id pointer, Id, Id) {
                         OpReturnValue(opcode == IR::Opcode::GlobalAtomicIAdd32
                                           ? OpAtomicIAdd(U32[1], pointer, scope, u32_zero_value, value)
                                           : OpAtomicUMax(U32[1], pointer, scope, u32_zero_value, value));
@@ -1190,7 +1237,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const Id value{OpFunctionParameter(U32[1])};
         const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
         define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2, true,
-                    [&](Id pointer) {
+                    [&](Id pointer, Id, Id) {
                         OpReturnValue(OpAtomicCompareExchange(U32[1], pointer, scope,
                                                               u32_zero_value, u32_zero_value,
                                                               value, comparator));
