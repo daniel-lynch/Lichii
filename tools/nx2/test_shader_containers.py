@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 from pathlib import Path
+import json
 import struct
 import subprocess
 import sys
@@ -8,6 +9,7 @@ import tempfile
 import unittest
 import zlib
 
+from extract_static_shaders import extract, write_offline_inputs
 from shader_archive import ArchiveError
 from shader_containers import dcx_decompress, lz4_block, parse_bnd4, parse_cgsb, parse_sharcb, parse_shn
 
@@ -66,6 +68,39 @@ class SharcbTests(unittest.TestCase):
         self.assertEqual([item["control_offset"] for item in records], [control, control])
         self.assertEqual(records[0]["code"], records[1]["code"])
         self.assertEqual(records[0]["code"][:144], graphics(0))
+
+    def test_graphics_retains_exact_bank1_bytes(self):
+        data, _, _, control = sharcb()
+        struct.pack_into("<4I", data, control + 56, 144, 4, 0xf0, 0x100)
+        struct.pack_into("<I", data, 0x600 + 0xf0, 0x12345678)
+        record = parse_sharcb(data)[0]
+        self.assertEqual(len(record["code"]), 0x100)
+        self.assertEqual(record["code"][0xf0:0xf4], bytes.fromhex("78563412"))
+
+    def test_extractor_writes_owned_per_title_offline_index(self):
+        data, _, _, control = sharcb()
+        struct.pack_into("<4I", data, control + 56, 144, 4, 0xf0, 0x100)
+        struct.pack_into("<I", data, 0x600 + 0xf0, 0x12345678)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "synthetic.sharcb"
+            source.write_bytes(data)
+            output = root / "output"
+            output.mkdir()
+            title = "0400000000000000"
+            result = extract([{"path": str(source), "game": "synthetic", "title_id": title}], output)
+            self.assertEqual(result["errors"], [])
+            write_offline_inputs(result, output)
+            index = json.loads((output / f"offline-{title}.json").read_text())
+            self.assertEqual(index["title_id"], title)
+            self.assertEqual(len(index["programs"]), 1)
+            row = index["programs"][0]
+            self.assertEqual(row["constants_offset"], 0xf0)
+            self.assertEqual(row["constants_size"], 4)
+            self.assertEqual(row["stage"], "vertex")
+            self.assertEqual((output / row["container"]).read_bytes()[0xf0:0xf4],
+                             bytes.fromhex("78563412"))
+            self.assertEqual(len(row["fingerprint"]), 16)
 
     def test_compute_uses_declared_extent_without_graphics_header(self):
         data, _, _, _ = sharcb(3)

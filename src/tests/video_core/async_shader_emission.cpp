@@ -169,7 +169,8 @@ TEST_CASE("Graphics IR survives transfer to the shader worker and emits identica
     auto released = release.get_future().share();
     Common::ThreadWorker workers{1, "TestPipelineBuilder"};
     auto job = std::make_shared<GraphicsPrograms>();
-    const auto reference = job->Emit();
+    GraphicsPrograms reference_job;
+    const auto reference = reference_job.Emit();
     std::weak_ptr<GraphicsPrograms> lifetime = job;
     std::promise<std::array<std::vector<u32>, 2>> result;
     auto emitted = result.get_future();
@@ -202,11 +203,15 @@ TEST_CASE("Production verification preserves merged vertex control flow and stag
     job->AddControlFlowAndDualVertex();
     const auto vertex_info = job->programs[0].info;
     const auto fragment_info = job->programs[1].info;
-    const auto reference = job->Emit();
+    GraphicsPrograms reference_job;
+    reference_job.AddControlFlowAndDualVertex();
+    const auto reference = reference_job.Emit();
+    auto emitted_job = std::make_shared<GraphicsPrograms>();
+    emitted_job->AddControlFlowAndDualVertex();
     std::array<std::vector<u32>, 2> emitted, verified;
     Common::ThreadWorker workers{1, "PipelineTest"};
     Vulkan::PipelineBuild build{&workers, [&] {
-                                    emitted = job->Emit();
+                                    emitted = emitted_job->Emit();
                                     verified = job->Emit(reference);
                                 }};
     build.Wait();
@@ -234,6 +239,8 @@ TEST_CASE("Production verification selects the reference when emitted words diff
     const auto emitted = job.Emit();
     auto reference = emitted;
     reference[0][2] ^= 1;
-    REQUIRE(job.Emit(reference) == reference);
-    REQUIRE(job.Emit() == emitted);
+    GraphicsPrograms verified_job;
+    REQUIRE(verified_job.Emit(reference) == reference);
+    GraphicsPrograms fresh_job;
+    REQUIRE(fresh_job.Emit() == emitted);
 }

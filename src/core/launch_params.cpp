@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <regex>
+#include <charconv>
 #include <cctype>
 
 #include "common/assert.h"
@@ -51,6 +52,13 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
         {"clear-nup-version", no_argument, 0, 0x106},
         {"clear-nup-publisher", no_argument, 0, 0x107},
         {"precompile-shaders", no_argument, 0, 0x108},
+        {"shader-archive-index", required_argument, 0, 0x109},
+        {"shader-workers", required_argument, 0, 0x10a},
+        {"shader-recipe-cache", required_argument, 0, 0x10b},
+        {"shader-recipe-count", required_argument, 0, 0x10c},
+        {"shader-recipe-limit", required_argument, 0, 0x10d},
+        {"shader-recipe-baseline", required_argument, 0, 0x10f},
+        {"shader-report", required_argument, 0, 0x10e},
         {0, 0, 0, 0},
         // clang-format on
     };
@@ -109,6 +117,53 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                 break;
             case 0x108:
                 p.precompile_shaders = true;
+                break;
+            case 0x109:
+                p.shader_archive_index = optarg;
+                p.precompile_shaders = true;
+                break;
+            case 0x10a: {
+                const std::string_view value{optarg};
+                const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), p.shader_workers);
+                if (error != std::errc{} || end != value.data() + value.size() ||
+                    p.shader_workers == 0 || p.shader_workers > 64) {
+                    LOG_ERROR(Frontend, "--shader-workers must be between 1 and 64");
+                    p.print_help = true;
+                }
+                break;
+            }
+            case 0x10b:
+                p.shader_recipe_cache = optarg;
+                break;
+            case 0x10c: {
+                const std::string_view value{optarg};
+                const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), p.shader_recipe_count);
+                if (error != std::errc{} || end != value.data() + value.size() ||
+                    p.shader_recipe_count == 0 || p.shader_recipe_count > 64) {
+                    LOG_ERROR(Frontend, "--shader-recipe-count must be between 1 and 64");
+                    p.print_help = true;
+                }
+                break;
+            }
+            case 0x10d: {
+                const std::string_view value{optarg};
+                const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), p.shader_recipe_limit);
+                if (error != std::errc{} || end != value.data() + value.size() || p.shader_recipe_limit == 0) {
+                    LOG_ERROR(Frontend, "--shader-recipe-limit must be a positive 32-bit integer");
+                    p.print_help = true;
+                }
+                break;
+            }
+            case 0x10f:
+                p.shader_recipe_baseline = optarg;
+                if (p.shader_recipe_baseline != "auto" && p.shader_recipe_baseline != "always" &&
+                    p.shader_recipe_baseline != "never") {
+                    LOG_ERROR(Frontend, "--shader-recipe-baseline must be auto, always or never");
+                    p.print_help = true;
+                }
+                break;
+            case 0x10e:
+                p.shader_report = optarg;
                 break;
             case 'i': {
                 p.input_profile = std::string(optarg);
@@ -253,6 +308,13 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             " --nup-publisher NAME --clear-nup-name --clear-nup-icon --clear-nup-version"
             " --clear-nup-publisher]"
             " Rewrite default-language NUP metadata in place and exit\n"
+            "--shader-archive-index FILE  Translate extracted archive index (eden-cli, Vulkan)\n"
+            "--shader-workers N    Archive workers, 1..64 (default: hardware threads / 2)\n"
+            "--shader-recipe-cache FILE  Read exact-stage and class recipes from a gameplay translation cache\n"
+            "--shader-recipe-limit N     Cap imported catalog entries (default 200000; 256 MiB import budget)\n"
+            "--shader-recipe-baseline auto|always|never  Baseline policy (default auto: omit with exact recipes)\n"
+            "--shader-report FILE        Write per-run production statistics as JSON\n"
+            "--shader-recipe-count N     Emit up to N exact/class recipes per stage (default 2)\n"
             "--precompile-shaders  Build every cached pipeline of the game, save the pipeline"
             " caches and exit before the game runs\n",
             lp.argv0

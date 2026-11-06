@@ -5,14 +5,17 @@
 
 #include <atomic>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -179,6 +182,9 @@ struct CacheIdentity {
                                       const Shader::HostTranslateInfo& host_info, u64 extra);
 
 [[nodiscard]] Digest DigestRuntimeInfo(const Shader::RuntimeInfo& runtime_info);
+[[nodiscard]] Shader::RuntimeInfo CanonicalRuntimeInfo(Shader::RuntimeInfo runtime,
+                                                      const Shader::Info& info,
+                                                      Shader::Stage stage);
 
 /// A program without its IR: what pipelines and later stages read from a translated program.
 struct ProgramMeta {
@@ -204,12 +210,16 @@ struct Entry {
     ProgramMeta meta;
     /// Digest of the stage key and the queries: identifies the program the entry translates.
     Digest id;
+    bool offline{};
+
+    [[nodiscard]] bool CanReuseMetadata() const { return true; }
 };
 
 struct Variant {
     Shader::Backend::Bindings binding_out{};
     Shader::Info info;
     std::vector<u32> spirv;
+    bool fallback_recipe{};
 };
 
 [[nodiscard]] Digest MakeVariantKey(const Digest& entry_id, const Digest& runtime,
@@ -226,45 +236,116 @@ void WriteInfo(std::vector<u8>& out, const Shader::Info& info);
 /// write yet; the cache is then off rather than handing pipelines an incomplete info.
 [[nodiscard]] bool LayoutIsCovered();
 
+struct EmissionRecipe {
+    Shader::RuntimeInfo runtime{};
+    Shader::Backend::Bindings bindings{};
+};
+
+[[nodiscard]] EmissionRecipe DefaultEmissionRecipe(Shader::Stage stage);
+
+[[nodiscard]] u64 RecipeClass(Shader::Stage stage, const Shader::Info* info);
+
+constexpr u32 DefaultRecipeLimit = 200000;
+constexpr u64 DefaultRecipeImportBytes = 256ULL * 1024 * 1024;
+
+constexpr u32 DefaultRecipeCount = 2;
+enum class RecipeBaseline { Auto, Always, Never };
+enum class RecipeSource { ExactStage, Class, Baseline };
+struct SelectedRecipe {
+    EmissionRecipe recipe;
+    RecipeSource source;
+};
+
+struct RecipeCatalog {
+    struct CountedRecipe {
+        EmissionRecipe recipe;
+        Digest key;
+        u64 count{};
+    };
+    Digest source_config{};
+    u64 entries{}, truncated_entries{}, skipped_records{}, imported_bytes{}, invalid_recipes{};
+    u64 scanned_records{}, eligible_records{}, admitted_records{}, framing_skipped_bytes{};
+    std::unordered_map<Digest, std::vector<CountedRecipe>, DigestHash> exact;
+    std::unordered_map<u64, std::vector<CountedRecipe>> classes;
+    [[nodiscard]] std::vector<SelectedRecipe> SelectWithSources(
+        const Digest& stage_key, Shader::Stage stage, const Shader::Info& info, u32 top_k = DefaultRecipeCount,
+        RecipeBaseline baseline = RecipeBaseline::Auto) const;
+    [[nodiscard]] std::vector<EmissionRecipe> Select(
+        const Digest& stage_key, Shader::Stage stage, const Shader::Info& info,
+        u32 top_k = DefaultRecipeCount,
+        RecipeBaseline baseline = RecipeBaseline::Auto) const;
+};
+
+enum class OfflineOutcome { VariantHit, VariantMiss, MetaMismatch, FullHit };
+
 class Store {
 public:
-    Store() = default;
+    /// Override the environment budget in bytes (primarily for deterministic tests).
+    explicit Store(std::optional<u64> resident_budget_bytes = std::nullopt);
     ~Store();
 
     /// Loads the cache file of a title, or starts a new one when its build or configuration
     /// differs. An empty path keeps the cache in memory only.
     void Open(const std::filesystem::path& path, const Digest& config);
     void Close();
+    [[nodiscard]] bool Persistent();
 
     [[nodiscard]] bool Enabled() const noexcept {
         return enabled;
     }
 
     /// The entry of a stage whose recorded queries the environment answers the same way.
-    /// With `live`, TextureHandle queries are replayed by class and the live answers of the
-    /// matching entry are returned there. Without it, an entry holding them never matches.
+    /// TextureHandle queries replay by class; optional `live` captures the matching entry's
+    /// current answers for worker-side reconstruction.
     [[nodiscard]] std::shared_ptr<const Entry> FindEntry(const Digest& stage_key,
                                                          Shader::Environment& env,
                                                          LiveAnswers* live = nullptr);
     /// True when entries exist for the stage key (whether or not the environment matches them).
     [[nodiscard]] bool HasStageKey(const Digest& stage_key);
+    /// Current non-dropped entries grouped by their number of stored modules.
+    [[nodiscard]] std::map<u64, u64> VariantMultiplicity();
+    /// Key presence only; does not validate disk payloads.
+    [[nodiscard]] bool HasVariant(const Digest& variant_key);
+    enum class ResumeVariant { Missing, Ready, Validated, Invalidated };
+    /// Fully decode a disk-backed variant once per open store; erase it on failure.
+    [[nodiscard]] ResumeVariant ValidateVariantForResume(const Digest& variant_key);
     /// The variant, decompressed.
     [[nodiscard]] std::optional<Variant> FindVariant(const Digest& variant_key);
 
     /// Adds an entry (when new) and appends it to the file. With `expected_generation`, nothing
     /// is added unless the store is still the one opened then (checked under the store mutex).
     std::shared_ptr<const Entry> Insert(const Digest& stage_key, std::vector<Query> queries,
-                                        const ProgramMeta& meta,
+                                        const ProgramMeta& meta, bool offline = false,
                                         std::optional<u64> expected_generation = std::nullopt);
-    /// Adds a variant of `entry`, which must be an entry of this store (one from before a
-    /// reopen is refused); returns whether it was taken.
-    bool InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant);
-    /// Changes whenever the store is closed (and so on every Open).
+    std::shared_ptr<const Entry> Insert(const Digest& stage_key, std::vector<Query> queries,
+                                        const ProgramMeta& meta, u64 expected_generation) {
+        return Insert(stage_key, std::move(queries), meta, false, expected_generation);
+    }
+    /// Adds a variant only if its entry still belongs to this store.
+    bool InsertVariant(const Entry& entry, const Digest& variant_key, const Variant& variant,
+                       const EmissionRecipe* recipe = nullptr);
     [[nodiscard]] u64 Generation() const noexcept {
         return generation.load();
     }
     std::atomic<u64> rejected_variants{};
+    std::atomic<u64> variant_disk_reads{};
+    [[nodiscard]] u64 ResidentBytes();
 
+    /// Reads recipes without modifying the source cache, including an incomplete tail.
+    [[nodiscard]] static std::array<EmissionRecipe, Shader::MaxStageTypes> ReadRecipes(
+        const std::filesystem::path& path, const Digest& config);
+
+    /// Read only recipes from any compatible format-10 configuration; never reuse its modules.
+    [[nodiscard]] static RecipeCatalog ReadRecipeCatalog(const std::filesystem::path& path,
+                                                        const Digest& config,
+                                                        u32 entry_limit = DefaultRecipeLimit,
+                                                        u64 byte_budget = DefaultRecipeImportBytes);
+
+    /// Reject speculative metadata before any pipeline state is derived from it.
+    [[nodiscard]] bool ValidateOfflineEntry(const Entry& entry, const Shader::IR::Program& live);
+
+    void DropEntry(const Entry& entry);
+    void LogOfflineOutcome(Shader::Stage stage, u64 hash, OfflineOutcome outcome);
     void LogStatistics(std::string_view when);
 
     /// With count_mismatches set (use_shader_aot_translation), FindEntry misses on a known
@@ -274,30 +355,74 @@ public:
     std::array<std::atomic<u64>, 16> first_mismatch{};
 
     // Statistics
+    std::array<std::array<std::atomic<u64>, 4>, Shader::MaxStageTypes> offline_outcomes{};
+    std::atomic<u64> offline_entry_only_rejected{};
+    std::atomic<u64> entry_key_misses{}, offline_replay_misses{}, offline_dropped_misses{};
     std::atomic<u64> stage_hits{};
     std::atomic<u64> stage_misses{};
     std::atomic<u64> hit_ns{};
     std::atomic<u64> miss_ns{};
 
 private:
-    struct StoredVariant {
-        Shader::Backend::Bindings binding_out{};
+    struct ResidentVariant {
         Shader::Info info;
-        u32 spirv_words{};
         std::vector<u8> compressed_spirv;
+        [[nodiscard]] u64 Bytes() const;
+    };
+    struct StoredVariant {
+        Digest entry_id{};
+        mutable bool resume_validated{}; // Guarded by mutex.
+        bool fallback_recipe{};
+        Shader::Backend::Bindings binding_out{};
+        mutable std::shared_ptr<const ResidentVariant> resident; // Guarded by mutex.
+        // Backing locations are finalized under mutex before residency can be evicted.
+        u64 info_offset{};
+        u32 info_size{};
+        u32 spirv_words{};
+        std::filesystem::path source;
+        u64 compressed_offset{};
+        u32 compressed_size{};
     };
 
     std::shared_ptr<const Entry> InsertLocked(Entry entry);
-    void Append(const std::vector<u8>& record);
-    bool LoadFile(const std::filesystem::path& path, const Digest& config);
+    std::optional<u64> Append(const std::vector<u8>& record);
+    void AdmitResident(const std::shared_ptr<const StoredVariant>& stored,
+                       std::shared_ptr<const ResidentVariant> resident);
+    const u64 resident_budget;
+    u64 resident_bytes{};
+    std::deque<std::weak_ptr<const StoredVariant>> resident_order;
+    void DisablePersistence(const std::error_code& error);
+    bool LoadFile(const std::filesystem::path& path, const Digest& config, bool writable = true,
+                  u64 byte_budget = UINT64_MAX);
 
+    bool LoadRecipeRecords(std::ifstream& in, u64 size, u64 byte_budget);
+
+    struct RecipeCount {
+        EmissionRecipe recipe;
+        Shader::Stage stage;
+        u64 count{};
+    };
+    void CountRecipe(Shader::Stage stage, const EmissionRecipe& recipe);
+    std::unordered_map<Digest, RecipeCount, DigestHash> recipes;
+
+    bool collect_recipe_entries{};
+    u64 skipped_import_records{}, imported_bytes{}, invalid_recipes{};
+    u64 scanned_records{}, eligible_records{}, admitted_records{}, framing_skipped_bytes{};
+    std::unordered_map<Digest, std::vector<EmissionRecipe>, DigestHash> entry_recipes;
+
+    // Writers serialize publication and append; readers never wait for file I/O.
+    std::mutex writer_mutex;
     std::mutex mutex;
     bool enabled{};
+    bool persistence_failed{};
     std::atomic<u64> generation{};
     std::unordered_map<Digest, std::vector<std::shared_ptr<const Entry>>, DigestHash> entries;
     std::unordered_map<Digest, std::shared_ptr<const StoredVariant>, DigestHash> variants;
+    std::unordered_set<Digest, DigestHash> dropped_entries;
+    std::unordered_set<Digest, DigestHash> entries_with_modules;
     std::filesystem::path filename;
     std::ofstream file;
+    u64 append_offset{};
     u64 loaded_entries{};
     u64 loaded_variants{};
 };

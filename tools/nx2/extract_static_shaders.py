@@ -103,6 +103,31 @@ def extract(sources, output, dictionaries=None):
     return {"schema_version": 1, "archives": archives, "programs": list(programs.values()), "errors": errors}
 
 
+def write_offline_inputs(result, output):
+    """Index the owned allocations, including decompressed/nested effect members."""
+    titles = {}
+    for program in result["programs"]:
+        code = (output / program["code"]).read_bytes()
+        control = (output / program["control"]).read_bytes()
+        if len(control) < 0x58 or not code:
+            continue
+        fingerprint = 0xcbf29ce484222325
+        for byte in code[:256]:
+            fingerprint = ((fingerprint ^ byte) * 0x100000001b3) & ((1 << 64) - 1)
+        row = {"container": program["code"], "control": program["control"],
+               "offset": 0, "size": len(code), "control_offset": 0,
+               "constants_offset": int.from_bytes(control[0x40:0x44], "little"),
+               "constants_size": int.from_bytes(control[0x3c:0x40], "little"),
+               "stage": program["stage"], "fingerprint": f"{fingerprint:016x}"}
+        titles.setdefault(program["title_id"], []).append(row)
+    for title, rows in titles.items():
+        # Compact: a whole title's index is read in one piece by the producer, and the
+        # indented form of a large library (OoT: 18.3 MB) is a quarter whitespace.
+        (output / f"offline-{title}.json").write_text(json.dumps(
+            {"schema_version": 1, "title_id": title, "programs": rows},
+            separators=(",", ":")) + "\n", encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inventory", type=Path)
@@ -167,6 +192,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     result = extract(sources, output, dictionaries)
     result["errors"].extend(coverage_errors)
+    write_offline_inputs(result, output)
     (output / "manifest.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"archives": len(result["archives"]), "programs": len(result["programs"]),
                       "stages": dict(Counter(p["stage"] for p in result["programs"])),

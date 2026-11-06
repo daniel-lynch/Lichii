@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/offline_shader_producer.h"
 #include <algorithm>
 #include <atomic>
 #include <iterator>
@@ -21,6 +22,7 @@
 #include <optional>
 #include <regex>
 #include <string>
+#include <thread>
 #include "common/settings_enums.h"
 #include "core/launch_params.h"
 #ifdef __EMSCRIPTEN__
@@ -253,7 +255,16 @@ struct SdlState {
     InputCommon::InputSubsystem input_subsystem{};
     std::unique_ptr<EmuWindow_SDL3> emu_window;
     bool network_initialized{};
+    // --precompile-shaders: SDL_AppInit returns straight to SDL_AppQuit.
+    bool precompile_exit{};
+    int precompile_signal{};
 };
+
+// How long a precompile run lets the guest run before stopping it (see SDL_AppInit).
+constexpr auto kPrecompileSettle = std::chrono::seconds{5};
+// Last resort if that stop still hangs: the translation cache is flushed record by record, so
+// nothing is lost by leaving, and a hung precompile must not hold the caller forever.
+constexpr auto kPrecompileShutdownLimit = std::chrono::seconds{120};
 
 constexpr int kRestartExitCode = 75;
 static std::atomic_bool restart_requested{false};
@@ -657,6 +668,9 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         }
     }
 
+    std::optional<VideoCommon::OfflineShaders::SignalGuard> production_signals;
+    if (lp.precompile_shaders) production_signals.emplace();
+
     // Core is loaded, start the GPU (makes the GPU contexts current to this thread)
     state->system.GPU().Start();
     state->system.GetCpuManager().OnGpuReady();
@@ -673,16 +687,32 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             });
     }
     if (lp.precompile_shaders) {
+        bool archive_ok = true;
+        if (!lp.shader_archive_index.empty()) {
+            archive_ok = state->system.Renderer().ReadRasterizer()->PrecompileArchiveShaders(
+                lp.shader_archive_index, state->system.GetApplicationProcessProgramID(),
+                lp.shader_workers, lp.shader_recipe_cache, lp.shader_recipe_count, lp.shader_recipe_limit,
+                lp.shader_report, lp.shader_recipe_baseline);
+            if (!archive_ok) LOG_ERROR(Frontend, "Archive precompile failed (requires Vulkan and disk translation cache)");
+        }
         // LoadDiskResources saved the Vulkan pipeline cache; SDL_AppQuit shuts the renderer down,
-        // which saves it again. The cores are started once first: shutting down a process whose
-        // cores never ran hangs in ServerManager's destructor.
+        // which saves it again. Like the GUI action (77d4e19313), the guest cores run before the
+        // stop, on the success and the failure path alike: stopping a process whose cores never
+        // ran hangs in ServerManager's destructor. Starting them is not enough by itself; stopped
+        // at once, the services they start are still registering (KernelCore::CloseServices holds
+        // the server lock that a late RunServer waits for), so let them settle as the GUI does
+        // during its shutdown timer.
         Settings::values.force_preload_all_pipelines = false;
         if (!Settings::values.use_disk_shader_cache.GetValue()) {
             LOG_WARNING(Frontend, "Precompile: the disk pipeline cache is off, nothing to build");
         }
-        LOG_INFO(Frontend, "Precompile finished: {} pipelines built; exiting", pipeline_total);
+        LOG_INFO(Frontend, "Precompile finished: {} pipelines built; stopping after {} s",
+                 pipeline_total, kPrecompileSettle.count());
         void(state->system.Run());
-        return SDL_APP_SUCCESS;
+        std::this_thread::sleep_for(kPrecompileSettle);
+        state->precompile_exit = true;
+        state->precompile_signal = VideoCommon::OfflineShaders::StopSignal();
+        return archive_ok ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
     }
 
     // don't do anything, SDL3 already exists for us :D
@@ -818,6 +848,18 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     if (!state) {
         return;
     }
+    if (state->precompile_exit) {
+        const int code = state->precompile_signal ? 128 + state->precompile_signal
+                                                  : result == SDL_APP_SUCCESS ? 0 : 1;
+        std::thread([code] {
+            std::this_thread::sleep_for(kPrecompileShutdownLimit);
+            LOG_CRITICAL(Frontend, "Precompile: shutdown still running after {} s, exiting {}",
+                         kPrecompileShutdownLimit.count(), code);
+            std::fflush(nullptr);
+            std::_Exit(code);
+        }).detach();
+        LOG_INFO(Frontend, "Precompile: shutting down");
+    }
     state->system.DetachDebugger();
     // SDL calls this even when SDL_AppInit never powered the system on (no ROM given, --help or
     // --version): the kernel is uninitialised then, and Pause()/ShutdownMainProcess() would
@@ -826,10 +868,18 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
         void(state->system.Pause());
         state->system.ShutdownMainProcess();
     }
+    if (state->precompile_exit) {
+        LOG_INFO(Frontend, "Precompile: shutdown complete");
+    }
     const bool network_initialized = state->network_initialized;
+    const int production_signal = state->precompile_signal;
     delete state;
     if (network_initialized) {
         Network::Shutdown();
+    }
+    if (production_signal) {
+        SDL_Quit();
+        std::exit(128 + production_signal);
     }
     if (restart_requested) {
         // SDL3 maps SDL_APP_SUCCESS to exit code 0; quit SDL ourselves to return the restart code.

@@ -125,6 +125,10 @@ struct ComputePipelineCacheEntry {
 
 class PipelineCache : public VideoCommon::ShaderCache {
 public:
+    bool PrecompileArchiveShaders(const std::filesystem::path& input, u64 title_id, u32 workers,
+                                  const std::filesystem::path& recipes, u32 recipe_count,
+                                  u32 recipe_limit, const std::filesystem::path& report,
+                                  std::string_view baseline);
     explicit PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, const Device& device,
                            Scheduler& scheduler, DescriptorPool& descriptor_pool,
                            GuestDescriptorQueue& guest_descriptor_queue,
@@ -211,6 +215,7 @@ private:
     bool translation_cache_verify{};
     std::atomic<u64> translation_cache_verified{};
     std::atomic<u64> translation_cache_mismatches{};
+    std::atomic<u64> translation_cache_canonical_differences{};
     std::chrono::steady_clock::time_point translation_cache_logged{};
     void OpenTranslationCache(const std::filesystem::path& filename);
     [[nodiscard]] bool IsTranslationCacheable(const Shader::Environment& env) const;
@@ -303,7 +308,6 @@ private:
     std::mutex recipe_mutex;
     /// Class key -> recipes seen (a few per class; key 0 of a stage holds the stage's recipes).
     std::unordered_map<u64, std::vector<EmissionRecipe>> recipes;
-    [[nodiscard]] static u64 RecipeClass(Shader::Stage stage, const Shader::Info* info);
     /// A plain vertex-B + fragment pipeline's stage was emitted (or taken from the cache) with
     /// this runtime info and these bindings in.
     void RecordRecipe(Shader::Stage stage, const Shader::Info& info,

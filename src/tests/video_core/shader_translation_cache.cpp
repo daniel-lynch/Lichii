@@ -12,9 +12,13 @@
 #include <string>
 #include <string_view>
 #include <catch2/catch_test_macros.hpp>
+#include "common/logging.h"
+#include "common/fs/path_util.h"
 #include "video_core/shader_pool_index.h"
 #include "shader_recompiler/translator_identity.h"
+#include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "video_core/shader_translation_cache.h"
+#include "video_core/shader_archive_environment.h"
 
 namespace {
 using namespace VideoCommon::TranslationCache;
@@ -130,9 +134,26 @@ std::filesystem::path TempPath(const char* name) {
 }
 } // Anonymous namespace
 
-TEST_CASE("Translation cache covers every field of the shader structures",
-          "[video_core][translation_cache]") {
+TEST_CASE("cache is enabled for this build", "[video_core][translation_cache]") {
     REQUIRE(LayoutIsCovered());
+    const Shader::Profile profile{};
+    const Shader::HostTranslateInfo host_info{};
+    Store store;
+    store.Open({}, MakeConfigDigest(profile, host_info, 0));
+    REQUIRE(store.Enabled());
+    const ProgramMeta meta{.info = SampleInfo()};
+    const auto entry = store.Insert(Digest{0x12, 0x34}, {}, meta);
+    REQUIRE(entry);
+    REQUIRE(InfoEqual(entry->meta.info, meta.info));
+}
+
+TEST_CASE("Translation cache separates fragment shuffle workaround profiles",
+          "[video_core][translation_cache][fragment_shuffle]") {
+    Shader::Profile profile{};
+    const Shader::HostTranslateInfo host_info{};
+    const auto native = MakeConfigDigest(profile, host_info, 0);
+    profile.has_broken_spirv_fragment_shuffle = true;
+    REQUIRE(MakeConfigDigest(profile, host_info, 0) != native);
 }
 
 TEST_CASE("Translation cache round-trips the shader info", "[video_core][translation_cache]") {
@@ -287,6 +308,8 @@ TEST_CASE("Translation cache persists entries and variants", "[video_core][trans
         REQUIRE(found->spirv == variant.spirv);
         REQUIRE(found->binding_out.texture == 3);
         REQUIRE(found->info.stores_frag_depth);
+        REQUIRE(InfoEqual(found->info, variant.info));
+        REQUIRE(store.HasVariant(variant_key));
         REQUIRE_FALSE(store.FindVariant(MakeVariantKey(entry->id, runtime, {})));
 
         // The environment answers a query differently: no entry.
@@ -520,7 +543,7 @@ size_t CountKind(const std::vector<Query>& queries, QueryKind kind) {
 }
 } // Anonymous namespace
 
-TEST_CASE("Class-level replay compares texture classes instead of handle words",
+TEST_CASE("Class-level replay compares texture classes instead of handle words with live answers",
           "[video_core][translation_cache]") {
     FakeEnvironment env;
     const u64 word = (u64{2} << 32) | 0x20;
@@ -548,12 +571,12 @@ TEST_CASE("Class-level replay compares texture classes instead of handle words",
     // A handle of another class does not.
     env.cbufs[word] = 7; // ColorArray2D in FakeEnvironment
     REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) < queries.size());
-    // Without live answers (the setting off), such an entry never matches.
+    // Validation also works without collecting a worker replay snapshot.
     env.cbufs[word] = 5;
-    REQUIRE_FALSE(ReplayQueries(queries, env));
+    REQUIRE(ReplayQueries(queries, env));
 }
 
-TEST_CASE("Class-level replay keeps exact words exact", "[video_core][translation_cache]") {
+TEST_CASE("Class-level replay keeps exact words exact with live answers", "[video_core][translation_cache]") {
     FakeEnvironment env;
     env.cbufs[(u64{1} << 32) | 0x10] = 0x40;
     env.cbufs[(u64{2} << 32) | 0x20] = 5;
@@ -568,7 +591,7 @@ TEST_CASE("Class-level replay keeps exact words exact", "[video_core][translatio
         (void)recording.ReadTextureType(handle);
         queries = recording.TakeQueries();
     }
-    REQUIRE(CountKind(queries, QueryKind::CbufValue) == 3); // the exact word, both handle reads
+    REQUIRE(CountKind(queries, QueryKind::CbufValue) == 4); // exact word, handle reads and explicit exact notification
     LiveAnswers live;
     REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) == queries.size());
     env.cbufs[(u64{1} << 32) | 0x10] = 0x44;
@@ -578,7 +601,7 @@ TEST_CASE("Class-level replay keeps exact words exact", "[video_core][translatio
     REQUIRE(ReplayQueriesUntilMismatch(queries, env, &live) < queries.size());
 }
 
-TEST_CASE("Class-level replay covers two-word handles and rejects one-to-many mappings",
+TEST_CASE("Class-level replay covers two-word handles and rejects one-to-many mappings with live answers",
           "[video_core][translation_cache]") {
     FakeEnvironment env;
     Shader::ConstBufferAddr two_word = HandleAt(2, 0x20);
@@ -710,4 +733,725 @@ TEST_CASE("Translation cache identifies the translator by its source",
         REQUIRE_FALSE(MakeConfigDigest(profile, host_info, 0) == source_digest);
 #endif
     }
+}
+
+
+
+TEST_CASE("Class-level replay compares texture classes instead of handle words",
+          "[video_core][translation_cache]") {
+    FakeEnvironment env;
+    const u64 word = (u64{2} << 32) | 0x20;
+    env.cbufs[word] = 5; // a 2D texture
+    std::vector<Query> queries;
+    {
+        RecordingEnvironment recording{env, true};
+        const u32 handle = ReadHandle(recording, HandleAt(2, 0x20));
+        (void)recording.ReadTextureType(handle);
+        queries = recording.TakeQueries();
+    }
+    // Handle-only word: no exact query, one TextureHandle query.
+    REQUIRE(CountKind(queries, QueryKind::CbufValue) == 0);
+    REQUIRE(CountKind(queries, QueryKind::TextureHandle) == 1);
+    // A different handle of the same class matches.
+    env.cbufs[word] = 6;
+    REQUIRE(ReplayQueries(queries, env));
+    // A handle of another class does not.
+    env.cbufs[word] = 7; // ColorArray2D in FakeEnvironment
+    REQUIRE(!ReplayQueries(queries, env));
+    // Restoring the original handle also matches.
+    env.cbufs[word] = 5;
+    REQUIRE(ReplayQueries(queries, env));
+}
+
+TEST_CASE("Class-level replay keeps exact words exact", "[video_core][translation_cache]") {
+    FakeEnvironment env;
+    env.cbufs[(u64{1} << 32) | 0x10] = 0x40;
+    env.cbufs[(u64{2} << 32) | 0x20] = 5;
+    std::vector<Query> queries;
+    {
+        RecordingEnvironment recording{env, true};
+        // Exact-only word (a folded driver constant).
+        (void)recording.ReadCbufValue(1, 0x10);
+        // Shared word: read for a handle, then consumed by value from the pass's word cache.
+        const u32 handle = ReadHandle(recording, HandleAt(2, 0x20));
+        recording.NoteExactCbufWord(2, 0x20);
+        (void)recording.ReadTextureType(handle);
+        queries = recording.TakeQueries();
+    }
+    REQUIRE(CountKind(queries, QueryKind::CbufValue) == 4); // exact word, handle reads and explicit exact notification
+    REQUIRE(ReplayQueries(queries, env));
+    env.cbufs[(u64{1} << 32) | 0x10] = 0x44;
+    REQUIRE(!ReplayQueries(queries, env));
+    env.cbufs[(u64{1} << 32) | 0x10] = 0x40;
+    env.cbufs[(u64{2} << 32) | 0x20] = 6; // same class, but the word is also used by value
+    REQUIRE(!ReplayQueries(queries, env));
+}
+
+TEST_CASE("Class-level replay covers two-word handles and rejects one-to-many mappings",
+          "[video_core][translation_cache]") {
+    FakeEnvironment env;
+    Shader::ConstBufferAddr two_word = HandleAt(2, 0x20);
+    two_word.has_secondary = true;
+    two_word.secondary_index = 3;
+    two_word.secondary_offset = 0x40;
+    two_word.secondary_shift_left = 20;
+    env.cbufs[(u64{2} << 32) | 0x20] = 5;
+    env.cbufs[(u64{3} << 32) | 0x40] = 1;
+    env.cbufs[(u64{2} << 32) | 0x30] = 5;
+    std::vector<Query> queries;
+    {
+        RecordingEnvironment recording{env, true};
+        const u32 first = ReadHandle(recording, two_word);
+        (void)recording.ReadTextureType(first);
+        // A second handle recorded with the same value from other words.
+        Shader::ConstBufferAddr other = HandleAt(2, 0x30);
+        other.has_secondary = true;
+        other.secondary_index = 3;
+        other.secondary_offset = 0x40;
+        other.secondary_shift_left = 20;
+        const u32 second = ReadHandle(recording, other);
+        REQUIRE(second == first);
+        (void)recording.ReadTextureType(second);
+        queries = recording.TakeQueries();
+    }
+    REQUIRE(CountKind(queries, QueryKind::CbufValue) == 0);
+    REQUIRE(CountKind(queries, QueryKind::TextureHandle) == 2);
+    REQUIRE(ReplayQueries(queries, env));
+    // The secondary word is covered: changing it changes the live handle (7 << 20 here is
+    // still a 2D texture, so it matches with a new handle).
+    env.cbufs[(u64{3} << 32) | 0x40] = 2;
+    REQUIRE(ReplayQueries(queries, env));
+    // The two recorded-equal handles now differ live: one recorded handle, two live ones.
+    env.cbufs[(u64{2} << 32) | 0x30] = 6;
+    REQUIRE(!ReplayQueries(queries, env));
+}
+
+TEST_CASE("Class replay rejects unrepresentable recipes and malformed shifts",
+          "[video_core][translation_cache]") {
+    FakeEnvironment env;
+    RecordingEnvironment recording{env, true};
+    auto address = HandleAt(2, 0x20);
+    address.has_secondary = true;
+    address.secondary_offset = 0x10000;
+    REQUIRE_THROWS(recording.EndTextureHandle(address, 1));
+    Query invalid{QueryKind::TextureHandle, 2U | (32U << 8), 0x20, 1, 0};
+    REQUIRE_FALSE(ReplayQueries(std::span{&invalid, 1}, env));
+    REQUIRE(env.reads == 0);
+}
+
+TEST_CASE("Offline metadata can be reused after replay and is dropped on disagreement",
+          "[translation_cache][video_core]") {
+    FakeEnvironment env;
+    Store store;
+    store.Open({}, {});
+    Shader::IR::Program live;
+    live.stage = Shader::Stage::VertexB;
+    live.info.stores.Set(Shader::IR::Attribute::Generic0X, true);
+    auto guessed = ProgramMeta::From(live);
+    guessed.info.stores.Set(Shader::IR::Attribute::Generic0X, false);
+    const auto entry = store.Insert({91, 1}, {}, guessed, true);
+    const auto recipe = DefaultEmissionRecipe(live.stage);
+    const auto key = MakeVariantKey(entry->id, DigestRuntimeInfo(recipe.runtime), recipe.bindings);
+    store.InsertVariant(*entry, key, {.spirv = {0x07230203, 0x10000, 0, 1, 0}});
+    REQUIRE(store.FindEntry({91, 1}, env));
+    REQUIRE(entry->CanReuseMetadata());
+    auto other = recipe.runtime;
+    other.convert_depth_mode = !other.convert_depth_mode;
+    REQUIRE_FALSE(store.FindVariant(MakeVariantKey(entry->id, DigestRuntimeInfo(other), recipe.bindings)));
+    // A fresh translation that disagrees invalidates both metadata and modules.
+    REQUIRE_FALSE(store.ValidateOfflineEntry(*entry, live));
+    REQUIRE(live.info.stores[Shader::IR::Attribute::Generic0X]);
+    REQUIRE_FALSE(store.FindEntry({91, 1}, env));
+    REQUIRE_FALSE(store.FindVariant(key));
+    const auto demand = store.Insert({91, 1}, {}, ProgramMeta::From(live));
+    REQUIRE(demand->id != entry->id);
+    REQUIRE(demand->CanReuseMetadata());
+    REQUIRE(store.FindEntry({91, 1}, env)->id == demand->id);
+}
+
+TEST_CASE("Offline entry-only records remain reusable after load and truncated append",
+          "[translation_cache][video_core]") {
+    const auto path = std::filesystem::temp_directory_path() / "lichii_offline_entry_only_test.bin";
+    std::filesystem::remove(path);
+    Digest config{91, 2};
+    FakeEnvironment env;
+    {
+        Store store;
+        store.Open(path, config);
+        REQUIRE(store.Persistent());
+        const auto offline = store.Insert({1, 2}, {}, {}, true);
+        REQUIRE(store.FindEntry({1, 2}, env));
+        REQUIRE(offline);
+        REQUIRE(store.Insert({3, 4}, {}, {}));
+    }
+    {
+        std::ofstream tail(path, std::ios::binary | std::ios::app);
+        tail.write("STCR", 4);
+    }
+    {
+        Store store;
+        store.Open(path, config);
+        REQUIRE(store.FindEntry({1, 2}, env));
+        REQUIRE(store.FindEntry({3, 4}, env));
+        REQUIRE(store.offline_entry_only_rejected.load() == 0);
+    }
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("Offline matching modules and persistent metadata rejection round trip",
+          "[translation_cache][video_core]") {
+    const auto path = std::filesystem::temp_directory_path() / "lichii_offline_drop_test.bin";
+    std::filesystem::remove(path);
+    Digest config{91, 3};
+    FakeEnvironment env;
+    Shader::IR::Program live;
+    live.stage = Shader::Stage::Fragment;
+    Digest variant_key{};
+    {
+        Store store;
+        store.Open(path, config);
+        const auto entry = store.Insert({1, 2}, {}, ProgramMeta::From(live), true);
+        auto recipe = DefaultEmissionRecipe(live.stage);
+        variant_key = MakeVariantKey(entry->id, DigestRuntimeInfo(recipe.runtime), recipe.bindings);
+        store.InsertVariant(*entry, variant_key,
+                            {.spirv = {0x07230203, 0x10000, 0, 1, 0}, .fallback_recipe = true}, &recipe);
+    }
+    {
+        Store store;
+        store.Open(path, config);
+        const auto entry = store.FindEntry({1, 2}, env);
+        REQUIRE(entry);
+        REQUIRE(entry->offline);
+        REQUIRE(store.offline_entry_only_rejected.load() == 0);
+        REQUIRE(store.ValidateOfflineEntry(*entry, live));
+        const auto variant = store.FindVariant(variant_key);
+        REQUIRE(variant);
+        REQUIRE(variant->fallback_recipe);
+        live.output_vertices = 19; // Scalar metadata matters as well as Shader::Info.
+        REQUIRE_FALSE(store.ValidateOfflineEntry(*entry, live));
+    }
+    {
+        Store store;
+        store.Open(path, config);
+        REQUIRE_FALSE(store.FindEntry({1, 2}, env));
+        REQUIRE_FALSE(store.FindVariant(variant_key));
+    }
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("Canonical vertex and fragment keys ignore only unused runtime inputs",
+          "[translation_cache][video_core]") {
+    for (const auto stage : {Shader::Stage::VertexB, Shader::Stage::Fragment}) {
+        Shader::IR::Program program;
+        program.stage = stage;
+        program.info.loads.Set(Shader::IR::Attribute::Generic0X, true);
+        program.info.passthrough.Set(Shader::IR::Attribute::Generic0X + 8, true);
+        auto a = DefaultEmissionRecipe(stage).runtime;
+        auto b = a;
+        b.generic_input_types[1] = Shader::AttributeType::SignedInt;
+        b.previous_stage_stores.Set(Shader::IR::Attribute::Generic0X + 4, false);
+        b.input_topology = Shader::InputTopology::Triangles;
+        const auto digest = [&](const auto& runtime) {
+            return DigestRuntimeInfo(CanonicalRuntimeInfo(runtime, program.info, program.stage));
+        };
+        REQUIRE(DigestRuntimeInfo(a) != DigestRuntimeInfo(b));
+        REQUIRE(digest(a) == digest(b));
+        SECTION("loaded input type remains significant") {
+            b.generic_input_types[0] = Shader::AttributeType::SignedInt;
+            REQUIRE(digest(a) != digest(b));
+        }
+        SECTION("loaded input stores remain significant") {
+            b.previous_stage_stores.Set(Shader::IR::Attribute::Generic0X, false);
+            REQUIRE(digest(a) != digest(b));
+        }
+        SECTION("passthrough stores remain significant") {
+            b.previous_stage_stores.Set(Shader::IR::Attribute::Generic0X + 8, false);
+            REQUIRE(digest(a) != digest(b));
+        }
+        SECTION("geometry is unchanged") {
+            program.stage = Shader::Stage::Geometry;
+            REQUIRE(digest(a) != digest(b));
+            REQUIRE(digest(b) == DigestRuntimeInfo(b));
+        }
+        SECTION("legacy varying programs are unchanged") {
+            program.info.loads.Set(Shader::IR::Attribute::ColorFrontDiffuseR, true);
+            REQUIRE(digest(a) != digest(b));
+            REQUIRE(digest(b) == DigestRuntimeInfo(b));
+        }
+    }
+}
+
+TEST_CASE("Offline resume replays guessed handles in their original scope",
+          "[video_core][translation_cache]") {
+    std::vector<u8> bytes(0x200), control(0x58);
+    auto put = [](auto& out, size_t offset, u32 word) {
+        std::memcpy(out.data() + offset, &word, sizeof(word));
+    };
+    put(bytes, 0, 1 << 10);
+    put(bytes, 0x80, 0x0000794d);
+    put(bytes, 0x88, 0x03800000);
+    put(control, 0, 0x98761234);
+    put(control, 4, 0xc9);
+    put(control, 8, 20);
+    put(control, 0x38, 0x90);
+    VideoCommon::ArchiveEnvironment env(bytes, control, Shader::Stage::VertexB);
+    RecordingEnvironment recording(env, true);
+    auto handle = ReadHandle(recording, HandleAt(2, 0x20));
+    (void)recording.ReadTextureType(handle);
+    const auto queries = recording.TakeQueries();
+    VideoCommon::ArchiveEnvironment resumed(bytes, control, Shader::Stage::VertexB);
+    RecordingEnvironment replay(resumed, true);
+    REQUIRE(ReplayQueries(queries, replay));
+    REQUIRE_THROWS(resumed.ReadCbufValue(2, 0x20));
+}
+
+TEST_CASE("Read-only translation caches retain usable records without throwing",
+          "[video_core][translation_cache]") {
+    const auto path = TempPath("lichii_readonly_translation_cache.bin");
+    const Digest config{11, 22}, key{33, 44};
+    FakeEnvironment env;
+    std::filesystem::remove(path);
+    Digest variant_key;
+    {
+        Store store;
+        store.Open(path, config);
+        const auto entry = store.Insert(key, {}, {.stage = Shader::Stage::Fragment});
+        variant_key = MakeVariantKey(entry->id, {}, {});
+        REQUIRE(store.InsertVariant(*entry, variant_key, {.spirv = {0x07230203, 1, 2}}));
+    }
+    SECTION("valid file cannot be opened for append") {}
+    SECTION("incomplete tail cannot be truncated") {
+        std::ofstream tail(path, std::ios::binary | std::ios::app);
+        tail << "broken";
+    }
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() {
+            std::error_code ec;
+            std::filesystem::permissions(path, std::filesystem::perms::owner_all, ec);
+            std::filesystem::remove(path, ec);
+            Common::Log::SetRingCapacity(0);
+        }
+    } cleanup{path};
+    std::error_code ec;
+    std::filesystem::permissions(path, std::filesystem::perms::owner_read |
+        std::filesystem::perms::group_read | std::filesystem::perms::others_read, ec);
+    if (ec || std::ofstream(path, std::ios::binary | std::ios::app).is_open())
+        SKIP("Read-only file permissions are not enforceable for this platform/user");
+    Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, path.parent_path());
+    Common::Log::Initialize();
+    Common::Log::SetGlobalFilter(Common::Log::Filter{Common::Log::Level::Info});
+    Common::Log::SetRingCapacity(64);
+    const auto size = std::filesystem::file_size(path);
+    Store store{0};
+    REQUIRE_NOTHROW(store.Open(path, config));
+    REQUIRE(store.Enabled());
+    REQUIRE_FALSE(store.Persistent());
+    REQUIRE(store.FindEntry(key, env));
+    REQUIRE(store.FindVariant(variant_key));
+    const auto new_entry = store.Insert({55, 66}, {}, {});
+    REQUIRE(new_entry);
+    const auto new_key = MakeVariantKey(new_entry->id, {}, {});
+    const Variant new_variant{.binding_out = {.unified = 7, .texture = 9},
+                              .info = SampleInfo(), .spirv = {0x07230203, 4, 5, 6}};
+    REQUIRE(store.InsertVariant(*new_entry, new_key, new_variant));
+    const auto reads_before = store.variant_disk_reads.load();
+    const auto found = store.FindVariant(new_key);
+    REQUIRE(store.variant_disk_reads == reads_before);
+    REQUIRE(store.ResidentBytes() > 0);
+    REQUIRE(found);
+    REQUIRE(InfoEqual(found->info, new_variant.info));
+    REQUIRE(MakeVariantKey({}, {}, found->binding_out) ==
+            MakeVariantKey({}, {}, new_variant.binding_out));
+    REQUIRE(found->spirv == new_variant.spirv);
+    REQUIRE(std::filesystem::file_size(path) == size);
+    const auto lines = Common::Log::ReadRing(0);
+    REQUIRE(std::ranges::count_if(lines, [&](const auto& line) {
+        return line.text.find("persistence disabled for " + path.string()) != std::string::npos &&
+               line.text.find(std::make_error_code(std::errc::permission_denied).message()) != std::string::npos;
+    }) == 1);
+}
+
+TEST_CASE("Recipe catalogs cap exact selection and total import size",
+          "[video_core][translation_cache]") {
+    const auto path = TempPath("lichii_recipe_limits.bin");
+    std::filesystem::remove(path);
+    const Digest config{71, 72}, key{73, 74};
+    const auto stage = Shader::Stage::Fragment;
+    {
+        Store source;
+        source.Open(path, config);
+        for (u32 id = 0; id < 3; ++id) {
+            const auto entry = source.Insert(key, {{QueryKind::CbufValue, 0, id, id}}, {.stage = stage});
+            for (u32 texture = 1; texture <= (id == 0 ? 6 : 1); ++texture) {
+                auto recipe = DefaultEmissionRecipe(stage);
+                recipe.bindings.texture = texture;
+                REQUIRE(source.InsertVariant(*entry,
+                    MakeVariantKey(entry->id, DigestRuntimeInfo(recipe.runtime), recipe.bindings),
+                    {.spirv = {0x07230203, 1, 2}}, &recipe));
+            }
+        }
+    }
+    const auto catalog = Store::ReadRecipeCatalog(path, config);
+    REQUIRE(catalog.exact.at(key).size() == 6);
+    REQUIRE(catalog.exact.at(key).front().recipe.bindings.texture == 1);
+    REQUIRE(catalog.exact.at(key).front().count == 3);
+    REQUIRE(catalog.entries == 18);
+    REQUIRE(catalog.truncated_entries == 0);
+    const auto selected = catalog.Select(key, stage, {}, 2, RecipeBaseline::Always);
+    REQUIRE(selected.size() == 3);
+    REQUIRE(selected.front().bindings.texture == 1);
+    REQUIRE(selected.back().bindings.texture == 0);
+    Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, path.parent_path());
+    Common::Log::Initialize();
+    Common::Log::SetGlobalFilter(Common::Log::Filter{Common::Log::Level::Info});
+    Common::Log::SetRingCapacity(64);
+    const auto capped = Store::ReadRecipeCatalog(path, config, 3);
+    REQUIRE(capped.entries == 3);
+    REQUIRE(capped.truncated_entries == 15);
+    REQUIRE(capped.exact.at(key).size() == 1);
+    const auto budgeted = Store::ReadRecipeCatalog(path, config, 200000, 1);
+    REQUIRE(budgeted.entries == 0);
+    REQUIRE(budgeted.imported_bytes == 0);
+    REQUIRE(budgeted.skipped_records == 8);
+    const auto lines = Common::Log::ReadRing(0);
+    REQUIRE(std::ranges::any_of(lines, [](const auto& line) {
+        return line.text.find("3 catalog entries; 15 recipe references truncated by entry limit 3") != std::string::npos;
+    }));
+    REQUIRE(std::ranges::any_of(lines, [](const auto& line) {
+        return line.text.find("8 records skipped by byte budget 1; 0 bytes admitted") != std::string::npos;
+    }));
+    Common::Log::SetRingCapacity(0);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("Recipe import skips malformed fields and continues with later records",
+          "[video_core][translation_cache]") {
+    const auto path = TempPath("lichii_invalid_recipe.bin");
+    std::filesystem::remove(path);
+    const Digest config{81, 82}, key{83, 84};
+    const auto stage = Shader::Stage::VertexB;
+    auto bad = DefaultEmissionRecipe(stage);
+    bad.runtime.xfb_count = 33;
+    bad.runtime.xfb_varyings[32] = {0, 0, 16, 0, 4};
+    SECTION("nine components") { bad.runtime.xfb_varyings[32].components = 9; }
+    SECTION("buffer outside hardware slots") { bad.runtime.xfb_varyings[32].buffer = 4; }
+    SECTION("stream outside hardware slots") { bad.runtime.xfb_varyings[32].stream = 4; }
+    SECTION("offset outside stride") { bad.runtime.xfb_varyings[32].offset = 16; }
+    SECTION("oversized stride") { bad.runtime.xfb_varyings[32].stride = UINT32_MAX; }
+    SECTION("partial unused slot") { bad.runtime.xfb_varyings[32].components = 0; }
+    SECTION("invalid attribute slot") { bad.runtime.xfb_varyings[0] = {0, 0, 4, 0, 1}; }
+    SECTION("vector boundary") {
+        bad.runtime.xfb_varyings[31] = {0, 0, 16, 0, 2};
+    }
+    SECTION("input type enum") {
+        bad.runtime.generic_input_types[0] = static_cast<Shader::AttributeType>(255);
+    }
+    SECTION("color type enum") {
+        bad.runtime.color_output_types[0] = static_cast<Shader::AttributeType>(255);
+    }
+    SECTION("topology enum") { bad.runtime.input_topology = static_cast<Shader::InputTopology>(-1); }
+    SECTION("tessellation primitive enum") { bad.runtime.tess_primitive = static_cast<Shader::TessPrimitive>(3); }
+    SECTION("tessellation spacing enum") { bad.runtime.tess_spacing = static_cast<Shader::TessSpacing>(3); }
+    SECTION("compare enum") { bad.runtime.alpha_test_func = static_cast<Shader::CompareFunction>(8); }
+    SECTION("mapping source") {
+        bad.runtime.previous_stage_legacy_stores_mapping[static_cast<Shader::IR::Attribute>(512)] = Shader::IR::Attribute::Generic0X;
+    }
+    SECTION("mapping target") {
+        bad.runtime.previous_stage_legacy_stores_mapping[Shader::IR::Attribute::ColorFrontDiffuseR] = static_cast<Shader::IR::Attribute>(512);
+    }
+    SECTION("point size") { bad.runtime.fixed_state_point_size = -1.0f; }
+    SECTION("binding overflow") { bad.bindings.texture = UINT32_MAX; }
+    SECTION("scaling index") { bad.bindings.texture_scaling_index = 129; }
+    {
+        Store source;
+        source.Open(path, config);
+        const auto entry = source.Insert(key, {}, {.stage = stage});
+        // The writer supplies the framing; this record's recipe payload is deliberately malformed.
+        REQUIRE(source.InsertVariant(*entry, {91, 92}, {.spirv = {0x07230203, 1, 2}}, &bad));
+        const auto good = DefaultEmissionRecipe(stage);
+        REQUIRE(source.InsertVariant(*entry, {93, 94}, {.spirv = {0x07230203, 1, 2}}, &good));
+    }
+    Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, path.parent_path());
+    Common::Log::Initialize();
+    Common::Log::SetGlobalFilter(Common::Log::Filter{Common::Log::Level::Info});
+    Common::Log::SetRingCapacity(64);
+    const auto size = std::filesystem::file_size(path);
+    const auto catalog = Store::ReadRecipeCatalog(path, config);
+    REQUIRE(catalog.invalid_recipes == 1);
+    REQUIRE(catalog.exact.at(key).size() == 1);
+    const auto lines = Common::Log::ReadRing(0);
+    REQUIRE(std::ranges::any_of(lines, [&](const auto& line) {
+        return line.text.find("skipped 1 invalid recipes in " + path.string()) != std::string::npos;
+    }));
+    Common::Log::SetRingCapacity(0);
+    Store runtime;
+    REQUIRE_NOTHROW(runtime.Open(path, config));
+    REQUIRE(runtime.Persistent());
+    REQUIRE_FALSE(runtime.FindVariant({91, 92}));
+    REQUIRE(runtime.FindVariant({93, 94}));
+    REQUIRE(std::filesystem::file_size(path) == size);
+    runtime.Close();
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("SPIR-V emission bounds transform-feedback components to each output vector",
+          "[video_core][translation_cache]") {
+    Shader::IR::Program program;
+    program.stage = Shader::Stage::VertexB;
+    program.info.stores.Set(Shader::IR::Attribute::Generic0X);
+    Shader::Profile profile{};
+    profile.supported_spirv = 0x00010300;
+    Shader::RuntimeInfo runtime{};
+    runtime.xfb_count = 36;
+    runtime.xfb_varyings[32] = {0, 0, 16, 0, 9};
+    u32 first_components = 4;
+    SECTION("oversized first vector") {}
+    SECTION("oversized remaining component") {
+        runtime.xfb_varyings[32].components = 3;
+        runtime.xfb_varyings[35] = {0, 0, 16, 12, 9};
+        first_components = 3;
+    }
+    Shader::Backend::Bindings bindings{};
+    Shader::Backend::SPIRV::EmitContext context(profile, runtime, program, bindings);
+    for (u32 i = 0; i < first_components; ++i) {
+        REQUIRE(context.output_generics[0][i].num_components == first_components);
+        REQUIRE(context.output_generics[0][i].first_element == 0);
+    }
+    if (first_components == 3) {
+        REQUIRE(context.output_generics[0][3].num_components == 1);
+        REQUIRE(context.output_generics[0][3].first_element == 3);
+    }
+    for (const auto& component : context.output_generics[1]) {
+        REQUIRE(component.num_components == 0);
+    }
+}
+
+TEST_CASE("Product multiplicity counts unique modules and excludes dropped entries",
+          "[video_core][translation_cache]") {
+    Store store;
+    store.Open({}, {11, 22});
+    const auto a = store.Insert({1, 2}, {}, {.stage = Shader::Stage::Fragment});
+    const auto b = store.Insert({3, 4}, {}, {.stage = Shader::Stage::Fragment});
+    REQUIRE(store.VariantMultiplicity().at(0) == 2);
+    const Variant variant{.spirv = {0x07230203, 1, 2, 3, 4}};
+    REQUIRE(store.InsertVariant(*a, {5, 6}, variant));
+    REQUIRE(store.InsertVariant(*a, {5, 6}, variant));
+    REQUIRE(store.InsertVariant(*a, {7, 8}, variant));
+    REQUIRE(store.VariantMultiplicity().at(2) == 1);
+    REQUIRE(store.VariantMultiplicity().at(0) == 1);
+    store.DropEntry(*a);
+    REQUIRE_FALSE(store.HasVariant({5, 6}));
+    const auto histogram = store.VariantMultiplicity();
+    REQUIRE(histogram.size() == 1);
+    REQUIRE(histogram.at(0) == 1);
+}
+
+TEST_CASE("Recipe import seeks past large offline products before runtime recipes",
+          "[video_core][translation_cache]") {
+    const auto path = TempPath("vulkan_translations.source-test.fork-v54.bin");
+    std::filesystem::remove(path);
+    const Digest config{101, 102}, key{103, 104};
+    bool offline_entry = false;
+    SECTION("runtime entries") {}
+    SECTION("runtime recipes attached to offline entries") { offline_entry = true; }
+    constexpr u32 payload_size = 100 * 1024 * 1024;
+    {
+        Store source;
+        source.Open(path, config);
+        REQUIRE(source.Insert({201, 202}, {}, {}, true));
+    }
+    // Sparse framed fallback modules: reading their irrelevant payload would allocate 300 MiB.
+    {
+        std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+        file.seekp(0, std::ios::end);
+        const auto put = [&](const auto& value) {
+            file.write(reinterpret_cast<const char*>(&value), sizeof(value));
+        };
+        for (u32 i = 0; i < 3; ++i) {
+            put(u32{0x52435453});
+            put(payload_size);
+            const auto begin = file.tellp();
+            put(u8{1});
+            put(Digest{301, i});
+            put(Digest{201, 202});
+            put(true);
+            file.seekp(begin + std::streamoff(payload_size - 1));
+            put(u8{});
+        }
+    }
+    // Append a valid runtime entry/recipes from another small file without loading the product.
+    const auto tail = TempPath("lichii_recipe_tail.bin");
+    std::filesystem::remove(tail);
+    {
+        Store source;
+        source.Open(tail, config);
+        const auto entry = source.Insert(key, {}, {.stage = Shader::Stage::Fragment}, offline_entry);
+        for (u32 i = 1; i <= 3; ++i) {
+            auto recipe = DefaultEmissionRecipe(Shader::Stage::Fragment);
+            recipe.bindings.texture = i;
+            REQUIRE(source.InsertVariant(*entry,
+                MakeVariantKey(entry->id, DigestRuntimeInfo(recipe.runtime), recipe.bindings),
+                {.spirv = {0x07230203, 1, 2}}, &recipe));
+        }
+        REQUIRE(source.Insert({401, 402}, {}, {})); // Entry-only record.
+    }
+    {
+        std::ifstream input(tail, std::ios::binary);
+        input.seekg(8 + sizeof(u32) + sizeof(Digest));
+        std::ofstream output(path, std::ios::binary | std::ios::app);
+        output << input.rdbuf();
+    }
+    Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, path.parent_path());
+    Common::Log::Initialize();
+    Common::Log::SetGlobalFilter(Common::Log::Filter{Common::Log::Level::Info});
+    Common::Log::SetRingCapacity(64);
+    const auto catalog = Store::ReadRecipeCatalog(path, {999, 999});
+    const auto lines = Common::Log::ReadRing(0);
+    REQUIRE(std::ranges::count_if(lines, [](const auto& line) {
+        return line.text.find("source translator tag source-test into current tag " +
+                              CurrentCacheIdentity().file_tag) != std::string::npos;
+    }) == 1);
+    Common::Log::SetRingCapacity(0);
+    REQUIRE(catalog.source_config == config);
+    REQUIRE(catalog.exact.at(key).size() == 3);
+    REQUIRE(catalog.scanned_records == 9);
+    REQUIRE(catalog.eligible_records == 3);
+    REQUIRE(catalog.admitted_records == 3);
+    REQUIRE(catalog.skipped_records == 0);
+    REQUIRE(catalog.imported_bytes < 16384);
+    REQUIRE(catalog.framing_skipped_bytes > 299ULL * 1024 * 1024);
+    const auto limited = Store::ReadRecipeCatalog(path, config, 200000, catalog.imported_bytes - 1);
+    REQUIRE(limited.admitted_records == 2);
+    REQUIRE(limited.skipped_records == 1);
+    REQUIRE(limited.eligible_records == 3);
+    REQUIRE(limited.imported_bytes < catalog.imported_bytes);
+    std::filesystem::remove(path);
+    std::filesystem::remove(tail);
+}
+
+TEST_CASE("Translation cache open names other translator tags once",
+          "[video_core][translation_cache]") {
+    const auto directory = TempPath("lichii_translation_tag_test");
+    std::filesystem::create_directories(directory);
+    const auto current = CurrentCacheIdentity().file_tag;
+    for (const auto* tag : {"old-tag-a", "old-tag-b"}) {
+        std::ofstream(directory / (std::string{"vulkan_translations."} + tag + ".fork-v54.bin"));
+    }
+    Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, directory);
+    Common::Log::Initialize();
+    Common::Log::SetGlobalFilter(Common::Log::Filter{Common::Log::Level::Info});
+    Common::Log::SetRingCapacity(64);
+    {
+        Store store;
+        store.Open(directory / ("vulkan_translations." + current + ".fork-v54.bin"), {1, 2});
+    }
+    const auto lines = Common::Log::ReadRing(0);
+    REQUIRE(std::ranges::count_if(lines, [&](const auto& line) {
+        return line.text.find("ignoring files with translator tag(s) old-tag-a, old-tag-b; current tag " + current) != std::string::npos;
+    }) == 1);
+    Common::Log::SetRingCapacity(0);
+    std::filesystem::remove_all(directory);
+}
+
+TEST_CASE("Translation cache keeps appended variants resident and promotes loaded variants",
+          "[video_core][translation_cache]") {
+    const auto path = TempPath("lichii_translation_resident_test.bin");
+    std::filesystem::remove(path);
+    const Digest config{11, 12}, key{13, 14};
+    const Variant variant{.info = SampleInfo(), .spirv = {0x07230203, 1, 2, 3}};
+    {
+        Store store;
+        store.Open(path, config);
+        REQUIRE(store.Persistent());
+        const auto entry = store.Insert({15, 16}, {}, ProgramMeta{});
+        REQUIRE(entry);
+        REQUIRE(store.InsertVariant(*entry, key, variant));
+        REQUIRE(store.ResidentBytes() > 0);
+        for (int i = 0; i < 2; ++i) {
+            const auto found = store.FindVariant(key);
+            REQUIRE(found);
+            REQUIRE(InfoEqual(found->info, variant.info));
+            REQUIRE(found->spirv == variant.spirv);
+        }
+        REQUIRE(store.variant_disk_reads == 0);
+    }
+    {
+        Store store;
+        store.Open(path, config);
+        REQUIRE(store.ResidentBytes() == 0);
+        const auto first = store.FindVariant(key);
+        REQUIRE(first);
+        REQUIRE(InfoEqual(first->info, variant.info));
+        REQUIRE(first->spirv == variant.spirv);
+        REQUIRE(store.variant_disk_reads == 1);
+        REQUIRE(store.ResidentBytes() > 0);
+        const auto second = store.FindVariant(key);
+        REQUIRE(second);
+        REQUIRE(InfoEqual(second->info, variant.info));
+        REQUIRE(second->spirv == variant.spirv);
+        REQUIRE(store.variant_disk_reads == 1);
+    }
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("Translation cache evicts oldest resident variants only with a disk copy",
+          "[video_core][translation_cache]") {
+    const auto path = TempPath("lichii_translation_resident_budget_test.bin");
+    std::filesystem::remove(path);
+    const Digest config{21, 22}, first_key{23, 24}, second_key{25, 26};
+    const Variant variant{.info = SampleInfo(), .spirv = {0x07230203, 1, 2, 3}};
+    u64 one_variant_bytes{};
+    {
+        Store memory;
+        memory.Open({}, config);
+        const auto entry = memory.Insert({27, 28}, {}, ProgramMeta{});
+        REQUIRE(entry);
+        REQUIRE(memory.InsertVariant(*entry, first_key, variant));
+        one_variant_bytes = memory.ResidentBytes();
+    }
+    REQUIRE(one_variant_bytes > 0);
+    {
+        Store store{one_variant_bytes};
+        store.Open(path, config);
+        REQUIRE(store.Persistent());
+        const auto entry = store.Insert({27, 28}, {}, ProgramMeta{});
+        REQUIRE(entry);
+        REQUIRE(store.InsertVariant(*entry, first_key, variant));
+        REQUIRE(store.InsertVariant(*entry, second_key, variant));
+        REQUIRE(store.ResidentBytes() <= one_variant_bytes);
+        REQUIRE(store.FindVariant(second_key));
+        REQUIRE(store.variant_disk_reads == 0);
+        const auto first = store.FindVariant(first_key);
+        REQUIRE(first);
+        REQUIRE(InfoEqual(first->info, variant.info));
+        REQUIRE(first->spirv == variant.spirv);
+        REQUIRE(store.variant_disk_reads == 1);
+        REQUIRE(store.ResidentBytes() <= one_variant_bytes);
+        REQUIRE(store.FindVariant(first_key));
+        REQUIRE(store.variant_disk_reads == 1);
+        REQUIRE(store.FindVariant(second_key));
+        REQUIRE(store.variant_disk_reads == 2);
+    }
+    {
+        Store store{0};
+        store.Open(path, config);
+        REQUIRE(store.FindVariant(first_key));
+        REQUIRE(store.ResidentBytes() == 0);
+        REQUIRE(store.FindVariant(first_key));
+        REQUIRE(store.variant_disk_reads == 2);
+    }
+    {
+        Store memory{0};
+        memory.Open({}, config);
+        const auto entry = memory.Insert({27, 28}, {}, ProgramMeta{});
+        REQUIRE(entry);
+        REQUIRE(memory.InsertVariant(*entry, first_key, variant));
+        REQUIRE(memory.ResidentBytes() > 0);
+        REQUIRE(memory.FindVariant(first_key));
+        REQUIRE(memory.variant_disk_reads == 0);
+        memory.Close();
+        REQUIRE(memory.ResidentBytes() == 0);
+    }
+    std::filesystem::remove(path);
 }
