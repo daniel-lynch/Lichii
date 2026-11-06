@@ -563,7 +563,14 @@ void A64EmitX64::EmitA64GetCNTPCT(A64EmitContext& ctx, IR::Inst* inst) {
         const Xbyak::Reg64 rax_reg = ctx.reg_alloc.ScratchGpr(code, HostLoc::RAX);
         const Xbyak::Reg64 rdx_reg = ctx.reg_alloc.ScratchGpr(code, HostLoc::RDX);
         const Xbyak::Reg64 tmp = ctx.reg_alloc.ScratchGpr(code);
+        // ISB is not hooked by default, so the counter read itself must be ordered:
+        // the leading LFENCE keeps RDTSC from sampling before earlier loads complete
+        // (LDR; ISB; MRS CNTPCT_EL0), the trailing one keeps later loads from issuing
+        // before the sample (MRS CNTPCT_EL0; ISB; LDR). Same sequence as
+        // Common::X64::FencedRDTSC() on the host-call path.
+        code.lfence();
         code.rdtsc();
+        code.lfence();
         code.shl(rdx_reg, 32);
         code.or_(rax_reg, rdx_reg);
         code.mov(tmp, conf.inline_cntpct_tsc_base);
