@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <chrono>
 #include <cstddef>
 #include <deque>
@@ -298,12 +299,32 @@ private:
         Shader::Backend::Bindings binding_in{};
         VideoCommon::TranslationCache::Digest digest{};
         u64 count{};
+        bool seen{}; ///< Recorded this session (false: only from the recipe file)
     };
     bool aot_emit_variants{};
     std::mutex recipe_mutex;
     /// Class key -> recipes seen (a few per class; key 0 of a stage holds the stage's recipes).
     std::unordered_map<u64, std::vector<EmissionRecipe>> recipes;
     [[nodiscard]] static u64 RecipeClass(Shader::Stage stage, const Shader::Info* info);
+    [[nodiscard]] static u64 RecipeClassOf(Shader::Stage stage, const std::bitset<512>* loads);
+    /// What each class key stands for (stage, loaded varyings or none), to write it out.
+    struct RecipeClassId {
+        Shader::Stage stage;
+        bool by_loads;
+        std::bitset<512> loads;
+    };
+    std::unordered_map<u64, RecipeClassId> recipe_class_ids; ///< Under recipe_mutex
+    /// The recipe histogram is kept next to the translation file
+    /// (vulkan_translations.<tag>.recipes.fork-vN.bin), so a later session guesses from the
+    /// start. Loaded when the translation file is opened, written every 30 s when it changed
+    /// and at shutdown.
+    std::filesystem::path recipes_filename;
+    bool recipes_dirty{}; ///< Under recipe_mutex
+    size_t recipes_loaded{};
+    size_t recipe_classes_loaded{};
+    void LoadRecipes();
+    void SaveRecipes();
+    std::atomic<u64> aot_variants_from_file{}; ///< Seeds emitted with a recipe not seen yet
     /// A plain vertex-B + fragment pipeline's stage was emitted (or taken from the cache) with
     /// this runtime info and these bindings in.
     void RecordRecipe(Shader::Stage stage, const Shader::Info& info,
@@ -337,6 +358,11 @@ private:
                   const std::shared_ptr<const VideoCommon::TranslationCache::Entry>& entry,
                   Shader::Stage stage, const Shader::Info& info, u64 bytes, u64 generation);
     void EmitWaitingSeeds(std::vector<WaitingSeed> seeds);
+    /// Seeds whose class's recipe was seen, waiting for a pending slot (under recipe_mutex).
+    std::deque<WaitingSeed> ready_seeds;
+    size_t ready_seeds_peak{};
+    void PumpReadySeeds();
+    void EmitWaitingSeed(const WaitingSeed& seed);
     std::atomic<u64> aot_parked{};
     std::atomic<u64> aot_waiting_dropped{};
     std::atomic<u64> aot_late_variants{};
