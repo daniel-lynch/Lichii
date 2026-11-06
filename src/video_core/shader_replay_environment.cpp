@@ -9,8 +9,9 @@ namespace VideoCommon {
 using TranslationCache::QueryKind;
 
 ReplayEnvironment::ReplayEnvironment(const GenericEnvironment& live,
-                                     std::span<const TranslationCache::Query> queries)
-    : GenericEnvironment(live) {
+                                     std::span<const TranslationCache::Query> queries,
+                                     bool guess_)
+    : GenericEnvironment(live), guess{guess_} {
     gpu_memory = nullptr;
     for (const auto& query : queries) {
         answers.emplace(std::tuple{static_cast<u8>(query.kind), query.a, query.b, query.c},
@@ -22,6 +23,24 @@ ReplayEnvironment::~ReplayEnvironment() = default;
 
 u32 ReplayEnvironment::Answer(QueryKind kind, u32 a, u32 b, u32 c) const {
     const auto it = answers.find(std::tuple{static_cast<u8>(kind), a, b, c});
+    if (it == answers.end() && guess) {
+        switch (kind) {
+        case QueryKind::TextureType:
+            return static_cast<u32>(Shader::TextureType::Color2D);
+        case QueryKind::TexturePixelFormat:
+            return static_cast<u32>(Shader::TexturePixelFormat::A8B8G8R8_UNORM);
+        case QueryKind::TexturePixelFormatInteger:
+        case QueryKind::CbufIndirectStorageBufferPointer:
+            return 0;
+        case QueryKind::CbufStorageBufferPointer:
+        case QueryKind::ViewportTransformState:
+            return 1;
+        case QueryKind::ReplaceConstBuffer:
+            return ~0U;
+        default:
+            break;
+        }
+    }
     if (it == answers.end()) {
         if (!first_missing) {
             first_missing = kind;
@@ -33,6 +52,14 @@ u32 ReplayEnvironment::Answer(QueryKind kind, u32 a, u32 b, u32 c) const {
 }
 
 u32 ReplayEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
+    if (guess && handle_depth != 0 &&
+        !answers.contains(std::tuple{static_cast<u8>(QueryKind::CbufValue), cbuf_index,
+                                     cbuf_offset, 0U})) {
+        // Distinct per word, so distinct handles stay distinct for the class-level replay.
+        const auto [it, inserted] = guessed_words.try_emplace(
+            std::pair{cbuf_index, cbuf_offset}, static_cast<u32>(guessed_words.size() + 1));
+        return it->second;
+    }
     return Answer(QueryKind::CbufValue, cbuf_index, cbuf_offset);
 }
 

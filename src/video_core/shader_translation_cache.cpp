@@ -416,12 +416,14 @@ bool RecordingEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 off
 
 void RecordingEnvironment::BeginTextureHandle() {
     ++handle_depth;
+    inner.BeginTextureHandle();
 }
 
 void RecordingEnvironment::EndTextureHandle(const Shader::ConstBufferAddr& cbuf, u32 handle) {
     if (handle_depth != 0) {
         --handle_depth;
     }
+    inner.EndTextureHandle(cbuf, handle);
     if (class_replay) {
         queries.push_back(PackHandleAddress(cbuf, handle));
     }
@@ -429,6 +431,7 @@ void RecordingEnvironment::EndTextureHandle(const Shader::ConstBufferAddr& cbuf,
 
 void RecordingEnvironment::NoteExactCbufWord(u32 index, u32 offset) {
     exact_words.insert(WordKey(index, offset));
+    inner.NoteExactCbufWord(index, offset);
 }
 
 std::vector<Query> RecordingEnvironment::TakeQueries() {

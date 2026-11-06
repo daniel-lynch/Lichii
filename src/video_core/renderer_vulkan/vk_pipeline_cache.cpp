@@ -877,9 +877,11 @@ void PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
         ++aot_skipped_known;
         return;
     }
-    // No recorded answers: any query throws, so only programs that make none are stored.
+    // No recorded answers: the worker answers with the common case (guess mode) and records
+    // what it answered; the draw's class-level replay keeps the entry only if the live
+    // environment agrees. A word consumed by value cannot be guessed and aborts the job.
     auto owned = std::make_shared<VideoCommon::ReplayEnvironment>(
-        env, std::span<const TC::Query>{});
+        env, std::span<const TC::Query>{}, true);
     aot_capture_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                            std::chrono::steady_clock::now() - begin)
                                            .count());
@@ -900,17 +902,19 @@ void PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_h
         bool stored = false;
         try {
             ShaderPools pools;
+            TC::RecordingEnvironment recording{*owned, true};
             const u32 cfg_offset{
                 static_cast<u32>(owned->StartAddress() + sizeof(Shader::ProgramHeader))};
-            Shader::Maxwell::Flow::CFG cfg(*owned, pools.flow_block, cfg_offset, false);
+            Shader::Maxwell::Flow::CFG cfg(recording, pools.flow_block, cfg_offset, false);
             Shader::IR::Program program =
-                TranslateProgram(pools.inst, pools.block, *owned, cfg, host_info);
+                TranslateProgram(pools.inst, pools.block, recording, cfg, host_info);
             const bool broken = device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
                                 Shader::Optimization::HasBrokenPattern(program);
             if (program.info.requires_layer_emulation || broken) {
                 ++aot_failed;
             } else if (generation == aot_generation.load() &&
-                       translation_cache.Insert(stage_key, {}, TC::ProgramMeta::From(program))) {
+                       translation_cache.Insert(stage_key, recording.TakeQueries(),
+                                                TC::ProgramMeta::From(program))) {
                 stored = true;
                 ++aot_completed;
                 std::scoped_lock lock{aot_mutex};
@@ -969,8 +973,8 @@ void PipelineCache::LogStageOutcomes(std::string_view when) {
         }
     }
     LOG_INFO(Render_Vulkan,
-             "Shader AOT ({}): {} candidates, {} stored without queries, {} needed a query "
-             "(by kind:{}), {} failed; skipped {} known, {} uncacheable, {} over budget; {} "
+             "Shader AOT ({}): {} candidates, {} stored with guessed answers, {} needed an exact "
+             "word (by kind:{}), {} failed; skipped {} known, {} uncacheable, {} over budget; {} "
              "pending; {} stored entries used by a draw; GPU thread {:.1f} ms, worker {:.1f} ms",
              when, aot_candidates.load(), aot_completed.load(),
              [&] {

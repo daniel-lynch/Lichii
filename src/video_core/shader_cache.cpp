@@ -181,8 +181,9 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                     }
                     if (pool_index) {
                         pool_index->OnFirstUse(*gpu_memory, shader_addr);
-                        // Query-free seeding stored 11 of 2674 OOT candidates (run
-                        // 20261105-231202): opt-in with EDEN_NX2_AOT_SEED=1.
+                        // Seeding costs GPU-thread time to build candidate environments
+                        // (329 ms in cold run 20261106-001156): opt-in with
+                        // EDEN_NX2_AOT_SEED=1 until it is shown to pay for itself.
                         static const bool seed = [] {
                             const char* value = std::getenv("EDEN_NX2_AOT_SEED");
                             return value != nullptr && value[0] == '1';
