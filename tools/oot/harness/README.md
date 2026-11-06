@@ -25,6 +25,11 @@ check, and the per-game pins (GPU Mode Fast, reactive flushing off, async shader
 pipelines, no eviction; `--pin key=value` adds more). The run checks mtimes of the live files
 before and after and records any change in `run.json` (`live_files_changed`).
 
+`--cold-shader-cache` runs from a private copy of the profile in `<run>/profile` whose
+`user/cache/shader` is empty: no pipeline cache and no translation cache, so every pipeline is
+built at run time. The shared profile is only read. The driver's own cache (`~/.cache/nvidia`)
+stays warm.
+
 ## How it works
 
 - **Input**: `pad.py` creates an Xbox-layout uinput gamepad (vendor 1209, product 0e0d) before

@@ -66,6 +66,20 @@ def refresh(profile: Path, log=print):
     log(f"profile refreshed from live dirs into {profile}")
 
 
+def cold_copy(profile: Path, dest: Path, log=print):
+    """Copy the profile to `dest` without its shader caches, for a run that starts with an empty
+    shader directory. The source profile is only read; the copy is left in the run folder."""
+    profile, dest = Path(profile).resolve(), Path(dest).resolve()
+    if dest.exists():
+        shutil.rmtree(dest)
+    shader = profile / "user/cache/shader"
+    shutil.copytree(profile, dest, symlinks=False,
+                    ignore=lambda d, names: [n for n in names if Path(d, n).resolve() == shader])
+    (dest / "user/cache/shader").mkdir(parents=True, exist_ok=True)
+    log(f"cold shader cache: running from {dest} (empty user/cache/shader)")
+    return dest
+
+
 def exists(profile: Path):
     p = Path(profile)
     return (p / "seed/config/qt-config.ini").exists() and (p / "seed/nand").is_dir()
