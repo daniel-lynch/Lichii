@@ -124,10 +124,12 @@ public:
                          offset, length, file->GetSize());
             }
         }
-        if (!scene.empty()) {
+        const std::size_t read = file->Read(data, length, offset);
+        // Only a read that returned bytes says the game has the file.
+        if (read != 0 && !scene.empty()) {
             Common::ShaderAotScene::Post(scene, entered, session);
         }
-        return file->Read(data, length, offset);
+        return read;
     }
     std::size_t Write(const u8* data, std::size_t length, std::size_t offset) override {
         return file->Write(data, length, offset);
