@@ -1446,8 +1446,7 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                         }
                     }
                     // Accurate GPU mode holds report and semaphore writes in the query cache until a
-                    // fence: write them out, or occlusion predicates read stale values. The split only
-                    // runs with immediate payload writes, and the query cache belongs to its back.
+                    // fence: write them out, or occlusion predicates read stale values.
                     const bool owns_caches = !VideoCommon::GpuSplit::Get().Active() ||
                                              VideoCommon::GpuSplit::OnBackThread();
                     if (owns_caches && VideoCommon::QueryDma::TraceEnabled() &&
@@ -1456,7 +1455,14 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                         VideoCommon::QueryDma::Trace(memory, maxwell3d.Rasterizer(), method, address,
                                                      source, read_bytes);
                     }
-                    if (!VideoCommon::GpuSplit::Get().Active()) {
+                    // EDEN_NX2_QUERY_DMA_FLUSH=0 keeps the pre-#204 behaviour: a plain query
+                    // flush, skipped under the split, with no wait for pending results.
+                    if (VideoCommon::QueryDma::FlushUnderSplit()) {
+                        if (owns_caches) {
+                            VideoCommon::QueryDma::FlushPending(memory, maxwell3d.Rasterizer(),
+                                                                source, read_bytes);
+                        }
+                    } else if (!VideoCommon::GpuSplit::Get().Active()) {
                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
                     }
                     const bool dirty = memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache);

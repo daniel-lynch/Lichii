@@ -1627,13 +1627,14 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     if (trace) {
         trace->Waited();
     }
+    u64 traced_read{};
     if (VideoCommon::QueryDma::TraceEnabled()) {
         split.Run(
-            [this, macro, method, source, read_bytes] {
+            [this, macro, method, source, read_bytes, &traced_read] {
                 if (VideoCommon::QueryDma::HasPendingQueries(memory_manager, *rasterizer, source,
                                                              read_bytes)) {
-                    VideoCommon::QueryDma::Trace(memory_manager, *rasterizer, macro, method,
-                                                 source, read_bytes);
+                    traced_read = VideoCommon::QueryDma::Trace(memory_manager, *rasterizer, macro,
+                                                               method, source, read_bytes);
                 }
             },
             VideoCommon::DrainSite::MacroDmaFlush);
@@ -1652,6 +1653,21 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
         split.Drain(VideoCommon::DrainSite::MacroDmaCheck);
         flush_if_dirty();
+    }
+    // Reports and semaphore writes held in the query cache are written out on the thread that
+    // owns it, waiting for pending host results: without this, macro DMA reads of occlusion
+    // reports return stale counts. The non-split path in macro.cpp has the matching flush.
+    // EDEN_NX2_QUERY_DMA_FLUSH=0 skips it (the pre-#204 behaviour).
+    if (VideoCommon::QueryDma::FlushUnderSplit()) {
+        split.Run(
+            [this, source, read_bytes] {
+                VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source,
+                                                    read_bytes);
+            },
+            VideoCommon::DrainSite::MacroDmaFlush);
+    }
+    if (traced_read != 0) {
+        VideoCommon::QueryDma::TracePostFlush(memory_manager, traced_read, source, read_bytes);
     }
     u32 changed{};
     std::array<u32, 8> first_words{};
