@@ -160,10 +160,9 @@ void ObserveFlash(u64 session, u64 source_frame, u64 current_frame, double fract
                                       .trigger_frame = source_frame,
                                       .capture_frame = current_frame + 1,
                                       .trigger_white_fraction = fraction});
-            // test/oot-local lacks d03eb2a806 (buffer records in frame dumps), so
-            // config.buffers is accepted for API compatibility but has no effect here.
             request = CaptureRequest{.id = id, .directory = directory,
-                                     .sampled = status.config.sampled};
+                                     .sampled = status.config.sampled,
+                                     .buffers = status.config.buffers};
             if (status.captures.size() >= status.config.max_captures) {
                 status.armed = false;
                 status.reason = "capture_limit";

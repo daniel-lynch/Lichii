@@ -5,12 +5,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <unordered_set>
 #include <thread>
@@ -32,11 +35,13 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
+#include "video_core/renderer_vulkan/pipeline_shader_emission.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
@@ -325,6 +330,62 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     return info;
 }
 
+std::array<std::atomic<std::chrono::nanoseconds::rep>, 2> runtime_spirv_ns{};
+
+void AddRuntimeSpirvTime(size_t thread, std::chrono::steady_clock::time_point begin) {
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    runtime_spirv_ns[thread].fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
+        std::memory_order::relaxed);
+}
+
+/// Saves, builds and (with the GPU log or a debugging tool) names a stage's module.
+vk::ShaderModule BuildStageModule(const Device& device, std::span<const u32> code, u64 shader_hash,
+                                  size_t stage_index) {
+    device.SaveShader(code);
+    vk::ShaderModule module{BuildShader(device, code)};
+
+    // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
+    // is independent and gated only by gpu_log_shader_dumps.
+    const bool should_log = GPU::Logging::IsActive();
+    const bool should_dump = Settings::values.gpu_log_shader_dumps.GetValue();
+    if (should_log || should_dump) {
+        static constexpr std::array stage_names{"vertex", "tess_control", "tess_eval", "geometry",
+                                               "fragment"};
+        const std::string shader_name =
+            fmt::format("shader_{:016x}_{}", shader_hash, stage_names[stage_index]);
+        if (should_log) {
+            const std::string shader_info = fmt::format(
+                "SPIR-V size: {} bytes, hash: {:016x}", code.size() * sizeof(u32), shader_hash);
+            GPU::Logging::GPULogger::GetInstance().LogShaderCompilation(shader_name, shader_info);
+        }
+        if (should_dump) {
+            GPU::Logging::DumpSpirvShader(shader_hash, code);
+        }
+    }
+
+    if (device.HasDebuggingToolAttached()) {
+        const std::string name{fmt::format("Shader {:016x}", shader_hash)};
+        module.SetObjectNameEXT(name.c_str());
+    }
+    return module;
+}
+
+struct DeferredStages {
+    std::unique_ptr<EmissionBudget::Reservation> reservation;
+    std::shared_ptr<ShaderPools> pools;
+    std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
+    std::array<std::optional<Shader::RuntimeInfo>, Maxwell::MaxShaderStage> runtime_infos;
+    std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
+    /// Stages taken from the translation cache, built on the GPU thread.
+    std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
+    /// Translation cache entries of the deferred stages: their variants are added by the worker.
+    std::array<std::shared_ptr<const VideoCommon::TranslationCache::Entry>, Maxwell::MaxShaderStage>
+        entries;
+    /// The bindings before the first deferred stage.
+    Shader::Backend::Bindings binding{};
+};
+
 size_t GetTotalPipelineWorkers() {
     const size_t max_core_threads =
         std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
@@ -460,7 +521,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue() &&
                                 !DriverCachesPipelines(device_)},
-      workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
+      num_pipeline_workers{device.HasBrokenParallelShaderCompiling() ? 1ULL
+                                                                   : GetTotalPipelineWorkers()},
+      emission_budget{num_pipeline_workers},
+      workers(num_pipeline_workers,
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {},
                            Common::ThreadPlacement::Background) {
@@ -680,11 +744,16 @@ constexpr u32 UsedPipelinesMagic = 0x31505545; // "EUP1"
 // MoltenVK keeps the previous eight sessions: a pipeline built while playing goes through
 // SPIR-V -> MSL -> Metal, far more than the 2-3 ms the shorter window assumes, so each one
 // built at boot is a stutter avoided.
-constexpr u8 UsedPipelinesMaxAge = 2;
+// Ocarina still built pipelines for 1-2 s of every 10 s early in play with two sessions kept:
+// keep sixteen (#161).
+constexpr u8 UsedPipelinesMaxAge = 16;
 constexpr u8 UsedPipelinesMaxAgeMoltenVK = 8;
 
 u8 MaxUsedPipelineAge(const Device& device) {
-    return device.IsMoltenVK() ? UsedPipelinesMaxAgeMoltenVK : UsedPipelinesMaxAge;
+    if (device.IsMoltenVK()) {
+        return UsedPipelinesMaxAgeMoltenVK;
+    }
+    return UsedPipelinesMaxAge;
 }
 
 std::unordered_map<u64, u8> LoadUsedPipelines(const std::filesystem::path& path, u8 max_age) {
@@ -764,6 +833,8 @@ bool PipelineCache::IsTranslationCacheable(const Shader::Environment& env) const
 }
 
 PipelineCache::~PipelineCache() {
+    workers.WaitForRequests();
+    serialization_thread.WaitForRequests();
     translation_cache.LogStatistics("run time");
     if (translation_cache_verify) {
         LOG_INFO(Render_Vulkan,
@@ -775,6 +846,8 @@ PipelineCache::~PipelineCache() {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
     }
+    graphics_cache.clear();
+    evicted_pipelines.clear();
 }
 
 void PipelineCache::SaveUsedPipelines() {
@@ -1138,8 +1211,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     if (!pipeline) {
         return nullptr;
     }
+    constexpr auto save_interval = std::chrono::seconds{15};
     if (used_this_session.insert(pipeline.get()).second &&
-        std::chrono::steady_clock::now() - used_pipelines_saved > std::chrono::minutes{2}) {
+        std::chrono::steady_clock::now() - used_pipelines_saved > save_interval) {
         SaveUsedPipelines();
     }
     if (current_pipeline) {
@@ -1230,7 +1304,8 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
-    bool build_in_parallel) try {
+    bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools,
+    std::unique_ptr<EmissionBudget::Reservation> reservation) try {
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
     size_t env_index{0};
@@ -1378,6 +1453,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     }
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
+    std::array<std::optional<Shader::RuntimeInfo>, Maxwell::MaxShaderStage> deferred_runtime_infos;
+    std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
+    std::array<std::shared_ptr<const TC::Entry>, Maxwell::MaxShaderStage> deferred_entries;
+    Shader::Backend::Bindings deferred_binding{};
+    bool deferring = false;
 
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
@@ -1402,13 +1482,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                                                                  : cached_entries[index];
         TC::Digest variant_key{};
         std::optional<TC::Variant> variant;
-        if (entry) {
+        // Once a stage is deferred, the bindings of the later ones are known only after it is
+        // emitted: they are deferred too, and the worker looks their variants up.
+        if (entry && !deferring) {
             variant_key =
                 TC::MakeVariantKey(entry->id, TC::DigestRuntimeInfo(runtime_info), binding);
             variant = translation_cache.FindVariant(variant_key);
         }
+        // #184 native async pipelines: the SPIR-V of a stage the translation cache does not
+        // supply is emitted on the worker that builds the pipeline. Not while verifying the
+        // translation cache, which compares on this thread.
+        const bool defer = emit_pools != nullptr && !translation_cache_verify &&
+                           (deferring || !variant);
         std::vector<u32> code;
-        if (!variant || translation_cache_verify) {
+        if (defer || !variant || translation_cache_verify) {
             if (from_cache[index]) {
                 // The stage's entry matched but no module for this runtime info: translate.
                 Shader::Environment& env{*stage_envs[index]};
@@ -1419,24 +1506,41 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 from_cache[index] = false;
             }
             ConvertLegacyToGeneric(program, runtime_info);
-            code = EmitSPIRV(profile, runtime_info, program, binding);
-            if (variant) {
-                ++translation_cache_verified;
-                const bool info_equal = TC::InfoEqual(variant->info, program.info);
-                if (variant->spirv != code || !info_equal ||
-                    std::memcmp(&variant->binding_out, &binding, sizeof(binding)) != 0) {
-                    ++translation_cache_mismatches;
-                    LOG_ERROR(Render_Vulkan,
-                              "Translation cache: stage {} of shader {:016x} differs from a "
-                              "fresh translation (spirv {}, info {}, bindings {})",
-                              index, key.unique_hashes[index], variant->spirv == code,
-                              info_equal,
-                              std::memcmp(&variant->binding_out, &binding, sizeof(binding)) ==
-                                  0);
+            if (defer) {
+                if (!deferring) {
+                    deferring = true;
+                    deferred_binding = binding;
                 }
-            } else if (entry) {
-                translation_cache.InsertVariant(*entry, variant_key,
-                                                TC::Variant{binding, program.info, code});
+                deferred_runtime_infos[stage_index] = runtime_info;
+                deferred_entries[stage_index] = entry;
+                if (VideoCommon::Nx2Perf::Verify()) {
+                    reference_spirv[stage_index] =
+                        EmitSPIRV(profile, runtime_info, program, binding);
+                }
+            } else {
+                const auto begin = std::chrono::steady_clock::now();
+                code = EmitSPIRV(profile, runtime_info, program, binding);
+                if (build_in_parallel) {
+                    AddRuntimeSpirvTime(0, begin);
+                }
+                if (variant) {
+                    ++translation_cache_verified;
+                    const bool info_equal = TC::InfoEqual(variant->info, program.info);
+                    if (variant->spirv != code || !info_equal ||
+                        std::memcmp(&variant->binding_out, &binding, sizeof(binding)) != 0) {
+                        ++translation_cache_mismatches;
+                        LOG_ERROR(Render_Vulkan,
+                                  "Translation cache: stage {} of shader {:016x} differs from a "
+                                  "fresh translation (spirv {}, info {}, bindings {})",
+                                  index, key.unique_hashes[index], variant->spirv == code,
+                                  info_equal,
+                                  std::memcmp(&variant->binding_out, &binding, sizeof(binding)) ==
+                                      0);
+                    }
+                } else if (entry) {
+                    translation_cache.InsertVariant(*entry, variant_key,
+                                                    TC::Variant{binding, program.info, code});
+                }
             }
         } else {
             program.info = std::move(variant->info);
@@ -1456,38 +1560,77 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
         }
         LogUntrackedGlobal(key.unique_hashes[index], program.stage, program.info);
-        device.SaveShader(code);
-        modules[stage_index] = BuildShader(device, code);
-
-        // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
-        // is independent and gated only by gpu_log_shader_dumps.
-        const bool should_log = GPU::Logging::IsActive();
-        const bool should_dump = Settings::values.gpu_log_shader_dumps.GetValue();
-        if (should_log || should_dump) {
-            static constexpr std::array stage_names{"vertex", "tess_control", "tess_eval", "geometry", "fragment"};
-            const std::string shader_name = fmt::format("shader_{:016x}_{}", key.unique_hashes[index], stage_names[stage_index]);
-            if (should_log) {
-                const std::string shader_info = fmt::format("SPIR-V size: {} bytes, hash: {:016x}",
-                    code.size() * sizeof(u32), key.unique_hashes[index]);
-                GPU::Logging::GPULogger::GetInstance().LogShaderCompilation(shader_name, shader_info);
-            }
-            if (should_dump) {
-                GPU::Logging::DumpSpirvShader(key.unique_hashes[index],
-                                              std::span<const u32>(code.data(), code.size()));
-            }
-        }
-
-        if (device.HasDebuggingToolAttached()) {
-            const std::string name{fmt::format("Shader {:016x}", key.unique_hashes[index])};
-            modules[stage_index].SetObjectNameEXT(name.c_str());
+        if (!defer) {
+            modules[stage_index] =
+                BuildStageModule(device, code, key.unique_hashes[index], stage_index);
         }
         previous_stage = &program;
     }
+    std::function<std::array<vk::ShaderModule, Maxwell::MaxShaderStage>()> emit_stages;
+    if (deferring) {
+        auto job = std::make_shared<DeferredStages>();
+        job->reservation = std::move(reservation);
+        job->pools = emit_pools;
+        job->programs = std::move(programs);
+        job->runtime_infos = std::move(deferred_runtime_infos);
+        job->reference_spirv = std::move(reference_spirv);
+        job->modules = std::move(modules);
+        job->entries = std::move(deferred_entries);
+        job->binding = deferred_binding;
+        for (size_t stage = 0; stage < infos.size(); ++stage) {
+            if (infos[stage]) {
+                infos[stage] = &job->programs[stage + 1].info;
+            }
+        }
+        emit_stages = [this, job = std::move(job), hashes = key.unique_hashes]() mutable {
+            const auto begin = std::chrono::steady_clock::now();
+            std::array<vk::ShaderModule, Maxwell::MaxShaderStage> stage_modules =
+                std::move(job->modules);
+            Shader::Backend::Bindings stage_binding = job->binding;
+            for (size_t stage = 0; stage < stage_modules.size(); ++stage) {
+                if (!job->runtime_infos[stage]) {
+                    continue;
+                }
+                const Shader::RuntimeInfo& stage_runtime_info = *job->runtime_infos[stage];
+                Shader::IR::Program& stage_program = job->programs[stage + 1];
+                TC::Digest stage_variant_key{};
+                const auto& stage_entry = job->entries[stage];
+                if (stage_entry) {
+                    stage_variant_key = TC::MakeVariantKey(
+                        stage_entry->id, TC::DigestRuntimeInfo(stage_runtime_info), stage_binding);
+                }
+                const std::vector<u32> stage_code =
+                    EmitPipelineShader(profile, stage_runtime_info, stage_program, stage_binding,
+                                       hashes[stage + 1], job->reference_spirv[stage]);
+                if (stage_entry) {
+                    // The store takes its own lock: the GPU thread may look variants up meanwhile.
+                    translation_cache.InsertVariant(
+                        *stage_entry, stage_variant_key,
+                        TC::Variant{stage_binding, stage_program.info, stage_code});
+                }
+                stage_modules[stage] =
+                    BuildStageModule(device, stage_code, hashes[stage + 1], stage);
+            }
+            auto pools = std::move(job->pools);
+            job.reset();
+            pools->ReleaseContents();
+            {
+                std::scoped_lock lock{spare_pools_mutex};
+                if (spare_pools.size() < 4) {
+                    spare_pools.push_back(std::move(pools));
+                }
+            }
+            AddRuntimeSpirvTime(1, begin);
+            return stage_modules;
+        };
+    }
+    // Without a deferred stage (all from the translation cache, or verifying it), the
+    // reservation and emit_pools are released when this returns.
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     return std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
-        render_pass_cache, key, std::move(modules), infos);
+        render_pass_cache, key, std::move(modules), infos, std::move(emit_stages));
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();
@@ -1513,9 +1656,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 }
 
 namespace {
-// Pipelines built on the GPU thread at run time (shader translation; the driver compile is on
-// workers): the first 400 over 2 ms and every one over 100 ms are logged, and the total every
-// 10 s, to tell how much of the stutter on new content is translation.
+// Pipelines built on the GPU thread at run time (shader translation, and the SPIR-V unless a worker
+// emits it; the driver compile is on workers): the first 400 over 2 ms and every one over 100 ms
+// are logged, and the totals every 10 s, to tell how much of the stutter on new content is
+// translation.
 void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_point begin,
                            const std::string& shaders) {
     static std::chrono::steady_clock::duration total{};
@@ -1535,8 +1679,15 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
                  ms(elapsed), shaders);
     }
     if (now - window > std::chrono::seconds{10}) {
-        LOG_INFO(Render_Vulkan, "Runtime pipelines in the last 10 s: {} built, {:.1f} ms on the GPU thread",
-                 count, ms(total));
+        const auto take = [](auto& counter) {
+            return std::chrono::nanoseconds{counter.exchange(0, std::memory_order::relaxed)};
+        };
+        LOG_INFO(Render_Vulkan,
+                 "Runtime pipelines in the last 10 s: {} built, {:.1f} ms on the GPU thread "
+                 "({:.1f} ms of it graphics SPIR-V), {:.1f} ms graphics SPIR-V on workers, "
+                 "{:.1f} ms of draws held for unbuilt pipelines",
+                 count, ms(total), ms(take(runtime_spirv_ns[0])), ms(take(runtime_spirv_ns[1])),
+                 ms(GraphicsPipeline::TakeHoldTime()));
         total = {};
         count = 0;
         window = now;
@@ -1563,9 +1714,25 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
 
-    main_pools.ReleaseContents();
-    auto pipeline{
-        CreateGraphicsPipeline(main_pools, graphics_key, environments.Span(), nullptr, true)};
+    std::shared_ptr<ShaderPools> emit_pools;
+    auto reservation = emission_budget.TryAcquire(maxwell3d->GetNativeMacroEngine().native_turing);
+    if (reservation) {
+        {
+            std::scoped_lock lock{spare_pools_mutex};
+            if (!spare_pools.empty()) {
+                emit_pools = std::move(spare_pools.back());
+                spare_pools.pop_back();
+            }
+        }
+        if (!emit_pools) {
+            emit_pools = std::make_shared<ShaderPools>();
+        }
+    } else {
+        main_pools.ReleaseContents();
+    }
+    ShaderPools& pools = emit_pools ? *emit_pools : main_pools;
+    auto pipeline{CreateGraphicsPipeline(pools, graphics_key, environments.Span(), nullptr, true,
+                                         std::move(emit_pools), std::move(reservation))};
     if (!pipeline || pipeline_cache_filename.empty()) {
         return pipeline;
     }
