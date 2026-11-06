@@ -207,9 +207,10 @@ public:
         return static_cast<u32>(device.GetShaderStorageBufferAlignment());
     }
 
-    /// Largest range a storage buffer binding may have: the minimum GL guarantees
+    /// Largest range a storage buffer binding may have: the driver's storage block size for
+    /// storage buffer bindings, the minimum GL guarantees (2^27) for bindless (GLASM) ones
     u64 GetMaxStorageBufferRange() const {
-        return u64{1} << 27;
+        return use_storage_buffers ? device.GetMaxShaderStorageBlockSize() : u64{1} << 27;
     }
 
 private:
