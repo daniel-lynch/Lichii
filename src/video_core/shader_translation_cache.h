@@ -131,9 +131,28 @@ private:
 [[nodiscard]] Digest MakeStageKey(Shader::Environment& env, u64 unique_hash, u32 slot,
                                   const Digest& config);
 
-/// Digest of what translation and emission depend on beyond the environment: the profile, the
-/// host info, the settings and environment variables the recompiler reads, and an extra value
-/// from the caller (device limits it applies itself).
+/// What identifies the translator in the configuration digest and the file name.
+struct CacheIdentity {
+    /// "source": Shader::TranslatorIdentity(), a hash of the translator's source and of the build
+    /// facts that can change its output, computed at build time. A rebuild that leaves the
+    /// translator alone keeps the cache, and other executables built from the same source agree.
+    /// "exe" (EDEN_NX2_TRANSLATION_CACHE_KEY=exe): the commit and the executable's size and
+    /// modification time, as before; every build starts a new cache.
+    std::string_view kind;
+    /// The value folded into the configuration digest; empty when the build cannot be identified.
+    std::string value;
+    /// 16 hexadecimal digits for the file name (vulkan_translations.<tag>.fork-vN.bin), so files
+    /// of different translators sit side by side. Empty for "exe", which keeps the old name.
+    std::string file_tag;
+    /// One line for the log.
+    std::string description;
+};
+
+[[nodiscard]] CacheIdentity CurrentCacheIdentity();
+
+/// Digest of what translation and emission depend on beyond the environment: the translator's
+/// identity, the profile, the host info, the settings and environment variables the recompiler
+/// reads, and an extra value from the caller (device limits it applies itself).
 [[nodiscard]] Digest MakeConfigDigest(const Shader::Profile& profile,
                                       const Shader::HostTranslateInfo& host_info, u64 extra);
 

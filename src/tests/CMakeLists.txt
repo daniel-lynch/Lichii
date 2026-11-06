@@ -168,6 +168,13 @@ endif()
 
 add_test(NAME tests COMMAND tests)
 
+# The translated-shader cache's translator identity (CMakeModules/TranslatorIdentity.cmake).
+add_test(NAME translator_identity
+         COMMAND ${CMAKE_COMMAND}
+                 -DMODULE=${PROJECT_SOURCE_DIR}/CMakeModules/TranslatorIdentity.cmake
+                 -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/translator_identity_test
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/translator_identity_test.cmake)
+
 if (WIN32 AND ARCHITECTURE_x86_64)
     add_executable(event_wait_probe ../../tools/nx2/event_wait_probe.cpp)
     target_link_libraries(event_wait_probe PRIVATE common)
