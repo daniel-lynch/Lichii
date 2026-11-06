@@ -367,9 +367,12 @@ class Run:
         if a.refresh_profile or not prof.exists(a.profile):
             prof.refresh(a.profile, log=self.say)
         if a.cold_shader_cache:
-            a.profile = prof.cold_copy(a.profile, self.dir / "profile", log=self.say)
+            a.profile = prof.cold_copy(a.profile, self.dir / "profile", log=self.say,
+                                       seed=a.cold_shader_seed)
             self.info["profile"] = str(a.profile)
             self.info["cold_shader_cache"] = True
+            if a.cold_shader_seed:
+                self.info["cold_shader_seed"] = [str(Path(f).resolve()) for f in a.cold_shader_seed]
         qt_extra = [("Debugging", "use_gdbstub", "true"), ("Debugging", "gdbstub_port", str(a.gdb_port))] \
             if a.gdb else [("Debugging", "use_gdbstub", "false")]
         self.user = prof.prepare_run(a.profile, padmod.sdl_guid(), keep_save=a.keep_save,
@@ -857,6 +860,11 @@ def build_parser():
                     help="run from a private copy of the profile inside the run folder whose shader "
                          "cache directory is empty (no pipeline or translation cache); the shared "
                          "profile is only read")
+    ap.add_argument("--cold-shader-seed", action="append", default=[], metavar="FILE",
+                    help="with --cold-shader-cache: copy FILE into the empty shader directory, "
+                         "under its parent directory's name (the title id), e.g. a previous run's "
+                         "profile/user/cache/shader/<title>/vulkan_translations.<tag>.recipes."
+                         "fork-vN.bin (repeatable)")
     ap.add_argument("--env", action="append", default=[], metavar="K=V",
                     help="emulator env (repeatable; K= removes a default). EDEN_NX2_* from the caller's env pass through")
     ap.add_argument("--pin", action="append", default=[], metavar="KEY=VAL",
