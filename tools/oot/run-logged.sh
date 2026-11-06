@@ -61,10 +61,10 @@ fi
 # OOT_AOT_MANIFEST=<file or dir> overrides the manifest set; OOT_AOT_WORKERS=N sets the
 # translation threads (unset = the emulator's default, 2).
 if [ "${OOT_AOT:-1}" = "1" ]; then  # default ON since dev 18832d80a5 (AOT merged; -36% frame-blocking cold)
-  AOT_INDEX="$OOT/aot/index/oot-aot-index.bin"
+  AOT_INDEX="$OOT/aot/index/${OOT_AOT_INDEX_FILE:-oot-aot-index-sharcb.bin}"  # sharcb index (engine shaders) since AOT branch 3; oot-aot-index.bin = BNSH-only
   if [ -f "$AOT_INDEX" ]; then
     export EDEN_NX2_AOT_TRANSLATE=1 EDEN_NX2_AOT_INDEX="$AOT_INDEX" EDEN_NX2_AOT_SEED=1
-    export EDEN_NX2_AOT_MANIFEST="${OOT_AOT_MANIFEST:-$OOT/aot/manifests-active}"  # global + current scene; the 81-file union overfills the seed queue until per-scene selection lands
+    export EDEN_NX2_AOT_MANIFEST="${OOT_AOT_MANIFEST:-$OOT/aot/manifests}"  # full directory: per-scene selection (AOT branch 3) picks the scene the game enters; OOT_AOT_MANIFEST=$OOT/aot/manifests-active restores the global+Kokiri union
     [ -n "${OOT_AOT_WORKERS:-}" ] && export EDEN_NX2_AOT_WORKERS="$OOT_AOT_WORKERS"
     [ -e "$EDEN_NX2_AOT_MANIFEST" ] || echo "OOT_AOT: no manifests at $EDEN_NX2_AOT_MANIFEST (index only; see $OOT/aot/README.md)" >&2
     echo "OOT_AOT: index $AOT_INDEX, manifests $EDEN_NX2_AOT_MANIFEST"
