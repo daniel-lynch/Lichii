@@ -33,6 +33,9 @@ EDEN_NX2_FENCE_BATCH=1
 # switch; either one set to 0 turns the write off.
 #EDEN_NX2_REAL_SPEED=0
 #EDEN_NX2_OOT_REAL_TIME=0
+# Deltas below this (1.1 = 54.5 fps) are delivered as the fixed 1.0. Range 1.0-1.5; lower values
+# keep 55-59 fps at real speed too, at the cost of following more timing jitter near 60 fps.
+#EDEN_NX2_OOT_REAL_TIME_SNAP=1.1
 
 # Drop reactive-flushing read traps on Switch 2 programs (opt-in; can reduce FPS from 29 to 24 in MKW).
 #EDEN_NX2_NO_REACTIVE=1

@@ -1881,10 +1881,10 @@ private:
                     m_stats.oot_presents == 0
                         ? std::string{}
                         : fmt::format(" oot_delta={:.2f}{} (min {:.2f}, max {:.2f}, 1.00 on {} "
-                                      "of {})",
+                                      "of {}, snap {:.2f})",
                                       m_stats.oot_last, oot_real_time ? "" : "(off)",
                                       m_stats.oot_min, m_stats.oot_max, m_stats.oot_fixed,
-                                      m_stats.oot_presents);
+                                      m_stats.oot_presents, m_oot_frame_delta.SnapBelow());
                 LOG_INFO(Service,
                          "nx2:vi2 last 600 presents: frame {} us (max {}, {} over 100 ms), "
                          "blocked on the GPU fence {} us (max {}), composite {} us, vblank "
@@ -1922,7 +1922,7 @@ private:
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     Nx2PresentPacer m_present_pacer;
     u32 m_swap_word{};
-    Nx2OotTime::FrameDelta m_oot_frame_delta;
+    Nx2OotTime::FrameDelta m_oot_frame_delta{Nx2OotTime::SnapFromEnv()};
 
     struct FrameTrace {
         Common::DkbFrameTrace::RateLimit rate;

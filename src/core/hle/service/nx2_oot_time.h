@@ -38,10 +38,36 @@ inline constexpr u32 HookInstruction = 0x14D57D48; // b 0x3c461e4
     return enabled;
 }
 
+inline constexpr float DefaultSnapBelow = 1.1f;
+
+/// EDEN_NX2_OOT_REAL_TIME_SNAP=<float>, read once: deltas below it are delivered as the fixed 1.0.
+/// Default 1.1 (54.5 fps), clamped to [1.0, 1.5].
+inline float SnapFromEnv() {
+    static const float snap = [] {
+        const char* value = std::getenv("EDEN_NX2_OOT_REAL_TIME_SNAP");
+        if (value == nullptr) {
+            return DefaultSnapBelow;
+        }
+        char* end = nullptr;
+        const float parsed = std::strtof(value, &end);
+        // NaN or no number: the default.
+        return end == value || !(parsed == parsed) ? DefaultSnapBelow
+                                                    : std::clamp(parsed, 1.0f, 1.5f);
+    }();
+    return snap;
+}
+
 /// The game's delta (1.0 = one 60th of a second) for the frame that follows a present.
 class FrameDelta {
 public:
     using Clock = std::chrono::steady_clock;
+
+    FrameDelta() = default;
+    explicit FrameDelta(float snap) : snap_below{snap} {}
+
+    [[nodiscard]] float SnapBelow() const {
+        return snap_below;
+    }
 
     [[nodiscard]] float Update(Clock::time_point now) {
         if (last != Clock::time_point{}) {
@@ -52,15 +78,15 @@ public:
         last = now;
         const float delta = std::clamp(average_seconds * 60.0f, 1.0f, MaxDelta);
         // Near 60 fps, keep the game's own fixed step instead of following timing jitter.
-        return delta < SnapBelow ? 1.0f : delta;
+        return delta < snap_below ? 1.0f : delta;
     }
 
 private:
     static constexpr float MaxFrameSeconds = 0.1f;
     static constexpr float Smoothing = 0.125f;
     static constexpr float MaxDelta = 4.0f;
-    static constexpr float SnapBelow = 1.1f;
 
+    float snap_below = DefaultSnapBelow;
     Clock::time_point last{};
     float average_seconds = 1.0f / 60.0f;
 };

@@ -55,3 +55,17 @@ TEST_CASE("NX2 Ocarina delta follows the measured frame time", "[core][nx2_oot_t
         REQUIRE(delta.Update(now) == Catch::Approx(1.625f).margin(0.01f));
     }
 }
+
+TEST_CASE("NX2 Ocarina delta snap threshold is configurable", "[core][nx2_oot_time]") {
+    FrameDelta::Clock::time_point now{1s};
+
+    SECTION("A lower snap keeps 55 fps at real speed") {
+        FrameDelta delta{1.02f};
+        REQUIRE(Run(delta, now, 18ms, 120) == Catch::Approx(1.08f).margin(0.01f));
+    }
+
+    SECTION("60 fps still keeps the fixed step with a lower snap") {
+        FrameDelta delta{1.02f};
+        REQUIRE(Run(delta, now, 16'666'666ns, 120) == 1.0f);
+    }
+}
