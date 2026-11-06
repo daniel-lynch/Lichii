@@ -61,12 +61,19 @@ public:
     std::vector<u64> pages;
 
 private:
+    // The page mask of b1c4c69cb0 (dev): every 64-byte unit the range touches, none for an empty
+    // range. #184's copy of the old mask shifted by 64 for an empty tail (undefined behaviour),
+    // which marked a whole extra page after a page-aligned end.
     void TrackPage(u64 page, u64 offset, u64 size) noexcept {
         const size_t offset_in_page = offset % BUFFER_PAGE_BYTES;
+        const size_t end_in_page = std::min<size_t>(
+            offset_in_page + std::min<u64>(size, BUFFER_PAGE_BYTES), BUFFER_PAGE_BYTES);
+        if (end_in_page <= offset_in_page) {
+            return;
+        }
         const size_t first_bit = offset_in_page >> BUFFER_BYTES_PER_BITSHIFT;
-        const size_t num_bits = std::min<size_t>(size, BUFFER_PAGE_BYTES) >> BUFFER_BYTES_PER_BITSHIFT;
-        const size_t mask = ~u64{0} >> (64 - num_bits);
-        pages[page] |= (~u64{0} & mask) << first_bit;
+        const size_t last_bit = (end_in_page - 1) >> BUFFER_BYTES_PER_BITSHIFT;
+        pages[page] |= (~u64{0} >> (63 - (last_bit - first_bit))) << first_bit;
     }
 
     std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};

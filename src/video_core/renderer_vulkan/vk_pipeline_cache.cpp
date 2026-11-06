@@ -810,13 +810,14 @@ void PipelineCache::OpenTranslationCache(const std::filesystem::path& filename) 
     translation_cache_verify = verify != nullptr && verify[0] == '1';
     // Device values the translation and MakeRuntimeInfo read besides the profile and host info.
     const std::string device_id =
-        fmt::format("{}|{}|{}|{}|{}|{}|{}|dyncbuf{}|indirect{}", CACHE_VERSION,
+        fmt::format("{}|{}|{}|{}|{}|{}|{}|dyncbuf{}|indirect{}|ssbobounds{}", CACHE_VERSION,
                     device.GetModelName(),
                     static_cast<u32>(device.GetDriverID()), device.GetDriverVersion(),
                     device.GetMaxComputeSharedMemorySize(), device.IsGeometryShaderSupported(),
                     device.IsExtMeshShaderSupported(),
                     Shader::Optimization::NativeDynamicCbufPointers() ? 1 : 0,
-                    IndirectPointersMode());
+                    IndirectPointersMode(),
+                    Shader::Optimization::NativeStorageBoundsCheck() ? 1 : 0);
     translation_config = TC::MakeConfigDigest(
         profile, host_info, Common::CityHash64(device_id.data(), device_id.size()));
     translation_cache.Open(filename, translation_config);
@@ -1007,15 +1008,6 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
-
-        // Task/mesh pipelines are not stored (their mesh registers are not in the format); skip
-        // any that were.
-        if (std::ranges::any_of(envs, [](const FileEnvironment& env) {
-                return env.ShaderStage() == Shader::Stage::Task ||
-                       env.ShaderStage() == Shader::Stage::Mesh;
-            })) {
-            return;
-        }
 
         if ((key.state.extended_dynamic_state != 0) !=
                 dynamic_features.has_extended_dynamic_state ||
@@ -1734,12 +1726,6 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     auto pipeline{CreateGraphicsPipeline(pools, graphics_key, environments.Span(), nullptr, true,
                                          std::move(emit_pools), std::move(reservation))};
     if (!pipeline || pipeline_cache_filename.empty()) {
-        return pipeline;
-    }
-    if (pipeline->IsMeshPipeline()) {
-        // Not stored: task and mesh programs are translated with the mesh registers, which the
-        // cache format does not carry. The few of them rebuild quickly from the driver cache.
-        QueueVulkanPipelineCacheFlush();
         return pipeline;
     }
     if (disk_pipelines.contains(graphics_key.Hash())) {

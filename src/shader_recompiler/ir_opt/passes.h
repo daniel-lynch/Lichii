@@ -44,6 +44,11 @@ bool NativeDynamicCbufPointers();
 /// through a pointer loaded from a record that upstream's table entries leave unbound get
 /// read-only native_indirect bindings, and the runtime pick checks the bound length.
 bool NativeIndirectPointers();
+/// The SPIR-V runtime pick of native global accesses takes only a buffer whose bound length
+/// (OpArrayLength) reaches the address: a miss loads zero and stores nothing instead of landing
+/// in the closest buffer below it. On by default (EDEN_NX2_SSBO_BOUNDS_CHECK=0 turns it off
+/// unless EDEN_NX2_INDIRECT_POINTERS is set). Read once.
+bool NativeStorageBoundsCheck();
 /// Also for task and mesh programs (bound per draw); EDEN_NX2_INDIRECT_POINTERS=compute: compute
 /// programs only
 bool NativeIndirectGraphicsPointers();
