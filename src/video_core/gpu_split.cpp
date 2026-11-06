@@ -103,8 +103,14 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     // mid-game: hand the engines back to the front (and start again when they allow it).
     const bool safe_reads = Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh()
                                                           : Settings::IsDMALevelSafe();
-    const bool allowed = !safe_reads && !Settings::IsGPULevelHigh() &&
-                         Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;
+    // EDEN_NX2_SPLIT_SAFE_READS=1: a safe read's flush is queued on the back rather than run on the
+    // front (MemoryManager::FlushRegionForRead), so the split no longer has to be given up for
+    // accuracy. Off by default. It adds a drain per safe read, so measure before believing it is a
+    // win: the point is that accuracy and the split stop being a trade, not that both must be on.
+    static const bool split_safe_reads = std::getenv("EDEN_NX2_SPLIT_SAFE_READS") != nullptr;
+    const bool allowed =
+        (split_safe_reads || (!safe_reads && !Settings::IsGPULevelHigh())) &&
+        Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;
     if (active && !allowed) {
         Drain();
         Stop();
