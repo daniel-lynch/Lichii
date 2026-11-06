@@ -1032,7 +1032,18 @@ TEST_CASE("Read-only translation caches retain usable records without throwing",
     REQUIRE_FALSE(store.Persistent());
     REQUIRE(store.FindEntry(key, env));
     REQUIRE(store.FindVariant(variant_key));
-    REQUIRE(store.Insert({55, 66}, {}, {}));
+    const auto new_entry = store.Insert({55, 66}, {}, {});
+    REQUIRE(new_entry);
+    const auto new_key = MakeVariantKey(new_entry->id, {}, {});
+    const Variant new_variant{.binding_out = {.unified = 7, .texture = 9},
+                              .info = SampleInfo(), .spirv = {0x07230203, 4, 5, 6}};
+    REQUIRE(store.InsertVariant(*new_entry, new_key, new_variant));
+    const auto found = store.FindVariant(new_key);
+    REQUIRE(found);
+    REQUIRE(InfoEqual(found->info, new_variant.info));
+    REQUIRE(MakeVariantKey({}, {}, found->binding_out) ==
+            MakeVariantKey({}, {}, new_variant.binding_out));
+    REQUIRE(found->spirv == new_variant.spirv);
     REQUIRE(std::filesystem::file_size(path) == size);
     const auto lines = Common::Log::ReadRing(0);
     REQUIRE(std::ranges::count_if(lines, [&](const auto& line) {
