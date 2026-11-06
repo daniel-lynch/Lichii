@@ -49,7 +49,8 @@ runtime variants; untouched offline fallback modules do not count as observed re
 
 `--shader-recipe-count N` selects the most frequent N recipes for each stage's input
 class (stage kind if that class has no observations); default 3, allowed range 1–64.
-All exact-stage recipes are included in addition to this limit. Canonical duplicate
+All exact-stage recipes and the baseline default are included in addition to this
+limit, preserving default coverage when observed recipes fill the class budget. Canonical duplicate
 variants are emitted only once, and every emission uses fresh IR. Class frequencies
 count distinct recorded runtime variants, not repeated gameplay draw invocations.
 The producer reports uncompressed emitted SPIR-V bytes as `module_bytes`; `translated`
@@ -400,3 +401,39 @@ reviewable patches/messages are in `/tmp/offline-translation-commits/`; the unex
 script is `commit-plan4.sh`. Its cached patch sequence was verified in an isolated index against
 HEAD `120d0078ee`. The audit helper was built under the shared lock and reproduced the histogram.
 No emulator or eden-cli was run, no default user config/cache was touched, and no commits were made.
+
+
+## Pass 5 integration and validation
+
+The dev AOT implementation (18832d80a5, dev head 859b6ef80c) is unified with the
+Format 10 producer. One canonicalizer and recipe-class function serve runtime,
+seeding and offline production. Replay-valid entries can supply metadata before any
+module exists; worker lookup resolves bindings before reconstructing IR for a missing
+variant. Full module hits avoid reconstruction. A missing module still requires a
+worker translation from captured answers: Format 10 does not serialize IR. Legacy
+varying conversion and non-deferred builds retain their synchronous path.
+
+Offline metadata disagreement persists a drop record, including when discovered on
+a worker. Canonical verify and asynchronous reference emission use fresh programs;
+no comparison emits a second module from an already-emitted program. AOT seeding
+retains its existing switches and default-off setting. CLI teardown is outside this
+change's scope.
+
+For round-5 validation, rebuild a fresh product using round-4's gameplay cache with
+`--shader-recipe-cache FILE --shader-recipe-count 3`, then repeat production and
+confirm `translated=0`. Use separate portable profiles for product, empty-cache
+control and `EDEN_NX2_TRANSLATION_CACHE_VERIFY=1`; keep settings and the Kokiri route
+identical. Record module bytes, variant misses/full hits, replay misses, metadata
+drops, GPU-thread translation count/time, memory overhead and verify mismatches.
+The expected coverage improvement is a target, not a measured result. The coordinator
+must still verify NVIDIA pipeline creation and rendering on the real game.
+
+The Pass 5 locked Ninja build completed for `lichii`, `eden-cli` and `tests`.
+`bin/tests '[translation_cache],[video_core]'` ran 440 cases: 437 passed, the two
+known `nx2_video_render.cpp` failures (151 and 210), and one skipped Vulkan test;
+62,848,335 of 62,848,337 assertions passed. No emulator was run. Build/test logs,
+patches and the owner-run commit/revalidation scripts are under
+`/tmp/offline-translation-commits/` (`build-plan5-retry.log`, `tests-plan5.log`,
+`commit-plan5.sh`, `revalidate-plan5.sh`). The real Git metadata was read-only in
+this session, so conflict resolution used temporary Git metadata; the commit
+script performs the real merge before installing the reviewed resolution.
