@@ -12,6 +12,10 @@ export EDEN_NX2_SHADER_DUMP="$OOT/shaders"
 if [ "${OOT_UPSTREAM_DEFAULTS:-0}" != "1" ]; then
   export EDEN_NX2_GFX_STORAGE_SIZE_LIKE_COMPUTE=0 EDEN_NX2_UNIFORM_BANK_REUPLOAD=0 EDEN_NX2_NATIVE_PREFLUSH="${OOT_PREFLUSH:-1}"  # preflush: +3.4 fps median, interleaved A/B 2026-11-06
 fi
+# Pipeline eviction: upstream destroys graphics pipelines unused for 9000 frames (~2.5 min at 60),
+# so re-entering an area rebuilds them on the GPU thread (upstream issue #293 — stutter).
+# Off for this game; OOT_EVICT=1 restores upstream behaviour.
+if [ "${OOT_EVICT:-0}" != "1" ]; then export EDEN_NX2_PIPELINE_EVICT=0; fi
 # OOT_GPU=fast|accurate pins the per-game GPU Mode and reactive flushing before boot
 # (fast = GPU Mode Fast + reactive flushing off; accurate = Accurate + flushing on).
 # OOT_FLUSH=0|1 overrides the flushing half. Unset = leave the config alone.
