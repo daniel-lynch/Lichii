@@ -23,7 +23,62 @@ PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_SERVER = "127.0.0.1:6545"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+BUTTONS = ["A", "B", "X", "Y", "L", "R", "ZL", "ZR", "Plus", "Minus", "Up", "Down", "Left", "Right",
+           "StickL", "StickR"]
+STICK = {"type": "array", "items": {"type": "number", "minimum": -1, "maximum": 1},
+         "minItems": 2, "maxItems": 2, "description": "[x, y], up is +y"}
+
 TOOLS = [
+    {
+        "name": "capture_on_flash",
+        "description": "Arms an asynchronous 64x36 per-present white-flash probe. Returns immediately. "
+                       "Read status.flash for triggers, captured-frame white fractions, directories "
+                       "and measured CPU/GPU probe timings. Full dumps capture the next frame after "
+                       "the GPU probe is observed, not necessarily the triggering frame.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "threshold_white_fraction": {"type": "number", "minimum": 0, "maximum": 1},
+                "min_luma": {"type": "number", "minimum": 0, "maximum": 1},
+                "max_captures": {"type": "integer", "minimum": 1, "maximum": 10, "default": 1},
+                "timeout_s": {"type": "integer", "minimum": 1, "maximum": 600},
+                "buffers": {"type": "boolean"},
+                "sampled": {"type": "boolean"},
+            },
+            "required": ["threshold_white_fraction", "min_luma"],
+        },
+    },
+    {
+        "name": "disarm",
+        "description": "Stops white-flash probing and returns its results. An already-started "
+                       "frame dump finishes; a missing captured-frame measurement is reported.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "flash_monitor",
+        "description": "Starts (enable true) or stops continuous flash/flicker statistics on the "
+                       "64x36 present probe: a flash is a one-frame centre brightening of at least "
+                       "flash_jump luma (0-255) over both neighbours; flicker is a non-flash frame "
+                       "whose 8x6-sample tiles spike by tile_jump. capture_first dumps one frame "
+                       "after the first flash. Read the counters with flash_stats.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "enable": {"type": "boolean", "default": True},
+                "flash_jump": {"type": "number", "exclusiveMinimum": 0, "maximum": 255, "default": 6},
+                "tile_jump": {"type": "number", "exclusiveMinimum": 0, "maximum": 255, "default": 12},
+                "capture_first": {"type": "boolean", "default": True},
+                "sampled": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "flash_stats",
+        "description": "Flash monitor counters: window (since the last reset) and total: frames, "
+                       "flashes, flicker_frames, max_jump, last_flash_frame, plus probe cost. "
+                       "reset true starts a new window.",
+        "inputSchema": {"type": "object", "properties": {"reset": {"type": "boolean", "default": False}}},
+    },
     {
         "name": "status",
         "description": "Game title, program id, build, renderer, paused state, presented frame "
@@ -75,7 +130,10 @@ TOOLS = [
         "name": "capture_frame",
         "description": "EDEN_NX2_FRAME_DUMP for the next frame, now: every pass colour target, "
                        "dispatch storage image and the present source as PNG and .raw.zst, plus "
-                       "manifest.jsonl. 'sampled' also reads back every sampled texture. Returns "
+                       "manifest.jsonl. 'sampled' also reads back every sampled texture with its "
+                       "sampler state; 'buffers' records every draw's and dispatch's uniform and "
+                       "storage buffers (kind: buffer, buffer_<hash>.bin.zst) and dispatch group "
+                       "counts (kind: launch). Returns "
                        "the directory, summary, entry counts and the first manifest entries. "
                        "'index' builds index.html with frame_dump_index.py. 'count' (1-8, default "
                        "EDEN_NX2_FRAME_DUMP_COUNT or 1) captures consecutive frames into "
@@ -85,6 +143,7 @@ TOOLS = [
             "properties": {
                 "sampled": {"type": "boolean"},
                 "count": {"type": "integer", "minimum": 1, "maximum": 8},
+                "buffers": {"type": "boolean"},
                 "timeout_s": {"type": "integer", "minimum": 1, "maximum": 600},
                 "manifest_lines": {"type": "integer", "minimum": 0, "maximum": 5000},
                 "index": {"type": "boolean"},
@@ -114,6 +173,116 @@ TOOLS = [
                 "reject": {"type": "boolean"},
                 "timeout_s": {"type": "integer", "minimum": 0, "maximum": 60},
             },
+        },
+    },
+    {
+        "name": "sample",
+        "description": "Sampling profiler: pauses the named host threads about 1000 times a second "
+                       "for the given seconds and returns where they were (self, self <- caller, "
+                       "inclusive counts per function). Also writes the report and its folded "
+                       "stacks to the dump directory. Windows only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "threads": {"type": "string",
+                            "description": "Comma separated thread names; default GPU,GPUBack"},
+                "seconds": {"type": "number", "minimum": 1, "maximum": 60},
+                "max_chars": {"type": "integer", "minimum": 0},
+            },
+        },
+    },
+    {
+        "name": "read_memory",
+        "description": "Reads up to 64 KiB of the game's guest virtual memory, read only and "
+                       "while it runs. 'as' formats it: hex (default), u32, u64 (hex strings) or "
+                       "f32. An unmapped page fails with the first unmapped address. Addresses "
+                       "are hex strings ('0x8012345000') or numbers.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": ["string", "integer"]},
+                "size": {"type": "integer", "minimum": 1, "maximum": 65536},
+                "as": {"type": "string", "enum": ["hex", "u32", "u64", "f32"]},
+            },
+            "required": ["address", "size"],
+        },
+    },
+    {
+        "name": "search_memory",
+        "description": "Finds a byte pattern (hex pairs in memory order: little endian, so 1.0f "
+                       "is '0000803f') in the mapped guest memory of the heap region (default) or "
+                       "the whole address space, optionally narrowed by start and end. Returns up "
+                       "to max_hits (at most 256) addresses; it stops after budget_ms and then "
+                       "returns 'next', the start for the following call.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"},
+                "start": {"type": ["string", "integer"]},
+                "end": {"type": ["string", "integer"]},
+                "max_hits": {"type": "integer", "minimum": 1, "maximum": 256},
+                "regions": {"type": "string", "enum": ["heap", "all"]},
+                "budget_ms": {"type": "integer", "minimum": 1, "maximum": 10000},
+            },
+            "required": ["pattern"],
+        },
+    },
+    {
+        "name": "read_gpu_memory",
+        "description": "Reads up to 64 KiB of GPU virtual memory (e.g. query report and semaphore "
+                       "buffers the game reads back) at the next frame end, as the GPU sees it, "
+                       "without flushing GPU caches. Tries the bound channel's address space "
+                       "first; 'as' as for read_memory.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "gpu_address": {"type": ["string", "integer"]},
+                "size": {"type": "integer", "minimum": 1, "maximum": 65536},
+                "as": {"type": "string", "enum": ["hex", "u32", "u64", "f32"]},
+                "timeout_s": {"type": "integer", "minimum": 1, "maximum": 60},
+            },
+            "required": ["gpu_address", "size"],
+        },
+    },
+    {
+        "name": "input",
+        "description": "Holds buttons and sticks on player 1 (or the handheld controller) for "
+                       "'frames' presented frames from the next present on, then releases; returns "
+                       "when done. Buttons are added to the owner's; a given stick replaces the "
+                       "owner's. Fails and releases when frames stop (paused or loading) for "
+                       "timeout_s (default frames / 20 + 10).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {**{
+                "buttons": {"type": "array", "items": {"type": "string", "enum": BUTTONS}},
+                "left_stick": STICK,
+                "right_stick": STICK,
+                "frames": {"type": "integer", "minimum": 1, "maximum": 36000},
+            },
+                           "timeout_s": {"type": "integer", "minimum": 1, "maximum": 900}},
+            "required": ["frames"],
+        },
+    },
+    {
+        "name": "input_sequence",
+        "description": "Runs input steps back to back, each for exactly its 'frames' presented "
+                       "frames, so a camera pan or walk replays identically for an A/B test. A "
+                       "step without buttons or sticks leaves the owner's input alone. At most "
+                       "1000 steps and 36000 frames.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "steps": {"type": "array", "minItems": 1, "maxItems": 1000,
+                          "items": {"type": "object", "properties": {
+                "buttons": {"type": "array", "items": {"type": "string", "enum": BUTTONS}},
+                "left_stick": STICK,
+                "right_stick": STICK,
+                "frames": {"type": "integer", "minimum": 1, "maximum": 36000},
+            },
+                                    "required": ["frames"]}},
+                "timeout_s": {"type": "integer", "minimum": 1, "maximum": 900},
+            },
+            "required": ["steps"],
         },
     },
 ]
@@ -205,6 +374,18 @@ class Emulator:
         return response.get("result")
 
 
+def default_timeout(name, params):
+    """The emulator's own timeout_s default, so the adapter waits at least as long."""
+    if name == "capture_frame":
+        return 120
+    if name == "sample":
+        return int(params.get("seconds", 10)) + 90
+    if name in ("input", "input_sequence"):
+        steps = params.get("steps", []) if name == "input_sequence" else [params]
+        return sum(int(step.get("frames", 0)) for step in steps) // 20 + 10
+    return 5
+
+
 def text(value):
     return {"type": "text", "text": value if isinstance(value, str) else json.dumps(value, indent=1)}
 
@@ -230,8 +411,11 @@ class Adapter:
             summary["out"] = os.path.abspath(out).replace("\\", "/")
             return summary, None
         index = params.pop("index", False)
-        timeout = max(int(params.get("timeout_s", 120 if name == "capture_frame" else 5)), 1) + 30
+        timeout = max(int(params.get("timeout_s", default_timeout(name, params))), 1) + 30
         result = self.emulator.call(name, params, timeout)
+        flash = result.get("flash", {}) if name == "status" else result if name == "disarm" else {}
+        for capture in flash.get("captures", []):
+            self.captures.add(os.path.realpath(capture["directory"]))
         if name == "screenshot":
             png = result.pop("png_base64", None)
             return result, base64.b64decode(png) if png else None

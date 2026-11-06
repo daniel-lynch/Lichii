@@ -9,6 +9,7 @@
 #include <unordered_map>
 
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_flash_trigger.h"
 
 namespace VideoCore::Nx2Debug {
 namespace {
@@ -18,6 +19,8 @@ struct State {
     std::condition_variable changed;
     std::deque<CaptureRequest> captures;
     std::unordered_map<u64, CaptureResult> finished;
+    std::deque<GpuReadRequest> gpu_reads;
+    std::unordered_map<u64, GpuReadResult> gpu_read_results;
     std::vector<u64> rejected;
     u64 reject_generation{};
     u64 applied_generation{};
@@ -31,15 +34,18 @@ std::atomic<bool> pending{};
 std::atomic<bool> any_rejected{};
 
 void UpdatePending() {
-    pending.store(!state.captures.empty() || state.reject_pending, std::memory_order_relaxed);
+    pending.store(!state.captures.empty() || !state.gpu_reads.empty() || state.reject_pending, std::memory_order_relaxed);
 }
 
 } // Anonymous namespace
 
 void BeginSession() {
+    ResetFlash();
     std::scoped_lock lock{state.mutex};
     state.captures.clear();
     state.finished.clear();
+    state.gpu_reads.clear();
+    state.gpu_read_results.clear();
     state.rejected.clear();
     state.reject_pending = false;
     state.unrejected = false;
@@ -50,10 +56,12 @@ void BeginSession() {
 }
 
 void EndSession() {
+    ResetFlash();
     {
         std::scoped_lock lock{state.mutex};
         state.open = false;
         state.captures.clear();
+        state.gpu_reads.clear();
         UpdatePending();
     }
     state.changed.notify_all();
@@ -100,12 +108,63 @@ std::optional<CaptureRequest> TakeCapture() {
 }
 
 void FinishCapture(u64 id, CaptureResult result) {
+    if (FinishFlashCapture(id, result.error)) {
+        return;
+    }
     {
         std::scoped_lock lock{state.mutex};
         if (!state.open) {
             return;
         }
         state.finished.insert_or_assign(id, std::move(result));
+    }
+    state.changed.notify_all();
+}
+
+void RequestGpuRead(GpuReadRequest request) {
+    std::scoped_lock lock{state.mutex};
+    state.gpu_reads.push_back(request);
+    UpdatePending();
+}
+
+void CancelGpuRead(u64 id) {
+    std::scoped_lock lock{state.mutex};
+    std::erase_if(state.gpu_reads, [id](const GpuReadRequest& request) { return request.id == id; });
+    state.gpu_read_results.erase(id);
+    UpdatePending();
+}
+
+std::optional<GpuReadResult> WaitGpuRead(u64 id, std::chrono::milliseconds timeout) {
+    std::unique_lock lock{state.mutex};
+    state.changed.wait_for(lock, timeout,
+                           [id] { return !state.open || state.gpu_read_results.contains(id); });
+    const auto it = state.gpu_read_results.find(id);
+    if (it == state.gpu_read_results.end()) {
+        return std::nullopt;
+    }
+    GpuReadResult result = std::move(it->second);
+    state.gpu_read_results.erase(it);
+    return result;
+}
+
+std::optional<GpuReadRequest> TakeGpuRead() {
+    std::scoped_lock lock{state.mutex};
+    if (state.gpu_reads.empty()) {
+        return std::nullopt;
+    }
+    const GpuReadRequest request = state.gpu_reads.front();
+    state.gpu_reads.pop_front();
+    UpdatePending();
+    return request;
+}
+
+void FinishGpuRead(u64 id, GpuReadResult result) {
+    {
+        std::scoped_lock lock{state.mutex};
+        if (!state.open) {
+            return;
+        }
+        state.gpu_read_results.insert_or_assign(id, std::move(result));
     }
     state.changed.notify_all();
 }

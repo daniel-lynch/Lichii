@@ -36,6 +36,10 @@ constexpr u8 CodecRaw = 0;
 constexpr u8 CodecZstd = 1;
 constexpr u8 PackageFlagStandaloneUpdate = 0x01;
 constexpr u32 MaxDirDepth = 128;
+// BuildDirTree expands every reference to a directory, so shared subtrees (allowed) are built once
+// per parent. Bound the expanded tree: a short chain of directories each listed twice would
+// otherwise grow exponentially until memory ran out. Far above any real dump's entry count.
+constexpr u64 MaxExpandedNodes = u64{1} << 21;
 
 #pragma pack(push, 1)
 struct Superblock {
@@ -550,6 +554,20 @@ bool NupContainer::ValidateDirTree() const {
     };
     std::vector<u8> state(dirs.size(), Unvisited);
     std::vector<u32> height(dirs.size(), 0);
+    // Entries BuildDirTree creates for a directory's subtree, saturated past MaxExpandedNodes.
+    std::vector<u64> expanded(dirs.size(), 0);
+    const auto count_expanded = [&](u32 dir) {
+        const DirNode& node = dirs[dir];
+        u64 total = 0;
+        for (u32 slot = 0; slot < node.child_count; ++slot) {
+            const u32 child = children[static_cast<std::size_t>(node.first_child) + slot];
+            total += child >= dirs.size() ? 1 : 1 + expanded[child];
+            if (total > MaxExpandedNodes) {
+                return MaxExpandedNodes + 1;
+            }
+        }
+        return total;
+    };
     std::vector<Frame> stack;
     for (u32 start = 0; start < dirs.size(); ++start) {
         if (state[start] != Unvisited) {
@@ -561,6 +579,11 @@ bool NupContainer::ValidateDirTree() const {
             const Frame frame = stack.back();
             const DirNode& node = dirs[frame.dir];
             if (frame.next == node.child_count) {
+                expanded[frame.dir] = count_expanded(frame.dir);
+                if (expanded[frame.dir] > MaxExpandedNodes) {
+                    LOG_ERROR(Loader, "NUP directory tree expands to too many entries");
+                    return false;
+                }
                 state[frame.dir] = Done;
                 stack.pop_back();
                 if (!stack.empty()) {

@@ -176,6 +176,21 @@ TEST_CASE("NUP bounds directory depth while allowing shared subtrees", "[nup][nu
         REQUIRE(container.GetStatus() == Loader::ResultStatus::Success);
         REQUIRE(container.GetExeFSDir(0)->GetSubdirectories().size() == 2);
     }
+    SECTION("shared subtrees that expand exponentially") {
+        // Each directory lists the next one twice: 2^64 entries once expanded, from a tiny TOC
+        // (Orchid e2ac483595's OOM). Fewer levels stay within the budget.
+        const auto chain = [](u32 levels) {
+            std::vector<std::vector<u32>> dirs(levels + 1);
+            for (u32 i = 0; i < levels; ++i) {
+                dirs[i] = {i + 1, i + 1};
+            }
+            dirs[levels] = {levels + 1};
+            return dirs;
+        };
+        REQUIRE(NupFixture(chain(64)).Parse().GetStatus() ==
+                Loader::ResultStatus::ErrorNUPBadFormat);
+        REQUIRE(NupFixture(chain(8)).Parse().GetStatus() == Loader::ResultStatus::Success);
+    }
     SECTION("previously visited subtree exceeds depth limit") {
         std::vector<std::vector<u32>> dirs(129);
         for (u32 i = 1; i < dirs.size(); ++i) {

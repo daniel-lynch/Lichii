@@ -16,5 +16,8 @@ and pass paths as arguments; treat extracted game data as untrusted and keep it 
   (`OotAnchors`, `NvnTable` — recovers and labels the runtime-resolved NVN function-pointer table,
   `NvnTypes`, `OotProbe`), and `NOTES.md` with the exact `analyzeHeadless` invocations and caps.
   The Ghidra project itself and any findings quoting game code are not published.
+- `harness/`: unattended boot-to-game runs with MangoHud fps, guest fps, PCIe and screenshots per
+  camera heading, and per-window `flashes` / `flicker` counts from the emulator's flash monitor
+  (debug server `flash_monitor` / `flash_stats`, docs/nx2/debug-mcp.md); `harness/README.md`.
 - `run-logged.sh`: the play-session launcher (shader dump, MangoHud frame-time CSV, PCIe sampler,
   per-game GPU-mode pin, opt-in frame capture and reject-hash workaround).

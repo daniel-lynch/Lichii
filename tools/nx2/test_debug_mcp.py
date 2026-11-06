@@ -45,6 +45,18 @@ class FakeEmulator:
                 return {"result": {"directory": self.capture_dir, "count": count,
                                    "frames": frames}}
             return {"result": {"directory": self.capture_dir, "entries_total": 1}}
+        if method == "capture_on_flash":
+            return {"result": {"directory": self.capture_dir, "armed": True, "captures": []}}
+        if method == "disarm":
+            return {"result": {"armed": False, "captures": [
+                {"directory": self.capture_dir, "trigger_white_fraction": 0.95,
+                 "capture_white_fraction": 0.1, "complete": True}]}}
+        if method == "read_memory":
+            return {"result": {"address": request["params"]["address"], "hex": "0000803f"}}
+        if method == "read_gpu_memory":
+            return {"error": "GPU address 0x5000 is not mapped"}
+        if method in ("input", "input_sequence"):
+            return {"result": {"controller": "player1", "frames": 3}}
         return {"error": f"unknown method \"{method}\""}
 
     def serve(self):
@@ -96,9 +108,11 @@ class AdapterTest(unittest.TestCase):
         self.assertIsNone(self.adapter.handle({"method": "notifications/initialized"}))
         names = [tool["name"] for tool in self.adapter.handle({"id": 2, "method": "tools/list"})
                  ["result"]["tools"]]
-        self.assertEqual(names, ["status", "screenshot", "log_tail", "log_filter", "capture_frame",
-                                 "capture_image", "reject_shaders", "coverage_start",
-                             "coverage_reset", "coverage_stop", "coverage_snapshot"])
+        self.assertEqual(names, ["capture_on_flash", "disarm", "flash_monitor", "flash_stats", "status", "screenshot", "log_tail", "log_filter", "capture_frame",
+                                 "capture_image", "reject_shaders", "sample", "read_memory",
+                                 "search_memory", "read_gpu_memory", "input",
+                                 "input_sequence", "coverage_start", "coverage_reset",
+                                 "coverage_stop", "coverage_snapshot"])
         self.assertEqual(self.adapter.handle({"id": 3, "method": "bogus"})["error"]["code"], -32601)
 
     def test_status_is_forwarded(self):
@@ -106,6 +120,34 @@ class AdapterTest(unittest.TestCase):
         self.assertFalse(result["isError"])
         self.assertEqual(json.loads(result["content"][0]["text"])["title"], "Test")
         self.assertEqual(self.fake.requests[-1]["params"], {"fps_window_ms": 0})
+
+    def test_flash_arms_without_waiting_and_reports_triggered_captures(self):
+        params = {"threshold_white_fraction": 0.8, "min_luma": 0.95, "buffers": True}
+        result = self.call("capture_on_flash", params)
+        self.assertTrue(json.loads(result["content"][0]["text"])["armed"])
+        self.assertEqual(self.fake.requests[-1]["params"], params)
+        report = json.loads(self.call("disarm")["content"][0]["text"])
+        self.assertEqual(report["captures"][0]["trigger_white_fraction"], 0.95)
+        self.assertFalse(self.call("capture_image", {
+            "directory": self.capture_dir, "name": "0001_present"})["isError"])
+    def test_memory_reads_are_forwarded(self):
+        arguments = {"address": "0x8000001000", "size": 4, "as": "hex"}
+        result = self.call("read_memory", arguments)
+        self.assertFalse(result["isError"])
+        self.assertEqual(json.loads(result["content"][0]["text"])["hex"], "0000803f")
+        self.assertEqual(self.fake.requests[-1]["params"], arguments)
+        unmapped = self.call("read_gpu_memory", {"gpu_address": "0x5000", "size": 4})
+        self.assertTrue(unmapped["isError"])
+        self.assertIn("0x5000 is not mapped", unmapped["content"][0]["text"])
+
+    def test_input_waits_as_long_as_the_emulator(self):
+        self.assertEqual(debug_mcp.default_timeout("input", {"frames": 600}), 40)
+        sequence = {"steps": [{"frames": 300}, {"frames": 300, "buttons": ["A"]}]}
+        self.assertEqual(debug_mcp.default_timeout("input_sequence", sequence), 40)
+        self.assertEqual(debug_mcp.default_timeout("status", {}), 5)
+        result = self.call("input_sequence", sequence)
+        self.assertFalse(result["isError"])
+        self.assertEqual(self.fake.requests[-1]["params"], sequence)
 
     def test_screenshot_becomes_image_content(self):
         result = self.call("screenshot")

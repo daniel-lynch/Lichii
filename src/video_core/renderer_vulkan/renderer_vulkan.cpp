@@ -33,6 +33,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
+#include "video_core/nx2_flash_trigger.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/textures/decoders.h"
 #include "video_core/vulkan_common/vulkan_debug_callback.h"
@@ -234,6 +235,19 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
                                render_window.GetFramebufferLayout(),
                                present_manager.SwapchainImageCount(),
                                swapchain.GetImageViewFormat());
+
+    if (VideoCore::Nx2Debug::FlashEnabled()) {
+        try {
+            if (!flash_detector) {
+                flash_detector = std::make_unique<FlashDetector>(device, memory_allocator, scheduler);
+            }
+            flash_detector->Present(*frame->image, swapchain.GetImageViewFormat(), frame->width, frame->height);
+        } catch (const std::exception& error) {
+            if (const auto config = VideoCore::Nx2Debug::GetFlashConfig()) {
+                VideoCore::Nx2Debug::FailFlash(config->generation, error.what());
+            }
+        }
+    }
 
 #ifdef HAS_LSFG
     void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames()));

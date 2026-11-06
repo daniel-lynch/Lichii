@@ -270,8 +270,9 @@ void FrameDump::StopWriter() {
     stop_writer = false;
 }
 
-void FrameDump::Arm(std::filesystem::path directory_, bool sampled, u64 id, u32 count) {
-    if (!schedule.Arm(sampled, id, count)) {
+void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers, u64 id,
+                    u32 count) {
+    if (!schedule.Arm(sampled, buffers, id, count)) {
         VideoCore::Nx2Debug::FinishCapture(id, {.error = "another capture is in progress"});
         return;
     }
@@ -1029,7 +1030,10 @@ bool FrameDump::BeginFrame(double elapsed) {
                  schedule.BurstCount());
     }
     LOG_INFO(Render_Vulkan, "Frame dump: capturing frame {} ({:.1f} s after boot){} into {}", frame,
-             elapsed, sampled ? " with sampled textures" : "", path.string());
+             elapsed,
+             sampled ? (schedule.Buffers() ? " with sampled textures and buffers" : " with sampled textures")
+                     : (schedule.Buffers() ? " with buffers" : ""),
+             path.string());
     return true;
 }
 
@@ -1037,6 +1041,7 @@ void FrameDumpSchedule::Configure(std::string_view at, std::filesystem::path tri
                                   bool sampled_, u32 count) {
     enabled = true;
     sampled = sampled_;
+    buffers = sampled_;
     configured_count = std::clamp<u32>(count, 1, 8);
     burst_count = configured_count;
     if (at == "file") {
@@ -1048,13 +1053,14 @@ void FrameDumpSchedule::Configure(std::string_view at, std::filesystem::path tri
     }
 }
 
-bool FrameDumpSchedule::Arm(bool sampled_, u64 id, u32 count) {
+bool FrameDumpSchedule::Arm(bool sampled_, bool buffers_, u64 id, u32 count) {
     if (capturing) {
         return false;
     }
     enabled = true;
     done = false;
     sampled = sampled_;
+    buffers = buffers_;
     trigger_frame = 0;
     capture_id = id;
     armed = true;

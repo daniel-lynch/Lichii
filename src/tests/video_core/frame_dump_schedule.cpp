@@ -23,34 +23,52 @@ TEST_CASE("Frame dump schedule is idle until configured or armed", "[frame_dump_
 TEST_CASE("Frame dump schedule records sampled textures for an armed sampled capture",
           "[frame_dump_schedule]") {
     FrameDumpSchedule schedule;
-    REQUIRE(schedule.Arm(true, 7));
+    REQUIRE(schedule.Arm(true, false, 7));
     REQUIRE_FALSE(Vulkan::RecordingSampledTextures());
     // The pipelines read the flag while the captured frame is drawn, between Start and Finish.
     REQUIRE(schedule.Tick(0.0) == Step::Start);
     REQUIRE(schedule.Capturing());
     REQUIRE(schedule.Sampled());
+    REQUIRE_FALSE(schedule.Buffers());
     REQUIRE(schedule.CaptureId() == 7);
     REQUIRE(Vulkan::RecordingSampledTextures());
-    REQUIRE_FALSE(schedule.Arm(false, 8));
+    REQUIRE_FALSE(schedule.Arm(false, false, 8));
     REQUIRE(schedule.Tick(0.0) == Step::Finish);
     REQUIRE_FALSE(schedule.Capturing());
     REQUIRE_FALSE(Vulkan::RecordingSampledTextures());
     REQUIRE(schedule.Tick(0.0) == Step::None);
 
     // The next request decides again: this one does not read sampled textures back.
-    REQUIRE(schedule.Arm(false, 8));
+    REQUIRE(schedule.Arm(false, false, 8));
     REQUIRE(schedule.Tick(0.0) == Step::Start);
     REQUIRE(schedule.CaptureId() == 8);
     REQUIRE_FALSE(Vulkan::RecordingSampledTextures());
     REQUIRE(schedule.Tick(0.0) == Step::Finish);
 
-    REQUIRE(schedule.Arm(true, 9));
+    REQUIRE(schedule.Arm(true, false, 9));
     REQUIRE(schedule.Tick(0.0) == Step::Start);
     REQUIRE(Vulkan::RecordingSampledTextures());
     schedule.Abort();
     REQUIRE_FALSE(schedule.Capturing());
     REQUIRE_FALSE(Vulkan::RecordingSampledTextures());
     REQUIRE(schedule.Tick(0.0) == Step::None);
+}
+
+TEST_CASE("Frame dump schedule records buffers independently of sampled textures",
+          "[frame_dump_schedule]") {
+    FrameDumpSchedule schedule;
+    REQUIRE(schedule.Arm(false, true, 3));
+    REQUIRE(schedule.Tick(0.0) == Step::Start);
+    REQUIRE(schedule.Buffers());
+    REQUIRE_FALSE(schedule.Sampled());
+    // Buffers come from the buffer cache's bindings, not from the pipelines' sampled list.
+    REQUIRE_FALSE(Vulkan::RecordingSampledTextures());
+    REQUIRE(schedule.Tick(0.0) == Step::Finish);
+    REQUIRE(schedule.Arm(true, true, 4));
+    REQUIRE(schedule.Tick(0.0) == Step::Start);
+    REQUIRE(schedule.Buffers());
+    REQUIRE(Vulkan::RecordingSampledTextures());
+    REQUIRE(schedule.Tick(0.0) == Step::Finish);
 }
 
 TEST_CASE("Frame dump schedule follows EDEN_NX2_FRAME_DUMP_AT", "[frame_dump_schedule]") {
@@ -60,6 +78,8 @@ TEST_CASE("Frame dump schedule follows EDEN_NX2_FRAME_DUMP_AT", "[frame_dump_sch
     REQUIRE(by_frame.Tick(1000.0) == Step::None);
     REQUIRE(by_frame.Tick(1000.0) == Step::Start);
     REQUIRE(by_frame.Frame() == 3);
+    REQUIRE(by_frame.Sampled());
+    REQUIRE(by_frame.Buffers());
     REQUIRE(Vulkan::RecordingSampledTextures());
     REQUIRE(by_frame.Tick(1000.0) == Step::Finish);
     REQUIRE(by_frame.Tick(1000.0) == Step::None);
@@ -133,11 +153,11 @@ TEST_CASE("Frame dump schedule captures EDEN_NX2_FRAME_DUMP_COUNT consecutive fr
 
 TEST_CASE("Frame dump schedule bursts for the debug server", "[frame_dump_schedule]") {
     FrameDumpSchedule schedule;
-    REQUIRE(schedule.Arm(false, 11, 2));
+    REQUIRE(schedule.Arm(false, false, 11, 2));
     REQUIRE(schedule.Tick(0.0) == Step::Start);
     REQUIRE(schedule.CaptureId() == 11);
     REQUIRE(schedule.FrameSubdirectory() == "frame-1");
-    REQUIRE_FALSE(schedule.Arm(false, 12, 2));
+    REQUIRE_FALSE(schedule.Arm(false, false, 12, 2));
     REQUIRE(schedule.Tick(0.0) == Step::Next);
     REQUIRE(schedule.FrameSubdirectory() == "frame-2");
     REQUIRE(schedule.LastOfBurst());
@@ -146,7 +166,7 @@ TEST_CASE("Frame dump schedule bursts for the debug server", "[frame_dump_schedu
     REQUIRE(schedule.Tick(0.0) == Step::None);
 
     // A later single-frame request is not a burst, whatever the last one was.
-    REQUIRE(schedule.Arm(false, 12));
+    REQUIRE(schedule.Arm(false, false, 12));
     REQUIRE(schedule.Tick(0.0) == Step::Start);
     REQUIRE(schedule.FrameSubdirectory().empty());
     REQUIRE(schedule.Tick(0.0) == Step::Finish);
@@ -187,7 +207,7 @@ TEST_CASE("Frame dump schedule re-arms on the trigger file", "[frame_dump_schedu
     REQUIRE(schedule.Tick(0.0) == Step::Finish);
 
     // A debug server capture in between does not count as a burst and keeps the file armed.
-    REQUIRE(schedule.Arm(false, 3, 1));
+    REQUIRE(schedule.Arm(false, false, 3, 1));
     REQUIRE(schedule.Tick(0.0) == Step::Start);
     REQUIRE(schedule.FrameSubdirectory().empty());
     REQUIRE(schedule.Tick(0.0) == Step::Finish);

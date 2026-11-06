@@ -166,6 +166,20 @@ def window(run, mh, frames, pcie, wins):
     return out
 
 
+def flash_sum(windows):
+    """Flash-monitor window counters (flash_stats "window") summed over visits; None if never measured."""
+    ws = [w for w in windows if w]
+    if not ws:
+        return None
+    out = {k: sum(w.get(k) or 0 for w in ws)
+           for k in ("frames", "judged", "duplicates", "gaps", "flashes", "flicker_frames", "flicker_tiles")}
+    out["max_jump"] = r2(max(w.get("max_jump") or 0 for w in ws), 1)
+    out["max_tile_jump"] = r2(max(w.get("max_tile_jump") or 0 for w in ws), 1)
+    flashes = [w["last_flash_frame"] for w in ws if w.get("last_flash_frame") is not None]
+    out["last_flash_frame"] = max(flashes) if flashes else None
+    return out
+
+
 def analyze(rundir):
     rundir = Path(rundir)
     run = json.loads((rundir / "run.json").read_text())
@@ -176,25 +190,44 @@ def analyze(rundir):
                "result": run.get("result"), "failed_step": run.get("failed_step"),
                "shutdown": run.get("shutdown"), "steps": run.get("steps", []),
                "phases": {}, "headings": [], "heading_visits": [],
-               "gdb": run.get("gdb"), "svc_trace": run.get("svc_trace")}
+               "gdb": run.get("gdb"), "svc_trace": run.get("svc_trace"), "flash": run.get("flash")}
     groups = {}
     for ph in run.get("phases", []):
         if ph.get("kind") == "heading":
             groups.setdefault(ph["name"], []).append(ph)
         else:
-            summary["phases"][ph["name"]] = window(run, mh, frames, pcie, [(ph["start"], ph["end"])])
+            st = summary["phases"][ph["name"]] = window(run, mh, frames, pcie, [(ph["start"], ph["end"])])
+            st["flash"] = flash_sum([ph.get("flash")])
     for name in sorted(groups):
         st = window(run, mh, frames, pcie, [(p["start"], p["end"]) for p in groups[name]])
         st["name"] = name
         st["screenshots"] = [p.get("screenshot") for p in groups[name]]
+        st["flash"] = flash_sum([p.get("flash") for p in groups[name]])
         summary["headings"].append(st)
         for p in groups[name]:
             v = window(run, mh, frames, pcie, [(p["start"], p["end"])])
             v["name"] = f"{name}/c{p.get('cycle', 0)}"
+            v["flash"] = flash_sum([p.get("flash")])
             summary["heading_visits"].append(v)
+    total = _g(run, "flash", "final", "total")
+    if total and "in-game" in summary["phases"]:
+        # in-game = everything since flash_monitor started, camera turns included
+        summary["phases"]["in-game"]["flash"] = flash_sum([total])
     if presents:
         summary["vi2_present_windows"] = [{"log_t": t, "frame_us": a, "max_us": b} for t, a, b in presents[-20:]]
     (rundir / "summary.json").write_text(json.dumps(summary, indent=2))
+    # host contention: MangoHud's system-wide CPU load (the emulator alone is ~27-30 % on a 24-thread
+    # box; builds in flight push it far higher and invalidate the fps numbers) + the preflight record
+    hl = run.get("host_load_start") or {}
+    host = {"load1_start": hl.get("load1"), "build_procs_start": hl.get("build_procs")}
+    try:
+        mrow = next(iter(csv.DictReader(open(rundir / "mangohud_summary.csv"))))
+        host["cpu_load_avg"] = float(mrow.get("CPU Load", "nan"))
+        host["cpu_load_peak"] = float(mrow.get("Peak CPU Load", "nan"))
+    except (OSError, StopIteration, ValueError):
+        pass
+    host["tainted"] = bool((host.get("cpu_load_avg") or 0) > 40 or (host.get("build_procs_start") or 0) > 0)
+    summary["host"] = host
     (rundir / "summary.md").write_text(render_md(summary))
     return summary
 
@@ -216,9 +249,14 @@ def render_md(s):
          f"- result: **{s['result']}**" + (f" (failed at `{s['failed_step']}`)" if s.get("failed_step") else ""),
          f"- binary: `{s['binary']}`",
          f"- env: " + (", ".join(f"`{k}={v}`" for k, v in sorted(s["env"].items())) or "-"),
-         f"- shutdown: {s.get('shutdown')}", ""]
+         f"- shutdown: {s.get('shutdown')}",
+         "- host: " + (lambda h: (f"system CPU load avg {h.get('cpu_load_avg')} % / peak {h.get('cpu_load_peak')} %, "
+                                 f"load1 {h.get('load1_start')} with {h.get('build_procs_start')} build procs at start"
+                                 + (" — **TAINTED by host contention; do not compare fps**" if h.get('tainted') else "")))(s.get("host") or {}),
+         ""]
     cols = ["window", "s", "fps med", "fps p5", "fps p95", "ft p95 ms", "ft p99 ms", "guest fps",
-            "disp/f", "marked KB/f", "fence MB/f", "pool coll KB/f", "pool appl KB/f", "rx MB/s p95", "sm %"]
+            "disp/f", "marked KB/f", "fence MB/f", "pool coll KB/f", "pool appl KB/f", "rx MB/s p95", "sm %",
+            "flashes", "flicker"]
     L += ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
 
     def row(name, st):
@@ -228,7 +266,7 @@ def render_md(s):
                 _g(st, "log", "per_frame", "native_dispatches"), _g(st, "log", "per_frame", "native_marked_KB"),
                 _g(st, "log", "per_frame", "fence_copy_MB"), _g(st, "log", "per_frame", "pool_collected_KB"),
                 _g(st, "log", "per_frame", "pool_applied_KB"), _g(st, "pcie", "rx_MBps_p95"),
-                _g(st, "pcie", "gpu_sm_pct_median")]
+                _g(st, "pcie", "gpu_sm_pct_median"), _g(st, "flash", "flashes"), _g(st, "flash", "flicker_frames")]
         L.append("| " + " | ".join(_fmt(v) for v in vals) + " |")
 
     for name, st in s["phases"].items():
@@ -242,6 +280,8 @@ def render_md(s):
           "screenshots/heading<q>-c<cycle>.png show each view.",
           "fps = MangoHud (host presents, 100 ms rows); guest fps = emulator log frame lines; /f = per guest "
           "frame (totals in summary.json).", ""]
+    if s.get("flash"):
+        L += render_flash(s["flash"])
     if s.get("steps"):
         L += ["## Steps", ""] + [f"- {st['t']:7.1f}s {st['step']}: {st['status']}" + (f" — {st['note']}" if st.get("note") else "")
                                   for st in s["steps"]]
@@ -255,6 +295,36 @@ def render_md(s):
               f"- window presents {t.get('window')}; `svc-trace.md` (parser exit {t.get('parse_exit')}"
               + (", thread names from the stub)" if t.get("threads") else ", no thread names: add --gdb)")]
     return "\n".join(L) + "\n"
+
+
+def render_flash(f):
+    fin = f.get("final") or {}
+    t = fin.get("total") or {}
+    L = ["## Flash / flicker monitor", ""]
+    if not fin:
+        return L + [f"- not measured: {f.get('error') or 'no final flash_stats'}", ""]
+    L += [f"- flashes = frames whose centre-half mean luma (0-255) is >= {fin.get('flash_jump')} above BOTH "
+          f"neighbouring frames; flicker = non-flash frames where at least one of the 8x6 tiles' mean or "
+          f"deviation spikes >= {fin.get('tile_jump')} over both neighbours (a one-frame spike or dip). "
+          "Probe: every present downsampled to 64x36 (nearest) on the GPU; exact repeats of the previous "
+          "present are skipped, so a guest frame shown twice still counts as one frame.",
+          f"- in-game row = everything since the monitor started, camera turns included; heading/phase rows = "
+          f"the still windows only.",
+          f"- totals: {t.get('flashes')} flashes, {t.get('flicker_frames')} flicker frames "
+          f"({t.get('flicker_tiles')} tile spikes) over {t.get('frames')} probed presents "
+          f"({t.get('judged')} judged, {t.get('duplicates')} repeats, {t.get('gaps')} gaps, "
+          f"{fin.get('dropped_samples')} dropped); max centre jump {r2(t.get('max_jump'))}, "
+          f"max tile jump {r2(t.get('max_tile_jump'))}, last flash at probe frame {t.get('last_flash_frame')}",
+          f"- cost per present: CPU {r2(fin.get('cpu_mean_ms'), 3)} ms mean / {r2(fin.get('cpu_max_ms'), 3)} max, "
+          f"GPU blit+copy {r2(fin.get('gpu_mean_ms'), 3)} ms mean / {r2(fin.get('gpu_max_ms'), 3)} max"]
+    cap = fin.get("first_flash_capture")
+    if cap:
+        L.append(f"- first-flash frame dump: `{cap.get('directory')}` (flash at probe frame {cap.get('trigger_frame')}, "
+                 f"captured frame {cap.get('capture_frame')}, complete={cap.get('complete')}"
+                 + (f", error {cap['error']}" if cap.get("error") else "") + "); the dump stalls the window it lands in")
+    elif f.get("capture_first"):
+        L.append("- first-flash frame dump: none (no flash detected)")
+    return L + [""]
 
 
 if __name__ == "__main__":

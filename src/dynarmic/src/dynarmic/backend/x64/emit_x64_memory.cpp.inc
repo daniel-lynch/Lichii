@@ -126,7 +126,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
         bool require_abort_handling = false;
         const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
 
-        const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
+        const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered, conf.x64_tso_memory);
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
@@ -141,7 +141,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
         // Use page table
         ASSERT(conf.page_table);
         const auto src_ptr = EmitVAddrLookup(code, ctx, bitsize, *abort, vaddr);
-        EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
+        EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered, conf.x64_tso_memory);
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
@@ -374,7 +374,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
 
         const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
 
-        const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
+        const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered, conf.x64_tso_memory);
 
         AddFastmemPatch(location, code.getCurr(), wrapped_fn, *fastmem_marker, conf.recompile_on_exclusive_fastmem_failure);
 
@@ -465,7 +465,7 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
             code.movq(rcx, xmm0);
         }
     } else {
-        EmitReadMemoryMov<bitsize>(code, rax.getIdx(), tmp, false);
+        EmitReadMemoryMov<bitsize>(code, rax.getIdx(), tmp, false, false);
     }
 
     const auto fastmem_marker = ShouldFastmem(ctx, inst);

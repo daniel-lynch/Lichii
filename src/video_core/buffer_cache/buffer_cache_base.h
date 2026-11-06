@@ -35,6 +35,7 @@
 #include "common/slot_vector.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
@@ -43,6 +44,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_download_trace.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
 
@@ -629,6 +631,8 @@ private:
     /// Downloads the GPU-written data of several buffers with one wait for the GPU.
     void DownloadBuffersMemory(std::span<const BufferId> buffer_ids);
 
+    void DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges);
+
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
 
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
@@ -821,10 +825,14 @@ private:
         if (queued < size && !ArmReadTraps(device_addr, size)) {
             uncommitted_gpu_modified_ranges.Add(device_addr, size);
         }
+        if (Nx2DownloadTrace::g_enabled && queued != 0) [[unlikely]] {
+            Nx2DownloadTrace::Queued(device_addr, size, queued);
+        }
     }
 
     /// GPU writes that are not downloaded at fences: trap the guest CPU's next read of their
-    /// pages, which flushes them once and marks them Preflushable (then DownloadsAtFence).
+    /// pages, which flushes them on demand (native titles, #184) or once and marks them
+    /// Preflushable (then DownloadsAtFence).
     /// Returns false when a page could not be trapped: the caller downloads the write at the
     /// fence instead.
     bool ArmReadTraps(DAddr device_addr, u64 size) {
@@ -855,6 +863,12 @@ private:
     Common::RangeSet<DAddr> read_trapped_ranges;
     /// Ranges ArmReadTraps could not arm all of this frame (cleared by TickFrame).
     Common::RangeSet<DAddr> unarmed_read_trap_ranges;
+    /// Ranges the guest CPU read after GPU writes. A read that must flush downloads the GPU
+    /// writes in all of them, so the reads that usually follow it find nothing left to flush.
+    /// (#184's ReadTrapTracker is not used: the RangeSet above records a range only once the core
+    /// armed all of it, and remembers the ranges it could not.)
+    Common::RangeSet<DAddr> cpu_read_ranges;
+    bool download_cpu_read_ranges{};
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 
