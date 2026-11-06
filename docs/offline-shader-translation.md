@@ -1,5 +1,7 @@
 # Offline shader translation
 
+when a shader structure gains a field, update the X list and the count; the build fails otherwise.
+
 `eden-cli --shader-archive-index FILE` translates extracted native archive programs
 using the initialized Vulkan renderer's profile, host info, configuration digest and
 normal per-title translation-cache file. It implies `--precompile-shaders`. There

@@ -151,6 +151,32 @@ constexpr size_t RuntimeInfoFields = 19;
 constexpr size_t ProgramFields = 13;
 constexpr size_t BindingsFields = 7;
 
+// Aggregate counts also catch new fields that fit in existing padding. Keep the X lists and
+// counts in sync: changing only a count must not silently leave a field out of serialization.
+#define TRANSLATION_CACHE_COUNT_FIELD(field) + 1
+static_assert(0 TRANSLATION_CACHE_PROFILE_FIELDS(TRANSLATION_CACHE_COUNT_FIELD) == ProfileFields,
+              "Shader::Profile: update the translation cache X list and field count together");
+static_assert(0 TRANSLATION_CACHE_INFO_FIELDS(TRANSLATION_CACHE_COUNT_FIELD,
+                                            TRANSLATION_CACHE_COUNT_FIELD,
+                                            TRANSLATION_CACHE_COUNT_FIELD,
+                                            TRANSLATION_CACHE_COUNT_FIELD) == InfoFields,
+              "Shader::Info: update the translation cache X list and field count together");
+#undef TRANSLATION_CACHE_COUNT_FIELD
+
+#define TRANSLATION_CACHE_COVERED_STRUCTURES(X) \
+    X(Shader::Info, InfoFields) \
+    X(Shader::Profile, ProfileFields) \
+    X(Shader::HostTranslateInfo, HostFields) \
+    X(Shader::RuntimeInfo, RuntimeInfoFields) \
+    X(Shader::IR::Program, ProgramFields) \
+    X(Shader::Backend::Bindings, BindingsFields)
+
+#define TRANSLATION_CACHE_ASSERT_COVERED(type, count) \
+    static_assert(CountFields<type>() == count, \
+                  #type ": update shader_translation_cache.cpp field coverage and count");
+TRANSLATION_CACHE_COVERED_STRUCTURES(TRANSLATION_CACHE_ASSERT_COVERED)
+#undef TRANSLATION_CACHE_ASSERT_COVERED
+
 class Writer {
 public:
     explicit Writer(std::vector<u8>& out_) : out{out_} {}
@@ -1309,13 +1335,22 @@ bool InfoEqual(const Shader::Info& lhs, const Shader::Info& rhs) {
 }
 
 bool LayoutIsCovered() {
-    return CountFields<Shader::Info>() == InfoFields &&
-           CountFields<Shader::Profile>() == ProfileFields &&
-           CountFields<Shader::HostTranslateInfo>() == HostFields &&
-           CountFields<Shader::RuntimeInfo>() == RuntimeInfoFields &&
-           CountFields<Shader::IR::Program>() == ProgramFields &&
-           CountFields<Shader::Backend::Bindings>() == BindingsFields;
+    // Function-local initialization is thread-safe and reports each uncovered type only once.
+    static const bool covered = [] {
+        bool result = true;
+#define TRANSLATION_CACHE_CHECK_COVERED(type, count) \
+        if (CountFields<type>() != count) { \
+            LOG_ERROR(Render_Vulkan, "Translation cache off: {} has fields it does not store " \
+                      "(update shader_translation_cache.cpp)", #type); \
+            result = false; \
+        }
+        TRANSLATION_CACHE_COVERED_STRUCTURES(TRANSLATION_CACHE_CHECK_COVERED)
+#undef TRANSLATION_CACHE_CHECK_COVERED
+        return result;
+    }();
+    return covered;
 }
+#undef TRANSLATION_CACHE_COVERED_STRUCTURES
 
 namespace {
 u64 ResidentBudget() {
@@ -1406,9 +1441,6 @@ void Store::Close() {
 void Store::Open(const std::filesystem::path& path, const Digest& config) {
     Close();
     if (!LayoutIsCovered()) {
-        LOG_WARNING(Render_Vulkan,
-                    "Translation cache off: a shader structure has fields it does not store "
-                    "(update shader_translation_cache.cpp)");
         return;
     }
     std::scoped_lock writer_lock{writer_mutex};

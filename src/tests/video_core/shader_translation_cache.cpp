@@ -134,9 +134,17 @@ std::filesystem::path TempPath(const char* name) {
 }
 } // Anonymous namespace
 
-TEST_CASE("Translation cache covers every field of the shader structures",
-          "[video_core][translation_cache]") {
+TEST_CASE("cache is enabled for this build", "[video_core][translation_cache]") {
     REQUIRE(LayoutIsCovered());
+    const Shader::Profile profile{};
+    const Shader::HostTranslateInfo host_info{};
+    Store store;
+    store.Open({}, MakeConfigDigest(profile, host_info, 0));
+    REQUIRE(store.Enabled());
+    const ProgramMeta meta{.info = SampleInfo()};
+    const auto entry = store.Insert(Digest{0x12, 0x34}, {}, meta);
+    REQUIRE(entry);
+    REQUIRE(InfoEqual(entry->meta.info, meta.info));
 }
 
 TEST_CASE("Translation cache separates fragment shuffle workaround profiles",
