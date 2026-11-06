@@ -50,6 +50,26 @@ if [ "${OOT_CAPTURE:-0}" = "1" ]; then
   export EDEN_NX2_FRAME_DUMP="$OOT/framedump/$STAMP" EDEN_NX2_FRAME_DUMP_AT=file EDEN_NX2_FRAME_DUMP_SAMPLED=1
   export EDEN_NX2_FRAME_DUMP_COUNT="${OOT_CAPTURE_FRAMES:-1}"   # consecutive frames per trigger (needs the burst patch)
 fi
+# OOT_AOT=1 turns on shader AOT translation (default off until feat/shader-aot-manifest merges;
+# needs a build of that branch, e.g. BIN=~/dev/Lichii-aot2/build-aot2/bin/lichii). Its inputs are
+# built from the game's own files into ~/Downloads/OOT/aot/ (see its README.md), never here:
+# the pool index, and a directory of static scene manifests the emulator loads and unites.
+# OOT_AOT_MANIFEST=<file or dir> overrides the manifest set; OOT_AOT_WORKERS=N sets the
+# translation threads (unset = the emulator's default, 2).
+if [ "${OOT_AOT:-0}" = "1" ]; then
+  AOT_INDEX="$OOT/aot/index/oot-aot-index.bin"
+  if [ -f "$AOT_INDEX" ]; then
+    export EDEN_NX2_AOT_TRANSLATE=1 EDEN_NX2_AOT_INDEX="$AOT_INDEX" EDEN_NX2_AOT_SEED=1
+    export EDEN_NX2_AOT_MANIFEST="${OOT_AOT_MANIFEST:-$OOT/aot/manifests}"
+    [ -n "${OOT_AOT_WORKERS:-}" ] && export EDEN_NX2_AOT_WORKERS="$OOT_AOT_WORKERS"
+    [ -e "$EDEN_NX2_AOT_MANIFEST" ] || echo "OOT_AOT: no manifests at $EDEN_NX2_AOT_MANIFEST (index only; see $OOT/aot/README.md)" >&2
+    echo "OOT_AOT: index $AOT_INDEX, manifests $EDEN_NX2_AOT_MANIFEST"
+  else
+    echo "OOT_AOT: no pool index at $AOT_INDEX, AOT left off. Build it once per game version with" >&2
+    echo "  mkdir -p $OOT/aot/index && nice -n 10 python3 -I ~/dev/Lichii-aot2/tools/oot/container/aot_index.py <OoT .nup> $OOT/extract/zsdic $AOT_INDEX" >&2
+    echo "  (then the manifests: see $OOT/aot/README.md)" >&2
+  fi
+fi
 # MangoHud: overlay + CSV of fps/frametime, starts 5 s after launch, runs until exit.
 export MANGOHUD=1
 export MANGOHUD_CONFIG="fps,frametime,gpu_stats,cpu_stats,output_folder=$OOT/logs,autostart_log=5,log_duration=0,log_interval=100"
