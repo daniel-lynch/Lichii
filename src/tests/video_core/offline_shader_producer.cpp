@@ -94,8 +94,8 @@ TEST_CASE("Recipe selection counts variants and preserves full emission inputs",
     common.runtime.fixed_state_point_size = 2.5f;
     common.runtime.alpha_test_func = Shader::CompareFunction::Greater;
     common.runtime.alpha_test_reference = 0.25f;
-    common.runtime.xfb_count = 1;
-    common.runtime.xfb_varyings[0] = {1, 2, 3, 4, 1};
+    common.runtime.xfb_count = 33;
+    common.runtime.xfb_varyings[32] = {1, 2, 8, 4, 1};
     auto rare = common;
     rare.bindings.texture = 8;
     {

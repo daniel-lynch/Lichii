@@ -7,6 +7,7 @@
 #include <bit>
 #include <chrono>
 #include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -221,6 +222,9 @@ public:
         static_assert(std::is_trivially_copyable_v<T>);
         if (in.size() < sizeof(T)) {
             return false;
+        }
+        if constexpr (std::is_same_v<T, bool>) {
+            if (in[0] > 1) return false;
         }
         std::memcpy(&value, in.data(), sizeof(T));
         in = in.subspan(sizeof(T));
@@ -814,6 +818,62 @@ void WriteRecipe(Writer& writer, const EmissionRecipe& recipe) {
     }
 }
 
+template <typename E>
+bool EnumInRange(E value, E last) {
+    return static_cast<u64>(value) <= static_cast<u64>(last);
+}
+
+bool ValidAttribute(Shader::IR::Attribute attribute) {
+    switch (attribute) {
+#define SRIR_ATTRIBUTE_ELEM(name, value) case Shader::IR::Attribute::name: return true;
+        SRIR_ATTRIBUTE_LIST
+#undef SRIR_ATTRIBUTE_ELEM
+    default: return false;
+    }
+}
+
+bool ValidRecipe(const EmissionRecipe& recipe) {
+    const auto& info = recipe.runtime;
+    const auto valid_type = [](Shader::AttributeType type) {
+        return EnumInRange(type, Shader::AttributeType::Disabled);
+    };
+    if (!std::ranges::all_of(info.generic_input_types, valid_type) ||
+        !std::ranges::all_of(info.color_output_types, valid_type) ||
+        !EnumInRange(info.tess_primitive, Shader::TessPrimitive::Quads) ||
+        !EnumInRange(info.tess_spacing, Shader::TessSpacing::FractionalEven) ||
+        !EnumInRange(info.input_topology, Shader::InputTopology::TrianglesAdjacency) ||
+        (info.alpha_test_func && !EnumInRange(*info.alpha_test_func, Shader::CompareFunction::Always)) ||
+        !std::isfinite(info.alpha_test_reference) ||
+        (info.fixed_state_point_size && (!std::isfinite(*info.fixed_state_point_size) ||
+                                        *info.fixed_state_point_size <= 0))) return false;
+    // Imported binding bases must leave room for descriptor increments. Scaling indices
+    // address the fixed 128-texture and 64-image push-constant masks (end positions allowed).
+    const auto& bindings = recipe.bindings;
+    if (bindings.unified > 65535 || bindings.uniform_buffer > 65535 ||
+        bindings.storage_buffer > 65535 || bindings.texture > 65535 || bindings.image > 65535 ||
+        bindings.texture_scaling_index > 128 || bindings.image_scaling_index > 64) return false;
+    for (const auto& [from, to] : info.previous_stage_legacy_stores_mapping) {
+        if (!ValidAttribute(from) || !Shader::IR::IsGeneric(to)) return false;
+    }
+    if (info.xfb_count > info.xfb_varyings.size()) return false;
+    for (u32 slot = 0; slot < info.xfb_count; ++slot) {
+        const auto& varying = info.xfb_varyings[slot];
+        // Unused slots in the sparse attribute-indexed array have an all-zero record.
+        if (varying.components == 0) {
+            if (varying.buffer || varying.stream || varying.stride || varying.offset) return false;
+            continue;
+        }
+        // Each of the four Maxwell stream-out buffers has 128 scalar slots (512 bytes).
+        if (!ValidAttribute(static_cast<Shader::IR::Attribute>(slot)) ||
+            varying.components > 4 || varying.components > 4 - slot % 4 ||
+            varying.buffer >= 4 || varying.stream >= 4 ||
+            varying.stride == 0 || varying.stride > 512 || varying.stride % 4 ||
+            varying.offset % 4 || varying.offset >= varying.stride ||
+            varying.components * 4 > varying.stride - varying.offset) return false;
+    }
+    return true;
+}
+
 bool ReadRecipe(Reader& reader, EmissionRecipe& recipe) {
     if (!reader.Get(recipe.bindings)) return false;
     auto& info = recipe.runtime;
@@ -827,17 +887,19 @@ bool ReadRecipe(Reader& reader, EmissionRecipe& recipe) {
     if (!reader.Get(has_point) || !reader.Get(point) || !reader.Get(has_alpha) ||
         !reader.Get(alpha) || !reader.Get(count) || count > 512 ||
         info.xfb_count > info.xfb_varyings.size()) return false;
+    if (!EnumInRange(alpha, Shader::CompareFunction::Always) || !std::isfinite(point)) return false;
     if (has_point) info.fixed_state_point_size = point;
     if (has_alpha) info.alpha_test_func = alpha;
     for (u32 i = 0; i < count; ++i) {
         Shader::IR::Attribute from{}, to{};
-        if (!reader.Get(from) || !reader.Get(to)) return false;
+        if (!reader.Get(from) || !reader.Get(to) || !ValidAttribute(from) ||
+            !Shader::IR::IsGeneric(to)) return false;
         info.previous_stage_legacy_stores_mapping.emplace(from, to);
     }
     for (u32 i = 0; i < info.xfb_count; ++i) {
         if (!reader.Get(info.xfb_varyings[i])) return false;
     }
-    return true;
+    return ValidRecipe(recipe);
 }
 #undef RECIPE_FIELDS
 } // namespace
@@ -962,6 +1024,7 @@ RecipeCatalog Store::ReadRecipeCatalog(const std::filesystem::path& path, const 
             source.entry_recipes.erase(it);
         }
     }
+    result.invalid_recipes = source.invalid_recipes;
     result.skipped_records = source.skipped_import_records;
     result.imported_bytes = source.imported_bytes;
     source.Close();
@@ -1279,6 +1342,7 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
     }
     skipped_import_records = 0;
     imported_bytes = 0;
+    invalid_recipes = 0;
     std::unordered_set<Digest, DigestHash> imported_entries;
     std::unordered_set<Digest, DigestHash> imported_variants;
     size_t offset = HeaderSize;
@@ -1332,7 +1396,13 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
             EmissionRecipe recipe;
             ok = ok && reader.Get(has_recipe);
             if (ok && has_recipe) {
-                ok = reader.Get(stage) && ReadRecipe(reader, recipe);
+                ok = reader.Get(stage) && static_cast<size_t>(stage) < Shader::MaxStageTypes &&
+                     ReadRecipe(reader, recipe);
+                if (!ok) {
+                    ++invalid_recipes;
+                    offset += 8 + length;
+                    continue;
+                }
             }
             ok = ok && record.empty();
             if (ok && collect_recipe_entries) {
@@ -1361,6 +1431,9 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
         offset += 8 + length;
     }
     in.close();
+    if (invalid_recipes)
+        LOG_WARNING(Render_Vulkan, "Translation cache: skipped {} invalid recipes in {}",
+                    invalid_recipes, Common::FS::PathToUTF8String(path));
     if (!writable) return true;
     if (offset != size) {
         // A record cut short (the emulator stopped while writing) or damaged: keep what precedes.

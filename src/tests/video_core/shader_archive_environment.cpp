@@ -248,6 +248,11 @@ TEST_CASE("Offline producer resumes complete modules and repairs interrupted app
         ProgramMeta meta{};
         meta.stage = Shader::Stage::VertexB;
         const auto entry = recipes.Insert(key, {}, meta);
+        auto malformed = DefaultEmissionRecipe(meta.stage);
+        malformed.runtime.xfb_count = 33;
+        malformed.runtime.xfb_varyings[32] = {0, 0, 16, 0, 9};
+        REQUIRE(recipes.InsertVariant(*entry, {99, 100},
+            {.spirv = {0x07230203, 0x10000, 0, 1, 0}}, &malformed));
         for (u32 texture : {2, 3, 4}) {
             auto recipe = DefaultEmissionRecipe(meta.stage);
             recipe.bindings.texture = texture;
@@ -256,6 +261,7 @@ TEST_CASE("Offline producer resumes complete modules and repairs interrupted app
                 {.spirv = {0x07230203, 0x10000, 0, 1, 0}}, &recipe));
         }
     }
+    REQUIRE(Store::ReadRecipeCatalog(recipes_path, config).invalid_recipes == 1);
     {
         Store store;
         store.Open(directory / "multi.bin", config);

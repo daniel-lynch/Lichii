@@ -16,6 +16,7 @@
 #include "common/fs/path_util.h"
 #include "video_core/shader_pool_index.h"
 #include "shader_recompiler/translator_identity.h"
+#include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "video_core/shader_translation_cache.h"
 #include "video_core/shader_archive_environment.h"
 
@@ -1089,4 +1090,106 @@ TEST_CASE("Recipe catalogs cap exact selection and total import size",
     }));
     Common::Log::SetRingCapacity(0);
     std::filesystem::remove(path);
+}
+
+TEST_CASE("Recipe import skips malformed fields and continues with later records",
+          "[video_core][translation_cache]") {
+    const auto path = TempPath("lichii_invalid_recipe.bin");
+    std::filesystem::remove(path);
+    const Digest config{81, 82}, key{83, 84};
+    const auto stage = Shader::Stage::VertexB;
+    auto bad = DefaultEmissionRecipe(stage);
+    bad.runtime.xfb_count = 33;
+    bad.runtime.xfb_varyings[32] = {0, 0, 16, 0, 4};
+    SECTION("nine components") { bad.runtime.xfb_varyings[32].components = 9; }
+    SECTION("buffer outside hardware slots") { bad.runtime.xfb_varyings[32].buffer = 4; }
+    SECTION("stream outside hardware slots") { bad.runtime.xfb_varyings[32].stream = 4; }
+    SECTION("offset outside stride") { bad.runtime.xfb_varyings[32].offset = 16; }
+    SECTION("oversized stride") { bad.runtime.xfb_varyings[32].stride = UINT32_MAX; }
+    SECTION("partial unused slot") { bad.runtime.xfb_varyings[32].components = 0; }
+    SECTION("invalid attribute slot") { bad.runtime.xfb_varyings[0] = {0, 0, 4, 0, 1}; }
+    SECTION("vector boundary") {
+        bad.runtime.xfb_varyings[31] = {0, 0, 16, 0, 2};
+    }
+    SECTION("input type enum") {
+        bad.runtime.generic_input_types[0] = static_cast<Shader::AttributeType>(255);
+    }
+    SECTION("color type enum") {
+        bad.runtime.color_output_types[0] = static_cast<Shader::AttributeType>(255);
+    }
+    SECTION("topology enum") { bad.runtime.input_topology = static_cast<Shader::InputTopology>(-1); }
+    SECTION("tessellation primitive enum") { bad.runtime.tess_primitive = static_cast<Shader::TessPrimitive>(3); }
+    SECTION("tessellation spacing enum") { bad.runtime.tess_spacing = static_cast<Shader::TessSpacing>(3); }
+    SECTION("compare enum") { bad.runtime.alpha_test_func = static_cast<Shader::CompareFunction>(8); }
+    SECTION("mapping source") {
+        bad.runtime.previous_stage_legacy_stores_mapping[static_cast<Shader::IR::Attribute>(512)] = Shader::IR::Attribute::Generic0X;
+    }
+    SECTION("mapping target") {
+        bad.runtime.previous_stage_legacy_stores_mapping[Shader::IR::Attribute::ColorFrontDiffuseR] = static_cast<Shader::IR::Attribute>(512);
+    }
+    SECTION("point size") { bad.runtime.fixed_state_point_size = -1.0f; }
+    SECTION("binding overflow") { bad.bindings.texture = UINT32_MAX; }
+    SECTION("scaling index") { bad.bindings.texture_scaling_index = 129; }
+    {
+        Store source;
+        source.Open(path, config);
+        const auto entry = source.Insert(key, {}, {.stage = stage});
+        // The writer supplies the framing; this record's recipe payload is deliberately malformed.
+        REQUIRE(source.InsertVariant(*entry, {91, 92}, {.spirv = {0x07230203, 1, 2}}, &bad));
+        const auto good = DefaultEmissionRecipe(stage);
+        REQUIRE(source.InsertVariant(*entry, {93, 94}, {.spirv = {0x07230203, 1, 2}}, &good));
+    }
+    Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, path.parent_path());
+    Common::Log::Initialize();
+    Common::Log::SetGlobalFilter(Common::Log::Filter{Common::Log::Level::Info});
+    Common::Log::SetRingCapacity(64);
+    const auto size = std::filesystem::file_size(path);
+    const auto catalog = Store::ReadRecipeCatalog(path, config);
+    REQUIRE(catalog.invalid_recipes == 1);
+    REQUIRE(catalog.exact.at(key).size() == 1);
+    const auto lines = Common::Log::ReadRing(0);
+    REQUIRE(std::ranges::any_of(lines, [&](const auto& line) {
+        return line.text.find("skipped 1 invalid recipes in " + path.string()) != std::string::npos;
+    }));
+    Common::Log::SetRingCapacity(0);
+    Store runtime;
+    REQUIRE_NOTHROW(runtime.Open(path, config));
+    REQUIRE(runtime.Persistent());
+    REQUIRE_FALSE(runtime.FindVariant({91, 92}));
+    REQUIRE(runtime.FindVariant({93, 94}));
+    REQUIRE(std::filesystem::file_size(path) == size);
+    runtime.Close();
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("SPIR-V emission bounds transform-feedback components to each output vector",
+          "[video_core][translation_cache]") {
+    Shader::IR::Program program;
+    program.stage = Shader::Stage::VertexB;
+    program.info.stores.Set(Shader::IR::Attribute::Generic0X);
+    Shader::Profile profile{};
+    profile.supported_spirv = 0x00010300;
+    Shader::RuntimeInfo runtime{};
+    runtime.xfb_count = 36;
+    runtime.xfb_varyings[32] = {0, 0, 16, 0, 9};
+    u32 first_components = 4;
+    SECTION("oversized first vector") {}
+    SECTION("oversized remaining component") {
+        runtime.xfb_varyings[32].components = 3;
+        runtime.xfb_varyings[35] = {0, 0, 16, 12, 9};
+        first_components = 3;
+    }
+    Shader::Backend::Bindings bindings{};
+    Shader::Backend::SPIRV::EmitContext context(profile, runtime, program, bindings);
+    for (u32 i = 0; i < first_components; ++i) {
+        REQUIRE(context.output_generics[0][i].num_components == first_components);
+        REQUIRE(context.output_generics[0][i].first_element == 0);
+    }
+    if (first_components == 3) {
+        REQUIRE(context.output_generics[0][3].num_components == 1);
+        REQUIRE(context.output_generics[0][3].first_element == 3);
+    }
+    for (const auto& component : context.output_generics[1]) {
+        REQUIRE(component.num_components == 0);
+    }
 }
