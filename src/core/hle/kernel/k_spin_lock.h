@@ -32,7 +32,12 @@ private:
 };
 
 // TODO(bunnei): Alias for now, in case we want to implement these accurately in the future.
-using KAlignedSpinLock = KSpinLock;
+// On a cache line of its own: the scheduler lock is spun on by every core, while its holder
+// writes the data next to it (lock count, owner, the priority queue's bitsets).
+class alignas(64) KAlignedSpinLock : public KSpinLock {
+public:
+    KAlignedSpinLock() = default;
+};
 using KNotAlignedSpinLock = KSpinLock;
 
 using KScopedSpinLock = KScopedLock<KSpinLock>;

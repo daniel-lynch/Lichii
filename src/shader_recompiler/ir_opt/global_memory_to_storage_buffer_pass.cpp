@@ -2556,9 +2556,21 @@ bool NativeDynamicCbufPointers() {
 bool NativeIndirectPointers() {
     static const bool enabled = [] {
         // Opt-in since the merge of upstream #150 (=1 or =guest), whose table entries are the
-        // default; also gates the in-bounds check of the SPIR-V runtime pick.
+        // default. Also forces on the in-bounds check of the SPIR-V runtime pick
+        // (NativeStorageBoundsCheck).
         const char* const value = std::getenv("EDEN_NX2_INDIRECT_POINTERS");
         return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool NativeStorageBoundsCheck() {
+    static const bool enabled = [] {
+        // On by default; EDEN_NX2_SSBO_BOUNDS_CHECK=0 restores upstream's unbounded pick. Always
+        // on with EDEN_NX2_INDIRECT_POINTERS, whose record bindings rely on it.
+        const char* const value = std::getenv("EDEN_NX2_SSBO_BOUNDS_CHECK");
+        const bool disabled = value != nullptr && value[0] == '0';
+        return !disabled || NativeIndirectPointers();
     }();
     return enabled;
 }

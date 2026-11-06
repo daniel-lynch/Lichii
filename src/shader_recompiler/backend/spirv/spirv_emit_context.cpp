@@ -1020,12 +1020,12 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         }};
         if (info.native_global_bounds) {
             // Native pointers carry no NVN size word. The address belongs to the candidate buffer
-            // whose base is the closest one at or below it (upstream #150). With
-            // EDEN_NX2_INDIRECT_POINTERS (14b9ce0dab), only among those whose bound length reaches
-            // it: a miss loads zero and stores nothing instead of landing out of range in the
-            // closest buffer. Buffers bound to pointers loaded from records (native_indirect) take
-            // their base from the push constants and are read only.
-            const bool bounded_pick{Optimization::NativeIndirectPointers()};
+            // whose base is the closest one at or below it (upstream #150), and, unless
+            // EDEN_NX2_SSBO_BOUNDS_CHECK=0, only among those whose bound length reaches it
+            // (14b9ce0dab): a miss loads zero and stores nothing instead of landing out of range
+            // in the closest buffer. Buffers bound to pointers loaded from records
+            // (native_indirect) take their base from the push constants and are read only.
+            const bool bounded_pick{Optimization::NativeStorageBoundsCheck()};
             std::vector<Id> bases(num_buffers);
             Id best_index{Const(~0U)};
             Id best_distance{Constant(U64, ~u64{0})};

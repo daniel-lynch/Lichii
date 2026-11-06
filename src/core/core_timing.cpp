@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <tuple>
@@ -19,9 +20,31 @@
 #include "core/core_timing.h"
 #include "core/hardware_properties.h"
 
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+
 namespace Core::Timing {
 
 constexpr s64 MAX_SLICE_LENGTH = 10000;
+
+namespace {
+// Off switches for the two HostTiming changes ported from Orchid (6e14af2079, e0a549c6db), read
+// once. EDEN_NX2_TIMING_WAKE_ALL=1 wakes the thread for every scheduled event again;
+// EDEN_NX2_TIMER_SLACK=0 keeps the kernel's default timer slack.
+bool EnvFlag(const char* name, bool fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    return *value != '0';
+}
+
+bool WakeOnlyForEarliest() {
+    static const bool enabled = !EnvFlag("EDEN_NX2_TIMING_WAKE_ALL", false);
+    return enabled;
+}
+} // Anonymous namespace
 
 constexpr u32 CPU_CLOCK_BASE_MHZ = 1020;
 constexpr u32 CPU_CLOCK_BOOST_MHZ = 1734;
@@ -74,6 +97,13 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
         timer_thread = std::jthread([this](std::stop_token stop_token) {
             Common::SetCurrentThreadName("HostTiming");
             Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
+#ifdef __linux__
+            // This thread sleeps until the next event (vsync, guest timeouts, pollers) with timed
+            // waits, which Linux lets run late by the thread's timer slack, 50 us by default.
+            if (EnvFlag("EDEN_NX2_TIMER_SLACK", true)) {
+                prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);
+            }
+#endif
             Common::SetCurrentThreadToPerformanceCores();
             on_thread_init();
             has_started = true;
@@ -149,31 +179,43 @@ bool CoreTiming::HasPendingEvents() const {
 
 void CoreTiming::ScheduleEvent(std::chrono::nanoseconds ns_into_future,
                                const std::shared_ptr<EventType>& event_type, bool absolute_time) {
+    bool earliest;
     {
         std::scoped_lock scope{basic_lock};
         const auto next_time{absolute_time ? ns_into_future : GetGlobalTimeNs() + ns_into_future};
 
-        auto h{event_queue.emplace(Event{next_time.count(), event_fifo_id++, event_type, 0})};
+        const u64 fifo_order = event_fifo_id++;
+        auto h{event_queue.emplace(Event{next_time.count(), fifo_order, event_type, 0})};
         (*h).handle = h;
+        earliest = event_queue.top().fifo_order == fifo_order;
     }
 
-    event.Set();
+    // The timing thread sleeps until the earliest event: wake it only when that changed (each
+    // wake is a futex call; kernel timeouts schedule an event for every timed wait).
+    if (earliest || !WakeOnlyForEarliest()) {
+        event.Set();
+    }
 }
 
 void CoreTiming::ScheduleLoopingEvent(std::chrono::nanoseconds start_time,
                                       std::chrono::nanoseconds resched_time,
                                       const std::shared_ptr<EventType>& event_type,
                                       bool absolute_time) {
+    bool earliest;
     {
         std::scoped_lock scope{basic_lock};
         const auto next_time{absolute_time ? start_time : GetGlobalTimeNs() + start_time};
 
+        const u64 fifo_order = event_fifo_id++;
         auto h{event_queue.emplace(
-            Event{next_time.count(), event_fifo_id++, event_type, resched_time.count()})};
+            Event{next_time.count(), fifo_order, event_type, resched_time.count()})};
         (*h).handle = h;
+        earliest = event_queue.top().fifo_order == fifo_order;
     }
 
-    event.Set();
+    if (earliest || !WakeOnlyForEarliest()) {
+        event.Set();
+    }
 }
 
 void CoreTiming::UnscheduleEvent(const std::shared_ptr<EventType>& event_type,

@@ -2733,19 +2733,36 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         const u32 width = new_info.size.width;
         const u32 height = new_info.size.height;
+        // Vulkan also clips clears to the framebuffer render area, which starts at
+        // surface_clip before it is intersected with the bound attachment sizes.
+        if (regs.surface_clip.width < width || regs.surface_clip.height < height) {
+            return false;
+        }
         if (regs.clear_control.use_scissor != 0) {
             const auto& scissor = regs.scissor_test[0];
             if (scissor.min_x != 0 || scissor.min_y != 0 || scissor.max_x < width ||
                 scissor.max_y < height) {
                 return false;
             }
+            using WindowOrigin = Tegra::Engines::Maxwell3D::Regs::WindowOrigin;
+            if (scissor.enable && regs.window_origin.mode != WindowOrigin::Mode::UpperLeft) {
+                // Vulkan flips Y around surface_clip.height, then clamps both bounds to zero
+                // (GetScissorState). Require the flipped interval to start at zero and cover
+                // the new image.
+                const u32 clip_height = regs.surface_clip.height;
+                if (scissor.max_y < clip_height || clip_height - scissor.min_y < height) {
+                    return false;
+                }
+            }
         }
         // The clear covers the framebuffer's render area, the smallest bound target.
         for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
             const auto& rt = regs.rt[index];
-            if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
-                (rt.width < width || rt.height < height)) {
-                return false;
+            if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE) {
+                // Linear targets store their width as a byte pitch, not a texel count.
+                if (rt.tile_mode.is_pitch_linear || rt.width < width || rt.height < height) {
+                    return false;
+                }
             }
         }
         if (regs.zeta_enable && regs.zeta.Address() != 0 &&
