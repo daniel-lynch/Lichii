@@ -348,3 +348,151 @@ The translation-cache FormatVersion is 9 after the merge with dev (this branch h
 - Recipes: about half of the held time left is seeded stages whose recipe guess missed (the
   fragment's bindings in follow the paired vertex program). Persisting the recipe histogram
   with the translation file would make warm sessions guess from the start.
+
+## Per-scene manifests, engine shader packs, persisted recipes (feat/shader-aot-scenes)
+
+Branch 3 closes the three gaps measured on branch 2: the union of all 81 manifests diluted
+priority, the global manifest's engine rows matched nothing, and seeds guessed before their
+class's first recipe missed. Everything stays behind the existing switches.
+
+### What was added
+
+- **Per-scene manifest selection.** When `EDEN_NX2_AOT_MANIFEST` names a directory that holds
+  `manifest-_global.json`, the global manifest is loaded at the first native program and
+  `manifest-<Scene>.json` when the game enters that scene.
+  - The RomFS builder wraps the scene files while the switch is on: the placement files
+    `Banc/<Dir>/<Scene>_Static|_Dynamic.bcett.byml.zs` and
+    `Banc/GameBancParam/<Scene>.game__banc__GameBancParam.bgyml` (240 files). Each read posts
+    the scene name (`Common::ShaderAotScene`). The pool index polls it on every draw.
+  - Which read names the scene was measured with `EDEN_NX2_AOT_SCENE_TRACE=1`, which logs every
+    Banc file read. The game reads the save's placement files at boot, behind the title. On
+    entry it reads only the scene's GameBancParam. 7 s later it reads Hyrule Field's placement
+    files, which is a neighbour prefetch. The first rule ("the last placement read") therefore
+    selected Hyrule Field for a Kokiri Forest session (runs 20261106-063022 and 063753). Now a
+    GameBancParam read commits the scene, and a placement read names it only before the first
+    entry.
+  - A new scene drops the queued candidates and replaces the previous scene's tiers; global
+    tiers stay. The new scene's programs are then offered from every pool recognised so far, in
+    tier order, after their fingerprints are verified again. Seeds already stored stay.
+  - A scene without a manifest keeps the current rows. The union of every manifest, as before,
+    is used when no scene file was hooked, with `EDEN_NX2_AOT_SCENES=0`, or when no scene is
+    entered within `EDEN_NX2_AOT_SCENE_WAIT` seconds (default 120).
+- **sharcb (BAHS) code pools in the index.** `tools/oot/container/aot_index.py` also indexes
+  the sharcb members of the Shader/ and Lib/ SARCs: the agl, gsys and terrain engine packs and
+  the application package.
+  - Each code pool (header +0x1C) is one container.
+  - Program offsets are relative to that pool, the size is NVN control +0x44, and the stage
+    comes from the BAHS record table (`shader_containers.parse_sharcb`).
+  - The LXAOTIX2 format is unchanged, and the recogniser needed no change.
+  - That agl maps the pool contiguously was not known from the file. The run verifies it:
+    siblings are checked by fingerprint, as for BNSH pools.
+- **Recipe histogram persistence.**
+  - The per-class emission recipes are written next to the translation file, as
+    `vulkan_translations.<tag>.recipes.fork-vN.bin`. They are written every 30 s when they
+    changed and at shutdown, and read when the translation file opens.
+  - The file is refused for another translation configuration. Counts from earlier sessions
+    weigh half.
+  - A recipe from the file is used like one seen this session. A wrong guess is still never
+    used, because the variant key carries the runtime info and the bindings.
+- **Re-emission takes pending slots.** Seeds re-emitted once their class's recipe is seen used
+  to be queued all at once, bounded only by the 2048 parked seeds. They now wait in a ready list
+  and take one of the 32 pending slots each. Every finished AOT job queues the next.
+- **Harness.**
+  - `--cold-shader-seed FILE` copies a file into the empty shader directory of a cold run.
+  - `--gdb` now resumes the guest only after the process is suspended (or 10 s). A `c` sent
+    earlier was lost, and the title never showed (runs 20261106-065922 and 072438).
+
+### Index regeneration
+
+    mkdir -p ~/Downloads/OOT/aot/index
+    nice -n 10 python3 -I tools/oot/container/aot_index.py <game .nup> <zstd dictionary dir> \
+      ~/Downloads/OOT/aot/index/oot-aot-index-sharcb.bin
+
+8 s and 1.2 GB peak RSS. Result: 2907 containers and 64031 programs, against 2894 and 57381
+before. The difference is 13 sharcb code pools holding 6650 programs. All 204 engine rows of
+`manifest-_global.json` now match an indexed program; 0 did before.
+
+### Measurements
+
+These are cold runs with the harness arguments above plus `EDEN_NX2_NATIVE_PREFLUSH=1`, all
+on the feat/shader-aot-scenes binary. The base moved since branch 2: fps rose from about 39 to
+about 46, so the comparison is the new "base" run, not 051402. Cells are pipelines /
+GPU-thread ms / held ms = frame-blocking. "Burst" and "After" are split as in branch 2. None of
+the runs was tainted.
+
+| Run | Config | Whole log | Burst | After | Seeds stored / drawn | Full hits / emitted at the draw | Uncovered pipelines / ms held | fps med / p5 |
+|---|---|---|---|---|---|---|---|---|
+| 20261106-070421 | off | 882 / 3427 / 362 = 3790 | 2566 | 1060 | - | - | - | 44.6 / 28.5 |
+| 20261106-065647 | base: global + Kokiri united (`EDEN_NX2_AOT_SCENES=0`), BNSH index | 894 / 1897 / 538 = 2435 | 1703 | 599 | 1002 / 267 | 111 / 156 | 358 / 297 | 46.5 / 29.7 |
+| 20261106-063022 | all 81 manifests, selection by the last placement read (picked Hyrule Field) | 886 / 2178 / 607 = 2785 | 1766 | 882 | 1359 / 184 | 79 / 105 | 396 / 444 | 49.8 / 30.5 |
+| 20261106-065902 | all 81 manifests, selection on entry (step 1) | 901 / 1846 / 585 = 2431 | 1713 | 579 | 1024 / 280 | 122 / 158 | 356 / 356 | 46.4 / 28.4 |
+| 20261106-072033 | + sharcb index (step 2) | 868 / 1927 / 883 = 2810 | 1725 | 940 | 1050 / 363 | 160 / 203 | 290 / 595 | 47.2 / 30.0 |
+| 20261106-073407 | + only 072033's recipe file in the empty shader dir (step 3) | 889 / 1881 / 335 = 2216 | 1571 | 509 | 1086 / 376 | 317 / 59 | 287 / 204 | 47.6 / 28.8 |
+
+- **Step 1.** The full directory with selection matches the global + Kokiri union: 2431
+  against 2435 frame-blocking, and 280 against 267 seeds drawn. Branch 2's union of all 81 files
+  was 2918, and the first rule here gave 2785.
+  - Manifest load: the global file is read in 2.1–2.5 ms on the loader thread and applied in
+    about 4 ms. Kokiri's is read in 20–28 ms and applied in 0.4–0.6 ms.
+  - Peak resident: 12.86 GB, against 12.78 GB for base.
+- **Step 2.**
+  - 531 of 531 global rows match (327 before), and every first use is now found in the index
+    (800 of 800).
+  - The sharcb pools verify at their expected addresses: 73 pools recognised against 66, and
+    siblings verified 19822 against 14987 (1 differed). So agl maps the code pool contiguously.
+  - Uncovered pipelines fell from 356 to 290, and seeds drawn rose from 280 to 363.
+  - Run 072033's frame-blocking rose anyway, from held time after the burst (562 ms; one
+    window has 333 ms over 28 pipelines). That run also has 5 pipelines whose worker emission
+    plus driver build took over 200 ms; sel has none. These look like first-time driver compiles
+    of SPIR-V the driver cache had not seen. Run 073407 used the same index and had none of them,
+    with 158 ms held after the burst.
+- **Step 3.** With only the recipe file, the session starts with 320 recipes of 250 classes. 602
+  seeds used a recipe from the file before this session saw it.
+  - 820 seeds were emitted with their class's recipe, against 240, and 195 parked, against 737.
+  - Full hits at the first draw rose from 160 to 317, and stages emitted at the draw fell from
+    203 to 59.
+  - Held time on seeded stages fell from 276 to 105 ms. Frame-blocking is 2216: 9 % below base
+    and 42 % below off.
+
+Scene change, using the tour kit's Kokiri Forest → Hyrule Field change. The GameBancParam read
+at 135.4 s applied Hyrule Field's manifest in 2.0 ms (34.9 ms read). It dropped 0 queued
+candidates and offered 1173 programs from 59 recognised pools. Market's placement prefetch was
+ignored.
+
+| Run | Config | Hyrule load window (10 s) | Walk in Hyrule Field (5 windows) | Seeds stored / drawn | fps med / p5 |
+|---|---|---|---|---|---|
+| 20261106-074925 | global + Kokiri united, sharcb index | 438 / 1167 / 220 = 1387 | held 906 ms | 1088 / 316 | 46.3 / 38.5 |
+| 20261106-072835 | all manifests, selection, sharcb index | 450 / 749 / 335 = 1084 | held 5876 ms | 2071 / 533 | 47.6 / 36.6 |
+
+- With the scene's manifest, the load window's GPU-thread time fell by 418 ms (−36 %), and its
+  frame-blocking by 303 ms (−22 %).
+- The walk windows held 5.9 s against 0.9 s. In run 072835, 4 pipelines spent over 500 ms in
+  worker emission plus driver build (2563, 2568, 742 and 732 ms), against 1 in run 074925.
+  These are probably the same first-sight driver compiles as in run 072033. That is not
+  established: it needs a repeat of 072835 on the now-warm driver cache.
+- Whole-log frame-blocking is therefore not comparable between the two tour runs (9611 against
+  5453).
+
+Correctness and limits:
+- Worker retranslations and replay are unchanged. Bank-1 words agreed with the pool 487–523
+  times per run and differed 0 times.
+- The SIGSEGV seen at shutdown in some runs (063753, 072033) is the core teardown-order fault
+  shared by every branch. The runs reached their 300 s and their statistics are read from the
+  periodic lines.
+- Unit tests: `[translation_cache]` has 177 assertions in 18 cases, including scene tier
+  replacement, the entry/prefetch rule and the scene file names. `[video_core]` has only the 2
+  known nx2_video_render failures.
+- Not measured:
+  - a return to an earlier scene (A → B → A), where the game might not read GameBancParam
+    again;
+  - a scene entered without a manifest (its rows stay as they were).
+
+### Commits (feat/shader-aot-scenes, from dev 859b6ef80c)
+
+- `af5978f1cc` AOT: select scene manifests by the scene the game reads
+- `a9bbdcd202` tools/oot/container/aot_index: index sharcb (BAHS) code pools
+- `3afe6a88d7` AOT: keep the recipe histogram with the translation file; re-emission takes pending slots
+- `3009389c59` tools/oot/harness: --cold-shader-seed copies chosen files into the empty shader dir
+- `d30e337226` AOT scenes: the scene is the one the game enters; placement reads are prefetches after that
+- `c014adbc3a` tools/oot/harness: --gdb resumes the guest only once the process is suspended
+- `9de4d57112` tools/oot/harness: wait at most 10 s for the suspension line (the log is flushed late)
