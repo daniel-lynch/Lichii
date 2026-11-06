@@ -22,6 +22,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/shader_environment.h"
+#include "video_core/shader_pool_index.h"
 
 namespace Tegra {
 class MemoryManager;
@@ -197,6 +198,10 @@ private:
     std::atomic<VAddr> rejected_highest{};
     std::atomic<u64> page_serial{1};
     std::atomic<bool> removal_pending{};
+
+    /// use_shader_aot_translation with EDEN_NX2_AOT_INDEX: recognises shader pools at first use.
+    std::unique_ptr<ShaderPoolIndex> pool_index;
+    bool pool_index_opened{};
 };
 
 } // namespace VideoCommon

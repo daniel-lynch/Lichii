@@ -7,6 +7,7 @@
 #include <map>
 #include <set>
 #include <catch2/catch_test_macros.hpp>
+#include "video_core/shader_pool_index.h"
 #include "video_core/shader_translation_cache.h"
 
 namespace {
@@ -372,4 +373,38 @@ TEST_CASE("Translation cache records indirect storage pointer classifications",
     // A pointer table that now classifies differently no longer matches.
     env.indirect_pointers.insert(0x08);
     REQUIRE_FALSE(ReplayQueries(queries, env));
+}
+
+TEST_CASE("AOT pool index parses the index file and fingerprints like the tool",
+          "[video_core][translation_cache]") {
+    using VideoCommon::ShaderPoolIndex;
+    // FNV-1a 64 test vectors (tools/oot/container/aot_index.py uses the same function).
+    REQUIRE(ShaderPoolIndex::Fingerprint({}) == 0xcbf29ce484222325ULL);
+    const std::array<u8, 1> a{'a'};
+    REQUIRE(ShaderPoolIndex::Fingerprint(a) == 0xaf63dc4c8601ec8cULL);
+
+    std::vector<u8> data{'L', 'X', 'A', 'O', 'T', 'I', 'X', '1'};
+    const auto put = [&](auto value) {
+        const auto* bytes = reinterpret_cast<const u8*>(&value);
+        data.insert(data.end(), bytes, bytes + sizeof(value));
+    };
+    put(u32{1});
+    put(u32{2});
+    put(u32{0x100});
+    put(u32{0x380});
+    put(u8{4});
+    put(u64{0x1122334455667788ULL});
+    put(u32{0x480});
+    put(u32{0x80});
+    put(u8{0});
+    put(u64{7});
+    std::vector<ShaderPoolIndex::Container> containers;
+    REQUIRE(ShaderPoolIndex::Parse(data, containers));
+    REQUIRE(containers.size() == 1);
+    REQUIRE(containers[0].programs.size() == 2);
+    REQUIRE(containers[0].programs[0].offset == 0x100);
+    REQUIRE(containers[0].programs[0].stage == 4);
+    REQUIRE(containers[0].programs[1].fingerprint == 7);
+    data.pop_back();
+    REQUIRE_FALSE(ShaderPoolIndex::Parse(data, containers));
 }

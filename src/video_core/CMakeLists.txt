@@ -272,6 +272,8 @@ add_library(video_core STATIC
     shader_cache.h
     shader_environment.cpp
     shader_environment.h
+    shader_pool_index.cpp
+    shader_pool_index.h
     shader_translation_cache.cpp
     shader_translation_cache.h
     shader_handle_program.h

@@ -32,6 +32,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
+#include "common/settings.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/util.h"
@@ -168,6 +169,19 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                 RethrowIfRejected(*cpu_shader_addr);
                 GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address};
                 shader_info = MakeShaderInfo(env, *cpu_shader_addr);
+                if (native) {
+                    if (!pool_index_opened) {
+                        pool_index_opened = true;
+                        const char* aot = std::getenv("EDEN_NX2_AOT_TRANSLATE");
+                        if (Settings::values.use_shader_aot_translation.GetValue() ||
+                            (aot != nullptr && aot[0] == '1')) {
+                            pool_index = ShaderPoolIndex::Open();
+                        }
+                    }
+                    if (pool_index) {
+                        pool_index->OnFirstUse(*gpu_memory, shader_addr);
+                    }
+                }
             } catch (const Shader::Exception&) {
                 RememberRejection(*cpu_shader_addr);
                 // Once per program: which stage slot it is bound to, its header and the slot's
