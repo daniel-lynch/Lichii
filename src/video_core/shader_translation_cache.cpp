@@ -24,6 +24,7 @@
 #include "common/settings.h"
 #include "common/zstd_compression.h"
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/nx2_switch.h"
 #include "shader_recompiler/translator_identity.h"
 #include "video_core/shader_translation_cache.h"
 
@@ -876,12 +877,24 @@ Digest MakeConfigDigest(const Shader::Profile& profile, const Shader::HostTransl
     hasher.Add(Settings::values.disable_shader_loop_safety_checks.GetValue());
     hasher.Add(Settings::values.renderer_debug.GetValue());
     hasher.Add(Settings::values.fix_bloom_effects.GetValue());
-    for (const char* variable : {"EDEN_NX2_UNDEF_ZERO", "EDEN_NX2_NO_TENSOR",
-                                 "EDEN_NX2_POINTER_TABLE_ACCOUNTING", "EDEN_NX2_STORAGE_BUFFERS_64",
-                                 "EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD", "EDEN_NX2_COMPUTE_KEEP_POINTERS",
-                                 "EDEN_NX2_AB_FMINMAX", "EDEN_NX2_AB_MESH_TRI_ONLY"}) {
+    for (const char* variable : {"EDEN_NX2_UNDEF_ZERO", "EDEN_NX2_NO_TENSOR"}) {
         const char* value = std::getenv(variable);
         hasher.AddString(value ? value : "\x01unset");
+    }
+    // The translation-affecting vegetation switches by their effective value (nx2_switch.h), so
+    // spelling out a default (=1 for a fix, =0 for an A/B experiment) keeps the default's entries
+    // and offline product. EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD and EDEN_NX2_COMPUTE_KEEP_POINTERS
+    // stay out: they decide when a program is translated again and with which recorded pointer
+    // answers, and an entry is only served to an environment that gives the same answers.
+    constexpr std::pair<const char*, bool> vegetation_switches[]{
+        {"EDEN_NX2_POINTER_TABLE_ACCOUNTING", true},
+        {"EDEN_NX2_STORAGE_BUFFERS_64", true},
+        {"EDEN_NX2_AB_FMINMAX", false},
+        {"EDEN_NX2_AB_MESH_TRI_ONLY", false},
+    };
+    for (const auto& [variable, fallback] : vegetation_switches) {
+        hasher.AddString(variable);
+        hasher.Add(Shader::Nx2Switch(variable, fallback));
     }
     hasher.Add(extra);
     return hasher.Finish();

@@ -792,13 +792,30 @@ TEST_CASE("Translation cache separates vegetation policies and device storage li
     const auto original = MakeConfigDigest(profile, host, 0);
     host.max_per_stage_descriptor_storage_buffers = 31;
     CHECK(MakeConfigDigest(profile, host, 0) != original);
-    for (const char* variable : {"EDEN_NX2_POINTER_TABLE_ACCOUNTING", "EDEN_NX2_STORAGE_BUFFERS_64",
-                                 "EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD", "EDEN_NX2_COMPUTE_KEEP_POINTERS",
-                                 "EDEN_NX2_AB_FMINMAX", "EDEN_NX2_AB_MESH_TRI_ONLY"}) {
-        ScopedEnvironmentVariable off{variable, "0"};
-        const auto disabled = MakeConfigDigest(profile, host, 0);
-        ScopedEnvironmentVariable on{variable, "1"};
-        CHECK(MakeConfigDigest(profile, host, 0) != disabled);
+    const auto digest_with = [&](const char* variable, const char* value) {
+        ScopedEnvironmentVariable scoped{variable, value};
+        return MakeConfigDigest(profile, host, 0);
+    };
+    // Translation-affecting switches, by effective value: an explicit default keeps the digest
+    // (and the offline product), "=0" never means on.
+    for (const auto& [variable, fallback] :
+         {std::pair{"EDEN_NX2_POINTER_TABLE_ACCOUNTING", true},
+          std::pair{"EDEN_NX2_STORAGE_BUFFERS_64", true}, std::pair{"EDEN_NX2_AB_FMINMAX", false},
+          std::pair{"EDEN_NX2_AB_MESH_TRI_ONLY", false}}) {
+        INFO(variable);
+        const auto disabled = digest_with(variable, "0");
+        CHECK(digest_with(variable, "1") != disabled);
+        CHECK(digest_with(variable, " off ") == disabled);
+        CHECK(digest_with(variable, "yes") == disabled);
+        CHECK(digest_with(variable, "TRUE") == digest_with(variable, "1"));
+        CHECK(digest_with(variable, nullptr) == digest_with(variable, fallback ? "1" : "0"));
+    }
+    // The compute rebuild switches choose when a program is translated, not its translation.
+    for (const char* variable :
+         {"EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD", "EDEN_NX2_COMPUTE_KEEP_POINTERS"}) {
+        INFO(variable);
+        CHECK(digest_with(variable, "0") == digest_with(variable, nullptr));
+        CHECK(digest_with(variable, "1") == digest_with(variable, nullptr));
     }
 }
 

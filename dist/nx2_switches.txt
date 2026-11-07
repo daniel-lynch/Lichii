@@ -102,6 +102,8 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_AB_TABLE_CAP_MIB=8
 # Reject QMD releases outside the old strict format (reverts #515 behavior; may stall the game).
 #EDEN_NX2_AB_QMD_STRICT=1
-# Translation-affecting switches enter the translation-cache config digest. Preserve a clean
+# POINTER_TABLE_ACCOUNTING, STORAGE_BUFFERS_64, AB_FMINMAX and AB_MESH_TRI_ONLY change
+# translations: their effective values enter the translation-cache config digest, so a run with
+# one flipped away from its default gets no offline-product hits. The rest leave it. Preserve a clean
 # copy of the field tester's pipeline-key cache and restore it before EACH comparison: rebuilds
 # append pointer classifications to that cache, and later runs would otherwise inherit them.
