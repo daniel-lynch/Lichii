@@ -24,6 +24,7 @@ add_executable(tests
     core/nx2_present_pacer.cpp
     common/dkb_cpu_trace.cpp
     common/dkb_frame_trace.cpp
+    common/nx2_event_trace.cpp
     audio_core/nx2_sysmix.cpp
     audio_core/nx2_input_service.cpp
     audio_core/nx2_audio_service.cpp
@@ -191,7 +192,8 @@ target_link_libraries(tests PRIVATE common core audio_core input_common video_co
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
 if (TARGET dynarmic::dynarmic)
-    target_sources(tests PRIVATE core/window_trace.cpp)
+    target_sources(tests PRIVATE core/window_trace.cpp core/oot_gamedata_trace.cpp
+                                 core/oot_coop_sync.cpp)
     # dynarmic_tso.cpp allocates guest memory with mmap (POSIX only).
     if (ARCHITECTURE_x86_64 AND NOT WIN32)
         target_sources(tests PRIVATE core/dynarmic_tso.cpp)

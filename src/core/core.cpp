@@ -13,6 +13,7 @@
 #include "audio_core/audio_core.h"
 #include "common/fs/fs.h"
 #include "common/logging.h"
+#include "common/nx2_event_trace.h"
 #include "common/shader_aot_scene.h"
 #include "common/nx2_sampler.h"
 #include "common/adpf.h"
@@ -20,6 +21,7 @@
 #include "common/settings_enums.h"
 #include "common/string_util.h"
 #include "core/arm/exclusive_monitor.h"
+#include "core/arm/dynarmic/oot_coop_sync.h"
 #include "core/core.h"
 
 #include "launch_timestamp_cache.h"
@@ -195,6 +197,7 @@ struct System::Impl {
         // core_timing (whose timer thread runs the cheat event) last. Stop the engine first for a
         // System destroyed without ShutdownMainProcess.
         cheat_engine.reset();
+        OotCoop::BeginSession();
     }
 
     u64 program_id;
@@ -395,6 +398,9 @@ struct System::Impl {
         // Shader AOT scene hints belong to this session: the previous game's scene, entry and
         // hooked files are forgotten before this game's RomFS is built.
         Common::ShaderAotScene::BeginSession();
+        // EDEN_NX2_ROMFS_TRACE / EDEN_NX2_GAMEDATA_TRACE: a new trace file and session clock.
+        Common::Nx2EventTrace::BeginSession();
+        OotCoop::BeginSession();
 
         const bool switch2_program =
             virtual_filesystem != nullptr &&
@@ -535,6 +541,7 @@ struct System::Impl {
     }
 
     void ShutdownMainProcess() {
+        OotCoop::BeginSession();
         debug_service.reset();
         SetShuttingDown(true);
         Common::ADPF::Shutdown();

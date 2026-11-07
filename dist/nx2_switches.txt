@@ -51,6 +51,39 @@ EDEN_NX2_FENCE_BATCH=1
 # slow, with a speed step where the smoothed frame time crosses 18.3 ms.
 #EDEN_NX2_OOT_REAL_TIME_SNAP=1.1
 
+# Progression traces (off by default; they only log, nothing the game reads or runs changes).
+# =1 writes to the emulator log, =<dir> to <dir>/event-trace-<local time>.log (one file per game
+# session, flushed per line; both switches naming the same dir share the file). Each line starts
+# with the local wall time and the seconds since the game was loaded.
+# RomFS: which event flows (Event/EventFlow/*.bfevfl*), cutscenes (Event/EventFlow/Dm_*,
+# Event/Timeline/*), movies (Event/Movie/*), Banc/* and GameData/* files the game reads, once per
+# burst of reads (a read after a second without one). A read can be a prefetch, not a playback.
+#EDEN_NX2_ROMFS_TRACE=1
+# Ocarina of Time 1.1.0 (main build E0F3CCFAF50065AE) only: quest-step sets and applies (with the
+# direction, so a quest moving backwards shows) and HavePlayedEvent flags. The JIT runs a logging
+# breakpoint in place of one instruction at each of three sites and then does what that
+# instruction does; guest memory is never written. Other builds log "gamedata trace off".
+#EDEN_NX2_GAMEDATA_TRACE=1
+# Names for the GameData trace's hashes (quest steps are named without it): a text file with one
+# challenge, flag or event name per line, made from your own extract.
+#EDEN_NX2_GAMEDATA_NAMES=/path/to/names.txt
+
+# OoT co-op v2: relay transport and diagnostics; remote guest writes remain disabled.
+# Requires the exact main build above. See docs/oot-coop/PROTOCOL.md and FIELD-PLAN.md.
+# Explicit relay address, no authentication: trusted LAN only. Unset = off.
+#EDEN_NX2_OOT_COOP=127.0.0.1:43390
+#EDEN_NX2_OOT_COOP_ROOM=default
+#EDEN_NX2_OOT_COOP_TEAM=default
+#EDEN_NX2_OOT_COOP_NAME=Player
+# Seed digest from your own randomizer; 0 means vanilla. Must match all peers in the room.
+#EDEN_NX2_OOT_COOP_SEED=0
+# Optional JSON array of numeric hashes to keep local; no built-in transient flag list.
+#EDEN_NX2_OOT_COOP_DENY_LIST=/path/to/deny.json
+# Setter-request hooks are diagnostic only; played-event names are not flat bool hashes.
+# Grant classes default empty; selecting a class still cannot enable unverified guest writes.
+#EDEN_NX2_OOT_COOP_ALLOW_CLASSES=bool,bit
+#EDEN_NX2_OOT_COOP_POLICY=or-v2
+
 # Drop reactive-flushing read traps on Switch 2 programs (opt-in; can reduce FPS from 29 to 24 in MKW).
 #EDEN_NX2_NO_REACTIVE=1
 

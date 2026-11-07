@@ -1,0 +1,348 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <array>
+#include <map>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include <catch2/catch_test_macros.hpp>
+
+#include "common/nx2_event_trace.h"
+#include "core/arm/dynarmic/oot_gamedata_trace.h"
+#include "dynarmic/interface/A64/a64.h"
+
+namespace {
+
+namespace Trace = Core::OotGameDataTrace;
+using Trace::Point;
+using Common::Nx2EventTrace::Murmur3;
+
+constexpr u64 Base = 0x10000000;
+constexpr u64 Stop = 0x08000000;
+constexpr u64 Data = 0x40000000;
+
+constexpr u32 Ret = 0xD65F03C0;
+constexpr u32 Svc0 = 0xD4000001;
+constexpr u32 MovzX9Seven = 0xD28000E9; // movz x9, #7
+
+/// Guest memory as bytes (what the handler reads) and the code words the JIT fetches.
+class TraceEnvironment final : public Dynarmic::A64::UserCallbacks {
+public:
+    bool enabled{};
+    Dynarmic::A64::Jit* jit{};
+    std::optional<Trace::Session> session;
+    std::map<u64, u32> code;
+    std::map<u64, u8> bytes;
+    std::vector<std::string> lines;
+    u32 breakpoints{};
+
+    void Code(u64 address, u32 word) {
+        code[address] = word;
+        Write32(address, word);
+    }
+    void Write32(u64 address, u32 value) {
+        for (u32 i = 0; i < 4; ++i) {
+            bytes[address + i] = static_cast<u8>(value >> (8 * i));
+        }
+    }
+    void Write64(u64 address, u64 value) {
+        Write32(address, static_cast<u32>(value));
+        Write32(address + 4, static_cast<u32>(value >> 32));
+    }
+
+    // The memory interface Trace::Handle reads through (Core::Memory::Memory's names).
+    bool IsValidVirtualAddressRange(u64 address, u64 size) const {
+        for (u64 i = 0; i < size; ++i) {
+            if (!bytes.contains(address + i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    u8 Read8(u64 address) {
+        return bytes.at(address);
+    }
+    u32 Read32(u64 address) {
+        u32 value = 0;
+        for (u32 i = 0; i < 4; ++i) {
+            value |= u32{bytes.at(address + i)} << (8 * i);
+        }
+        return value;
+    }
+    u64 Read64(u64 address) {
+        return u64{Read32(address)} | (u64{Read32(address + 4)} << 32);
+    }
+
+    std::optional<u32> MemoryReadCode(u64 address) override {
+        const auto it = code.find(address);
+        if (it == code.end()) {
+            return std::nullopt;
+        }
+        return enabled ? Trace::InstructionFor(Base, address, it->second) : it->second;
+    }
+    u64 MemoryRead(u64, size_t) override {
+        FAIL("Unexpected memory read");
+        return 0;
+    }
+    Dynarmic::A64::Vector MemoryRead128(u64) override {
+        FAIL("Unexpected memory read");
+        return {};
+    }
+    void MemoryWrite(u64, u64, size_t) override {
+        FAIL("Unexpected memory write");
+    }
+    void MemoryWrite128(u64, Dynarmic::A64::Vector) override {
+        FAIL("Unexpected memory write");
+    }
+    void CallSVC(u32) override {
+        jit->HaltExecution();
+    }
+    void ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) override {
+        REQUIRE(exception == Dynarmic::A64::Exception::Breakpoint);
+        REQUIRE(session.has_value());
+        ++breakpoints;
+        std::string line;
+        REQUIRE(Trace::Handle(*session, pc, *jit, *this, &line));
+        lines.push_back(std::move(line));
+    }
+    void AddTicks(u64) override {}
+    u64 GetTicksRemaining() override {
+        return 1000;
+    }
+    u64 GetCNTPCT() override {
+        return 0;
+    }
+};
+
+Dynarmic::A64::UserConfig Config(TraceEnvironment& env) {
+    Dynarmic::A64::UserConfig config;
+    config.callbacks = &env;
+    config.enable_cycle_counting = false;
+    return config;
+}
+
+u64 Site(Point point) {
+    for (const auto& site : Trace::Sites) {
+        if (site.point == point) {
+            return Base + site.offset;
+        }
+    }
+    FAIL("No such site");
+    return 0;
+}
+
+/// Runs from `entry` with x0..x5 = `args`, x8 = all ones, every other register a marker, and
+/// checks the JIT ends in the same state the untraced code reaches.
+void RunAndCheck(TraceEnvironment& env, u64 entry, const std::array<u64, 6>& args,
+                 u64 expected_x8, u64 expected_x9) {
+    Dynarmic::A64::Jit jit{Config(env)};
+    env.jit = &jit;
+    jit.SetPC(entry);
+    for (size_t i = 0; i < 30; ++i) {
+        jit.SetRegister(i, 0x12340000 + i);
+    }
+    for (size_t i = 0; i < args.size(); ++i) {
+        jit.SetRegister(i, args[i]);
+    }
+    jit.SetRegister(8, ~0ULL);
+    jit.SetRegister(30, Stop);
+    jit.SetSP(0x20000000);
+    jit.SetPstate(0xA0000000);
+    jit.Run();
+    REQUIRE(jit.GetPC() == Stop + 4);
+    for (size_t i = 0; i < args.size(); ++i) {
+        REQUIRE(jit.GetRegister(i) == args[i]);
+    }
+    REQUIRE(jit.GetRegister(8) == expected_x8);
+    REQUIRE(jit.GetRegister(9) == expected_x9);
+    for (size_t i = 10; i < 30; ++i) {
+        REQUIRE(jit.GetRegister(i) == 0x12340000 + i);
+    }
+    REQUIRE(jit.GetRegister(30) == Stop);
+    REQUIRE(jit.GetSP() == 0x20000000);
+    REQUIRE(jit.GetPstate() == 0xA0000000);
+}
+
+} // namespace
+
+TEST_CASE("GameData trace sites need the traced build's base and original instructions",
+          "[oot_gamedata_trace]") {
+    for (const auto& site : Trace::Sites) {
+        REQUIRE(Trace::Identify(Base, Base + site.offset, site.instruction) == site.point);
+        REQUIRE(Trace::InstructionFor(Base, Base + site.offset, site.instruction) ==
+                Trace::Breakpoint);
+        // No module registered (another build), or a different word there (a mod, a cheat, a
+        // debugger breakpoint): the JIT gets the word unchanged.
+        REQUIRE(Trace::Identify(0, site.offset, site.instruction) == Point::None);
+        REQUIRE(Trace::InstructionFor(0, site.offset, site.instruction) == site.instruction);
+        REQUIRE(Trace::Identify(Base, Base + site.offset, Trace::Breakpoint) == Point::None);
+        REQUIRE(Trace::InstructionFor(Base, Base + site.offset, 0xD503201F) == 0xD503201F);
+        REQUIRE(Trace::Identify(Base, Base + site.offset + 4, site.instruction) == Point::None);
+    }
+    REQUIRE(Trace::Identify(Base, Base - 4, Trace::Pacibsp) == Point::None);
+    REQUIRE(Trace::BuildId.size() == 40);
+    REQUIRE(Trace::BuildId.starts_with("E0F3CCFAF50065AE"));
+}
+
+TEST_CASE("GameData trace: the step setter hook keeps its mov w8, #1",
+          "[oot_gamedata_trace]") {
+    const u64 entry = Site(Point::StepSet) - 4;
+    const u64 manager = Data;
+    const u64 records = Data + 0x1000;
+    const u32 challenge = Murmur3("TraceTest_Challenge");
+    for (const bool enabled : {false, true}) {
+        TraceEnvironment env;
+        env.enabled = enabled;
+        env.session.emplace(nullptr, Base, 1);
+        env.Code(entry, MovzX9Seven);
+        env.Code(entry + 4, Trace::MovW8One);
+        env.Code(entry + 8, Ret);
+        env.Code(Stop, Svc0);
+        // One challenge record in the manager's first table, currently at Step06.
+        env.Write32(manager + 0x40, 1);
+        env.Write64(manager + 0x48, records);
+        env.Write32(manager + 0x50, 0);
+        env.Write64(manager + 0x58, 0);
+        env.Write32(manager + 0x60, 0);
+        env.Write64(manager + 0x68, 0);
+        env.Write32(records + 8, challenge);
+        env.Write32(records + 0x10, Murmur3("Step06"));
+
+        RunAndCheck(env, entry, {manager, challenge, Murmur3("Step07"), 1, 1, 0}, 1, 7);
+        if (enabled) {
+            REQUIRE(env.breakpoints == 1);
+            REQUIRE(env.lines.size() == 1);
+            const std::string& line = env.lines[0];
+            INFO(line);
+            REQUIRE(line.starts_with("gamedata step-set "));
+            REQUIRE(line.find("step=Step07 (0xee867c27)") != std::string::npos);
+            REQUIRE(line.find("current=Step06 (0x21d6fa38)") != std::string::npos);
+            REQUIRE(line.find(fmt::format("challenge={:#010x}", challenge)) != std::string::npos);
+            REQUIRE(line.find("ui=1 arg4=1 force=0") != std::string::npos);
+        } else {
+            REQUIRE(env.breakpoints == 0);
+        }
+    }
+}
+
+TEST_CASE("GameData trace: the step apply hook reports the direction",
+          "[oot_gamedata_trace]") {
+    const u64 entry = Site(Point::StepApply);
+    const u64 record = Data;
+    const u64 steps = Data + 0x1000;
+    for (const bool enabled : {false, true}) {
+        TraceEnvironment env;
+        env.enabled = enabled;
+        env.session.emplace(nullptr, Base, 1);
+        env.Code(entry, Trace::Pacibsp);
+        env.Code(entry + 4, MovzX9Seven);
+        env.Code(entry + 8, Ret);
+        env.Code(Stop, Svc0);
+        // The record: currently Step03 (index 2 of 3), pending Step01.
+        const u64 x0 = record + 0x18;
+        env.Write32(x0 - 0x10, Murmur3("TraceTest_Challenge"));
+        env.Write32(x0 - 0x8, Murmur3("Step03"));
+        env.Write32(x0 + 0x64, 2);
+        env.Write32(x0 + 0x68, 3);
+        env.Write64(x0 + 0x70, steps);
+        env.Write32(x0 + 0x8c, Murmur3("Step01"));
+        for (u32 i = 0; i < 3; ++i) {
+            env.Write32(steps + i * 0x90 + 0x78, Murmur3(fmt::format("Step{:02}", i + 1)));
+        }
+
+        RunAndCheck(env, entry, {x0, 1, 0x12340002, 0x12340003, 0x12340004, 0x12340005}, ~0ULL,
+                    7);
+        if (enabled) {
+            REQUIRE(env.lines.size() == 1);
+            const std::string& line = env.lines[0];
+            INFO(line);
+            REQUIRE(line.starts_with("gamedata step-apply "));
+            REQUIRE(line.find("from=Step03 (") != std::string::npos);
+            REQUIRE(line.find("#2 to=Step01 (") != std::string::npos);
+            REQUIRE(line.find("#0 of 3 backwards") != std::string::npos);
+        } else {
+            REQUIRE(env.breakpoints == 0);
+        }
+    }
+}
+
+TEST_CASE("GameData trace: the HavePlayedEvent hook reads the event name",
+          "[oot_gamedata_trace]") {
+    const u64 entry = Site(Point::PlayedEvent);
+    const u64 task = Data;
+    const u64 object = Data + 0x100;
+    const u64 text = Data + 0x200;
+    const std::string name = "TraceTest_Event";
+    for (const bool enabled : {false, true}) {
+        TraceEnvironment env;
+        env.enabled = enabled;
+        env.session.emplace(nullptr, Base, 1);
+        env.Code(entry, Trace::Pacibsp);
+        env.Code(entry + 4, MovzX9Seven);
+        env.Code(entry + 8, Ret);
+        env.Code(Stop, Svc0);
+        env.Write64(task + 0x10, object);
+        env.Write64(object + 8, text);
+        // The length counts the terminator, which the game writes before hashing.
+        env.Write32(object + 0x10, static_cast<u32>(name.size() + 1));
+        for (size_t i = 0; i < name.size(); ++i) {
+            env.bytes[text + i] = static_cast<u8>(name[i]);
+        }
+        env.bytes[text + name.size()] = 0xAA; // not yet terminated
+
+        RunAndCheck(env, entry, {task, 0x12340001, 0x12340002, 0x12340003, 0x12340004,
+                                 0x12340005},
+                    ~0ULL, 7);
+        if (enabled) {
+            REQUIRE(env.lines.size() == 1);
+            INFO(env.lines[0]);
+            REQUIRE(env.lines[0].starts_with(
+                fmt::format("gamedata played-event name={} hash={:#010x}", name, Murmur3(name))));
+        }
+    }
+}
+
+TEST_CASE("GameData trace reads nothing it cannot and stops logging at the cap",
+          "[oot_gamedata_trace]") {
+    const u64 entry = Site(Point::PlayedEvent);
+    TraceEnvironment env;
+    env.enabled = true;
+    env.session.emplace(nullptr, Base, 1);
+    env.Code(entry, Trace::Pacibsp);
+    env.Code(entry + 4, MovzX9Seven);
+    env.Code(entry + 8, Ret);
+    env.Code(Stop, Svc0);
+    // x0 points at unmapped memory: the line says so, the hook still resumes.
+    RunAndCheck(env, entry, {Data, 0x12340001, 0x12340002, 0x12340003, 0x12340004, 0x12340005},
+                ~0ULL, 7);
+    REQUIRE(env.lines.size() == 1);
+    REQUIRE(env.lines[0].starts_with("gamedata played-event name=? "));
+
+    Trace::Session session{nullptr, Base, 2};
+    bool last = false;
+    for (u32 i = 0; i < Trace::Session::LineLimit; ++i) {
+        REQUIRE(session.Take(Point::StepSet, last));
+        REQUIRE(last == (i + 1 == Trace::Session::LineLimit));
+    }
+    REQUIRE_FALSE(session.Take(Point::StepSet, last));
+    REQUIRE(session.Take(Point::StepApply, last));
+}
+
+TEST_CASE("GameData trace sessions follow the loaded main module", "[oot_gamedata_trace]") {
+    Trace::Sessions sessions;
+    int process_a = 0;
+    int process_b = 0;
+    const auto* a = reinterpret_cast<const Kernel::KProcess*>(&process_a);
+    const auto* b = reinterpret_cast<const Kernel::KProcess*>(&process_b);
+    REQUIRE_FALSE(sessions.Find(a));
+    sessions.Reset(a, Base);
+    const auto first = sessions.Find(a);
+    REQUIRE(first);
+    REQUIRE(first->base == Base);
+    REQUIRE_FALSE(sessions.Find(b));
+    sessions.Reset(b, 0); // another build: no hooks
+    REQUIRE_FALSE(sessions.Find(a));
+    REQUIRE_FALSE(sessions.Find(b));
+}

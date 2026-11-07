@@ -7,6 +7,9 @@
 add_library(core STATIC
     arm/arm_interface.cpp
     arm/arm_interface.h
+    arm/dynarmic/oot_coop_sync.cpp
+    arm/dynarmic/oot_coop_apply.h
+    arm/dynarmic/oot_coop_sync.h
     arm/exec_coverage.cpp
     arm/exec_coverage.h
     arm/debug.cpp
@@ -1286,6 +1289,7 @@ if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITE
         arm/dynarmic/arm_dynarmic.h
         arm/dynarmic/arm_dynarmic_64.cpp
         arm/dynarmic/arm_dynarmic_64.h
+        arm/dynarmic/oot_gamedata_trace.h
         arm/dynarmic/arm_dynarmic_32.cpp
         arm/dynarmic/arm_dynarmic_32.h
         arm/dynarmic/dynarmic_cp15.cpp

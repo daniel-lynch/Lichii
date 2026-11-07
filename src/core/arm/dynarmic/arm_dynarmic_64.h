@@ -26,6 +26,14 @@ namespace Core::WindowTrace {
 class Session;
 }
 
+namespace Core::OotGameDataTrace {
+class Session;
+}
+
+namespace Core::OotCoop {
+class Session;
+}
+
 namespace Kernel {
 enum class DebugWatchpointType : u8;
 class KPRocess;
@@ -73,6 +81,10 @@ public:
     u64 m_spin_ticks{32}; ///< Reads closer than this (~1.7 us) count as a polling loop
     Kernel::KProcess* m_process{};
     std::shared_ptr<WindowTrace::Session> m_window_trace;
+    std::shared_ptr<OotGameDataTrace::Session> m_gamedata_trace; ///< EDEN_NX2_GAMEDATA_TRACE
+    bool m_gamedata_trace_looked_up{};
+    std::shared_ptr<OotCoop::Session> m_oot_coop;
+    bool m_oot_coop_looked_up{};
     const bool m_debugger_enabled{};
     const bool m_check_memory_access{};
     static constexpr u64 MinimumRunCycles = 10000U;

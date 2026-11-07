@@ -18,6 +18,8 @@
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#include "core/arm/dynarmic/oot_coop_sync.h"
+#include "core/arm/dynarmic/oot_gamedata_trace.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
@@ -69,6 +71,26 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
         last_code_addr = aligned_vaddr;
     }
     const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
+    if (OotCoop::Enabled() && m_process->GetProgramId() == OotGameDataTrace::ProgramId) {
+        if (!m_oot_coop_looked_up) {
+            m_oot_coop = OotCoop::FindSession(m_process);
+            m_oot_coop_looked_up = true;
+        }
+    }
+    if (OotGameDataTrace::Enabled() && m_process->GetProgramId() == OotGameDataTrace::ProgramId) {
+        // The loader registered the session (or none, for another build) before any guest code
+        // ran, so one lookup per JIT is enough.
+        if (!m_gamedata_trace_looked_up) {
+            m_gamedata_trace = OotGameDataTrace::sessions.Find(m_process);
+            m_gamedata_trace_looked_up = true;
+        }
+        if (m_gamedata_trace) {
+            return OotGameDataTrace::InstructionFor(m_gamedata_trace->base, vaddr, instruction);
+        }
+    }
+    if (m_oot_coop) {
+        return OotGameDataTrace::InstructionFor(m_oot_coop->base, vaddr, instruction);
+    }
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
         if (!m_window_trace) {
             m_window_trace = WindowTrace::sessions.Find(m_process);
@@ -140,6 +162,24 @@ void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::Instruc
 }
 
 void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) {
+    if (exception == Dynarmic::A64::Exception::Breakpoint && (m_oot_coop || m_gamedata_trace)) {
+        const u64 base = m_oot_coop ? m_oot_coop->base : m_gamedata_trace->base;
+        const auto original = OotGameDataTrace::Detail::Read32(m_memory, pc);
+        const auto point = original ? OotGameDataTrace::Identify(base, pc, *original)
+                                    : OotGameDataTrace::Point::None;
+        if (point != OotGameDataTrace::Point::None) {
+            if (m_oot_coop) {
+                OotCoop::OnHook(*m_oot_coop, point, *m_parent.m_jit, m_memory);
+            }
+            // Resume exactly once, whether tracing, co-op, or both registered the breakpoint.
+            if (m_gamedata_trace) {
+                OotGameDataTrace::Handle(*m_gamedata_trace, pc, *m_parent.m_jit, m_memory);
+            } else {
+                OotGameDataTrace::Resume(point, *m_parent.m_jit);
+            }
+            return;
+        }
+    }
     if (m_window_trace && exception == Dynarmic::A64::Exception::Breakpoint) {
         const auto point = WindowTrace::Identify(m_window_trace->base, pc, m_memory.Read32(pc));
         if (point != WindowTrace::Point::None) {
