@@ -614,7 +614,14 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         const auto arch = GetNvidiaArch();
         if (arch >= NvidiaArchitecture::Arch_AmpereOrNewer) {
             LOG_WARNING(Render_Vulkan, "Ampere and newer have broken float16 math");
-            features.shader_float16_int8.shaderFloat16 = false;
+            // As for AMD below: the cooperative-matrix tensor path needs the fp16 matrix type, so
+            // keep the device feature then and report fp16 arithmetic as unsupported instead.
+            // GetSuitability (and its cooperative-matrix check) ran before this point.
+            if (TensorCoopmatRequested()) {
+                has_broken_float16_math = true;
+            } else {
+                features.shader_float16_int8.shaderFloat16 = false;
+            }
         }
 
         // Use hardware depth/stencil blits instead when available
@@ -679,6 +686,13 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         // Intel's compiler crashes when using fp16 on Astral Chain, disable it for the time being.
         LOG_WARNING(Render_Vulkan, "Intel has broken float16 math");
         features.shader_float16_int8.shaderFloat16 = false;
+    }
+
+    // The line from GetSuitability ran before the vendor fp16 workarounds above; this is what the
+    // shader profile gets.
+    if (TensorCoopmatRequested()) {
+        LOG_INFO(Render_Vulkan, "Cooperative matrix tensor path for shaders: {}",
+                 IsCooperativeMatrixF16Supported() ? "on" : "off (HMMA emulation)");
     }
 
     has_broken_compute =
