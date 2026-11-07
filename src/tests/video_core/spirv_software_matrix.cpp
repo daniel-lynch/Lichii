@@ -425,6 +425,50 @@ TEST_CASE("Cooperative HMMA self-test shader runs one lowering on one warp",
     }
 }
 
+// Hidden ([.]): writes software and cooperative HMMA modules whose operands come from the storage
+// buffer (8 words per invocation, results at word 512 + 2 * invocation) to EDEN_TENSOR_TEST_OUTPUT,
+// for comparing both lowerings on a real device with arbitrary inputs (K8 stays in software).
+TEST_CASE("Input-driven cooperative HMMA modules for a device comparison",
+          "[.][cooperative_hmma_dump]") {
+    for (const bool cooperative : {false, true}) {
+        for (const u32 depth : {8U, 16U}) {
+            TensorProgram fixture{0, 0};
+            auto& program = fixture.program;
+            program.info.uses_subgroup_shuffles = true;
+            program.info.uses_subgroup_invocation_id = true;
+            program.info.uses_local_invocation_id = true;
+            program.info.used_storage_buffer_types = IR::Type::U32;
+            program.info.storage_buffers_descriptors = {{0, 0, 1, true}};
+            fixture.profile.support_cooperative_hmma = cooperative;
+            IR::IREmitter ir{fixture.block};
+            const auto invocation = ir.LocalInvocationIdX();
+            const auto base = ir.ShiftLeftLogical(invocation, ir.Imm32(5));
+            std::array<IR::U32, 8> inputs;
+            for (u32 i = 0; i < inputs.size(); ++i) {
+                const auto load = fixture.block.PrependNewInst(
+                    fixture.block.end(), IR::Opcode::LoadStorage32,
+                    {ir.Imm32(0), ir.IAdd(base, ir.Imm32(i * 4))});
+                inputs[i] = IR::U32{IR::Value{&*load}};
+            }
+            const auto result = ir.TensorMulAdd(
+                ir.CompositeConstruct(inputs[0], inputs[1], inputs[2], inputs[3]),
+                ir.CompositeConstruct(inputs[4], inputs[5]),
+                ir.CompositeConstruct(inputs[6], inputs[7]), depth);
+            const auto out = ir.IAdd(ir.Imm32(2048), ir.ShiftLeftLogical(invocation, ir.Imm32(3)));
+            fixture.block.AppendNewInst(IR::Opcode::WriteStorage32,
+                                        {ir.Imm32(0), out, ir.CompositeExtract(result, 0)});
+            fixture.block.AppendNewInst(
+                IR::Opcode::WriteStorage32,
+                {ir.Imm32(0), ir.IAdd(out, ir.Imm32(4)), ir.CompositeExtract(result, 1)});
+            const auto code =
+                fixture.Emit(std::string{cooperative ? "cooperative" : "software"} + "-input-k" +
+                             std::to_string(depth));
+            REQUIRE(HasCapability(code, CAPABILITY_COOPERATIVE_MATRIX) ==
+                    (cooperative && depth == 16));
+        }
+    }
+}
+
 TEST_CASE("Captured Bananza matrix shaders lower without an environment override",
           "[video_core][tensor][ampere]") {
     TensorMode mode{nullptr};

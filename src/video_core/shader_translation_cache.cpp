@@ -154,8 +154,9 @@ constexpr size_t InfoFields = 89;
     X(has_gl_bool_ref_bug) X(ignore_nan_fp_comparisons) \
     X(has_broken_spirv_subgroup_mask_vector_extract_dynamic) \
     X(has_broken_spirv_subgroup_shuffle) X(has_broken_spirv_fragment_shuffle) X(max_subgroup_size) X(gl_max_compute_smem_size) \
-    X(has_broken_robust) X(min_ssbo_alignment) X(max_user_clip_distances)
-constexpr size_t ProfileFields = 76;
+    X(has_broken_robust) X(min_ssbo_alignment) X(max_user_clip_distances) \
+    X(support_cooperative_hmma)
+constexpr size_t ProfileFields = 77;
 
 constexpr size_t HostFields = 22;
 constexpr size_t RuntimeInfoFields = 19;

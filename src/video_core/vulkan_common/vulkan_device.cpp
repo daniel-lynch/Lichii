@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <string_view>
 #include <thread>
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
@@ -44,6 +45,18 @@
 namespace Vulkan {
 using namespace Common::Literals;
 namespace {
+
+/// EDEN_NX2_COOPERATIVE_HMMA=1 runs the guest's HMMA.16816.F16 on VK_KHR_cooperative_matrix
+/// (#475). Unset, empty or 0 keeps the shader emulation (OOT integration: off by default).
+/// EDEN_NX2_NO_COOPERATIVE_HMMA (the PR's opt-out) still wins when set to anything but 0.
+bool CooperativeHmmaRequested() {
+    const auto set = [](const char* name) {
+        const char* value = std::getenv(name);
+        return value != nullptr && value[0] != '\0' && std::string_view{value} != "0";
+    };
+    return set("EDEN_NX2_COOPERATIVE_HMMA") && !set("EDEN_NX2_NO_COOPERATIVE_HMMA");
+}
+
 namespace Alternatives {
 constexpr std::array STENCIL8_UINT{
     VK_FORMAT_D16_UNORM_S8_UINT,
@@ -1718,9 +1731,9 @@ void Device::RemoveUnsuitableExtensions() {
     // Used only for the guest's HMMA.16816.F16: the same M=16 N=8 K=16 shape with 16-bit floats
     // in every matrix, as a subgroup operation of compute shaders whose subgroups are the guest's
     // 32-lane warp. The matrices hold 16-bit floats, so the device needs shaderFloat16.
-    // EDEN_NX2_NO_COOPERATIVE_HMMA=1 keeps the shader emulation, to compare the two.
+    // Off unless EDEN_NX2_COOPERATIVE_HMMA=1 (see CooperativeHmmaRequested).
     {
-        const bool has_shape = !std::getenv("EDEN_NX2_NO_COOPERATIVE_HMMA") && std::ranges::any_of(
+        const bool has_shape = CooperativeHmmaRequested() && std::ranges::any_of(
             physical.GetCooperativeMatrixPropertiesKHR(),
             [](const VkCooperativeMatrixPropertiesKHR& shape) {
                 return shape.MSize == 16 && shape.NSize == 8 && shape.KSize == 16 &&
