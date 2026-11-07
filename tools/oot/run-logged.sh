@@ -190,6 +190,42 @@ if mkdir -p "${LIVE_PC%/*}" 2>/dev/null && exec 9>>"$LIVE_PC.session.lock"; then
         && echo "pipeline keys: used-pipeline list carried over to v$PC_VERSION" >&2
       rm -f "$USED_PC.carry.$$"
     fi
+    # One-time drop of stale #410 records. Since upstream #410 (b8d81e2097) the emulator fails to build
+    # some pipelines a cache recorded before it (FileEnvironment::IsCbufStorageBufferPointer, "Uncached
+    # storage pointer classification") and logs them as failed at every boot. The list
+    # ($OOT/offline-translate/pipeline-live/drop-keys-410.txt, g:/c:/cp: lines; OOT_DROP_KEYS=<file>
+    # overrides) names them; `filter --drop-keys` writes the cache without them (and without duplicate,
+    # invalid or cut-short records) to a temp file beside it, `check` verifies that file, and it
+    # replaces the live file only when the live file is unchanged since its backup
+    # (<live>.bak-drop410-<stamp>, kept) and no emulator runs. Inside the exclusive session lock, like
+    # the merge. <live>.dropped-410 records it, so it runs once per cache file (a refusal is retried
+    # next launch). A later carry from a changed v<N-1> file can bring such records back; the product
+    # never does (it is built without them). OOT_DROP_410=0 skips the step.
+    DROP_KEYS="${OOT_DROP_KEYS:-$OOT/offline-translate/pipeline-live/drop-keys-410.txt}" DROP_STAMP="$LIVE_PC.dropped-410"
+    if [ "${OOT_PIPELINES:-1}" = "1" ] && [ "${OOT_DROP_410:-1}" = "1" ] && [ -f "$DROP_KEYS" ] \
+        && [ -s "$LIVE_PC" ] && [ ! -L "$LIVE_PC" ] && [ ! -e "$DROP_STAMP" ]; then
+      DROP_TMP="${LIVE_PC%/*}/.drop410.vulkan.fork-v$PC_VERSION.bin" DROP_BAK="$LIVE_PC.bak-drop410-$STAMP"
+      DROP_LOG="$OOT/logs/drop410-$STAMP.log"
+      rm -f "$DROP_TMP" "$DROP_TMP.sha256"
+      before=$(stat -c '%i %s %Y' "$LIVE_PC")
+      if pgrep -x 'lichii|lichii-linux' >/dev/null; then
+        echo "pipeline keys: an emulator is running; stale #410 records not dropped (retried next launch)" >&2
+      elif cp --reflink=auto "$LIVE_PC" "$DROP_BAK" \
+          && timeout -s INT -k 10 300 python3 -I "$PC_TOOL" filter --version "$PC_VERSION" --allow-missing \
+               --drop-keys "$DROP_KEYS" "$DROP_TMP" "$LIVE_PC" > "$DROP_LOG" 2>&1 \
+          && timeout -s INT -k 10 300 python3 -I "$PC_TOOL" check --version "$PC_VERSION" "$DROP_TMP" >> "$DROP_LOG" 2>&1 \
+          && [ "$(stat -c '%i %s %Y' "$LIVE_PC")" = "$before" ] && ! pgrep -x 'lichii|lichii-linux' >/dev/null \
+          && mv -f "$DROP_TMP" "$LIVE_PC"; then
+        echo "$before -> $(stat -c '%i %s %Y' "$LIVE_PC") $(basename "$DROP_KEYS") $(sha256sum < "$DROP_KEYS" | cut -c1-16)" > "$DROP_STAMP"
+        grep -v '^  not found:' "$DROP_LOG" | head -2 | sed 's/^/pipeline keys: #410 drop: /' >&2
+        echo "pipeline keys: stale #410 records dropped from the v$PC_VERSION cache (backup $DROP_BAK)" >&2
+      else
+        grep -v '^  not found:' "$DROP_LOG" 2>/dev/null | head -5 >&2
+        rm -f "$DROP_BAK"  # the live file was not replaced: its backup is not needed
+        echo "pipeline keys: stale #410 records not dropped (reason above; retried next launch); launching anyway" >&2
+      fi
+      rm -f "$DROP_TMP" "$DROP_TMP.sha256"
+    fi
     rc=none
     if [ "${OOT_PIPELINES:-1}" = "1" ] && [ ! -f "$PC_PRODUCT" ]; then
       echo "pipeline keys: no v$PC_VERSION product ($PC_PRODUCT); nothing merged" >&2
