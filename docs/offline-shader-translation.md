@@ -67,12 +67,13 @@ Repeat `--source TITLE_ID=PATH` for more archives, or use the extractor's existi
 loaded application's program ID; this prevents accidental cross-title population.
 
 Optionally add `--shader-recipe-cache /absolute/path/to/vulkan_translations.TAG.fork-vN.bin`
-to the CLI command. That input must be a format-10 translation cache. The producer
+to the CLI command. That input must be a format-10 or format-11 translation cache. The producer
 imports emission recipes read-only, including from an incomplete tail or a different
 translator/GPU/settings configuration. It derives the source stage key using the source
 configuration, then translates and canonicalizes with the current destination configuration;
 source metadata and SPIR-V are never reused. It can be the destination cache.
-Format-9 and earlier inputs are rejected. Use the round-4 product-run cache to capture
+Format-9 and earlier inputs are rejected. Format 10 exists in two Info layouts (see
+"Format 11" below); both import. Use the round-4 product-run cache to capture
 runtime variants; untouched offline fallback modules do not count as observed recipes.
 
 `--shader-recipe-count N` selects at most N observed recipes per stage (default 2, allowed range 1–64),
@@ -88,7 +89,7 @@ Logs and the JSON import report distinguish scanned, eligible, and admitted reco
 admitted bytes, bytes skipped by framing, and eligible records skipped by the byte
 budget. Logs also report catalog entries and references omitted by the entry cap.
 Cross-configuration imports name the source filename's translator tag and the current
-tag; renamed/untagged sources report an unknown tag because format 10 stores only the
+tag; renamed/untagged sources report an unknown tag because formats 10 and 11 store only the
 configuration digest. Runtime open reports other translator tags in the directory once.
 The temporary source store is released before emission starts.
 Canonical duplicate
@@ -121,7 +122,7 @@ modified while its store is open.
 
 Playthrough-hint JSON is not accepted as an emission recipe source: its pipeline keys
 need device/runtime-state reconstruction before they can supply emission inputs.
-Use a format-10 translation cache recorded during the scene tour instead.
+Use a format-10 or format-11 translation cache recorded during the scene tour instead.
 The shared command parser exposes the options, but archive production is an
 **eden-cli** feature, not a GUI precompile operation.
 
@@ -572,3 +573,29 @@ state. Unrecorded task/mesh register states cannot be inferred from the archive 
 stage key and the first differing query. A rejected product candidate followed by a
 session entry hit no longer increments the replay-failure counter. Editing the Vulkan
 pipeline-cache source changes the translator tag, so regenerate products under the new tag.
+
+## Format 11 (2026-11-07)
+
+Upstream nx2 #353 (merged into dev at d70e51b845) added `Shader::Info::frag_color_components`
+(8 bytes, serialized right after `stores_frag_color`) without a format bump, so format-10 files
+exist in two layouts: 88 Info fields (written before that merge, e.g. tags 84d3ee17e49f2a55 and
+e8af3755867676a0) and 89 (written by dev builds since). Read with the 89-field layout, every
+older record was misframed by 8 bytes, and the recipe import read no recipes ("skipped-by-framing";
+r1 of the pass-15 gate admitted 0 of 209,002 records).
+
+- Files are now written as format 11 (89 fields).
+- Format-10 files are still read. Their layout is recognised from the records themselves (a
+  record parses exactly in one layout; the first decisive records decide) and logged as
+  `... is format 10 with the 88-field (before frag_color_components) info layout`.
+- An 88-field record gets `frag_color_components` derived from `stores_frag_color`: none for a
+  render target the shader does not store (exactly what #353 computes, since the component bits
+  are set by the same SetFragColor that sets `stores_frag_color`), all four for one it stores
+  (the pre-#353 pipeline write mask, i.e. the module behaves as when it was recorded).
+- Recipe sources and the recipe-file reader read format-10 files in place and never modify them.
+  A format-10 live cache of the same translator and configuration is upgraded on open: an
+  89-field file has its version rewritten, an 88-field file is copied record by record to the
+  new layout and replaces the original, so later appends follow in the same layout.
+- The configuration digest folds in 10 (the last version that changed what records mean), not
+  11, so the upgrade does not change a configuration. A product is still only valid for the
+  translator tag in its file name; regenerate products after this change (the tag changes).
+- No switch is involved.
