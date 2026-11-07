@@ -26,6 +26,8 @@ add_executable(tests
     common/dkb_frame_trace.cpp
     common/nx2_event_trace.cpp
     audio_core/nx2_sysmix.cpp
+    audio_core/nx2_input_service.cpp
+    audio_core/audio_in.cpp
     audio_core/sysmix_sink.cpp
     audio_core/sysmix_test_context.h
     video_core/ampere_starfox_test10.cpp
@@ -33,6 +35,7 @@ add_executable(tests
     video_core/ampere_yoshi_compute.cpp
     video_core/texture_rect_descriptor.cpp
     audio_core/batch_decoder.cpp
+    audio_core/microphone.cpp
     audio_core/hardware_audio_codec.cpp
     core/gpu_dirty_memory.cpp
     core/memory_acquire.cpp
@@ -102,25 +105,34 @@ add_executable(tests
     video_core/storage_binding_capacity.cpp
     video_core/native_indirect_reset.cpp
     video_core/fast_draw.cpp
+    video_core/native_qmd.cpp
     video_core/gpu_command_safety.cpp
     video_core/syncpoint_actions.cpp
     video_core/nx2_video_render.cpp
     video_core/ampere_matrix.cpp
     video_core/spirv_software_matrix.cpp
     video_core/spirv_builtin_capabilities.cpp
+    video_core/spirv_min_max_denorms.cpp
+    video_core/spirv_nan_safe_min_max.cpp
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp
+    common/core_pinning.cpp
     common/event.cpp
     common/fibers.cpp
+    common/fs_iterate.cpp
     common/game_presets.cpp
     common/host_memory.cpp
+    common/host_memory_failure.cpp
+    common/host_memory_test_access.h
+    core/host_memory_failure.cpp
     common/page_table.cpp
     common/param_package.cpp
     common/range_map.cpp
     common/ring_buffer.cpp
     common/scratch_buffer.cpp
     common/slot_vector.cpp
+    common/sparse_large_vector.cpp
     common/undefined_fix.cpp
     common/unique_function.cpp
     common/zstd_compression.cpp
@@ -151,10 +163,12 @@ add_executable(tests
     video_core/ampere_uniform_immediate_shift.cpp
     video_core/ampere_bindless_surfaces.cpp
     video_core/native_macro_fifo.cpp
+    video_core/turing_macro_ram.cpp
     video_core/uniform_stream_reuse.cpp
     video_core/shader_invalidation.cpp
     video_core/descriptor_table.cpp
     video_core/global_address_tracking.cpp
+    video_core/global_atomic_routing.cpp
     video_core/nvn_storage_descriptor.cpp
     video_core/ampere_f2i.cpp
     video_core/ampere_ldc.cpp
@@ -162,6 +176,7 @@ add_executable(tests
     video_core/shader_attributes.cpp
     video_core/indirect_reset.cpp
     video_core/offline_compute_producer.cpp
+    video_core/offline_recorded_producer.cpp
     video_core/offline_shader_producer.cpp
     video_core/shader_archive_environment.cpp
     video_core/shader_translation_cache.cpp
@@ -192,6 +207,12 @@ add_test(NAME translator_identity
                  -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/translator_identity_test
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/translator_identity_test.cmake)
 
+if (TARGET SDL3::SDL3)
+    add_executable(sdl_window_state_tests yuzu_cmd/sdl_window_state.cpp)
+    target_link_libraries(sdl_window_state_tests PRIVATE SDL3::SDL3 Catch2::Catch2WithMain)
+    add_test(NAME sdl_window_state_tests COMMAND sdl_window_state_tests)
+endif()
+
 if (WIN32 AND ARCHITECTURE_x86_64)
     add_executable(event_wait_probe ../../tools/nx2/event_wait_probe.cpp)
     target_link_libraries(event_wait_probe PRIVATE common)
@@ -204,6 +225,9 @@ target_link_libraries(update_checker_tests PRIVATE common Catch2::Catch2WithMain
 add_test(NAME update_checker_tests COMMAND update_checker_tests)
 
 if (NOT ANDROID)
+    target_sources(tests PRIVATE input_common/joycon_subcommand_response.cpp)
+    target_link_libraries(tests PRIVATE SDL3::SDL3)
+
     add_executable(config_tests
         common/first_run_config.cpp
         ../frontend_common/config.cpp)

@@ -2,6 +2,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <string_view>
@@ -14,13 +15,41 @@
 namespace VideoCommon {
 
 inline constexpr u32 OpenGLPipelineCacheVersion = 48;
-inline constexpr u32 VulkanPipelineCacheVersion = 53;
+inline constexpr u32 VulkanPipelineCacheVersion = 54;
 
 // Official Eglantine (cache version 18 at c0cb3325) and this fork (a different version) both
 // used <shader dir>/<title>/vulkan.bin and vulkan_pipelines.bin. Each build deletes a file
 // with another version at boot, so alternating builds made every run start with no pipelines
 // (MKW log: "Deleting old pipeline cache", "Total Pipeline Count: 0", then hundreds of
 // pipelines built on the GPU thread). Version-suffixed names let the builds coexist.
+/// "lichii-pipeline-cache=vulkan.fork-v<N>.bin", N = VulkanPipelineCacheVersion: the name of the
+/// pipeline cache file this build opens -- and deletes when its header holds another version. It is
+/// kept in the binary (logged at boot), so tools/oot/run-logged.sh reads the version from the
+/// binary itself with grep before it installs or converts a cache for it.
+inline constexpr auto VulkanPipelineCacheMarker = [] {
+    constexpr std::string_view prefix = "lichii-pipeline-cache=vulkan.fork-v";
+    constexpr std::string_view suffix = ".bin";
+    std::array<char, prefix.size() + 10 + suffix.size() + 1> text{};
+    std::size_t at = 0;
+    for (const char c : prefix) {
+        text[at++] = c;
+    }
+    std::array<char, 10> digits{};
+    std::size_t count = 0;
+    u32 value = VulkanPipelineCacheVersion;
+    do {
+        digits[count++] = static_cast<char>('0' + value % 10);
+        value /= 10;
+    } while (value != 0);
+    while (count != 0) {
+        text[at++] = digits[--count];
+    }
+    for (const char c : suffix) {
+        text[at++] = c;
+    }
+    return text; // zero-filled past the text: a C string
+}();
+
 [[nodiscard]] inline std::filesystem::path VersionedPipelineCachePath(
     const std::filesystem::path& directory, std::string_view stem, u32 version) {
     return directory / fmt::format("{}.fork-v{}.bin", stem, version);

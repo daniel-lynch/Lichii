@@ -47,7 +47,17 @@ namespace {
 // 8: Variants optionally carry their emission recipe for archive producers.
 // 9: Offline provenance and persistent rejection of speculative metadata.
 // 10: Canonical descriptor padding; old speculative entries and drops must be rebuilt.
-constexpr u32 FormatVersion = 10;
+// 11: Shader::Info gained frag_color_components (upstream nx2 #353, merged at d70e51b845). That
+//     merge inserted the field without a bump, so version-10 files exist in two layouts: 88
+//     Info fields (written before the merge) and 89 (written by builds since). Version-10 files
+//     are still read; their Info layout is recognised from their records (DetectInfoLayout).
+constexpr u32 FormatVersion = 11;
+// The oldest version still read. Its records keep their meaning; only the Info layout differs.
+constexpr u32 OldestReadableVersion = 10;
+// The version folded into the configuration digest: the last version that changed what records
+// mean. A layout-only bump keeps it, so a version-10 file of the same translator and
+// configuration still matches (and is upgraded to the current layout when opened for writing).
+constexpr u32 DigestFormatVersion = 10;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
@@ -84,7 +94,8 @@ consteval size_t CountFields() {
     POD(uses_is_helper_invocation) POD(uses_subgroup_invocation_id) POD(uses_subgroup_shuffles)   \
     POD(uses_quad_shuffles) POD(uses_patches) POD(interpolation) POD(loads) POD(stores)           \
     POD(passthrough) MAP(legacy_stores_mapping) POD(loads_indexed_attributes)                      \
-    POD(stores_frag_color) POD(stores_sample_mask) POD(stores_frag_depth)                          \
+    POD(stores_frag_color) POD(frag_color_components) POD(stores_sample_mask)                      \
+    POD(stores_frag_depth)                                                                         \
     POD(stores_tess_level_outer) POD(stores_tess_level_inner) POD(stores_indexed_attributes)      \
     POD(stores_global_memory) POD(uses_local_memory) POD(uses_fp16) POD(uses_fp64)                 \
     POD(uses_fp16_denorms_flush) POD(uses_fp16_denorms_preserve) POD(uses_fp32_denorms_flush)     \
@@ -108,7 +119,7 @@ consteval size_t CountFields() {
     VEC(storage_buffers_descriptors) VEC(texture_buffer_descriptors)                               \
     VEC(image_buffer_descriptors) VEC(texture_descriptors) VECVEC(handle_programs)                 \
     VEC(image_descriptors)
-constexpr size_t InfoFields = 88;
+constexpr size_t InfoFields = 89;
 
 #define TRANSLATION_CACHE_PROFILE_FIELDS(X) \
     X(supported_spirv) X(unified_descriptor_binding) X(support_descriptor_aliasing) \
@@ -311,10 +322,16 @@ private:
     u64& skipped;
 };
 
-bool SkipInfo(FramedReader& reader, Shader::Info* catalog_info = nullptr) {
+// Whether a layout serializes a field of TRANSLATION_CACHE_INFO_FIELDS.
+constexpr bool InfoLayoutHas(InfoLayout layout, std::string_view field) {
+    return layout == InfoLayout::Current || field != "frag_color_components";
+}
+
+bool SkipInfo(FramedReader& reader, InfoLayout layout, Shader::Info* catalog_info = nullptr) {
     Shader::Info info;
 #define POD(field) \
-    if (catalog_info && std::string_view{#field} == "loads") { \
+    if (!InfoLayoutHas(layout, #field)) { \
+    } else if (catalog_info && std::string_view{#field} == "loads") { \
         if (!reader.Get(catalog_info->loads)) return false; \
     } else if (!reader.Skip(sizeof(info.field))) return false;
 #define MAP(field) if (!reader.Array(sizeof(decltype(info.field)::key_type) + sizeof(decltype(info.field)::mapped_type))) return false;
@@ -423,13 +440,14 @@ void WriteMeta(std::vector<u8>& out, const ProgramMeta& meta) {
     }
 }
 
-bool ReadMeta(std::span<const u8>& in, ProgramMeta& meta) {
+bool ReadMeta(std::span<const u8>& in, ProgramMeta& meta,
+              InfoLayout layout = InfoLayout::Current) {
     Reader reader{in};
     return reader.Get(meta.stage) && reader.Get(meta.workgroup_size) &&
            reader.Get(meta.output_topology) && reader.Get(meta.output_vertices) &&
            reader.Get(meta.invocations) && reader.Get(meta.local_memory_size) &&
            reader.Get(meta.shared_memory_size) && reader.Get(meta.is_geometry_passthrough) &&
-           ReadInfo(in, meta.info) &&
+           ReadInfo(in, meta.info, layout) &&
            ((meta.stage != Shader::Stage::Task && meta.stage != Shader::Stage::Mesh) ||
             (reader.Get(meta.mesh.payload_words) && reader.Get(meta.mesh.max_vertices) &&
              reader.Get(meta.mesh.max_primitives) && reader.Get(meta.mesh.topology) &&
@@ -662,12 +680,13 @@ bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env) {
 }
 
 size_t ReplayQueriesUntilMismatch(std::span<const Query> queries, Shader::Environment& env,
-                                  LiveAnswers* live) {
+                                  LiveAnswers* live, ReplayMismatch* mismatch) {
     if (live) live->clear();
     // Class-level replay: recorded handle -> live handle.
     std::unordered_map<u32, u32> handles;
     for (size_t index = 0; index < queries.size(); ++index) {
         const Query& query = queries[index];
+        if (mismatch) *mismatch = {index, std::nullopt};
         if (query.kind == QueryKind::TextureHandle) {
             const HandleAddress cbuf = UnpackHandleAddress(query);
             if (cbuf.shift_left >= 32 || cbuf.secondary_shift_left >= 32) {
@@ -748,6 +767,7 @@ size_t ReplayQueriesUntilMismatch(std::span<const Query> queries, Shader::Enviro
             return index;
         }
         if (answer != query.answer) {
+            if (mismatch) mismatch->actual = answer;
             return index;
         }
         if (live) {
@@ -815,7 +835,7 @@ CacheIdentity CurrentCacheIdentity() {
 Digest MakeConfigDigest(const Shader::Profile& profile, const Shader::HostTranslateInfo& host_info,
                         u64 extra) {
     Hasher hasher;
-    hasher.Add(FormatVersion);
+    hasher.Add(DigestFormatVersion);
     hasher.AddString(CurrentCacheIdentity().value);
 #define TRANSLATION_CACHE_ADD(field) hasher.Add(profile.field);
     TRANSLATION_CACHE_PROFILE_FIELDS(TRANSLATION_CACHE_ADD)
@@ -1041,9 +1061,7 @@ std::vector<SelectedRecipe> RecipeCatalog::SelectWithSources(
     auto it = classes.find(RecipeClass(stage, &info));
     if (it == classes.end()) it = classes.find(RecipeClass(stage, nullptr));
     if (it != classes.end()) add_top(it->second, RecipeSource::Class);
-    const auto exact_it = exact.find(stage_key);
-    const bool has_exact = exact_it != exact.end() && !exact_it->second.empty();
-    if (baseline == RecipeBaseline::Always || (baseline == RecipeBaseline::Auto && !has_exact))
+    if (baseline != RecipeBaseline::Never)
         add(DefaultEmissionRecipe(stage), RecipeSource::Baseline);
     return result;
 }
@@ -1060,6 +1078,64 @@ std::vector<EmissionRecipe> RecipeCatalog::Select(const Digest& stage_key, Shade
 RecipeCatalog Store::ReadRecipeCatalog(const std::filesystem::path& path, const Digest& config,
                                       u32 entry_limit, u64 byte_budget) {
     RecipeCatalog result;
+    if (std::filesystem::is_directory(path)) {
+        std::vector<std::filesystem::path> files;
+        for (const auto& item : std::filesystem::recursive_directory_iterator(path))
+            if (item.is_regular_file() && item.path().filename().string().starts_with("vulkan_translations.") &&
+                item.path().extension() == ".bin") files.push_back(item.path());
+        std::ranges::sort(files);
+        bool first = true;
+        for (const auto& file : files) {
+            auto part = ReadRecipeCatalog(file, config, entry_limit, byte_budget);
+            if (!first && result.source_config != part.source_config)
+                throw std::runtime_error("Recipe directory contains different source configurations");
+            first = false;
+            result.source_config = part.source_config;
+            auto merge = [](auto& target, auto& source) {
+                for (auto& [key, sets] : source) {
+                    auto& out = target[key];
+                    for (auto& set : sets)
+                        if (std::ranges::find(out, set) == out.end()) out.push_back(std::move(set));
+                }
+            };
+            merge(result.recorded_answers, part.recorded_answers);
+            merge(result.compute_pointers, part.compute_pointers);
+            auto merge_recipes = [&](auto& target, auto& source) {
+                for (auto& [key, list] : source) {
+                    auto& out = target[key];
+                    for (auto& recipe : list) {
+                        const auto found = std::ranges::find(out, recipe.key, &RecipeCatalog::CountedRecipe::key);
+                        if (found != out.end()) {
+                            found->count += recipe.count;
+                        } else if (result.entries < entry_limit) {
+                            out.push_back(std::move(recipe));
+                            ++result.entries;
+                        } else {
+                            ++result.truncated_entries;
+                        }
+                    }
+                    std::ranges::sort(out, [](const auto& a, const auto& b) {
+                        if (a.count != b.count) return a.count > b.count;
+                        return std::tie(a.key.lo, a.key.hi) < std::tie(b.key.lo, b.key.hi);
+                    });
+                }
+            };
+            merge_recipes(result.exact, part.exact);
+            merge_recipes(result.classes, part.classes);
+            result.truncated_entries += part.truncated_entries;
+            result.skipped_records += part.skipped_records;
+            result.imported_bytes += part.imported_bytes;
+            result.invalid_recipes += part.invalid_recipes;
+            result.scanned_records += part.scanned_records;
+            result.eligible_records += part.eligible_records;
+            result.admitted_records += part.admitted_records;
+            result.framing_skipped_bytes += part.framing_skipped_bytes;
+            if (result.imported_bytes > byte_budget)
+                throw std::runtime_error("Recipe directory exceeds byte budget");
+        }
+        if (first) throw std::runtime_error("Recipe directory contains no translation caches");
+        return result;
+    }
     // The source config is used only to recover exact-stage keys from the current archive.
     // All emitted programs, metadata, and variant keys use the destination configuration.
     std::ifstream header(path, std::ios::binary);
@@ -1117,6 +1193,7 @@ RecipeCatalog Store::ReadRecipeCatalog(const std::filesystem::path& path, const 
         }
     }
     result.compute_pointers = std::move(source.compute_pointers);
+    result.recorded_answers = std::move(source.recorded_answers);
     result.invalid_recipes = source.invalid_recipes;
     result.skipped_records = source.skipped_import_records;
     result.imported_bytes = source.imported_bytes;
@@ -1241,9 +1318,20 @@ Digest MakeVariantKey(const Digest& entry_id, const Digest& runtime,
     return hasher.Finish();
 }
 
-void WriteInfo(std::vector<u8>& out, const Shader::Info& info) {
+void DeriveFragColorComponents(Shader::Info& info) {
+    // #353 sets a component bit for every SetFragColor, the instruction that also sets
+    // stores_frag_color: a target without stores has no components. For a target with stores
+    // the record does not say which components; all four is what the pipeline wrote before #353
+    // (the write mask the blend state alone decides), so the module behaves as when recorded.
+    for (size_t rt = 0; rt < info.frag_color_components.size(); ++rt) {
+        info.frag_color_components[rt] = info.stores_frag_color[rt] ? 0xF : 0;
+    }
+}
+
+void WriteInfo(std::vector<u8>& out, const Shader::Info& info, InfoLayout layout) {
     Writer writer{out};
-#define TRANSLATION_CACHE_POD(field) writer.Put(info.field);
+#define TRANSLATION_CACHE_POD(field)                                                               \
+    if (InfoLayoutHas(layout, #field)) writer.Put(info.field);
 #define TRANSLATION_CACHE_MAP(field)                                                               \
     writer.Put(static_cast<u32>(info.field.size()));                                               \
     for (const auto& [key, value] : info.field) {                                                  \
@@ -1264,11 +1352,11 @@ void WriteInfo(std::vector<u8>& out, const Shader::Info& info) {
 #undef TRANSLATION_CACHE_VECVEC
 }
 
-bool ReadInfo(std::span<const u8>& in, Shader::Info& info) {
+bool ReadInfo(std::span<const u8>& in, Shader::Info& info, InfoLayout layout) {
     Reader reader{in};
     info = {};
 #define TRANSLATION_CACHE_POD(field)                                                               \
-    if (!reader.Get(info.field)) {                                                                 \
+    if (InfoLayoutHas(layout, #field) && !reader.Get(info.field)) {                                \
         return false;                                                                              \
     }
 #define TRANSLATION_CACHE_MAP(field)                                                               \
@@ -1309,6 +1397,9 @@ bool ReadInfo(std::span<const u8>& in, Shader::Info& info) {
 #undef TRANSLATION_CACHE_MAP
 #undef TRANSLATION_CACHE_VEC
 #undef TRANSLATION_CACHE_VECVEC
+    if (layout == InfoLayout::NoFragColorComponents) {
+        DeriveFragColorComponents(info);
+    }
     return true;
 }
 
@@ -1430,6 +1521,7 @@ void Store::Close() {
     recipes.clear();
     entry_recipes.clear();
     compute_pointers.clear();
+    recorded_answers.clear();
     dropped_entries.clear();
     entries_with_modules.clear();
     offline_entry_only_rejected = 0;
@@ -1491,6 +1583,166 @@ void Store::Open(const std::filesystem::path& path, const Digest& config) {
                  .count());
 }
 
+namespace {
+constexpr u64 FileHeaderSize = FileMagic.size() + sizeof(u32) + sizeof(Digest);
+
+// Where the one Info of an entry or variant record lies, when the whole record parses in a
+// layout. Drops (no Info) and records that do not parse give nothing.
+struct InfoSpan {
+    size_t begin, end;
+    Shader::Info info;
+};
+std::optional<InfoSpan> FindInfoSpan(std::span<const u8> data, InfoLayout layout) {
+    std::span<const u8> record{data};
+    Reader reader{record};
+    u8 type{};
+    if (!reader.Get(type)) return std::nullopt;
+    InfoSpan span{};
+    if (type == RecordEntry) {
+        Digest stage_key{};
+        std::vector<Query> queries;
+        ProgramMeta meta;
+        bool offline{};
+        if (!reader.Get(stage_key) || !ReadQueries(reader, queries)) return std::nullopt;
+        constexpr size_t MetaPrefix = sizeof(meta.stage) + sizeof(meta.workgroup_size) +
+                                      sizeof(meta.output_topology) + sizeof(meta.output_vertices) +
+                                      sizeof(meta.invocations) + sizeof(meta.local_memory_size) +
+                                      sizeof(meta.shared_memory_size) +
+                                      sizeof(meta.is_geometry_passthrough);
+        span.begin = data.size() - record.size() + MetaPrefix;
+        // ReadMeta reads the Info at the end of the fixed fields, then the task/mesh tail.
+        std::span<const u8> probe{record};
+        if (!ReadMeta(probe, meta, layout)) return std::nullopt;
+        std::span<const u8> info_probe = record.subspan(std::min(MetaPrefix, record.size()));
+        if (!ReadInfo(info_probe, span.info, layout)) return std::nullopt;
+        span.end = data.size() - info_probe.size();
+        record = probe;
+        if (!reader.Get(offline) || !record.empty()) return std::nullopt;
+        return span;
+    }
+    if (type == RecordVariant) {
+        Digest key{}, id{};
+        bool fallback{};
+        Shader::Backend::Bindings binding_out{};
+        u32 words{}, compressed{};
+        bool has_recipe{};
+        if (!reader.Get(key) || !reader.Get(id) || !reader.Get(fallback) ||
+            !reader.Get(binding_out)) return std::nullopt;
+        span.begin = data.size() - record.size();
+        if (!ReadInfo(record, span.info, layout)) return std::nullopt;
+        span.end = data.size() - record.size();
+        if (!reader.Get(words) || !reader.Get(compressed) || compressed > record.size())
+            return std::nullopt;
+        record = record.subspan(compressed);
+        if (!reader.Get(has_recipe)) return std::nullopt;
+        if (has_recipe) {
+            Shader::Stage stage{};
+            EmissionRecipe recipe;
+            if (!reader.Get(stage) || !ReadRecipe(reader, recipe)) return std::nullopt;
+        }
+        if (!record.empty()) return std::nullopt;
+        return span;
+    }
+    return std::nullopt;
+}
+
+// Version-10 files hold 88 Info fields (before #353) or 89 (after). One file holds one layout:
+// only a build of the same translator appends to it. A record parses in at most one of them
+// unless its counts happen to absorb the 8 bytes, so the first decisive records settle it.
+InfoLayout DetectInfoLayout(std::ifstream& in, u64 size) {
+    std::array<u32, 2> votes{};
+    u32 examined = 0;
+    for (u64 offset = FileHeaderSize; offset + 8 <= size && examined < 64;) {
+        in.seekg(offset);
+        u32 magic{}, length{};
+        if (!in.read(reinterpret_cast<char*>(&magic), sizeof(magic)) ||
+            !in.read(reinterpret_cast<char*>(&length), sizeof(length)) ||
+            magic != RecordMagic || length > size - offset - 8 || !length) break;
+        std::vector<u8> data(length);
+        if (!in.read(reinterpret_cast<char*>(data.data()), length)) break;
+        offset += 8 + u64{length};
+        if (data[0] != RecordEntry && data[0] != RecordVariant) continue;
+        ++examined;
+        const bool current = FindInfoSpan(data, InfoLayout::Current).has_value();
+        const bool legacy = FindInfoSpan(data, InfoLayout::NoFragColorComponents).has_value();
+        if (current != legacy) ++votes[current ? 0 : 1];
+        if (votes[0] + votes[1] >= 8) break;
+    }
+    in.clear();
+    // Without a decisive record the layout does not matter; 88 fields is what 10 first meant.
+    return votes[0] > votes[1] ? InfoLayout::Current : InfoLayout::NoFragColorComponents;
+}
+
+std::string_view InfoLayoutName(InfoLayout layout) {
+    return layout == InfoLayout::Current ? "89-field (with frag_color_components)"
+                                         : "88-field (before frag_color_components)";
+}
+
+// Rewrites a version-10 file as version 11 so records appended in the current layout follow
+// records in the same layout. Records are copied as they are except for their Info; the copy
+// stops at the first record that does not parse, as loading would. The original is replaced
+// only once the copy is complete.
+bool UpgradeFile(const std::filesystem::path& path, InfoLayout layout) {
+    if (layout == InfoLayout::Current) {
+        std::fstream file{path, std::ios::binary | std::ios::in | std::ios::out};
+        file.seekp(FileMagic.size());
+        file.write(reinterpret_cast<const char*>(&FormatVersion), sizeof(FormatVersion));
+        file.flush();
+        return file.good();
+    }
+    std::ifstream in{path, std::ios::binary | std::ios::ate};
+    if (!in.is_open()) return false;
+    const u64 size = static_cast<u64>(in.tellg());
+    std::array<char, FileHeaderSize> header{};
+    in.seekg(0);
+    if (size < FileHeaderSize || !in.read(header.data(), header.size())) return false;
+    std::memcpy(header.data() + FileMagic.size(), &FormatVersion, sizeof(FormatVersion));
+    auto temporary = path;
+    temporary += ".format11.tmp";
+    std::ofstream out{temporary, std::ios::binary | std::ios::trunc};
+    out.write(header.data(), header.size());
+    u64 offset = FileHeaderSize, converted = 0;
+    while (offset + 8 <= size && out.good()) {
+        u32 magic{}, length{};
+        if (!in.read(reinterpret_cast<char*>(&magic), sizeof(magic)) ||
+            !in.read(reinterpret_cast<char*>(&length), sizeof(length)) ||
+            magic != RecordMagic || length > size - offset - 8 || !length) break;
+        std::vector<u8> data(length);
+        if (!in.read(reinterpret_cast<char*>(data.data()), length)) break;
+        std::vector<u8> record;
+        if (data[0] == RecordDrop) {
+            record = std::move(data);
+        } else {
+            const auto span = FindInfoSpan(data, layout);
+            if (!span) break;
+            record.assign(data.begin(), data.begin() + span->begin);
+            WriteInfo(record, span->info);
+            record.insert(record.end(), data.begin() + span->end, data.end());
+            ++converted;
+        }
+        const u32 out_length = static_cast<u32>(record.size());
+        out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+        out.write(reinterpret_cast<const char*>(&out_length), sizeof(out_length));
+        out.write(reinterpret_cast<const char*>(record.data()), record.size());
+        offset += 8 + u64{length};
+    }
+    out.flush();
+    const bool written = out.good();
+    out.close();
+    in.close();
+    std::error_code ec;
+    if (written) std::filesystem::rename(temporary, path, ec);
+    if (!written || ec) {
+        std::filesystem::remove(temporary, ec);
+        return false;
+    }
+    LOG_INFO(Render_Vulkan, "Translation cache: upgraded {} to format {} ({} records re-framed, "
+             "{} bytes of {} kept)", Common::FS::PathToUTF8String(path.filename()), FormatVersion,
+             converted, offset, size);
+    return true;
+}
+} // Anonymous namespace
+
 bool Store::LoadRecipeRecords(std::ifstream& in, u64 size, u64 byte_budget) {
     struct Location {
         u64 meta_begin, end;
@@ -1498,7 +1750,7 @@ bool Store::LoadRecipeRecords(std::ifstream& in, u64 size, u64 byte_budget) {
     };
     std::unordered_map<Digest, Location, DigestHash> locations;
     std::unordered_set<Digest, DigestHash> seen;
-    constexpr u64 HeaderSize = FileMagic.size() + sizeof(u32) + sizeof(Digest);
+    constexpr u64 HeaderSize = FileHeaderSize;
     // Drops can follow their variants. Discover them before spending the admission budget.
     for (u64 offset = HeaderSize; offset + 8 <= size;) {
         in.seekg(offset);
@@ -1547,11 +1799,12 @@ bool Store::LoadRecipeRecords(std::ifstream& in, u64 size, u64 byte_budget) {
                 hasher.Add(stage_key.lo);
                 hasher.Add(stage_key.hi);
                 bool ok = true;
-                std::vector<Query> pointers;
+                std::vector<Query> pointers, answers;
                 for (u32 i = 0; i < count && ok; ++i) {
                     Query query;
                     ok = reader.Get(query.kind) && reader.Get(query.a) &&
                          reader.Get(query.b) && reader.Get(query.answer) && reader.Get(query.c);
+                    answers.push_back(query);
                     hasher.Add(query.kind);
                     hasher.Add(query.a);
                     hasher.Add(query.b);
@@ -1563,6 +1816,16 @@ bool Store::LoadRecipeRecords(std::ifstream& in, u64 size, u64 byte_budget) {
                 }
                 if (!ok) break;
                 const auto id = hasher.Finish();
+                if (collect_recipe_entries && !offline && !dropped_entries.contains(id)) {
+                    auto& sets = recorded_answers[stage_key];
+                    if (std::ranges::find(sets, answers) == sets.end()) {
+                        const u64 retained = answers.size() * sizeof(Query);
+                        if (retained > byte_budget - imported_bytes)
+                            throw std::runtime_error("Recorded answer sets exceed recipe byte budget");
+                        imported_bytes += retained;
+                        sets.push_back(std::move(answers));
+                    }
+                }
                 const u64 meta_begin = reader.Position();
                 locations.try_emplace(id, Location{meta_begin, end, stage_key});
                 // Storage-pointer answers of compute translations made at run time (offline
@@ -1584,7 +1847,8 @@ bool Store::LoadRecipeRecords(std::ifstream& in, u64 size, u64 byte_budget) {
             if (!fallback && location != locations.end() && !dropped_entries.contains(id)) {
                 u32 words{}, compressed{};
                 u8 has_recipe{};
-                if (!reader.Skip(sizeof(Shader::Backend::Bindings)) || !SkipInfo(reader) ||
+                if (!reader.Skip(sizeof(Shader::Backend::Bindings)) ||
+                    !SkipInfo(reader, info_layout) ||
                     !reader.Get(words) || !reader.Get(compressed) || !reader.Skip(compressed) ||
                     !reader.Get(has_recipe) || has_recipe > 1) break;
                 if (has_recipe) {
@@ -1602,7 +1866,8 @@ bool Store::LoadRecipeRecords(std::ifstream& in, u64 size, u64 byte_budget) {
                         Reader recipe_reader{bytes};
                         Shader::Stage stage{};
                         EmissionRecipe recipe;
-                        if (!recipe_reader.Get(stage) || static_cast<size_t>(stage) >= Shader::MaxStageTypes ||
+                        if (!recipe_reader.Get(stage) || (static_cast<size_t>(stage) >= Shader::MaxStageTypes &&
+                            stage != Shader::Stage::Task && stage != Shader::Stage::Mesh) ||
                             !ReadRecipe(recipe_reader, recipe) || !bytes.empty()) {
                             ++invalid_recipes;
                         } else {
@@ -1616,7 +1881,7 @@ bool Store::LoadRecipeRecords(std::ifstream& in, u64 size, u64 byte_budget) {
                                                    sizeof(meta.output_vertices) + sizeof(meta.invocations) +
                                                    sizeof(meta.local_memory_size) + sizeof(meta.shared_memory_size) +
                                                    sizeof(meta.is_geometry_passthrough)) ||
-                                    !SkipInfo(metadata, &entry.meta.info)) break;
+                                    !SkipInfo(metadata, info_layout, &entry.meta.info)) break;
                                 entry.id = id;
                                 entries[entry.stage_key].push_back(std::make_shared<const Entry>(std::move(entry)));
                             }
@@ -1648,8 +1913,8 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
     if (!in.is_open()) {
         return false;
     }
-    const auto size = static_cast<size_t>(in.tellg());
-    constexpr size_t HeaderSize = FileMagic.size() + sizeof(u32) + sizeof(Digest);
+    auto size = static_cast<size_t>(in.tellg());
+    constexpr size_t HeaderSize = FileHeaderSize;
     std::array<u8, HeaderSize> header{};
     in.seekg(0);
     if (size < HeaderSize || !in.read(reinterpret_cast<char*>(header.data()), header.size()) ||
@@ -1660,10 +1925,31 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
     Digest file_config{};
     std::memcpy(&version, header.data() + FileMagic.size(), sizeof(version));
     std::memcpy(&file_config, header.data() + FileMagic.size() + sizeof(version), sizeof(Digest));
-    if (version != FormatVersion || file_config != config) {
+    if (version < OldestReadableVersion || version > FormatVersion || file_config != config) {
         LOG_INFO(Render_Vulkan,
                  "Translation cache: written by another build or configuration, starting over");
         return false;
+    }
+    info_layout = InfoLayout::Current;
+    if (version < FormatVersion) {
+        info_layout = DetectInfoLayout(in, size);
+        LOG_INFO(Render_Vulkan, "Translation cache: {} is format {} with the {} info layout",
+                 Common::FS::PathToUTF8String(path.filename()), version,
+                 InfoLayoutName(info_layout));
+        if (writable && !collect_recipe_entries) {
+            // Appends are written in the current layout: upgrade the file before reading it.
+            in.close();
+            if (!UpgradeFile(path, info_layout)) {
+                LOG_WARNING(Render_Vulkan, "Translation cache: could not upgrade {} to format {}",
+                            Common::FS::PathToUTF8String(path), FormatVersion);
+                return false;
+            }
+            info_layout = InfoLayout::Current;
+            in.open(path, std::ios::binary | std::ios::ate);
+            if (!in.is_open()) return false;
+            size = static_cast<size_t>(in.tellg());
+        }
+        in.seekg(HeaderSize);
     }
     if (collect_recipe_entries) {
         const bool loaded = LoadRecipeRecords(in, size, byte_budget);
@@ -1688,7 +1974,8 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
         if (ok && type == RecordEntry) {
             Entry entry;
             ok = reader.Get(entry.stage_key) && ReadQueries(reader, entry.queries) &&
-                 ReadMeta(record, entry.meta) && reader.Get(entry.offline) && record.empty();
+                 ReadMeta(record, entry.meta, info_layout) && reader.Get(entry.offline) &&
+                 record.empty();
             if (ok) {
                 InsertLocked(std::move(entry));
                 ++loaded_entries;
@@ -1701,8 +1988,9 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
             stored->info_offset = offset + 8 + length - record.size();
             const auto info_begin = record.size();
             Shader::Info info;
-            ok = ok && ReadInfo(record, info);
+            ok = ok && ReadInfo(record, info, info_layout);
             stored->info_size = static_cast<u32>(info_begin - record.size());
+            stored->info_layout = info_layout;
             ok = ok && reader.Get(stored->spirv_words) && reader.Get(stored->compressed_size) &&
                  stored->compressed_size <= record.size();
             if (ok) {
@@ -1715,7 +2003,8 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
             EmissionRecipe recipe;
             ok = ok && reader.Get(has_recipe);
             if (ok && has_recipe) {
-                ok = reader.Get(stage) && static_cast<size_t>(stage) < Shader::MaxStageTypes &&
+                ok = reader.Get(stage) && (static_cast<size_t>(stage) < Shader::MaxStageTypes ||
+                     stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) &&
                      ReadRecipe(reader, recipe);
                 if (!ok) {
                     ++invalid_recipes;
@@ -1784,13 +2073,28 @@ std::shared_ptr<const Entry> Store::InsertLocked(Entry entry) {
 }
 
 std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::Environment& env,
-                                              LiveAnswers* live) {
+                                              LiveAnswers* live, u64 pipeline_hash,
+                                              u64 shader_hash, u32 slot) {
+    static const bool log_misses = [] {
+        const char* value = std::getenv("EDEN_NX2_TRANSLATION_MISS_LOG");
+        return value && std::string_view{value} == "1";
+    }();
+    const auto log_miss = [&](std::string_view reason, std::string_view difference) {
+        if (log_misses) {
+            LOG_INFO(Render_Vulkan,
+                     "Translation cache miss: pipeline={:016x} slot={} shader={:016x} "
+                     "stage={} stage_key={:016x}{:016x} reason={} first_query={}",
+                     pipeline_hash, slot, shader_hash, static_cast<u32>(env.ShaderStage()),
+                     stage_key.hi, stage_key.lo, reason, difference);
+        }
+    };
     std::vector<std::shared_ptr<const Entry>> candidates;
     {
         std::scoped_lock lock{mutex};
         const auto it = entries.find(stage_key);
         if (it == entries.end()) {
             ++entry_key_misses;
+            log_miss("key", "none");
             return nullptr;
         }
         for (const auto& entry : it->second) {
@@ -1801,26 +2105,76 @@ std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::E
     }
     size_t furthest = 0;
     std::optional<QueryKind> furthest_kind;
+    std::string difference;
+    bool offline_failed = false;
     for (const auto& candidate : candidates) {
+        ReplayMismatch mismatch;
+        std::string failure;
         try {
-            const size_t matched = ReplayQueriesUntilMismatch(candidate->queries, env, live);
+            const size_t matched = ReplayQueriesUntilMismatch(candidate->queries, env, live,
+                                                              &mismatch);
             if (matched == candidate->queries.size()) {
                 return candidate;
             }
-            if (!furthest_kind || matched > furthest) {
-                furthest = matched;
-                furthest_kind = candidate->queries[matched].kind;
-            }
-        } catch (const Shader::Exception&) {
-            // An environment read from the pipeline cache only answers the queries its own
-            // translation made; a question outside them means this entry does not apply.
+        } catch (const Shader::Exception& exception) {
+            // A recorded environment may lack an answer requested by this candidate.
+            failure = exception.what();
         }
-        if (candidate->offline) ++offline_replay_misses;
+        if (candidate->offline) offline_failed = true;
+        if (mismatch.index < candidate->queries.size() &&
+            (!furthest_kind || mismatch.index > furthest)) {
+            furthest = mismatch.index;
+            const Query& query = candidate->queries[furthest];
+            furthest_kind = query.kind;
+            if (log_misses) {
+                constexpr std::array names{"CbufValue", "TextureType", "TexturePixelFormat",
+                    "TexturePixelFormatInteger", "ViewportTransformState",
+                    "CbufStorageBufferPointer", "ReplaceConstBuffer",
+                    "CbufIndirectStorageBufferPointer", "TextureHandle"};
+                const size_t kind = static_cast<size_t>(query.kind);
+                difference = fmt::format(
+                    "index={} kind={} a={:#x} b={:#x} c={:#x} expected={:#x} actual={}{}",
+                    furthest, kind < names.size() ? names[kind] : "unknown", query.a, query.b,
+                    query.c, query.answer,
+                    mismatch.actual ? fmt::format("{:#x}", *mismatch.actual) : "unavailable",
+                    failure.empty() ? "" : fmt::format(" error={}", failure));
+            }
+        }
     }
+    // Count lookup failures, not candidates rejected before a later entry succeeds.
+    if (offline_failed) ++offline_replay_misses;
     if (count_mismatches && furthest_kind) {
         ++first_mismatch[static_cast<size_t>(*furthest_kind) % first_mismatch.size()];
     }
+    log_miss(candidates.empty() ? "dropped" : "replay", difference.empty() ? "none" : difference);
     return nullptr;
+}
+
+Store::ReplayCounts Store::ReplayAllEntries(const Digest& stage_key, Shader::Environment& env) {
+    std::vector<std::shared_ptr<const Entry>> candidates;
+    {
+        std::scoped_lock lock{mutex};
+        if (const auto it = entries.find(stage_key); it != entries.end()) {
+            for (const auto& entry : it->second) {
+                if (!dropped_entries.contains(entry->id)) {
+                    candidates.push_back(entry);
+                }
+            }
+        }
+    }
+    ReplayCounts counts;
+    for (const auto& entry : candidates) {
+        try {
+            if (ReplayQueries(entry->queries, env)) {
+                ++counts.matched;
+            } else {
+                ++counts.mismatched;
+            }
+        } catch (const Shader::Exception&) {
+            ++counts.unavailable;
+        }
+    }
+    return counts;
 }
 
 bool Store::HasStageKey(const Digest& stage_key) {
@@ -1901,7 +2255,8 @@ std::optional<Variant> Store::FindVariant(const Digest& variant_key) {
         loaded.resize(prefix_size + stored->compressed_size);
         if (!input.read(reinterpret_cast<char*>(loaded.data()), loaded.size())) return std::nullopt;
         auto info_bytes = std::span<const u8>{loaded}.first(stored->info_size);
-        if (!ReadInfo(info_bytes, variant.info) || !info_bytes.empty()) return std::nullopt;
+        if (!ReadInfo(info_bytes, variant.info, stored->info_layout) || !info_bytes.empty())
+            return std::nullopt;
         compressed = std::span<const u8>{loaded}.subspan(prefix_size);
     }
     const size_t bytes = Common::Compression::DecompressDataZSTD(

@@ -3417,6 +3417,7 @@ private:
     // the front owns the macro code and bindings (the back thread then leaves them alone).
     struct FrontState;
     FrontState& Front(Core::System& system, VideoCommon::GpuSplit& split);
+    void ReleaseFront();
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
@@ -3425,6 +3426,8 @@ private:
     /// FrontDmaRead without draining the back, when the words can be known: false otherwise.
     bool FrontDmaReadQueued(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                             GPUVAddr source, u32 words);
+    void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
+    bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                       u32 count);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);

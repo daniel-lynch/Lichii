@@ -179,6 +179,7 @@ add_library(video_core STATIC
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h
     renderer_vulkan/pipeline_build.h
+    renderer_vulkan/pipeline_build_trace.h
     renderer_vulkan/pipeline_helper.h
     renderer_vulkan/pipeline_optimization.h
     renderer_vulkan/pipeline_shader_emission.h
@@ -274,6 +275,8 @@ add_library(video_core STATIC
     shader_cache.h
     offline_compute_producer.cpp
     offline_compute_producer.h
+    offline_recorded_producer.cpp
+    offline_recorded_producer.h
     offline_shader_producer.cpp
     offline_shader_producer.h
     shader_archive_environment.cpp

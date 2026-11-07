@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -19,6 +22,7 @@
 #include "video_core/shader_pool_index.h"
 #include "video_core/shader_recipe_histogram.h"
 #include "shader_recompiler/translator_identity.h"
+#include "shader_recompiler/exception.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "video_core/shader_translation_cache.h"
 #include "video_core/shader_archive_environment.h"
@@ -38,6 +42,7 @@ public:
     }
     u32 ReadCbufValue(u32 index, u32 offset) override {
         ++reads;
+        if (fail_cbuf_reads) throw Shader::LogicError("Uncached test constant buffer value");
         return cbufs[(u64{index} << 32) | offset];
     }
     Shader::TextureType ReadTextureType(u32 handle) override {
@@ -83,6 +88,7 @@ public:
     u32 viewport = 1;
     u32 texture_bound = 2;
     u32 reads = 0;
+    bool fail_cbuf_reads{};
     std::set<u32> indirect_pointers;
 };
 
@@ -1498,16 +1504,10 @@ TEST_CASE("Recipe catalogs cap exact selection and total import size",
     REQUIRE(capped.entries == 3);
     REQUIRE(capped.truncated_entries == 15);
     REQUIRE(capped.exact.at(key).size() == 1);
-    const auto budgeted = Store::ReadRecipeCatalog(path, config, 200000, 1);
-    REQUIRE(budgeted.entries == 0);
-    REQUIRE(budgeted.imported_bytes == 0);
-    REQUIRE(budgeted.skipped_records == 8);
+    REQUIRE_THROWS(Store::ReadRecipeCatalog(path, config, 200000, 1));
     const auto lines = Common::Log::ReadRing(0);
     REQUIRE(std::ranges::any_of(lines, [](const auto& line) {
         return line.text.find("3 catalog entries; 15 recipe references truncated by entry limit 3") != std::string::npos;
-    }));
-    REQUIRE(std::ranges::any_of(lines, [](const auto& line) {
-        return line.text.find("8 records skipped by byte budget 1; 0 bytes admitted") != std::string::npos;
     }));
     Common::Log::SetRingCapacity(0);
     std::filesystem::remove(path);
@@ -1842,4 +1842,389 @@ TEST_CASE("Translation cache evicts oldest resident variants only with a disk co
         REQUIRE(memory.ResidentBytes() == 0);
     }
     std::filesystem::remove(path);
+}
+
+TEST_CASE("Offline replay misses count failed lookups rather than rejected candidates",
+          "[translation_cache][video_core]") {
+    FakeEnvironment env;
+    Store store;
+    store.Open({}, {});
+    store.count_mismatches = true;
+    const Digest key{401, 402};
+    REQUIRE(store.Insert(key, {{QueryKind::ViewportTransformState, 0, 0, 2}},
+                         ProgramMeta{}, true));
+    REQUIRE(store.Insert(key, {{QueryKind::ViewportTransformState, 0, 0, 3}},
+                         ProgramMeta{}, true));
+    REQUIRE_FALSE(store.FindEntry(key, env));
+    REQUIRE(store.offline_replay_misses == 1);
+    const auto boot = store.Insert(key, {{QueryKind::ViewportTransformState, 0, 0, 1}},
+                                   ProgramMeta{});
+    REQUIRE(boot);
+    LiveAnswers live;
+    REQUIRE(store.FindEntry(key, env, &live) == boot);
+    REQUIRE(live == boot->queries);
+    REQUIRE(store.offline_replay_misses == 1);
+    REQUIRE(store.first_mismatch[static_cast<size_t>(QueryKind::ViewportTransformState)] == 1);
+    REQUIRE_FALSE(store.FindEntry({403, 404}, env));
+    REQUIRE(store.entry_key_misses == 1);
+    REQUIRE(store.offline_replay_misses == 1);
+}
+
+TEST_CASE("Replay diagnostics identify the first differing query and its actual answer",
+          "[translation_cache][video_core]") {
+    FakeEnvironment env;
+    const std::array queries{
+        Query{QueryKind::ViewportTransformState, 0, 0, 1},
+        Query{QueryKind::TextureType, 8, 0, static_cast<u32>(Shader::TextureType::ColorArray2D)},
+        Query{QueryKind::CbufValue, 0, 0, 99},
+    };
+    ReplayMismatch mismatch;
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, nullptr, &mismatch) == 1);
+    REQUIRE(mismatch.index == 1);
+    REQUIRE(mismatch.actual == static_cast<u32>(Shader::TextureType::Color2D));
+    REQUIRE(env.reads == 0);
+}
+
+
+TEST_CASE("Full producer replay visits every entry and preserves lookup counters",
+          "[translation_cache][video_core]") {
+    FakeEnvironment env;
+    env.fail_cbuf_reads = true;
+    Store store;
+    store.Open({}, {});
+    const Digest key{405, 406};
+    REQUIRE(store.Insert(key, {{QueryKind::ViewportTransformState, 0, 0, 1}},
+                         ProgramMeta{}, true));
+    const auto different = store.Insert(key, {{QueryKind::ViewportTransformState, 0, 0, 2}},
+                                        ProgramMeta{}, true);
+    REQUIRE(different);
+    REQUIRE(store.Insert(key, {{QueryKind::CbufValue, 0, 0, 99}}, ProgramMeta{}, true));
+    const auto counts = store.ReplayAllEntries(key, env);
+    REQUIRE(counts.matched == 1);
+    REQUIRE(counts.mismatched == 1);
+    REQUIRE(counts.unavailable == 1);
+    REQUIRE(env.reads == 1);
+    REQUIRE(store.entry_key_misses == 0);
+    REQUIRE(store.offline_replay_misses == 0);
+    REQUIRE(store.offline_dropped_misses == 0);
+
+    store.DropEntry(*different);
+    const auto remaining = store.ReplayAllEntries(key, env);
+    REQUIRE(remaining.matched == 1);
+    REQUIRE(remaining.mismatched == 0);
+    REQUIRE(remaining.unavailable == 1);
+    const auto missing = store.ReplayAllEntries({407, 408}, env);
+    REQUIRE(missing.matched == 0);
+    REQUIRE(missing.mismatched == 0);
+    REQUIRE(missing.unavailable == 0);
+    REQUIRE(store.entry_key_misses == 0);
+    REQUIRE(store.offline_replay_misses == 0);
+    REQUIRE(store.offline_dropped_misses == 0);
+}
+
+TEST_CASE("Recipe directories retain all answers while sharing one recipe limit",
+          "[translation_cache][video_core]") {
+    const auto directory = std::filesystem::temp_directory_path() / "eden-recipe-directory-test";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    const Digest config{501, 502}, key{503, 504};
+    for (u32 value : {1, 2}) {
+        Store source;
+        source.Open(directory / ("vulkan_translations.source" + std::to_string(value) + ".bin"), config);
+        ProgramMeta meta{};
+        meta.stage = Shader::Stage::Fragment;
+        const auto entry = source.Insert(key, {{QueryKind::ViewportTransformState, 0, 0, value}}, meta);
+        REQUIRE(entry);
+        auto recipe = DefaultEmissionRecipe(meta.stage);
+        recipe.bindings.texture = value;
+        REQUIRE(source.InsertVariant(*entry,
+            MakeVariantKey(entry->id, DigestRuntimeInfo(recipe.runtime), recipe.bindings),
+            {.spirv = {0x07230203, 0x10000, 0, 1, 0}}, &recipe));
+    }
+    const auto catalog = Store::ReadRecipeCatalog(directory, config, 1);
+    CHECK(catalog.entries == 1);
+    CHECK(catalog.recorded_answers.at(key).size() == 2);
+    CHECK(catalog.exact.at(key).size() == 1);
+    std::filesystem::remove_all(directory);
+}
+
+namespace {
+std::vector<u8> ReadFileBytes(const std::filesystem::path& path) {
+    std::ifstream in{path, std::ios::binary};
+    return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+}
+
+void WriteFileBytes(const std::filesystem::path& path, std::span<const u8> bytes) {
+    std::ofstream out{path, std::ios::binary | std::ios::trunc};
+    out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
+
+u32 FileVersion(const std::filesystem::path& path) {
+    const auto bytes = ReadFileBytes(path);
+    REQUIRE(bytes.size() >= 12);
+    u32 version{};
+    std::memcpy(&version, bytes.data() + 8, sizeof(version));
+    return version;
+}
+
+// A cache file as a build before upstream #353 wrote it: header version 10 and every Info
+// without frag_color_components. Built from the format-11 file by splicing each record's Info
+// bytes, independently of the reader's own conversion.
+std::vector<u8> ToPre353File(const std::vector<u8>& file, std::span<const Shader::Info> infos,
+                             u32 version = 10) {
+    constexpr size_t Header = 8 + 4 + 16;
+    REQUIRE(file.size() >= Header);
+    std::vector<u8> out(file.begin(), file.begin() + Header);
+    std::memcpy(out.data() + 8, &version, sizeof(version));
+    for (size_t offset = Header; offset < file.size();) {
+        u32 magic{}, length{};
+        std::memcpy(&magic, file.data() + offset, 4);
+        std::memcpy(&length, file.data() + offset + 4, 4);
+        REQUIRE(magic == 0x52435453);
+        std::vector<u8> record(file.begin() + offset + 8, file.begin() + offset + 8 + length);
+        offset += 8 + length;
+        if (record[0] != 2) {
+            bool replaced = false;
+            for (const auto& info : infos) {
+                std::vector<u8> current, legacy;
+                WriteInfo(current, info);
+                WriteInfo(legacy, info, InfoLayout::NoFragColorComponents);
+                const auto it = std::ranges::search(record, current).begin();
+                if (it == record.end()) continue;
+                const auto at = it - record.begin();
+                record.erase(record.begin() + at, record.begin() + at + current.size());
+                record.insert(record.begin() + at, legacy.begin(), legacy.end());
+                replaced = true;
+                break;
+            }
+            REQUIRE(replaced);
+        }
+        const u32 new_length = static_cast<u32>(record.size());
+        const auto* m = reinterpret_cast<const u8*>(&magic);
+        const auto* l = reinterpret_cast<const u8*>(&new_length);
+        out.insert(out.end(), m, m + 4);
+        out.insert(out.end(), l, l + 4);
+        out.insert(out.end(), record.begin(), record.end());
+    }
+    return out;
+}
+
+struct FormatFixture {
+    Digest config{0x353, 0x88};
+    FakeEnvironment env;
+    Digest stage_key{};
+    ProgramMeta meta{};
+    Variant variant{};
+    EmissionRecipe recipe = DefaultEmissionRecipe(Shader::Stage::Fragment);
+    Digest variant_key{};
+
+    FormatFixture() {
+        env.cbufs[(u64{1} << 32) | 0x10] = 0x40;
+        stage_key = MakeStageKey(env, 0x88, 4, config);
+        meta.stage = Shader::Stage::Fragment;
+        meta.info = SampleInfo();
+        // The fragment shader writes R, G and B of render target 2 (#353's per-component mask).
+        meta.info.frag_color_components[2] = 0x7;
+        variant.info = meta.info;
+        variant.binding_out = {.unified = 1, .texture = 6};
+        for (u32 i = 0; i < 64; ++i) variant.spirv.push_back(0x07230203 + i);
+        recipe.bindings.texture = 5;
+    }
+
+    void Write(const std::filesystem::path& path) {
+        Store store;
+        store.Open(path, config);
+        REQUIRE(store.Persistent());
+        RecordingEnvironment recording{env};
+        Translate(recording);
+        const auto entry = store.Insert(stage_key, recording.TakeQueries(), meta);
+        REQUIRE(entry);
+        variant_key = MakeVariantKey(entry->id, DigestRuntimeInfo(recipe.runtime), recipe.bindings);
+        REQUIRE(store.InsertVariant(*entry, variant_key, variant, &recipe));
+    }
+};
+} // Anonymous namespace
+
+TEST_CASE("Translation cache writes format 11 and round-trips frag_color_components",
+          "[video_core][translation_cache]") {
+    const auto directory = TempPath("lichii_translation_format11_test");
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    const auto path = directory / "vulkan_translations.1111111111111111.fork-v53.bin";
+    FormatFixture fixture;
+    fixture.Write(path);
+    REQUIRE(FileVersion(path) == 11);
+    {
+        Store store;
+        store.Open(path, fixture.config);
+        const auto entry = store.FindEntry(fixture.stage_key, fixture.env);
+        REQUIRE(entry);
+        REQUIRE(entry->meta.info.frag_color_components[2] == 0x7);
+        REQUIRE(InfoEqual(entry->meta.info, fixture.meta.info));
+        const auto found = store.FindVariant(fixture.variant_key);
+        REQUIRE(found);
+        REQUIRE(found->spirv == fixture.variant.spirv);
+        REQUIRE(found->info.frag_color_components[2] == 0x7);
+        REQUIRE(InfoEqual(found->info, fixture.variant.info));
+    }
+    REQUIRE(FileVersion(path) == 11);
+    const auto catalog = Store::ReadRecipeCatalog(path, {1, 2});
+    REQUIRE(catalog.scanned_records == 2);
+    REQUIRE(catalog.eligible_records == 1);
+    REQUIRE(catalog.admitted_records == 1);
+    REQUIRE(catalog.exact.at(fixture.stage_key).front().recipe.bindings.texture == 5);
+    const auto recipes = Store::ReadRecipes(path, fixture.config);
+    REQUIRE(recipes[static_cast<size_t>(Shader::Stage::Fragment)].bindings.texture == 5);
+    std::filesystem::remove_all(directory);
+}
+
+TEST_CASE("Translation cache reads version-10 files written before frag_color_components",
+          "[video_core][translation_cache]") {
+    // The serialized Info of the old layout is the new one without the 8 component bytes that
+    // follow stores_frag_color.
+    {
+        Shader::Info info = SampleInfo();
+        // Render target 0: R only, so the field's first byte differs from what follows it.
+        info.stores_frag_color[0] = true;
+        info.frag_color_components[0] = 0x1;
+        info.frag_color_components[2] = 0x7;
+        std::vector<u8> current, legacy;
+        WriteInfo(current, info);
+        WriteInfo(legacy, info, InfoLayout::NoFragColorComponents);
+        REQUIRE(current.size() == legacy.size() + 8);
+        const auto at = static_cast<size_t>(
+            std::ranges::mismatch(current, legacy).in1 - current.begin());
+        REQUIRE(std::equal(current.begin() + at, current.begin() + at + 8,
+                           info.frag_color_components.begin()));
+        REQUIRE(std::equal(current.begin() + at + 8, current.end(), legacy.begin() + at));
+        std::span<const u8> in{legacy};
+        Shader::Info read{};
+        REQUIRE(ReadInfo(in, read, InfoLayout::NoFragColorComponents));
+        REQUIRE(in.empty());
+        // Stored render target: all components; the others: none.
+        REQUIRE(read.frag_color_components ==
+                std::array<u8, 8>{0xF, 0, 0xF, 0, 0, 0, 0, 0});
+        Shader::Info expected = info;
+        expected.frag_color_components[0] = 0xF;
+        expected.frag_color_components[2] = 0xF;
+        REQUIRE(InfoEqual(read, expected));
+        std::span<const u8> misread{legacy};
+        REQUIRE_FALSE((ReadInfo(misread, read) && misread.empty()));
+    }
+
+    const auto directory = TempPath("lichii_translation_format10_test");
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    const auto current_path = directory / "vulkan_translations.1111111111111111.fork-v53.bin";
+    FormatFixture fixture;
+    fixture.Write(current_path);
+    const auto current_bytes = ReadFileBytes(current_path);
+    const std::array infos{fixture.meta.info, fixture.variant.info};
+    const auto legacy_bytes = ToPre353File(current_bytes, infos);
+    // One Info in the entry, one in the variant.
+    REQUIRE(legacy_bytes.size() == current_bytes.size() - 16);
+    // A recipe source of another translator tag, as the producer imports it.
+    const auto other_tag = directory / "vulkan_translations.84d3ee17e49f2a55.fork-v53.bin";
+    WriteFileBytes(other_tag, legacy_bytes);
+    REQUIRE(FileVersion(other_tag) == 10);
+
+    SECTION("the producer imports its recipes") {
+        const auto catalog = Store::ReadRecipeCatalog(other_tag, {1, 2});
+        REQUIRE(catalog.source_config == fixture.config);
+        REQUIRE(catalog.scanned_records == 2);
+        REQUIRE(catalog.eligible_records == 1);
+        REQUIRE(catalog.admitted_records == 1);
+        REQUIRE(catalog.invalid_recipes == 0);
+        REQUIRE(catalog.exact.at(fixture.stage_key).size() == 1);
+        REQUIRE(catalog.exact.at(fixture.stage_key).front().recipe.bindings.texture == 5);
+        REQUIRE(catalog.recorded_answers.at(fixture.stage_key).size() == 1);
+        REQUIRE(catalog.Select(fixture.stage_key, Shader::Stage::Fragment, fixture.meta.info, 2,
+                               RecipeBaseline::Never)
+                    .front()
+                    .bindings.texture == 5);
+        // The same in a directory of sources, next to a format-11 file of the same source.
+        const auto both = Store::ReadRecipeCatalog(directory, {1, 2});
+        REQUIRE(both.admitted_records == 2);
+        REQUIRE(both.exact.at(fixture.stage_key).front().count == 2);
+        // Reading never changes a source.
+        REQUIRE(ReadFileBytes(other_tag) == legacy_bytes);
+    }
+    SECTION("the recipe file reader reads it") {
+        const auto recipes = Store::ReadRecipes(other_tag, fixture.config);
+        REQUIRE(recipes[static_cast<size_t>(Shader::Stage::Fragment)].bindings.texture == 5);
+        REQUIRE(ReadFileBytes(other_tag) == legacy_bytes);
+    }
+    SECTION("a live cache of the same configuration loads and is upgraded to format 11") {
+        std::filesystem::remove(current_path);
+        const auto live = directory / "vulkan_translations.2222222222222222.fork-v53.bin";
+        WriteFileBytes(live, legacy_bytes);
+        Shader::Info derived = fixture.meta.info;
+        derived.frag_color_components[2] = 0xF;
+        Digest second_key{};
+        {
+            Store store;
+            store.Open(live, fixture.config);
+            REQUIRE(store.Persistent());
+            const auto entry = store.FindEntry(fixture.stage_key, fixture.env);
+            REQUIRE(entry);
+            REQUIRE(InfoEqual(entry->meta.info, derived));
+            const auto found = store.FindVariant(fixture.variant_key);
+            REQUIRE(found);
+            REQUIRE(found->spirv == fixture.variant.spirv);
+            REQUIRE(found->binding_out.texture == 6);
+            REQUIRE(InfoEqual(found->info, derived));
+            // Appends follow in the current layout.
+            auto recipe = fixture.recipe;
+            recipe.bindings.texture = 9;
+            second_key = MakeVariantKey(entry->id, DigestRuntimeInfo(recipe.runtime),
+                                        recipe.bindings);
+            REQUIRE(store.InsertVariant(*entry, second_key, fixture.variant, &recipe));
+        }
+        REQUIRE(FileVersion(live) == 11);
+        {
+            Store store;
+            store.Open(live, fixture.config);
+            const auto entry = store.FindEntry(fixture.stage_key, fixture.env);
+            REQUIRE(entry);
+            REQUIRE(InfoEqual(entry->meta.info, derived));
+            const auto first = store.FindVariant(fixture.variant_key);
+            REQUIRE(first);
+            REQUIRE(InfoEqual(first->info, derived));
+            const auto second = store.FindVariant(second_key);
+            REQUIRE(second);
+            REQUIRE(second->info.frag_color_components[2] == 0x7);
+        }
+        const auto catalog = Store::ReadRecipeCatalog(live, {1, 2});
+        REQUIRE(catalog.admitted_records == 2);
+        REQUIRE(catalog.invalid_recipes == 0);
+    }
+    SECTION("a version-10 file written since #353 keeps its components") {
+        const auto since = directory / "vulkan_translations.fc5d3b7d1d0996fe.fork-v53.bin";
+        auto bytes = current_bytes;
+        const u32 ten = 10;
+        std::memcpy(bytes.data() + 8, &ten, sizeof(ten));
+        WriteFileBytes(since, bytes);
+        const auto catalog = Store::ReadRecipeCatalog(since, {1, 2});
+        REQUIRE(catalog.admitted_records == 1);
+        {
+            Store store;
+            store.Open(since, fixture.config);
+            const auto entry = store.FindEntry(fixture.stage_key, fixture.env);
+            REQUIRE(entry);
+            REQUIRE(entry->meta.info.frag_color_components[2] == 0x7);
+            const auto found = store.FindVariant(fixture.variant_key);
+            REQUIRE(found);
+            REQUIRE(InfoEqual(found->info, fixture.variant.info));
+        }
+        // Only the version changes: the layout already is the current one.
+        REQUIRE(FileVersion(since) == 11);
+        REQUIRE(ReadFileBytes(since) == current_bytes);
+    }
+    SECTION("another configuration still starts over") {
+        Store store;
+        store.Open(other_tag, Digest{0x353, 0x89});
+        REQUIRE_FALSE(store.FindEntry(fixture.stage_key, fixture.env));
+        REQUIRE(FileVersion(other_tag) == 11);
+    }
+    std::filesystem::remove_all(directory);
 }

@@ -16,6 +16,7 @@
 #include "shader_recompiler/frontend/maxwell/structured_control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "video_core/offline_compute_producer.h"
+#include "video_core/offline_recorded_producer.h"
 #include "video_core/offline_shader_producer.h"
 #include "video_core/shader_archive_environment.h"
 
@@ -140,15 +141,9 @@ std::vector<TranslationCache::SelectedRecipe> ExpandRecipes(
 }
 
 Shader::TextureType TextureTypeForProgram(const Program& program) {
-    auto effect = [](std::string name) {
-        std::ranges::transform(name, name.begin(), [](unsigned char c) { return std::tolower(c); });
-        return name.find(".vsetb") != std::string::npos;
-    };
-    // Owned code filenames are content hashes. Classify using original container identities,
-    // including nested/compressed members, instead of guessing from the allocation filename.
-    for (const auto& origin : program.origins)
-        if (effect(origin.source) || effect(origin.member)) return Shader::TextureType::ColorArray2D;
-    if (effect(program.container.string())) return Shader::TextureType::ColorArray2D;
+    // Container identity does not determine the dimension of a bound texture. Recorded
+    // per-handle answers override this fallback; every guessed entry remains replay guarded.
+    (void)program;
     return Shader::TextureType::Color2D;
 }
 
@@ -169,6 +164,12 @@ void WriteReport(const std::filesystem::path& path, const Summary& summary) {
         {"resumed", summary.resumed}, {"modules", summary.modules},
         {"module_bytes", summary.module_bytes}, {"module_bytes_encoding", "uncompressed_spirv"},
         {"cancelled", summary.cancelled},
+        {"recorded_sets_validated", summary.recorded_sets_validated},
+        {"recorded_sets_failed", summary.recorded_sets_failed},
+        {"recorded_replay", {{"matched", summary.recorded_replay.matched},
+            {"mismatched", summary.recorded_replay.mismatched},
+            {"unavailable", summary.recorded_replay.unavailable}}},
+        {"pipeline_validation", Json::parse(summary.pipeline_validation)},
         {"skips", summary.skipped}, {"sources", sources},
         {"product_entry_multiplicity", histogram}, {"product_modules", summary.product_modules},
         {"compute", {{"translated", summary.compute.translated},
@@ -433,17 +434,22 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                     summary.compute.module_bytes += outcome.module_bytes;
                     summary.compute.pointer_modules += outcome.pointer_modules;
                     summary.compute.recorded_sets += outcome.recorded_sets;
+                    summary.recorded_sets_validated += outcome.recorded_validated;
+                    summary.recorded_sets_failed += outcome.recorded_failed;
+                    summary.recorded_replay.matched += outcome.replay.matched;
+                    summary.recorded_replay.mismatched += outcome.replay.mismatched;
+                    summary.recorded_replay.unavailable += outcome.replay.unavailable;
                     continue;
                 }
                 if (row.stage != Shader::Stage::VertexB && row.stage != Shader::Stage::Fragment &&
                     row.stage != Shader::Stage::Geometry) throw std::runtime_error("unsupported_stage");
                 if (!row.skip_reason.empty()) throw std::runtime_error(row.skip_reason);
-                auto env = environment(row);
-                const auto hash = env.Analyze();
+                auto base_env = environment(row);
+                const auto hash = base_env.Analyze();
                 if (!hash) throw std::runtime_error("unsupported_lowering");
-                const auto key = TC::MakeStageKey(env, *hash, static_cast<u32>(row.stage) + 1, config);
+                const auto key = TC::MakeStageKey(base_env, *hash, static_cast<u32>(row.stage) + 1, config);
                 const auto recipe_key = recipe_cache.empty() ? key :
-                    TC::MakeStageKey(env, *hash, static_cast<u32>(row.stage) + 1, recipes.source_config);
+                    TC::MakeStageKey(base_env, *hash, static_cast<u32>(row.stage) + 1, recipes.source_config);
                 std::scoped_lock stage_lock(stage_locks[key.lo % stage_locks.size()]);
                 auto& damaged_variants = damaged[key.lo % stage_locks.size()];
                 auto ready = [&](const TC::Digest& variant_key) {
@@ -457,73 +463,101 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
                     return state == TC::Store::ResumeVariant::Ready ||
                            state == TC::Store::ResumeVariant::Validated;
                 };
-                if (StopSignal()) break;
-                TC::RecordingEnvironment resume(env, true);
-                auto entry = store.FindEntry(key, resume);
-                std::vector<TC::SelectedRecipe> selected;
-                if (entry)
-                    selected = select(index, recipe_key, entry->meta.info);
-                size_t candidate{};
-                bool translated{};
-                while (!StopSignal()) {
-                    if (entry) {
-                        while (candidate < selected.size()) {
-                            const auto& recipe = selected[candidate].recipe;
-                            const auto runtime = TC::CanonicalRuntimeInfo(recipe.runtime,
-                                entry->meta.info, entry->meta.stage);
+                std::vector<std::span<const TC::Query>> sets{{}};
+                if (const auto it = recipes.recorded_answers.find(recipe_key);
+                    it != recipes.recorded_answers.end())
+                    for (const auto& answers : it->second) sets.emplace_back(answers);
+                for (size_t set = 0; set < sets.size(); ++set) {
+                    if (StopSignal()) break;
+                    try {
+                        auto env = environment(row);
+                        if (set != 0) env.SetRecordedAnswers(sets[set]);
+                        TC::RecordingEnvironment resume(env, true);
+                        auto entry = store.FindEntry(key, resume);
+                        std::vector<TC::SelectedRecipe> selected;
+                        if (entry)
+                            selected = select(index, recipe_key, entry->meta.info);
+                        size_t candidate{};
+                        bool translated{};
+                        while (!StopSignal()) {
+                            if (entry && (set == 0 || translated)) {
+                                while (candidate < selected.size()) {
+                                    const auto& recipe = selected[candidate].recipe;
+                                    const auto runtime = TC::CanonicalRuntimeInfo(recipe.runtime,
+                                        entry->meta.info, entry->meta.stage);
+                                    const auto variant_key = TC::MakeVariantKey(entry->id,
+                                        TC::DigestRuntimeInfo(runtime), recipe.bindings);
+                                    if (!ready(variant_key)) break;
+                                    ++candidate;
+                                }
+                                if (candidate == selected.size()) break;
+                            }
+                            // Each emission owns a fresh program: EmitSPIRV and legacy conversion mutate IR.
+                            TC::RecordingEnvironment recording(env, true);
+                            Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+                            Shader::ObjectPool<Shader::IR::Inst> inst_pool;
+                            Shader::ObjectPool<Shader::IR::Block> block_pool;
+                            Shader::Maxwell::Flow::CFG cfg(recording, flow_pool,
+                                Shader::Maxwell::Location{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))});
+                            auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, recording, cfg, host);
+                            if (!env.CanCacheTranslation() || program.info.requires_layer_emulation)
+                                throw std::runtime_error("lowering_or_emission_rejected");
+                            translated = true;
+                            {
+                                std::scoped_lock lock(results);
+                                ++summary.translated;
+                            }
+                            if (!entry || set != 0) {
+                                const auto fresh = store.Insert(key, recording.TakeQueries(),
+                                                                 TC::ProgramMeta::From(program), true);
+                                if (!fresh) throw std::runtime_error("cache_disabled");
+                                if (!entry || entry->id != fresh->id) {
+                                    selected = select(index, recipe_key, program.info);
+                                    candidate = 0;
+                                }
+                                entry = fresh;
+                            }
+                            if (selected.empty()) break;
+                            const auto selection = selected[candidate++];
+                            auto recipe = selection.recipe;
+                            recipe.runtime = TC::CanonicalRuntimeInfo(recipe.runtime, program.info, program.stage);
                             const auto variant_key = TC::MakeVariantKey(entry->id,
-                                TC::DigestRuntimeInfo(runtime), recipe.bindings);
-                            if (!ready(variant_key)) break;
-                            ++candidate;
+                                TC::DigestRuntimeInfo(recipe.runtime), recipe.bindings);
+                            if (ready(variant_key)) continue;
+                            Shader::Maxwell::ConvertLegacyToGeneric(program, recipe.runtime);
+                            auto bindings = recipe.bindings;
+                            const auto code = Shader::Backend::SPIRV::EmitSPIRV(profile, recipe.runtime, program, bindings);
+                            if (code.size() < 5 || code.front() != 0x07230203)
+                                throw std::runtime_error("lowering_or_emission_rejected");
+                            if (!store.InsertVariant(*entry, variant_key,
+                                                     {bindings, program.info, code, true}, &recipe))
+                                throw std::runtime_error("cache_disabled");
+                            std::scoped_lock lock(results);
+                            auto& source = summary.sources[static_cast<size_t>(selection.source)];
+                            ++source.modules;
+                            source.module_bytes += code.size() * sizeof(u32);
+                            ++summary.modules;
+                            if (damaged_variants.erase(variant_key)) ++summary.replaced_modules;
+                            summary.module_bytes += code.size() * sizeof(u32);
                         }
-                        if (candidate == selected.size()) break;
-                    }
-                    // Each emission owns a fresh program: EmitSPIRV and legacy conversion mutate IR.
-                    TC::RecordingEnvironment recording(env, true);
-                    Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
-                    Shader::ObjectPool<Shader::IR::Inst> inst_pool;
-                    Shader::ObjectPool<Shader::IR::Block> block_pool;
-                    Shader::Maxwell::Flow::CFG cfg(recording, flow_pool,
-                        Shader::Maxwell::Location{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))});
-                    auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, recording, cfg, host);
-                    if (!env.CanCacheTranslation() || program.info.requires_layer_emulation)
-                        throw std::runtime_error("lowering_or_emission_rejected");
-                    translated = true;
-                    {
+                        if (set != 0) {
+                            // Replay the final entry against every source answer set even on resume.
+                            if (!entry || !TC::ReplayQueries(entry->queries, env))
+                                throw std::runtime_error("recorded_replay_failed");
+                            std::scoped_lock lock(results);
+                            ++summary.recorded_sets_validated;
+                        }
+                        if (!translated && !StopSignal()) {
+                            std::scoped_lock lock(results);
+                            ++summary.resumed;
+                        }
+                    } catch (const std::exception& error) {
                         std::scoped_lock lock(results);
-                        ++summary.translated;
+                        if (set == 0) ++summary.skipped[Reason(error.what())];
+                        else ++summary.recorded_sets_failed;
+                        LOG_WARNING(Render_Vulkan, "Offline recorded answers: program={} set={} stage_key={:016x}{:016x}: {}",
+                                    index, set, key.hi, key.lo, error.what());
                     }
-                    if (!entry) {
-                        entry = store.Insert(key, recording.TakeQueries(), TC::ProgramMeta::From(program), true);
-                        if (!entry) throw std::runtime_error("cache_disabled");
-                        selected = select(index, recipe_key, program.info);
-                    }
-                    if (selected.empty()) break;
-                    const auto selection = selected[candidate++];
-                    auto recipe = selection.recipe;
-                    recipe.runtime = TC::CanonicalRuntimeInfo(recipe.runtime, program.info, program.stage);
-                    const auto variant_key = TC::MakeVariantKey(entry->id,
-                        TC::DigestRuntimeInfo(recipe.runtime), recipe.bindings);
-                    if (ready(variant_key)) continue;
-                    Shader::Maxwell::ConvertLegacyToGeneric(program, recipe.runtime);
-                    auto bindings = recipe.bindings;
-                    const auto code = Shader::Backend::SPIRV::EmitSPIRV(profile, recipe.runtime, program, bindings);
-                    if (code.size() < 5 || code.front() != 0x07230203)
-                        throw std::runtime_error("lowering_or_emission_rejected");
-                    if (!store.InsertVariant(*entry, variant_key,
-                                             {bindings, program.info, code, true}, &recipe))
-                        throw std::runtime_error("cache_disabled");
-                    std::scoped_lock lock(results);
-                    auto& source = summary.sources[static_cast<size_t>(selection.source)];
-                    ++source.modules;
-                    source.module_bytes += code.size() * sizeof(u32);
-                    ++summary.modules;
-                    if (damaged_variants.erase(variant_key)) ++summary.replaced_modules;
-                    summary.module_bytes += code.size() * sizeof(u32);
-                }
-                if (!translated && !StopSignal()) {
-                    std::scoped_lock lock(results);
-                    ++summary.resumed;
                 }
             } catch (const std::exception& error) {
                 std::scoped_lock lock(results);
@@ -535,6 +569,75 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
     {
         std::vector<std::jthread> threads;
         for (u32 i = 0; i < workers; ++i) threads.emplace_back(work);
+    }
+    if (const char* sources = std::getenv("EDEN_NX2_OFFLINE_PIPELINE_SOURCES"); sources && *sources) {
+        const auto recorded = ProduceRecorded(sources, profile, host, config, store,
+                                              recipe_cache.empty() ? nullptr : &recipes,
+                                              compute_shared_memory_limit);
+        Json failures = Json::array();
+        for (const auto& failure : recorded.failures)
+            failures.push_back({{"source", failure.source.string()}, {"record", failure.record},
+                {"pipeline", fmt::format("{:016x}", failure.pipeline)}, {"slot", failure.slot},
+                {"shader", fmt::format("{:016x}", failure.shader)}, {"error", failure.error}});
+        summary.pipeline_validation = Json{{"files", recorded.files}, {"records", recorded.records},
+            {"failed_records", recorded.failed_records}, {"stages", recorded.stages},
+            {"entries", recorded.entries}, {"modules", recorded.modules},
+            {"module_bytes", recorded.module_bytes},
+            {"stages_by_type", recorded.stages_by_type},
+            {"uncovered_by_type", recorded.uncovered_by_type},
+            {"resumed", recorded.resumed}, {"replay_matched", recorded.replay.matched},
+            {"replay_mismatched", recorded.replay.mismatched},
+            {"replay_unavailable", recorded.replay.unavailable}, {"failures", failures}}.dump();
+        summary.modules += recorded.modules;
+        summary.module_bytes += recorded.module_bytes;
+    }
+    // Validate against the final product, including entries appended by pipeline production.
+    summary.recorded_replay = {};
+    std::atomic<size_t> validate_next{};
+    auto validate = [&] {
+        while (!StopSignal()) {
+            const size_t index = validate_next.fetch_add(1);
+            if (index >= parsed.programs.size()) break;
+            const auto& row = parsed.programs[index];
+            try {
+                const bool compute = row.stage == Shader::Stage::Compute;
+                if (!compute && row.stage != Shader::Stage::VertexB &&
+                    row.stage != Shader::Stage::Fragment && row.stage != Shader::Stage::Geometry)
+                    continue;
+                const auto make = [&] {
+                    if (compute)
+                        return ArchiveEnvironment(ArchiveEnvironment::ComputeProgram{},
+                            Read(row.container, row.offset, row.size),
+                            Read(row.control, row.control_offset, 0x6c));
+                    return environment(row);
+                };
+                auto base = make();
+                const auto hash = base.Analyze();
+                if (!hash) continue;
+                const u32 slot = compute ? 5 : static_cast<u32>(row.stage) + 1;
+                const auto source_key = TC::MakeStageKey(base, *hash, slot, recipes.source_config);
+                const auto found = recipes.recorded_answers.find(source_key);
+                if (found == recipes.recorded_answers.end()) continue;
+                const auto key = TC::MakeStageKey(base, *hash, slot, config);
+                for (const auto& answers : found->second) {
+                    auto env = make();
+                    env.SetRecordedAnswers(answers);
+                    const auto counts = store.ReplayAllEntries(key, env);
+                    std::scoped_lock lock(results);
+                    summary.recorded_replay.matched += counts.matched;
+                    summary.recorded_replay.mismatched += counts.mismatched;
+                    summary.recorded_replay.unavailable += counts.unavailable;
+                }
+            } catch (const std::exception& error) {
+                std::scoped_lock lock(results);
+                ++summary.skipped["recorded_validation_input"];
+                LOG_WARNING(Render_Vulkan, "Offline validation: program={}: {}", index, error.what());
+            }
+        }
+    };
+    if (!recipe_cache.empty()) {
+        std::vector<std::jthread> threads;
+        for (u32 i = 0; i < workers; ++i) threads.emplace_back(validate);
     }
     summary.multiplicity = store.VariantMultiplicity();
     for (const auto& [modules, entries] : summary.multiplicity) {

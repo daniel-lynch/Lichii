@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -19,6 +20,7 @@
 #include <pthread.h>
 #endif
 
+#include "video_core/renderer_vulkan/pipeline_build_trace.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_optimization.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
@@ -339,9 +341,16 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         const auto build_begin = std::chrono::steady_clock::now();
         const auto cpu_begin = Common::CurrentThreadCpuTimeNs();
         try {
+            const std::array<u64, 1> traced{shader_hash};
+            const bool unoptimized = (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0;
+            const auto trace_begin = std::chrono::steady_clock::now();
+            TracePipelineBuild("BEGIN", "compute", shader_hash, traced, unoptimized);
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
-            ReportDriverBuild(shader_hash, std::chrono::steady_clock::now() - build_begin,
-                              cpu_begin);
+            const auto build_end = std::chrono::steady_clock::now();
+            ReportDriverBuild(shader_hash, build_end - build_begin, cpu_begin);
+            TracePipelineBuild("END", "compute", shader_hash, traced, unoptimized,
+                               std::chrono::duration<double, std::milli>(build_end - trace_begin)
+                                   .count());
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());

@@ -143,6 +143,12 @@ private:
 /// queries with the live environment's words, handles and answers.
 using LiveAnswers = std::vector<Query>;
 
+/// First differing query, including the current index when an environment read throws.
+struct ReplayMismatch {
+    size_t index{};
+    std::optional<u32> actual;
+};
+
 /// Asks the live environment the recorded queries in order; true when every answer matches.
 /// Stops at the first mismatch, so it never makes a query the translation would not make.
 [[nodiscard]] bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env);
@@ -150,7 +156,8 @@ using LiveAnswers = std::vector<Query>;
 /// differently (queries.size() when all matched).
 [[nodiscard]] size_t ReplayQueriesUntilMismatch(std::span<const Query> queries,
                                                 Shader::Environment& env,
-                                                LiveAnswers* live = nullptr);
+                                                LiveAnswers* live = nullptr,
+                                                ReplayMismatch* mismatch = nullptr);
 
 /// Key of a stage: its hash and the environment values the translator reads besides queries.
 [[nodiscard]] Digest MakeStageKey(Shader::Environment& env, u64 unique_hash, u32 slot,
@@ -228,9 +235,23 @@ struct Variant {
 /// Field-by-field equality of two infos (byte comparison would include struct padding).
 [[nodiscard]] bool InfoEqual(const Shader::Info& lhs, const Shader::Info& rhs);
 
+/// Serialized layouts of Shader::Info. Format 11 writes every field. Format-10 files hold either
+/// layout: upstream #353 added frag_color_components without a format bump, so files written
+/// before that merge lack it.
+enum class InfoLayout : u8 {
+    Current,               ///< All fields (format 11, and format 10 written since #353).
+    NoFragColorComponents, ///< Format 10 written before #353: 88 fields.
+};
+
+/// frag_color_components for an info read without it: no components for a render target the
+/// shader does not store, all four for one it does (the pre-#353 pipeline write mask).
+void DeriveFragColorComponents(Shader::Info& info);
+
 /// Serialization of the shader info, exposed for tests.
-void WriteInfo(std::vector<u8>& out, const Shader::Info& info);
-[[nodiscard]] bool ReadInfo(std::span<const u8>& in, Shader::Info& info);
+void WriteInfo(std::vector<u8>& out, const Shader::Info& info,
+               InfoLayout layout = InfoLayout::Current);
+[[nodiscard]] bool ReadInfo(std::span<const u8>& in, Shader::Info& info,
+                            InfoLayout layout = InfoLayout::Current);
 
 /// False when Shader::Info (or another serialized structure) gained a field this file does not
 /// write yet; the cache is then off rather than handing pipelines an incomplete info.
@@ -272,6 +293,8 @@ struct RecipeCatalog {
     /// queries), distinct sets only. Which constant-buffer slots hold mapped pointers depends on
     /// the area, and the answers decide which storage buffers the translation binds.
     std::unordered_map<Digest, std::vector<std::vector<Query>>, DigestHash> compute_pointers;
+    /// All runtime answer sets, without the emission recipe top-k limit.
+    std::unordered_map<Digest, std::vector<std::vector<Query>>, DigestHash> recorded_answers;
     [[nodiscard]] std::vector<SelectedRecipe> SelectWithSources(
         const Digest& stage_key, Shader::Stage stage, const Shader::Info& info, u32 top_k = DefaultRecipeCount,
         RecipeBaseline baseline = RecipeBaseline::Auto) const;
@@ -304,7 +327,16 @@ public:
     /// current answers for worker-side reconstruction.
     [[nodiscard]] std::shared_ptr<const Entry> FindEntry(const Digest& stage_key,
                                                          Shader::Environment& env,
-                                                         LiveAnswers* live = nullptr);
+                                                         LiveAnswers* live = nullptr,
+                                                         u64 pipeline_hash = 0, u64 shader_hash = 0,
+                                                         u32 slot = ~0U);
+    struct ReplayCounts {
+        u64 matched{};
+        u64 mismatched{};
+        u64 unavailable{};
+    };
+    /// Replays every non-dropped entry for producer validation, without updating miss counters.
+    [[nodiscard]] ReplayCounts ReplayAllEntries(const Digest& stage_key, Shader::Environment& env);
     /// True when entries exist for the stage key (whether or not the environment matches them).
     [[nodiscard]] bool HasStageKey(const Digest& stage_key);
     /// Current non-dropped entries grouped by their number of stored modules.
@@ -340,7 +372,8 @@ public:
     [[nodiscard]] static std::array<EmissionRecipe, Shader::MaxStageTypes> ReadRecipes(
         const std::filesystem::path& path, const Digest& config);
 
-    /// Read only recipes from any compatible format-10 configuration; never reuse its modules.
+    /// Read only recipes from any compatible format-10 or format-11 configuration (either
+    /// format-10 Info layout); never reuse its modules.
     [[nodiscard]] static RecipeCatalog ReadRecipeCatalog(const std::filesystem::path& path,
                                                         const Digest& config,
                                                         u32 entry_limit = DefaultRecipeLimit,
@@ -383,6 +416,7 @@ private:
         // Backing locations are finalized under mutex before residency can be evicted.
         u64 info_offset{};
         u32 info_size{};
+        InfoLayout info_layout{InfoLayout::Current};
         u32 spirv_words{};
         std::filesystem::path source;
         u64 compressed_offset{};
@@ -411,10 +445,14 @@ private:
     std::unordered_map<Digest, RecipeCount, DigestHash> recipes;
 
     bool collect_recipe_entries{};
+    /// Info layout of the file LoadFile is reading.
+    InfoLayout info_layout{InfoLayout::Current};
     u64 skipped_import_records{}, imported_bytes{}, invalid_recipes{};
     u64 scanned_records{}, eligible_records{}, admitted_records{}, framing_skipped_bytes{};
     std::unordered_map<Digest, std::vector<EmissionRecipe>, DigestHash> entry_recipes;
     std::unordered_map<Digest, std::vector<std::vector<Query>>, DigestHash> compute_pointers;
+    /// All runtime answer sets, without the emission recipe top-k limit.
+    std::unordered_map<Digest, std::vector<std::vector<Query>>, DigestHash> recorded_answers;
 
     // Writers serialize publication and append; readers never wait for file I/O.
     std::mutex writer_mutex;

@@ -256,6 +256,9 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
         break;
     case Shader::Stage::Mesh:
         info.convert_depth_mode = gl_ndc;
+        if (program.mesh.topology == 0) {
+            info.fixed_state_point_size = point_size;
+        }
         break;
     case Shader::Stage::Geometry:
         if (program.output_topology == Shader::OutputTopology::PointList) {
@@ -1587,6 +1590,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
     pipeline_cache_filename =
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan", CACHE_VERSION);
+    static_assert(CACHE_VERSION == VideoCommon::VulkanPipelineCacheVersion);
+    LOG_INFO(Render_Vulkan, "Pipeline cache: {} ({})",
+             VideoCommon::VulkanPipelineCacheMarker.data(),
+             Common::FS::PathToUTF8String(pipeline_cache_filename));
     used_pipelines_filename =
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used", CACHE_VERSION);
     constexpr std::array<char, 8> shader_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
@@ -2090,6 +2097,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if ((env.ShaderStage() == Shader::Stage::Task ||
              env.ShaderStage() == Shader::Stage::Mesh) &&
             !device.IsExtMeshShaderSupported()) {
+            static std::atomic<bool> logged{};
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                LOG_WARNING(Render_Vulkan,
+                            "{} has no VK_EXT_mesh_shader: pipelines with task/mesh shaders are "
+                            "skipped, so the geometry they draw (such as foliage and props) will "
+                            "be missing",
+                            device.GetModelName());
+            }
             return nullptr;
         }
 
@@ -2101,7 +2116,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             stage_key = TC::MakeStageKey(env, key.unique_hashes[index], static_cast<u32>(index),
                                          translation_config);
             cached_entries[index] = translation_cache.FindEntry(
-                stage_key, env, &live_answers[index]);
+                stage_key, env, &live_answers[index], hash, key.unique_hashes[index],
+                static_cast<u32>(index));
             from_cache[index] = cached_entries[index] != nullptr;
         }
         if (aot_translation && cacheable) {
@@ -2600,13 +2616,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 stage_modules[stage] =
                     BuildStageModule(device, stage_code, hashes[stage + 1], stage);
             }
-            auto pools = std::move(job->pools);
+            auto completed_pools = std::move(job->pools);
             job.reset();
-            pools->ReleaseContents();
+            completed_pools->ReleaseContents();
             {
                 std::scoped_lock lock{spare_pools_mutex};
                 if (spare_pools.size() < 4) {
-                    spare_pools.push_back(std::move(pools));
+                    spare_pools.push_back(std::move(completed_pools));
                 }
             }
             AddRuntimeSpirvTime(1, begin);
@@ -2662,7 +2678,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         env.Dump(hash, key.unique_hashes[index]);
     }
-    LOG_ERROR(Render_Vulkan, "{}", exception.what());
+    LOG_ERROR(Render_Vulkan, "Graphics pipeline compilation failed pipeline={:016x}: {}",
+              hash, exception.what());
     return nullptr;
 }
 
@@ -2898,7 +2915,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     std::shared_ptr<const TC::Entry> entry;
     if (cacheable) {
         stage_key = TC::MakeStageKey(env, key.unique_hash, 5, translation_config);
-        entry = translation_cache.FindEntry(stage_key, env);
+        entry = translation_cache.FindEntry(stage_key, env, nullptr, hash, key.unique_hash, 5);
     }
     const TC::Digest variant_key =
         entry ? TC::MakeVariantKey(entry->id, TC::Digest{}, Shader::Backend::Bindings{})

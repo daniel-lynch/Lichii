@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay native shader captures and v46-v53 pipeline caches without a GPU."""
+"""Replay native shader captures and v46-v54 pipeline caches without a GPU."""
 
 import argparse
 from collections import Counter, defaultdict
@@ -36,6 +36,8 @@ GAMES = {
 }
 MAP_MAGIC = 0x50414D4E4544454E
 GRAPHICS_KEY_SIZE = 1056
+# v54 invalidates SPIR-V for NaN handling (2e69168aae); its record layout is v53.
+SUPPORTED_CACHE_VERSIONS = tuple(range(46, 55))
 
 
 class CacheError(ValueError):
@@ -47,10 +49,11 @@ def digest(data):
 
 
 def parse_cache(data):
+    """Yield shader environments with their original pipeline keys."""
     if len(data) < 12 or data[:8] != b"yuzucach":
         raise CacheError("not a serialized shader-environment cache")
     version, = struct.unpack_from("<I", data, 8)
-    if version not in (46, 47, 48, 49, 50, 51, 52, 53):
+    if version not in SUPPORTED_CACHE_VERSIONS:
         raise CacheError(f"unsupported cache version {version}")
     cursor = 12
     entry = 0

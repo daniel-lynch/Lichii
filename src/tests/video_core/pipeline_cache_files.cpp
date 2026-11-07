@@ -233,6 +233,16 @@ TEST_CASE("Pipeline cache names are version-suffixed per build", "[pipeline_cach
           VideoCommon::VersionedPipelineCachePath(dir, "vulkan", 39));
 }
 
+TEST_CASE("The binary names the pipeline cache file it opens", "[pipeline_cache_files]") {
+    const std::string marker{VideoCommon::VulkanPipelineCacheMarker.data()};
+    CHECK(marker == "lichii-pipeline-cache=" +
+                        VideoCommon::VersionedPipelineCachePath(
+                            "shader", "vulkan", VideoCommon::VulkanPipelineCacheVersion)
+                            .filename()
+                            .string());
+    CHECK(marker.size() + 1 <= VideoCommon::VulkanPipelineCacheMarker.size());
+}
+
 TEST_CASE("A legacy cache of this version is adopted with its contents",
           "[pipeline_cache_files]") {
     TempDir temp;

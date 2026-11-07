@@ -8,6 +8,7 @@
 #include <mutex>
 #include <span>
 #include <stdexcept>
+#include "common/logging.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/maxwell/structured_control_flow.h"
@@ -93,7 +94,7 @@ ComputeOutcome ProduceCompute(const Program& row, const Shader::Profile& profile
         if (LoadWord(program_bytes, row.constants_offset + i * 4) != row.bank1_words[i])
             throw std::runtime_error("constants_mismatch");
 
-    // Effect (vsetb) programs sample array textures, as for graphics rows.
+    // Unrecorded bindings use a replay-guarded fallback.
     const auto texture_type = TextureTypeForProgram(row);
     ArchiveEnvironment env(ArchiveEnvironment::ComputeProgram{}, program_bytes, control, 0,
                            texture_type);
@@ -103,72 +104,99 @@ ComputeOutcome ProduceCompute(const Program& row, const Shader::Profile& profile
     std::scoped_lock lock(compute_locks[key.lo % compute_locks.size()]);
 
     ComputeOutcome outcome;
-    // One entry per storage-pointer answer set: the guess (every direct slot mapped, no
+    // One entry per recorded answer set: the guess (every direct slot mapped, no
     // indirect one), then each set recorded at run time for this program. The runtime replays
     // the answers against the live constant buffers, so an entry is served only where the
     // same slots hold mapped pointers; elsewhere it falls back to translating.
     std::vector<std::span<const TC::Query>> answer_sets{{}};
     if (recipes != nullptr) {
         const auto source_key = TC::MakeStageKey(env, *hash, ComputeSlot, recipes->source_config);
-        if (const auto it = recipes->compute_pointers.find(source_key);
-            it != recipes->compute_pointers.end()) {
+        if (const auto it = recipes->recorded_answers.find(source_key);
+            it != recipes->recorded_answers.end()) {
             for (const auto& set : it->second) answer_sets.emplace_back(set);
         }
     }
     for (size_t set = 0; set < answer_sets.size(); ++set) {
-        ArchiveEnvironment variant_env(ArchiveEnvironment::ComputeProgram{}, program_bytes,
-                                       control, 0, texture_type);
-        variant_env.SetStoragePointerAnswers(answer_sets[set]);
-        if (set != 0) ++outcome.recorded_sets;
-        TC::RecordingEnvironment resume(variant_env, true);
-        auto entry = store.FindEntry(key, resume);
-        bool invalidated = false;
-        if (entry) {
-            const auto state = store.ValidateVariantForResume(
-                TC::MakeVariantKey(entry->id, TC::Digest{}, Shader::Backend::Bindings{}));
-            outcome.validated |= state == TC::Store::ResumeVariant::Validated;
-            invalidated = state == TC::Store::ResumeVariant::Invalidated;
-            outcome.invalidated |= invalidated;
-            if (state == TC::Store::ResumeVariant::Ready ||
-                state == TC::Store::ResumeVariant::Validated) {
-                // Already produced, or an earlier set's entry answers this set the same way.
-                if (set == 0) outcome.resumed = true;
-                continue;
+        try {
+            ArchiveEnvironment variant_env(ArchiveEnvironment::ComputeProgram{}, program_bytes,
+                                           control, 0, texture_type);
+            if (set != 0) variant_env.SetRecordedAnswers(answer_sets[set]);
+            if (set != 0) ++outcome.recorded_sets;
+            TC::RecordingEnvironment resume(variant_env, true);
+            auto entry = store.FindEntry(key, resume);
+            bool invalidated = false;
+            bool ready = false;
+            if (entry) {
+                const auto state = store.ValidateVariantForResume(
+                    TC::MakeVariantKey(entry->id, TC::Digest{}, Shader::Backend::Bindings{}));
+                outcome.validated |= state == TC::Store::ResumeVariant::Validated;
+                invalidated = state == TC::Store::ResumeVariant::Invalidated;
+                outcome.invalidated |= invalidated;
+                if (state == TC::Store::ResumeVariant::Ready ||
+                    state == TC::Store::ResumeVariant::Validated) {
+                    // Already produced, or an earlier set's entry answers this set the same way.
+                    if (set == 0) outcome.resumed = true;
+                    ready = true;
+                    if (set == 0) continue;
+                }
             }
+            // As the runtime translates it: the control flow starts at the environment's start
+            // address (past the zeroed header), not past a graphics program header.
+            TC::RecordingEnvironment recording(variant_env, true);
+            Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+            Shader::ObjectPool<Shader::IR::Inst> inst_pool;
+            Shader::ObjectPool<Shader::IR::Block> block_pool;
+            Shader::Maxwell::Flow::CFG cfg(recording, flow_pool,
+                                           Shader::Maxwell::Location{variant_env.StartAddress()});
+            auto program =
+                Shader::Maxwell::TranslateProgram(inst_pool, block_pool, recording, cfg, host);
+            if (!variant_env.CanCacheTranslation())
+                throw std::runtime_error("lowering_or_emission_rejected");
+            if (program.local_memory_size == 0 && UsesLocalMemory(program))
+                throw std::runtime_error("unsupported_local_memory");
+            outcome.translated = true;
+            if (!entry || set != 0) {
+                const auto fresh = store.Insert(key, recording.TakeQueries(), TC::ProgramMeta::From(program), true);
+                if (!fresh) throw std::runtime_error("cache_disabled");
+                if (!entry || entry->id != fresh->id) {
+                    // The first replay-compatible entry need not be this transcript. Resume
+                    // the exact entry selected by current translation, not its predecessor.
+                    const auto state = store.ValidateVariantForResume(
+                        TC::MakeVariantKey(fresh->id, TC::Digest{}, Shader::Backend::Bindings{}));
+                    outcome.validated |= state == TC::Store::ResumeVariant::Validated;
+                    invalidated = state == TC::Store::ResumeVariant::Invalidated;
+                    outcome.invalidated |= invalidated;
+                    ready = state == TC::Store::ResumeVariant::Ready ||
+                            state == TC::Store::ResumeVariant::Validated;
+                }
+                entry = fresh;
+            }
+            if (set != 0) {
+                if (!TC::ReplayQueries(entry->queries, variant_env))
+                    throw std::runtime_error("recorded_replay_failed");
+                ++outcome.recorded_validated;
+            }
+            if (ready) continue;
+            // The runtime records the entry before clamping and emits after it.
+            if (shared_memory_limit != 0 && program.shared_memory_size > shared_memory_limit)
+                program.shared_memory_size = shared_memory_limit;
+            const auto code = Shader::Backend::SPIRV::EmitSPIRV(profile, program);
+            if (code.size() < 5 || code.front() != 0x07230203)
+                throw std::runtime_error("lowering_or_emission_rejected");
+            if (!store.InsertVariant(
+                    *entry, TC::MakeVariantKey(entry->id, TC::Digest{}, Shader::Backend::Bindings{}),
+                    {{}, program.info, code, true}))
+                throw std::runtime_error("cache_disabled");
+            ++outcome.modules;
+            outcome.replaced += invalidated ? 1 : 0;
+            outcome.pointer_modules += set != 0 ? 1 : 0;
+            outcome.module_bytes += code.size() * sizeof(u32);
+        } catch (const std::exception& error) {
+            if (set == 0 && answer_sets.size() == 1) throw;
+            if (set != 0) ++outcome.recorded_failed;
+            LOG_WARNING(Render_Vulkan, "Offline compute recorded answers: key={:016x}{:016x} set={}: {}",
+                        key.hi, key.lo, set, error.what());
         }
-        // As the runtime translates it: the control flow starts at the environment's start
-        // address (past the zeroed header), not past a graphics program header.
-        TC::RecordingEnvironment recording(variant_env, true);
-        Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
-        Shader::ObjectPool<Shader::IR::Inst> inst_pool;
-        Shader::ObjectPool<Shader::IR::Block> block_pool;
-        Shader::Maxwell::Flow::CFG cfg(recording, flow_pool,
-                                       Shader::Maxwell::Location{variant_env.StartAddress()});
-        auto program =
-            Shader::Maxwell::TranslateProgram(inst_pool, block_pool, recording, cfg, host);
-        if (!variant_env.CanCacheTranslation())
-            throw std::runtime_error("lowering_or_emission_rejected");
-        if (program.local_memory_size == 0 && UsesLocalMemory(program))
-            throw std::runtime_error("unsupported_local_memory");
-        outcome.translated = true;
-        if (!entry) {
-            entry = store.Insert(key, recording.TakeQueries(), TC::ProgramMeta::From(program), true);
-            if (!entry) throw std::runtime_error("cache_disabled");
-        }
-        // The runtime records the entry before clamping and emits after it.
-        if (shared_memory_limit != 0 && program.shared_memory_size > shared_memory_limit)
-            program.shared_memory_size = shared_memory_limit;
-        const auto code = Shader::Backend::SPIRV::EmitSPIRV(profile, program);
-        if (code.size() < 5 || code.front() != 0x07230203)
-            throw std::runtime_error("lowering_or_emission_rejected");
-        if (!store.InsertVariant(
-                *entry, TC::MakeVariantKey(entry->id, TC::Digest{}, Shader::Backend::Bindings{}),
-                {{}, program.info, code, true}))
-            throw std::runtime_error("cache_disabled");
-        ++outcome.modules;
-        outcome.replaced += invalidated ? 1 : 0;
-        outcome.pointer_modules += set != 0 ? 1 : 0;
-        outcome.module_bytes += code.size() * sizeof(u32);
     }
     return outcome;
 }

@@ -5,7 +5,10 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <thread>
 #include <catch2/catch_test_macros.hpp>
+#include "common/atomic_ops.h"
+#include "common/scope_exit.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/service/audio/errors.h"
@@ -15,6 +18,122 @@
 
 using Service::Audio::SysmixOutput;
 using SysmixTests::Context;
+
+TEST_CASE("sysmix input accepts a ring without output timestamp storage", "[sysmix][input]") {
+    Context context;
+    SysmixOutput stream{context.system, *context.process, context.sink, 2,
+                        Context::Base, 0x2000, 2, true};
+    REQUIRE(stream.Open(2, 1, 48000, 2000, 0, 0).IsSuccess());
+}
+
+TEST_CASE("sysmix input publishes fresh mono capture across ring wrap", "[sysmix][input]") {
+    Context context;
+    const auto previous_gain = Settings::values.microphone_volume.GetValue();
+    Settings::values.microphone_volume.SetValue(100);
+    SCOPE_EXIT {
+        Settings::values.microphone_volume.SetValue(previous_gain);
+    };
+    const u32 cursor = 8;
+    REQUIRE(context.Memory().WriteBlock(Context::Base + 0x44, &cursor, sizeof(cursor)));
+    REQUIRE(context.Memory().WriteBlock(Context::Base + 0x1004, &cursor, sizeof(cursor)));
+    SysmixOutput stream{
+        context.system, *context.process, context.sink, 2, Context::Base, Context::Size, 2, true};
+    REQUIRE(stream.IsInput());
+    REQUIRE(stream.Open(2, 1, 48000, 8, 0, 0).IsSuccess());
+    REQUIRE(stream.SetDataNotification(2, 2).IsSuccess());
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    stream.Pump();
+    u32 write{};
+    REQUIRE(context.Memory().Read32Acquire(Context::Base + 0x1004, write));
+    REQUIRE(write == 8);
+    REQUIRE_FALSE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()));
+    const std::array<s16, 6> samples{1000, 3000, -1000, -3000, 100, 300};
+    context.sink.last->ProcessAudioIn(samples, 3);
+    stream.Pump();
+    REQUIRE(context.Memory().Read32Acquire(Context::Base + 0x1004, write));
+    REQUIRE(write == 2);
+    u32 read{};
+    REQUIRE(context.Memory().Read32Acquire(Context::Base + 0x44, read));
+    REQUIRE(read == 8);
+    s16 last{};
+    std::array<s16, 2> first{};
+    REQUIRE(context.Memory().ReadBlock(Context::Base + 0x1040 + 8 * 2, &last, sizeof(last)));
+    REQUIRE(context.Memory().ReadBlock(Context::Base + 0x1040, first.data(), sizeof(first)));
+    REQUIRE(last == 2000);
+    REQUIRE(first == std::array<s16, 2>{-2000, 200});
+    REQUIRE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()));
+    REQUIRE(stream.GetCounters().accepted_frames == 3);
+    stream.Pump();
+    REQUIRE(stream.GetCounters().accepted_frames == 3);
+    u32 purged{};
+    REQUIRE(stream.Purge(0, purged).IsSuccess());
+    REQUIRE(purged == 3);
+    REQUIRE(context.Memory().Read32Acquire(Context::Base + 0x44, read));
+    REQUIRE(read == write);
+}
+
+TEST_CASE("sysmix input applies gain to float capture and protects producer ownership",
+          "[sysmix][input]") {
+    Context context;
+    const auto previous_gain = Settings::values.microphone_volume.GetValue();
+    Settings::values.microphone_volume.SetValue(100);
+    SCOPE_EXIT {
+        Settings::values.microphone_volume.SetValue(previous_gain);
+    };
+    SysmixOutput stream{
+        context.system, *context.process, context.sink, 2, Context::Base, Context::Size, 2, true};
+    REQUIRE(stream.Open(5, 2, 48000, 8, 0, 0).IsSuccess());
+    REQUIRE(stream.SetGain(0.5f, 0).IsSuccess());
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    const std::array<s16, 2> samples{16384, -16384};
+    context.sink.last->ProcessAudioIn(samples, 1);
+    stream.Pump();
+    std::array<f32, 2> recorded{};
+    REQUIRE(context.Memory().ReadBlock(Context::Base + 0x1040, recorded.data(), sizeof(recorded)));
+    REQUIRE(recorded == std::array<f32, 2>{0.25f, -0.25f});
+    const u32 tampered = 2;
+    REQUIRE(context.Memory().WriteBlock(Context::Base + 0x1004, &tampered, sizeof(tampered)));
+    stream.Pump();
+    REQUIRE(stream.GetState() == 0);
+    REQUIRE(stream.GetCounters().faults == 1);
+}
+
+TEST_CASE("sysmix input purge preserves capture during concurrent guest consumption",
+          "[sysmix][input]") {
+    Context context;
+    constexpr u32 frames = 2048;
+    SysmixOutput stream{
+        context.system, *context.process, context.sink, 2, Context::Base, Context::Size, 2, true};
+    REQUIRE(stream.Open(2, 2, 48000, frames, 0, 0).IsSuccess());
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    auto* read_cursor = reinterpret_cast<u32_le*>(context.backing + 0x44);
+    auto* write_cursor = reinterpret_cast<u32_le*>(context.backing + 0x1004);
+    std::jthread guest{[&](std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            u32_le read{}, write{};
+            static_cast<void>(Common::AtomicCompareAndSwap(read_cursor, u32_le{0}, u32_le{0}, read));
+            static_cast<void>(Common::AtomicCompareAndSwap(write_cursor, u32_le{0}, u32_le{0}, write));
+            if (read != write) {
+                static_cast<void>(Common::AtomicCompareAndSwap(
+                    read_cursor, u32_le{(static_cast<u32>(read) + 1) % (frames + 1)}, read));
+            }
+        }
+    }};
+    const std::array<s16, 480> samples{};
+    for (u32 iteration = 0; iteration < 4096; ++iteration) {
+        context.sink.last->ProcessAudioIn(samples, 240);
+        stream.Pump();
+        u32 purged = 99;
+        const auto result = stream.Purge(iteration % 2 == 0 ? 1 : 0, purged);
+        REQUIRE(stream.GetState() == 2);
+        REQUIRE(stream.GetCounters().faults == 0);
+        if (result.IsFailure()) {
+            REQUIRE(result == Service::Audio::ResultOperationFailed);
+            REQUIRE(purged == 0);
+        }
+    }
+    REQUIRE(stream.GetCounters().accepted_frames > 0);
+}
 
 namespace {
 void Cursor(Context& context, u32 read, u32 write) {
@@ -166,11 +285,37 @@ TEST_CASE("sysmix backpressure leaves guest ownership unchanged and resumes in o
     REQUIRE(ReadCursor(context) == 720);
     REQUIRE(stream.GetCounters().accepted_frames == 720);
     REQUIRE(stream.GetCounters().backpressure == 1);
+    REQUIRE(stream.GetCounters().copied_frames == 960);
+    REQUIRE(stream.GetCounters().retried_frames == 240);
     std::array<s16, 480> output{};
     context.sink.last->ProcessAudioOutAndRender(output, 240);
     stream.Pump();
     REQUIRE(ReadCursor(context) == 960);
     REQUIRE(context.sink.last->GetQueueSize() == 3);
+}
+
+TEST_CASE("sysmix pads a short guest block with silence for the host", "[sysmix]") {
+    Context context;
+    Cursor(context, 0, 100);
+    for (u32 i = 0; i < 100; ++i) {
+        Sample(context, i, 0.25f, -0.25f);
+    }
+    SysmixOutput stream{context.system, *context.process, context.sink, 1, Context::Base,
+                        Context::Size, 0x24};
+    REQUIRE(stream.Open(5, 2, 48000, 2048, 0, 0).IsSuccess());
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    stream.Pump();
+    REQUIRE(ReadCursor(context) == 100);
+    REQUIRE(stream.GetCounters().accepted_frames == 100);
+    REQUIRE(stream.GetCounters().padded_frames == 140);
+    REQUIRE(stream.GetCounters().admitted_blocks == 1);
+    std::array<s16, 480> output{};
+    context.sink.last->ProcessAudioOutAndRender(output, 240);
+    for (u32 i = 0; i < 200; ++i) {
+        REQUIRE(output[i] == (i % 2 == 0 ? 8192 : -8192));
+    }
+    REQUIRE(std::ranges::all_of(std::span{output}.subspan(200),
+                                [](s16 value) { return value == 0; }));
 }
 
 TEST_CASE("sysmix detects unmapped cursor publication even though exclusive store reports success", "[sysmix]") {
@@ -343,7 +488,7 @@ TEST_CASE("sysmix input advertises the formats the virtual microphone accepts", 
     REQUIRE_FALSE(SysmixOutput::IsInputFormatSupported(3, 1, 48000));
 }
 
-TEST_CASE("sysmix input opens without a host stream and validates its creation flags", "[sysmix]") {
+TEST_CASE("sysmix input validates its creation flags and engages through open and close", "[sysmix]") {
     Context context;
     REQUIRE(SysmixOutput::ValidateRegion(*context.process, Context::Base, Context::Size, 2, true)
                 .IsSuccess());
@@ -355,7 +500,6 @@ TEST_CASE("sysmix input opens without a host stream and validates its creation f
                         Context::Size, 2, true};
     REQUIRE(stream.IsInput());
     REQUIRE(stream.Open(2, 1, 48000, 4800, 0, 0).IsSuccess());
-    REQUIRE(context.sink.last == nullptr);
     REQUIRE(stream.GetState() == 1);
     REQUIRE(stream.SetEngaged(true).IsSuccess());
     REQUIRE(stream.GetState() == 2);
@@ -363,30 +507,6 @@ TEST_CASE("sysmix input opens without a host stream and validates its creation f
     REQUIRE(stream.GetState() == 1);
     stream.Close();
     REQUIRE(stream.GetState() == 0);
-}
-
-TEST_CASE("sysmix input records silence up to the guest's read cursor, with wrap", "[sysmix]") {
-    Context context;
-    Cursor(context, 4790, 4790);
-    std::memset(context.backing + 0x1040, 0x5a, Context::Size - 0x1040);
-    SysmixOutput stream{context.system, *context.process, context.sink, 1, Context::Base,
-                        Context::Size, 2, true};
-    REQUIRE(stream.Open(2, 1, 48000, 4800, 0, 0).IsSuccess());
-    REQUIRE(stream.SetDataNotification(2, 100).IsSuccess());
-    REQUIRE_FALSE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()));
-    stream.Pump(); // not engaged: nothing recorded
-    REQUIRE(WriteCursor(context) == 4790);
-    REQUIRE(stream.SetEngaged(true).IsSuccess());
-    stream.Pump();
-    REQUIRE(WriteCursor(context) == 229); // 11 frames to the end of the ring, 229 after the wrap
-    REQUIRE(ReadCursor(context) == 4790);
-    REQUIRE(stream.GetCounters().accepted_frames == 240);
-    REQUIRE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()));
-    const u8* payload = context.backing + 0x1040;
-    REQUIRE(std::all_of(payload + 4790 * 2, payload + 4801 * 2, [](u8 b) { return b == 0; }));
-    REQUIRE(std::all_of(payload, payload + 229 * 2, [](u8 b) { return b == 0; }));
-    REQUIRE(payload[229 * 2] == 0x5a);
-    REQUIRE(payload[4789 * 2 + 1] == 0x5a);
 }
 
 TEST_CASE("sysmix input purge discards captured frames and stops at the producer", "[sysmix]") {
@@ -401,6 +521,9 @@ TEST_CASE("sysmix input purge discards captured frames and stops at the producer
     REQUIRE(stream.Purge(0, purged).IsSuccess()); // nothing captured: a no-op
     REQUIRE(purged == 0);
     REQUIRE(stream.SetEngaged(true).IsSuccess());
+    const std::array<s16, 480> capture{}; // 240 stereo host frames
+    context.sink.last->ProcessAudioIn(capture, 240);
+    context.sink.last->ProcessAudioIn(capture, 240);
     stream.Pump();
     stream.Pump();
     REQUIRE(WriteCursor(context) == 480);
@@ -410,6 +533,7 @@ TEST_CASE("sysmix input purge discards captured frames and stops at the producer
     REQUIRE(stream.Purge(1000, purged).IsSuccess());
     REQUIRE(purged == 380);
     REQUIRE(ReadCursor(context) == 480);
+    context.sink.last->ProcessAudioIn(capture, 240);
     stream.Pump();
     REQUIRE(stream.Purge(0, purged).IsSuccess());
     REQUIRE(purged == 240);
