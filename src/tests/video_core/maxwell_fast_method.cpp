@@ -906,9 +906,9 @@ TEST_CASE("Maxwell3D's split front uploads macro code sent as one multi-method r
     constexpr std::array<u32, 6> code{0x740003, 0x18c00000, 0x318c0001,
                                       0x740003, 0x18c00000, 0x318c0000};
     engine.FrontCallMethod(f.system, split, MAXWELL3D_REG_INDEX(load_mme.instruction_ptr), pointer,
-                           true);
+                           true, {});
     engine.FrontCallMultiMethod(f.system, split, MAXWELL3D_REG_INDEX(load_mme.instruction),
-                                code.data(), code.size(), code.size());
+                                code.data(), code.size(), code.size(), {});
     const auto& macros = engine.GetNativeMacroEngine();
     REQUIRE(macros.native_write_offset == pointer * 3 + code.size());
     CHECK(std::equal(code.begin(), code.end(), macros.native_code.begin() + pointer * 3));
