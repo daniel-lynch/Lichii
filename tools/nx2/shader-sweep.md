@@ -38,7 +38,7 @@ new lowering no longer produces the exact bytes stored in the older cache.
 
 ## Inputs and coverage
 
-The loader reads little-endian `yuzucach` Vulkan caches, fork versions 46 through 53. It verifies each
+The loader reads little-endian `yuzucach` Vulkan caches, fork versions 46 through 54 (v54 changes SPIR-V generation, not the record layout). It verifies each
 record boundary and rejects unknown versions or truncated input. Version 47 includes captured
 storage-pointer classifications; versions 48 through 50 retain that layout and version 46 omits them.
 Version 49 invalidates pipelines after tessellation patch-size clamping. Version 50 captures the

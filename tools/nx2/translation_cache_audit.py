@@ -11,7 +11,7 @@ Build the small CityHash/ABI helper with a configured CMake build (use the share
 emulator lock on a machine running the validation harness):
   flock /path/to/.emulator.lock python3 tools/nx2/translation_cache_audit.py \
     --build-helper build-offline --hash-helper /tmp/translation-cache-audit.so
-Then pass --pipeline /private/vulkan.fork-v53.bin and the same --hash-helper when
+Then pass --pipeline /private/vulkan.fork-v54.bin and the same --hash-helper when
 comparing the two translation cache paths. The helper never runs an emulator.
 """
 import argparse
@@ -22,6 +22,10 @@ import struct
 import shlex
 import subprocess
 from pathlib import Path
+
+from shader_sweep import SUPPORTED_CACHE_VERSIONS
+
+RECOVERY_CACHE_VERSIONS = tuple(v for v in SUPPORTED_CACHE_VERSIONS if v >= 53)
 
 # Serialized field order and x86-64 element sizes, independent of host Python ABI.
 SCHEMA = """POD is_task 1
@@ -310,8 +314,9 @@ def recover_keys(pipeline, helper_path, config, live_keys, offline_keys):
                 raise ValueError("truncated pipeline cache or incompatible ABI")
             return data
 
-        if read(12) != b"yuzucach" + struct.pack("<I", 53):
-            raise ValueError("pipeline recovery supports cache version 53 only")
+        if read(12) not in tuple(b"yuzucach" + struct.pack("<I", v)
+                                 for v in RECOVERY_CACHE_VERSIONS):
+            raise ValueError(f"pipeline recovery supports cache versions {RECOVERY_CACHE_VERSIONS}")
         while frame := stream.read(4):
             count, = struct.unpack("<I", frame)
             if count not in range(1, 7):
@@ -379,7 +384,7 @@ def main():
     parser.add_argument("offline", type=Path, nargs="?")
     parser.add_argument("live", type=Path, nargs="?")
     parser.add_argument("--details", type=Path, help="JSONL: every live entry, exact key and named field differences")
-    parser.add_argument("--pipeline", type=Path, help="matching version-53 pipeline cache for verified key recovery")
+    parser.add_argument("--pipeline", type=Path, help=f"matching pipeline cache (versions {RECOVERY_CACHE_VERSIONS}) for verified key recovery")
     parser.add_argument("--hash-helper", type=Path, help="shared library built from translation_cache_audit_hash.cpp")
     parser.add_argument("--build-helper", type=Path, metavar="BUILD_DIRECTORY", help="compile the standalone helper using compile_commands.json, then exit")
     args = parser.parse_args()

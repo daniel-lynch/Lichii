@@ -11,11 +11,12 @@ import re
 import struct
 import tempfile
 
-from shader_sweep import GRAPHICS_KEY_SIZE, STAGES, digest, invoke, parse_cache
+from shader_sweep import GRAPHICS_KEY_SIZE, STAGES, SUPPORTED_CACHE_VERSIONS, digest, invoke, parse_cache
 from sweep_static_shaders import artifact_path, compute_format, output_path
 
 SCHEMA = "lichii-playthrough-hints-1"
 MAGIC = b"yuzucach"
+HINT_CACHE_VERSIONS = tuple(v for v in SUPPORTED_CACHE_VERSIONS if v >= 52)
 SUPPORTED_STAGES = {"vertex", "fragment", "geometry", "tess-control", "tess-eval", "compute", "task", "mesh"}
 
 
@@ -202,8 +203,8 @@ def main():
         parser.error("expected a 16-digit hexadecimal title ID")
     if args.command == "export":
         data = args.cache.read_bytes()
-        if data[:12] not in (MAGIC + struct.pack("<I", 52), MAGIC + struct.pack("<I", 53)):
-            parser.error("expected a v52 or v53 Vulkan cache")
+        if data[:12] not in tuple(MAGIC + struct.pack("<I", v) for v in HINT_CACHE_VERSIONS):
+            parser.error(f"expected a Vulkan cache version in {HINT_CACHE_VERSIONS}")
         if args.cache.parent.name.lower() != args.title:
             parser.error("cache directory does not match the title ID")
         hint = export_hints(data, args.title, args.game_version)
@@ -219,7 +220,7 @@ def main():
         parser.error("hint file exceeds 128 MiB")
     hint = json.loads(args.hints.read_bytes())
     if (not isinstance(hint, dict) or not isinstance(hint.get("pipelines"), list) or
-            hint.get("schema") != SCHEMA or hint.get("cache_version") not in (52, 53) or
+            hint.get("schema") != SCHEMA or hint.get("cache_version") not in HINT_CACHE_VERSIONS or
             hint.get("title_id") != args.title or hint.get("game_version") != args.game_version):
         parser.error("hint format, title, or game version does not match")
     summary = import_hints(args, hint)
