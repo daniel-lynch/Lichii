@@ -36,8 +36,11 @@ set(TRANSLATOR_IDENTITY_FILES
     src/video_core/shader_archive_environment.h
     src/video_core/shader_environment.cpp
     src/video_core/shader_environment.h
+    src/video_core/shader_replay_environment.cpp
+    src/video_core/shader_replay_environment.h
     src/video_core/shader_translation_cache.cpp
     src/video_core/shader_translation_cache.h
+    src/video_core/renderer_vulkan/pipeline_shader_emission.h
     CMakeModules/TranslatorIdentity.cmake
 )
 # Files of which only the code between "// TRANSLATOR-IDENTITY BEGIN[: what]" and

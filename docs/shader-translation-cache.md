@@ -138,8 +138,9 @@ of:
 - every file under `src/shader_recompiler` (frontend, IR passes, SPIR-V backend, native
   lowering, its `CMakeLists.txt`), globbed when the hash runs;
 - the video_core files that drive translation or store its result:
-  `shader_environment.*`, `shader_archive_environment.*`, `offline_shader_producer.*`,
-  `offline_compute_producer.*` and `shader_translation_cache.*`, plus the module itself
+  `shader_environment.*`, `shader_archive_environment.*`, `shader_replay_environment.*`,
+  `offline_shader_producer.*`, `offline_compute_producer.*`, `shader_translation_cache.*` and
+  `renderer_vulkan/pipeline_shader_emission.h`, plus the module itself
   (`TRANSLATOR_IDENTITY_FILES`);
 - the marked regions of `shader_cache.*` and `renderer_vulkan/vk_pipeline_cache.*`
   (`TRANSLATOR_IDENTITY_REGION_FILES`, below);
