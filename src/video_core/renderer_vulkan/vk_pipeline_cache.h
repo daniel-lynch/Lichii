@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bitset>
@@ -17,8 +18,10 @@
 #include <unordered_set>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include "common/container/unordered_map.h"
 #include <vector>
 
@@ -127,6 +130,36 @@ struct ComputePipelineCacheEntry {
     [[nodiscard]] ComputePipeline* Get(bool native, GPUVAddr address,
                                        const ComputePipelineCacheKey& key) const;
 };
+
+/// EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD (dist/nx2_switches.txt): on unless set to 0/off/false/none.
+/// Off restores the old behaviour: no rebuild of a native compute pipeline whose pointer slot
+/// was null at translation, and the boot loader tries the cached translations of one compute key
+/// in file order. Unrecognised values are logged once and mean off.
+[[nodiscard]] bool ParseComputeNullSlotRebuild(const char* value);
+[[nodiscard]] bool ComputeNullSlotRebuild();
+
+/// The null slots a translation depends on: those of `slots` (the environment's null
+/// classifications) that `queries` (the translation's recorded queries) asked about. An
+/// environment also holds answers to the queries of other cached translations replayed against
+/// it first; a slot only those asked about cannot make this translation stale.
+[[nodiscard]] std::vector<std::pair<u32, u32>> NullSlotsAskedBy(
+    std::vector<std::pair<u32, u32>> slots,
+    std::span<const VideoCommon::TranslationCache::Query> queries);
+
+/// Puts a cached translation of a compute key among the others of that key, in the order the
+/// boot loader tries them: with `by_mapped`, the ones that bound more storage pointers first and,
+/// on a tie, the one earlier in the file; otherwise file order.
+template <typename Env>
+void InsertComputeCandidate(std::vector<Env>& candidates, Env&& env, bool by_mapped) {
+    auto position = candidates.end();
+    if (by_mapped) {
+        const size_t mapped = env.MappedStoragePointerCount();
+        position = std::ranges::find_if(candidates, [mapped](const Env& other) {
+            return mapped > other.MappedStoragePointerCount();
+        });
+    }
+    candidates.insert(position, std::move(env));
+}
 
 class PipelineCache : public VideoCommon::ShaderCache {
 public:

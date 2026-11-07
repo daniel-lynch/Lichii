@@ -17,6 +17,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <type_traits>
 #include <unordered_set>
 #include <thread>
@@ -1543,6 +1544,58 @@ ComputePipeline* ComputePipelineCacheEntry::Get(bool native, GPUVAddr address,
     return pipeline.get();
 }
 
+bool ParseComputeNullSlotRebuild(const char* value) {
+    if (value == nullptr) {
+        return true;
+    }
+    // Trimmed and case-folded, as EDEN_NX2_GRAPHICS_NOINLINE (spirv_inline_control.cpp).
+    std::string_view raw{value};
+    constexpr std::string_view whitespace{" \t\r\n\v\f"};
+    const size_t first = raw.find_first_not_of(whitespace);
+    raw = first == std::string_view::npos
+              ? std::string_view{}
+              : raw.substr(first, raw.find_last_not_of(whitespace) - first + 1);
+    std::string word{raw};
+    for (char& letter : word) {
+        if (letter >= 'A' && letter <= 'Z') {
+            letter = static_cast<char>(letter - 'A' + 'a');
+        }
+    }
+    if (word.empty() || word == "1" || word == "on" || word == "true") {
+        return true;
+    }
+    if (word != "0" && word != "off" && word != "false" && word != "none") {
+        LOG_WARNING(Render_Vulkan,
+                    "EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD=\"{}\" is not a switch value; treated as 0",
+                    value);
+    }
+    return false;
+}
+
+bool ComputeNullSlotRebuild() {
+    static const bool enabled = [] {
+        const bool on =
+            ParseComputeNullSlotRebuild(std::getenv("EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD"));
+        LOG_INFO(Render_Vulkan, "Native compute rebuild when a null pointer slot is filled: {}",
+                 on ? "on" : "off (EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD)");
+        return on;
+    }();
+    return enabled;
+}
+
+std::vector<std::pair<u32, u32>> NullSlotsAskedBy(
+    std::vector<std::pair<u32, u32>> slots,
+    std::span<const VideoCommon::TranslationCache::Query> queries) {
+    using VideoCommon::TranslationCache::QueryKind;
+    std::erase_if(slots, [queries](const std::pair<u32, u32>& slot) {
+        return std::ranges::none_of(queries, [&slot](const auto& query) {
+            return query.kind == QueryKind::CbufStorageBufferPointer && query.a == slot.first &&
+                   query.b == slot.second;
+        });
+    });
+    return slots;
+}
+
 constexpr u32 MaxComputeRebuilds = 4;
 
 bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const {
@@ -1683,8 +1736,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     } state;
     // A rebuilt translation is cached beside the stale one. Choose between them before building, so
     // loading only ever adds entries: the one that binds more pointers first, on a tie the earlier
-    // one, and the next when a translation fails.
+    // one, and the next when a translation fails (file order with the rebuild switched off).
     ::Common::unordered_map<ComputePipelineCacheKey, std::vector<FileEnvironment>> compute_envs;
+    const bool compute_by_mapped = ComputeNullSlotRebuild();
 
     if (device.IsKhrPipelineExecutablePropertiesEnabled()) {
         state.statistics = std::make_unique<PipelineStatistics>(device);
@@ -1692,11 +1746,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
         ComputePipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
-        auto& candidates{compute_envs[key]};
-        const auto position{std::ranges::find_if(candidates, [&](const FileEnvironment& other) {
-            return env.MappedStoragePointerCount() > other.MappedStoragePointerCount();
-        })};
-        candidates.insert(position, std::move(env));
+        InsertComputeCandidate(compute_envs[key], std::move(env), compute_by_mapped);
     }};
     const auto queue_compute{[&](const ComputePipelineCacheKey& key,
                                  std::vector<FileEnvironment> candidates) {
@@ -1830,8 +1880,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }};
     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
                                load_graphics);
-    for (auto& [key, candidates] : compute_envs) {
-        queue_compute(key, std::move(candidates));
+    if (!stop_loading.stop_requested()) {
+        for (auto& [key, candidates] : compute_envs) {
+            queue_compute(key, std::move(candidates));
+        }
     }
     compute_envs.clear();
 
@@ -2977,6 +3029,17 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     if (entry && !translation_cache_verify) {
         variant = translation_cache.FindVariant(variant_key);
     }
+    // The null pointer slots the translation depends on: CurrentComputePipeline rebuilds the
+    // pipeline once one of them holds a mapped pointer. A translation served from the translation
+    // cache (runtime or offline) has them too: it was found by replaying its recorded answers,
+    // null classifications included, against this environment.
+    const auto null_pointer_slots = [&]() -> std::vector<std::pair<u32, u32>> {
+        if (!ComputeNullSlotRebuild() || !env.IsNativeProgram()) {
+            return {};
+        }
+        auto slots = env.NullStoragePointerSlots();
+        return entry ? NullSlotsAskedBy(std::move(slots), entry->queries) : slots;
+    };
     if (entry && entry->offline && !translation_cache_verify) {
         translation_cache.LogOfflineOutcome(Shader::Stage::Compute, key.unique_hash,
                                             variant ? TC::OfflineOutcome::FullHit
@@ -2999,7 +3062,8 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         return {.pipeline = std::make_unique<ComputePipeline>(
                     device, scheduler, vulkan_pipeline_cache, descriptor_pool,
                     guest_descriptor_queue, descriptor_buffer_ring, cached_worker, statistics,
-                    &shader_notify, variant->info, std::move(cached_module), key.unique_hash)};
+                    &shader_notify, variant->info, std::move(cached_module), key.unique_hash),
+                .null_pointer_slots = null_pointer_slots()};
     }
     std::optional<TC::RecordingEnvironment> recording;
     if (cacheable && !entry) {
@@ -3092,8 +3156,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                 device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
                 descriptor_buffer_ring, thread_worker, statistics, &shader_notify, program.info,
                 std::move(spv_module), key.unique_hash),
-            .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
-                                                        : std::vector<std::pair<u32, u32>>{}};
+            .null_pointer_slots = null_pointer_slots()};
 
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "Compute pipeline compilation failed shader={:#016x} pipeline={:#016x}: {}",

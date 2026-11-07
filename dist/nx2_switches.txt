@@ -69,3 +69,12 @@ EDEN_NX2_FENCE_BATCH=1
 # on/true mean =1; any other value is logged as a warning and treated as =0.
 # Applied when the module is built: the translation cache is unchanged.
 #EDEN_NX2_GRAPHICS_NOINLINE=0
+# A native compute pipeline translated while one of its constant-buffer pointer slots was null
+# has no storage binding for that slot and drops every access through it (PR 395: Ocarina's
+# foliage culling compute, near hedges and ivy as bare branches). The pipeline is rebuilt once
+# such a slot holds a mapped pointer, at most 4 times per pipeline, whether its translation came
+# from the pipeline-key cache, the translation cache or the offline product; among cached records
+# of one compute key the boot loader takes the one that bound the most pointers. =0 (off, false,
+# none) keeps the first translation for the whole session and loads records in file order, as
+# before; any other unrecognised value is logged as a warning and treated as =0.
+#EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD=0
