@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstdlib>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include "common/logging.h"
 #include "video_core/spirv_inline_control.h"
 
 namespace VideoCommon {
@@ -147,11 +149,23 @@ u32 ParseGraphicsNoInlineStages(const char* value) {
     if (value == nullptr) {
         return DefaultGraphicsNoInlineStages;
     }
-    const std::string_view text{value};
-    if (text.empty() || text == "1") {
+    // Trimmed of surrounding whitespace and case-folded: "0 ", "OFF" and "Vtm" read as meant.
+    std::string_view raw{value};
+    constexpr std::string_view whitespace{" \t\r\n\v\f"};
+    const std::size_t first = raw.find_first_not_of(whitespace);
+    raw = first == std::string_view::npos
+              ? std::string_view{}
+              : raw.substr(first, raw.find_last_not_of(whitespace) - first + 1);
+    std::string text{raw};
+    for (char& letter : text) {
+        if (letter >= 'A' && letter <= 'Z') {
+            letter = static_cast<char>(letter - 'A' + 'a');
+        }
+    }
+    if (text.empty() || text == "1" || text == "on" || text == "true") {
         return DefaultGraphicsNoInlineStages;
     }
-    if (text == "0" || text == "none") {
+    if (text == "0" || text == "none" || text == "off" || text == "false") {
         return 0;
     }
     if (text == "all") {
@@ -182,7 +196,14 @@ u32 ParseGraphicsNoInlineStages(const char* value) {
             mask |= StageBit(SpirvStage::Fragment);
             break;
         default:
-            return DefaultGraphicsNoInlineStages;
+            // A value that reads as neither a switch nor a stage list is a mistake: off, said
+            // once, rather than a silent default an A/B run would not notice.
+            LOG_WARNING(Render_Vulkan,
+                        "EDEN_NX2_GRAPHICS_NOINLINE=\"{}\" is not recognised (0/none/off/false, "
+                        "1/on/true, all, or stage letters vcegtmf): graphics modules are built as "
+                        "emitted",
+                        value);
+            return 0;
         }
     }
     return mask;

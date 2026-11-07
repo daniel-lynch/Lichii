@@ -159,7 +159,27 @@ TEST_CASE("EDEN_NX2_GRAPHICS_NOINLINE values", "[spirv_inline_control]") {
                                                    StageBit(SpirvStage::Mesh)));
     REQUIRE(ParseGraphicsNoInlineStages("f") == StageBit(SpirvStage::Fragment));
     REQUIRE(ParseGraphicsNoInlineStages("vcegtmf") == AllGraphicsNoInlineStages);
-    REQUIRE(ParseGraphicsNoInlineStages("vx") == DefaultGraphicsNoInlineStages);
+    // Conventional switch words, whitespace and case.
+    REQUIRE(ParseGraphicsNoInlineStages("on") == DefaultGraphicsNoInlineStages);
+    REQUIRE(ParseGraphicsNoInlineStages("TRUE") == DefaultGraphicsNoInlineStages);
+    REQUIRE(ParseGraphicsNoInlineStages("  ") == DefaultGraphicsNoInlineStages);
+    REQUIRE(ParseGraphicsNoInlineStages(" 1\n") == DefaultGraphicsNoInlineStages);
+    REQUIRE(ParseGraphicsNoInlineStages("off") == 0);
+    REQUIRE(ParseGraphicsNoInlineStages("false") == 0);
+    REQUIRE(ParseGraphicsNoInlineStages("False") == 0);
+    REQUIRE(ParseGraphicsNoInlineStages("NONE") == 0);
+    REQUIRE(ParseGraphicsNoInlineStages("0 ") == 0);
+    REQUIRE(ParseGraphicsNoInlineStages("\t0") == 0);
+    REQUIRE(ParseGraphicsNoInlineStages("ALL") == AllGraphicsNoInlineStages);
+    REQUIRE(ParseGraphicsNoInlineStages(" VTM ") == (StageBit(SpirvStage::Vertex) |
+                                                     StageBit(SpirvStage::Task) |
+                                                     StageBit(SpirvStage::Mesh)));
+    // Anything else is rejected: off, never the silent default.
+    REQUIRE(ParseGraphicsNoInlineStages("vx") == 0);
+    REQUIRE(ParseGraphicsNoInlineStages("v,f") == 0);
+    REQUIRE(ParseGraphicsNoInlineStages("v f") == 0);
+    REQUIRE(ParseGraphicsNoInlineStages("yes") == 0);
+    REQUIRE(ParseGraphicsNoInlineStages("2") == 0);
     // The default leaves fragment shaders, and never names compute.
     REQUIRE((DefaultGraphicsNoInlineStages & StageBit(SpirvStage::Fragment)) == 0);
     REQUIRE((AllGraphicsNoInlineStages & StageBit(SpirvStage::Compute)) == 0);

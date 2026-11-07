@@ -54,10 +54,11 @@ inline constexpr u32 DefaultGraphicsNoInlineStages =
 inline constexpr u32 AllGraphicsNoInlineStages =
     DefaultGraphicsNoInlineStages | StageBit(SpirvStage::Fragment);
 
-/// Stage mask for an EDEN_NX2_GRAPHICS_NOINLINE value (null when unset): unset, empty or "1" is
-/// the default; "0" or "none" none; "all" every graphics stage; otherwise a set of letters,
-/// v vertex, c tess control, e tess eval, g geometry, t task, m mesh, f fragment ("vtm"). A value
-/// with any other character is the default. Compute is never in the mask (it has its own switch).
+/// Stage mask for an EDEN_NX2_GRAPHICS_NOINLINE value (null when unset), trimmed of surrounding
+/// whitespace and case-folded: unset, empty, "1", "on" or "true" is the default; "0", "none",
+/// "off" or "false" none; "all" every graphics stage; otherwise a set of letters, v vertex,
+/// c tess control, e tess eval, g geometry, t task, m mesh, f fragment ("vtm"). Any other value
+/// is rejected with a warning and is none. Compute is never in the mask (it has its own switch).
 [[nodiscard]] u32 ParseGraphicsNoInlineStages(const char* value);
 
 /// The process's EDEN_NX2_GRAPHICS_NOINLINE mask, read once.

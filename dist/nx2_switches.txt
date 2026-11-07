@@ -65,5 +65,7 @@ EDEN_NX2_FENCE_BATCH=1
 # pipeline build in Ocarina's Hyrule Field). Fragment shaders keep the driver's inlining by
 # default: they run per pixel. =all adds fragment, =0 builds every graphics module as emitted;
 # letters pick stages (v vertex, c tess control, e tess eval, g geometry, t task, m mesh,
-# f fragment), e.g. =vtm. Applied when the module is built: the translation cache is unchanged.
+# f fragment), e.g. =vtm. Case and surrounding spaces are ignored; off/false/none mean =0 and
+# on/true mean =1; any other value is logged as a warning and treated as =0.
+# Applied when the module is built: the translation cache is unchanged.
 #EDEN_NX2_GRAPHICS_NOINLINE=0
