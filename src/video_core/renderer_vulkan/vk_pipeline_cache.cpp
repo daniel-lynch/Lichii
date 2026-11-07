@@ -2640,6 +2640,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             return stage_modules;
         };
     }
+    // TRANSLATOR-IDENTITY END
     // Without a deferred stage (all from the translation cache, or verifying it), the
     // reservation and emit_pools are released when this returns.
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
@@ -2692,7 +2693,6 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     LOG_ERROR(Render_Vulkan, "{}", exception.what());
     return nullptr;
 }
-// TRANSLATOR-IDENTITY END
 
 namespace {
 // Where the last compute stage built on this thread came from, for the runtime report: the
@@ -2910,7 +2910,7 @@ std::vector<u32> ComputeModuleCode(std::span<const u32> code, u64 shader_hash) {
 }
 } // Anonymous namespace
 
-// TRANSLATOR-IDENTITY BEGIN: compute stage translation and emission
+// TRANSLATOR-IDENTITY BEGIN: compute stage lookup
 ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     ShaderPools& pools, const ComputePipelineCacheKey& key, Shader::Environment& env,
     PipelineStatistics* statistics, bool build_in_parallel) try {
@@ -2943,6 +2943,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                                             variant ? TC::OfflineOutcome::FullHit
                                                     : TC::OfflineOutcome::VariantMiss);
     }
+    // TRANSLATOR-IDENTITY END
     if (variant) {
         compute_source = entry->offline ? ComputeSource::Offline : ComputeSource::Cached;
         if (Settings::values.dump_guest_shaders) {
@@ -2962,6 +2963,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                     guest_descriptor_queue, descriptor_buffer_ring, cached_worker, statistics,
                     &shader_notify, variant->info, std::move(cached_module), key.unique_hash)};
     }
+    // TRANSLATOR-IDENTITY BEGIN: compute stage translation and emission
     std::optional<TC::RecordingEnvironment> recording;
     if (cacheable && !entry) {
         recording.emplace(env);
@@ -3018,6 +3020,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         translation_cache.InsertVariant(*entry, compute_variant_key,
                                         TC::Variant{{}, program.info, code});
     }
+    // TRANSLATOR-IDENTITY END
     if (cacheable) {
         ++translation_cache.stage_misses;
         translation_cache.miss_ns += static_cast<u64>(
@@ -3059,7 +3062,6 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
               key.unique_hash, key.Hash(), exception.what());
     return {.failure = exception.what()};
 }
-// TRANSLATOR-IDENTITY END
 
 void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                                  const vk::PipelineCache& pipeline_cache,

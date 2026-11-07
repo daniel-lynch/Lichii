@@ -181,9 +181,13 @@ regions:
   configuration digest), the profile and host info set up by the constructor, the offline
   product run (`PrecompileArchiveShaders`), `OpenTranslationCache` (configuration digest) and
   `IsTranslationCacheable`, `RecordRecipe`, `EmitWaitingSeed` and `BestRecipe`, `SeedStage`,
-  the translation file name in `LoadDiskResources`, both `CreateGraphicsPipeline(pools, ...)`
-  and `CreateComputePipeline(pools, ...)` whole, and the compute environment built by
-  `CreateComputePipeline(key, shader)`;
+  the translation file name in `LoadDiskResources`, the compute environment built by
+  `CreateComputePipeline(key, shader)`, and of `CreateGraphicsPipeline(pools, ...)` and
+  `CreateComputePipeline(pools, ...)` everything from their start to their last write to the
+  cache (for graphics up to and with the deferred emission job; for compute the lookup, then
+  the translation, emission and store). The pipeline object built from the final modules, the
+  statistics after it, the compute module built from a cached variant and the exception
+  handlers are outside;
 - `vk_pipeline_cache.h`: the profile, host info, store and configuration digest members;
 - `shader_cache.cpp`: `MeshStateHash`, `RefreshStages`, `SeedPoolCandidates`, `ComputeShader`,
   `GetGraphicsEnvironments` and `MakeShaderInfo` (program hashes, lowered code and the
