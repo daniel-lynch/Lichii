@@ -76,8 +76,9 @@ void SubgroupBarrier(EmitContext& ctx) {
 // One HMMA.16816.F16 (or .1688 with zero upper halves) of a 32-lane warp: the NVIDIA fragments
 // go to row-major A, column-major B (columns 8-15 zero) and row-major C tiles in shared memory,
 // one 16x16x16 cooperative-matrix multiply-add replaces the per-lane emulation, and each lane
-// reads its two D words back from where it wrote C.
-Id EmitCooperativeTensorMulAdd(EmitContext& ctx, Id a, Id b, Id c) {
+// reads its two D words back from where it wrote C. For depth 8 the upper K halves are stored as
+// zero here, as the software helper ignores them, instead of trusting the caller to pass zeros.
+Id EmitCooperativeTensorMulAdd(EmitContext& ctx, Id a, Id b, Id c, u32 depth) {
     const Id u32ty = ctx.U32[1];
     const auto imm = [&](u32 value) { return ctx.Const(value); };
     const auto add = [&](Id lhs, Id rhs) { return ctx.OpIAdd(u32ty, lhs, rhs); };
@@ -98,11 +99,15 @@ Id EmitCooperativeTensorMulAdd(EmitContext& ctx, Id a, Id b, Id c) {
     };
     store(tile_a, row_lo, ctx.OpCompositeExtract(u32ty, a, 0));
     store(tile_a, row_hi, ctx.OpCompositeExtract(u32ty, a, 1));
-    store(tile_a, add(row_lo, imm(4)), ctx.OpCompositeExtract(u32ty, a, 2));
-    store(tile_a, add(row_hi, imm(4)), ctx.OpCompositeExtract(u32ty, a, 3));
+    const bool short_depth = depth == 8;
+    store(tile_a, add(row_lo, imm(4)),
+          short_depth ? ctx.u32_zero_value : ctx.OpCompositeExtract(u32ty, a, 2));
+    store(tile_a, add(row_hi, imm(4)),
+          short_depth ? ctx.u32_zero_value : ctx.OpCompositeExtract(u32ty, a, 3));
     // B column g holds k pairs t (b0) and t+4 (b1); columns 8-15 (words 64-127) are zero.
     store(tile_b, row_lo, ctx.OpCompositeExtract(u32ty, b, 0));
-    store(tile_b, add(row_lo, imm(4)), ctx.OpCompositeExtract(u32ty, b, 1));
+    store(tile_b, add(row_lo, imm(4)),
+          short_depth ? ctx.u32_zero_value : ctx.OpCompositeExtract(u32ty, b, 1));
     store(tile_b, add(lane, imm(64)), ctx.u32_zero_value);
     store(tile_b, add(lane, imm(96)), ctx.u32_zero_value);
     store(tile_c, row_lo, ctx.OpCompositeExtract(u32ty, c, 0));
@@ -298,7 +303,7 @@ Id EmitTensorMulAdd(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
         throw NotImplementedException("Unsupported matrix multiply depth");
     }
     if (ctx.tensor_coopmat) {
-        return EmitCooperativeTensorMulAdd(ctx, a, b, c);
+        return EmitCooperativeTensorMulAdd(ctx, a, b, c, depth);
     }
     return ctx.OpFunctionCall(ctx.U32[2], ctx.software_matrix_functions[depth == 16], a, b, c);
 }

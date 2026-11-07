@@ -332,3 +332,89 @@ TEST_CASE("Native matrix lowering selects compact software helpers without legac
     code[0].words[0] += 1U << 24;
     REQUIRE_FALSE(static_cast<bool>(Ampere::LowerToMaxwell(code, false, true)));
 }
+
+TEST_CASE("Cooperative-matrix HMMA replaces the software helper when the profile allows it",
+          "[video_core][tensor][ampere][tensor_coopmat]") {
+    for (const u32 depth : {8U, 16U}) {
+        TensorProgram fixture{1, depth};
+        fixture.program.shared_memory_size = 100;
+        fixture.profile.support_cooperative_matrix_f16 = true;
+        const auto code = fixture.Emit(depth == 8 ? "coopmat-k8" : "coopmat-k16");
+        // The scratch sizes the declared array only; the program keeps its own size.
+        REQUIRE(fixture.program.shared_memory_size == 100);
+        REQUIRE(HasCapability(code, 6022));             // CooperativeMatrixKHR
+        REQUIRE(Instructions(code, 4456).size() == 3);  // OpTypeCooperativeMatrixKHR A, B, C
+        REQUIRE(Instructions(code, 4457).size() == 3);  // OpCooperativeMatrixLoadKHR A, B, C
+        REQUIRE(Instructions(code, 4459).size() == 1);  // OpCooperativeMatrixMulAddKHR
+        REQUIRE(Instructions(code, 4458).size() == 1);  // OpCooperativeMatrixStoreKHR
+        REQUIRE(Instructions(code, 57).empty());        // no software helper call
+        REQUIRE(Instructions(code, 246).empty());       // no software K loop
+        // No marker survives: every OpTypeStruct left is a real structure.
+        std::map<u32, u32> constants;
+        for (const auto& words : Instructions(code, 43)) {
+            constants.emplace(words[1], words[2]);
+        }
+        for (const auto& words : Instructions(code, 30)) {
+            REQUIRE_FALSE(std::ranges::any_of(words.begin() + 1, words.end(),
+                                              [&](u32 id) { return constants.contains(id); }));
+        }
+        // 100 bytes round up to 112, then 2 subgroups x 384 words: 28 + 768 = 796 words.
+        bool sized = false;
+        for (const auto& words : Instructions(code, 28)) { // OpTypeArray
+            sized |= constants.contains(words[2]) && constants.at(words[2]) == 796;
+        }
+        REQUIRE(sized);
+        // A second emission of the same program is identical (no scratch growth).
+        REQUIRE(fixture.Emit() == code);
+    }
+}
+
+TEST_CASE("Cooperative-matrix HMMA stays off without the profile bit",
+          "[video_core][tensor][ampere][tensor_coopmat]") {
+    TensorProgram fixture{1, 16};
+    const auto code = fixture.Emit();
+    REQUIRE_FALSE(HasCapability(code, 6022));
+    REQUIRE(Instructions(code, 4456).empty());
+    REQUIRE(Instructions(code, 57).size() == 1);
+}
+
+// Hidden ([.]): writes software and cooperative-matrix modules whose HMMA operands come from the
+// storage buffer (8 words per invocation, results at word 512 + 2 * invocation) to
+// EDEN_TENSOR_TEST_OUTPUT, for comparing both lowerings on a real device with arbitrary inputs.
+TEST_CASE("Input-driven HMMA modules for a device comparison", "[.][tensor_coopmat_dump]") {
+    for (const bool coopmat : {false, true}) {
+        for (const u32 depth : {8U, 16U}) {
+            TensorProgram fixture{0, 0};
+            auto& program = fixture.program;
+            program.info.uses_subgroup_shuffles = true;
+            program.info.uses_subgroup_invocation_id = true;
+            program.info.uses_local_invocation_id = true;
+            program.info.used_storage_buffer_types = IR::Type::U32;
+            program.info.storage_buffers_descriptors = {{0, 0, 1, true}};
+            fixture.profile.support_cooperative_matrix_f16 = coopmat;
+            IR::IREmitter ir{fixture.block};
+            const auto invocation = ir.LocalInvocationIdX();
+            const auto base = ir.ShiftLeftLogical(invocation, ir.Imm32(5));
+            std::array<IR::U32, 8> inputs;
+            for (u32 i = 0; i < inputs.size(); ++i) {
+                const auto load = fixture.block.PrependNewInst(
+                    fixture.block.end(), IR::Opcode::LoadStorage32,
+                    {ir.Imm32(0), ir.IAdd(base, ir.Imm32(i * 4))});
+                inputs[i] = IR::U32{IR::Value{&*load}};
+            }
+            const auto result = ir.TensorMulAdd(
+                ir.CompositeConstruct(inputs[0], inputs[1], inputs[2], inputs[3]),
+                ir.CompositeConstruct(inputs[4], inputs[5]),
+                ir.CompositeConstruct(inputs[6], inputs[7]), depth);
+            const auto out = ir.IAdd(ir.Imm32(2048), ir.ShiftLeftLogical(invocation, ir.Imm32(3)));
+            fixture.block.AppendNewInst(IR::Opcode::WriteStorage32,
+                                        {ir.Imm32(0), out, ir.CompositeExtract(result, 0)});
+            fixture.block.AppendNewInst(
+                IR::Opcode::WriteStorage32,
+                {ir.Imm32(0), ir.IAdd(out, ir.Imm32(4)), ir.CompositeExtract(result, 1)});
+            const auto code = fixture.Emit(std::string{coopmat ? "coopmat" : "software"} + "-input-k" +
+                                         std::to_string(depth));
+            REQUIRE(HasCapability(code, 6022) == coopmat);
+        }
+    }
+}
