@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "audio_core/common/audio_renderer_parameter.h"
+#include "audio_core/nx2_audio_options.h"
 #include "audio_core/renderer/behavior/behavior_info.h"
 #include "audio_core/renderer/command/command_buffer.h"
 #include "audio_core/renderer/command/command_generator.h"
@@ -36,7 +37,8 @@ CommandGenerator::CommandGenerator(CommandBuffer& command_buffer_,
     : command_buffer{command_buffer_}, command_header{command_list_header_},
       render_context{render_context_}, voice_context{voice_context_}, mix_context{mix_context_},
       effect_context{effect_context_}, sink_context{sink_context_},
-      splitter_context{splitter_context_}, performance_manager{performance_manager_} {
+      splitter_context{splitter_context_}, performance_manager{performance_manager_},
+      ramp_fix{Nx2AudioOptions::RampFixEnabled()} {
     command_buffer.GenerateClearMixCommand(InvalidNodeId);
 }
 
@@ -232,7 +234,10 @@ void CommandGenerator::GenerateVoiceCommand(VoiceInfo& voice_info) {
                 volume_ramp_detail_aspect.performance_entry_address);
         }
 
-        voice_info.prev_volume = voice_info.volume;
+        // Every channel must consume the same previous volume before advancing the voice.
+        if (!ramp_fix || channel + 1 == voice_info.channel_count) {
+            voice_info.prev_volume = voice_info.volume;
+        }
 
         if (voice_info.mix_id == UnusedMixId) {
             if (voice_info.splitter_id != UnusedSplitterId) {

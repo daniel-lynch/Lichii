@@ -27,6 +27,7 @@ add_executable(tests
     audio_core/nx2_sysmix.cpp
     audio_core/nx2_input_service.cpp
     audio_core/nx2_audio_service.cpp
+    audio_core/nx2_audio_renderer.cpp
     audio_core/nx2_audio_output.cpp
     audio_core/audio_in.cpp
     audio_core/sysmix_sink.cpp

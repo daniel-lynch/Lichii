@@ -11,38 +11,14 @@
 
 #include "audio_core/nx2_audio_options.h"
 #include "common/scope_exit.h"
+#include "core/hle/service/audio/audio_controller.h"
 #include "core/hle/service/audio/nx2_audio_user_client.h"
 #include "core/hle/service/server_manager.h"
+#include "core/hle/service/set/system_settings_server.h"
+#include "tests/audio_core/scoped_environment.h"
 #include "tests/audio_core/sysmix_test_context.h"
 
-namespace {
-class ScopedEnvironment {
-public:
-    ScopedEnvironment(const char* name_, const char* value) : name{name_} {
-        if (const auto* old = std::getenv(name)) {
-            previous = old;
-        }
-        Set(value);
-    }
-    ~ScopedEnvironment() {
-        Set(previous ? previous->c_str() : nullptr);
-    }
-private:
-    void Set(const char* value) {
-#ifdef _WIN32
-        _putenv_s(name, value ? value : "");
-#else
-        if (value) {
-            setenv(name, value, 1);
-        } else {
-            unsetenv(name);
-        }
-#endif
-    }
-    const char* name;
-    std::optional<std::string> previous;
-};
-} // namespace
+using AudioTests::ScopedEnvironment;
 
 TEST_CASE("audio experiments have explicit defaults and zero opt-outs", "[sysmix][nx2_audio]") {
     using namespace AudioCore::Nx2AudioOptions;
@@ -51,10 +27,12 @@ TEST_CASE("audio experiments have explicit defaults and zero opt-outs", "[sysmix
         ScopedEnvironment shared{"EDEN_NX2_AUDIO_SHARED_MANAGERS", value};
         ScopedEnvironment async{"EDEN_NX2_AUDIO_ASYNC_POOL", value};
         ScopedEnvironment stereo{"EDEN_NX2_AUDIO_STEREO", value};
+        ScopedEnvironment ramp{"EDEN_NX2_AUDIO_RAMP_FIX", value};
         const bool explicit_zero = value && std::string_view{value} == "0";
         REQUIRE(SharedManagersEnabled() == !explicit_zero);
         REQUIRE(AsyncMemoryPoolControlEnabled() == !explicit_zero);
         REQUIRE(StereoOutputEnabled() == (value && std::string_view{value} == "1"));
+        REQUIRE(RampFixEnabled() == (value && std::string_view{value} == "1"));
     }
 }
 
@@ -138,5 +116,79 @@ TEST_CASE("nx2 audio IPC returns registered managers across repeated requests",
         const auto count = manager->DomainHandlerCount();
         REQUIRE(query(2) == Service::Audio::ResultOperationFailed.raw);
         REQUIRE(manager->DomainHandlerCount() == count);
+    }
+}
+
+TEST_CASE("audio output mode IPC keeps session writes and stereo overrides both query paths",
+          "[sysmix][nx2_audio_output]") {
+    using Mode = Service::Set::AudioOutputMode;
+    using Target = Service::Set::AudioOutputModeTarget;
+    ScopedEnvironment stereo{"EDEN_NX2_AUDIO_STEREO", nullptr};
+    SysmixTests::Context context;
+    // No real output sink is initialized by this service-only fixture.
+    Settings::values.audio_muted.SetValue(true);
+    auto& kernel = context.system.Kernel();
+    Kernel::KThread client{kernel};
+    Kernel::KAutoObject::Create(&client);
+    REQUIRE(Kernel::KThread::InitializeDummyThread(context.system, &client, &*context.process)
+                .IsSuccess());
+    SCOPE_EXIT {
+        context.process->UnregisterThread(kernel, &client);
+        context.process->Close(kernel);
+        kernel.UnregisterKernelObject(&client);
+    };
+    std::optional<std::jthread> server_thread;
+    Service::ServerManager server{context.system};
+    server_thread.emplace(
+        kernel.RunOnHostCoreProcess("audio-mode-ipc-test", [&] { server.LoopProcess(); }));
+    auto manager = std::make_shared<Service::SessionRequestManager>(kernel, server);
+    auto settings = std::make_shared<Service::Set::ISystemSettingsServer>(context.system);
+    Service::Audio::IAudioController controller{context.system, settings};
+    const auto query = [&](u32 command, Target target, Mode value = Mode::ch_7_1) {
+        std::array<u32_le, IPC::COMMAND_BUFFER_LENGTH> words{};
+        IPC::CommandHeader header{};
+        header.type.Assign(IPC::CommandType::Request);
+        header.data_size.Assign(12);
+        std::memcpy(words.data(), &header, sizeof(header));
+        words[4] = 0x49434653;
+        words[6] = command;
+        words[8] = static_cast<u32>(target);
+        words[9] = static_cast<u32>(value);
+        Service::HLERequestContext request{kernel, context.Memory(), nullptr, &client};
+        request.SetSessionRequestManager(manager);
+        REQUIRE(request.PopulateFromIncomingCommandBuffer(words.data()).IsSuccess());
+        controller.InvokeRequest(request);
+        REQUIRE(request.CommandBuffer()[4] == 0x4f434653);
+        REQUIRE(request.CommandBuffer()[6] == ResultSuccess.raw);
+        return static_cast<Mode>(static_cast<u32>(request.CommandBuffer()[8]));
+    };
+    constexpr std::array targets{Target::Hdmi, Target::Speaker, Target::Headphone,
+                                 Target::Type3, Target::Type4};
+    for (auto target : targets) {
+        REQUIRE(query(13, target) == Mode::ch_7_1);
+        query(14, target, Mode::ch_5_1);
+        REQUIRE(query(13, target) == Mode::ch_5_1);
+        query(10, target, Mode::ch_1);
+        REQUIRE(query(9, target) == Mode::ch_1);
+    }
+    query(14, Target::Hdmi, Mode::ch_2);
+    REQUIRE(query(13, Target::Speaker) == Mode::ch_5_1);
+    for (const char* option : {"0", "1"}) {
+        ScopedEnvironment override{"EDEN_NX2_AUDIO_STEREO", option};
+        const bool enabled = std::string_view{option} == "1";
+        for (auto target : targets) {
+            CAPTURE(option, static_cast<u32>(target));
+            query(14, target, enabled ? Mode::ch_1 : Mode::ch_7_1);
+            query(10, target, Mode::ch_5_1);
+            REQUIRE(query(13, target) == (enabled ? Mode::ch_2 : Mode::ch_7_1));
+            REQUIRE(query(9, target) == (enabled ? Mode::ch_2 : Mode::ch_5_1));
+            Mode mode{};
+            REQUIRE(settings->GetAudioOutputMode(&mode, target).IsSuccess());
+            REQUIRE(mode == (enabled ? Mode::ch_2 : Mode::ch_5_1));
+        }
+    }
+    for (auto target : targets) {
+        REQUIRE(query(13, target) == Mode::ch_1);
+        REQUIRE(query(9, target) == Mode::ch_5_1);
     }
 }

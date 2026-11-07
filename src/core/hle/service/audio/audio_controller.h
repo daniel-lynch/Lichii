@@ -23,6 +23,8 @@ namespace Service::Audio {
 class IAudioController final : public ServiceFramework<IAudioController> {
 public:
     explicit IAudioController(Core::System& system_);
+    IAudioController(Core::System& system_,
+                     std::shared_ptr<Service::Set::ISystemSettingsServer> settings);
     ~IAudioController() override;
 
 private:
@@ -65,6 +67,10 @@ private:
     std::shared_ptr<Service::Set::ISystemSettingsServer> m_set_sys;
     std::array<s32, 6> m_target_volumes{{15, 15, 15, 15, 15, 15}};
     std::array<bool, 6> m_target_muted{{false, false, false, false, false, false}};
+    std::array<Set::AudioOutputMode, 6> m_output_mode_settings{
+        Set::AudioOutputMode::ch_7_1, Set::AudioOutputMode::ch_7_1,
+        Set::AudioOutputMode::ch_7_1, Set::AudioOutputMode::ch_7_1,
+        Set::AudioOutputMode::ch_7_1, Set::AudioOutputMode::ch_7_1};
     Set::AudioOutputModeTarget m_active_target{Set::AudioOutputModeTarget::Speaker};
 };
 

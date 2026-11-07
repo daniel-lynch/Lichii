@@ -59,7 +59,7 @@ struct SinkBuffer {
  */
 class SinkStream {
 public:
-    explicit SinkStream(Core::System& system_, StreamType type_) : system{system_}, type{type_} {}
+    explicit SinkStream(Core::System& system_, StreamType type_);
     virtual ~SinkStream() {}
 
     /**
@@ -293,6 +293,7 @@ private:
     std::chrono::nanoseconds last_sample_count_update_time{};
     /// Set by the audio render/in/out system which uses this stream
     f32 system_volume{1.0f};
+    const f32 center_downmix_gain;
     /// Set via IAudioDevice service calls
     f32 device_volume{1.0f};
     /// Signalled when ring buffer entries are consumed

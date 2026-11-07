@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "audio_core/audio_core.h"
+#include "audio_core/nx2_audio_options.h"
 #include "audio_core/sink/sink_details.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -12,6 +13,10 @@
 namespace AudioCore {
 
 AudioCore::AudioCore(Core::System& system) {
+    if (std::getenv("EDEN_NX2_AUDIO_CENTER_GAIN")) {
+        LOG_INFO(Audio, "NX2 sink fallback downmix center gain={} (EDEN_NX2_AUDIO_CENTER_GAIN)",
+                 Nx2AudioOptions::CenterGain());
+    }
     audio_manager.emplace();
     CreateSinks();
     // Must be created after the sinks

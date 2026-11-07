@@ -14,6 +14,7 @@
 
 #include "audio_core/audio_core.h"
 #include "audio_core/common/common.h"
+#include "audio_core/nx2_audio_options.h"
 #include "audio_core/sink/input_processing.h"
 #include "audio_core/sink/sink_stream.h"
 #include "common/common_types.h"
@@ -24,6 +25,9 @@
 #include "core/core_timing.h"
 
 namespace AudioCore::Sink {
+
+SinkStream::SinkStream(Core::System& system_, StreamType type_)
+    : system{system_}, type{type_}, center_downmix_gain{Nx2AudioOptions::CenterGain()} {}
 
 void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
     if (type == StreamType::In)
@@ -40,7 +44,7 @@ void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
     const auto device_samples = samples.size() / system_channels * device_channels;
 
     if (system_channels > device_channels) {
-        static constexpr std::array<f32, 4> tcoeff{1.0f, 0.596f, 0.354f, 0.707f};
+        const std::array<f32, 4> tcoeff{1.0f, center_downmix_gain, 0.354f, 0.707f};
         for (u32 r_offs = 0, w_offs = 0; r_offs < samples.size(); r_offs += system_channels, w_offs += device_channels) {
             std::array<f32, 6> ccoeff{0.f};
             for (u32 i = 0; i < system_channels; ++i)
