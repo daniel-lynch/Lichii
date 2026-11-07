@@ -428,6 +428,16 @@ u64 AllocatedUsage(VkDeviceSize driver_usage, const VmaBudget& vma_budget) {
     return driver_usage - (std::min)(driver_usage, unused);
 }
 
+// EDEN_NX2_TENSOR_COOPMAT=1 opts into HMMA on VK_KHR_cooperative_matrix. Unset, empty or "0"
+// keeps the per-lane HMMA emulation.
+bool TensorCoopmatRequested() {
+    static const bool requested = [] {
+        const char* value = std::getenv("EDEN_NX2_TENSOR_COOPMAT");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return requested;
+}
+
 } // Anonymous namespace
 
 void Device::RemoveExtension(bool& extension, const std::string& extension_name) {
@@ -647,7 +657,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
                         "AMD drivers (2026+) have broken float16 math");
             // The cooperative-matrix tensor path needs fp16 matrix types: keep the device
             // feature then, but still report fp16 as unsupported to the shader compiler.
-            if (std::getenv("EDEN_NX2_TENSOR_COOPMAT") != nullptr) {
+            if (TensorCoopmatRequested()) {
                 has_broken_float16_math = true;
             } else {
                 features.shader_float16_int8.shaderFloat16 = false;
@@ -1672,7 +1682,7 @@ void Device::RemoveUnsuitableExtensions() {
                                        VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
 
     // VK_KHR_cooperative_matrix: only for the opt-in tensor-core path (EDEN_NX2_TENSOR_COOPMAT=1).
-    if (std::getenv("EDEN_NX2_TENSOR_COOPMAT") == nullptr) {
+    if (!TensorCoopmatRequested()) {
         RemoveExtensionFeature(extensions.cooperative_matrix, features.cooperative_matrix,
                                VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
     } else if (extensions.cooperative_matrix) {

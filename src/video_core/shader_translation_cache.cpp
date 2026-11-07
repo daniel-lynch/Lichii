@@ -149,13 +149,14 @@ constexpr size_t InfoFields = 89;
     X(need_declared_frag_colors) X(need_fastmath_off) X(need_gather_subpixel_offset) \
     X(has_broken_spirv_clamp) X(has_broken_spirv_position_input) \
     X(has_broken_unsigned_image_offsets) X(has_broken_signed_operations) \
-    X(has_broken_fp16_float_controls) X(has_broken_fp32_denorm_flush) \
+    X(has_broken_fp16_float_controls) X(support_cooperative_matrix_f16) \
+    X(has_broken_fp32_denorm_flush) \
     X(has_gl_component_indexing_bug) X(has_gl_precise_bug) X(has_gl_cbuf_ftou_bug) \
     X(has_gl_bool_ref_bug) X(ignore_nan_fp_comparisons) \
     X(has_broken_spirv_subgroup_mask_vector_extract_dynamic) \
     X(has_broken_spirv_subgroup_shuffle) X(has_broken_spirv_fragment_shuffle) X(max_subgroup_size) X(gl_max_compute_smem_size) \
     X(has_broken_robust) X(min_ssbo_alignment) X(max_user_clip_distances)
-constexpr size_t ProfileFields = 76;
+constexpr size_t ProfileFields = 77;
 
 constexpr size_t HostFields = 22;
 constexpr size_t RuntimeInfoFields = 19;

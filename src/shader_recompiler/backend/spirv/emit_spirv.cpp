@@ -675,6 +675,7 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     // memory (explicit workgroup layouts alias every shared variable at offset 0).
     bool tensor_coopmat{};
     u32 tensor_scratch_bytes{};
+    const u32 program_shared_memory_size{program.shared_memory_size};
     if (profile.support_cooperative_matrix_f16 && program.stage == Stage::Compute) {
         for (const auto* block : program.blocks) {
             for (const auto& inst : block->Instructions()) {
@@ -690,6 +691,10 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
         }
     }
     EmitContext ctx{profile, runtime_info, program, bindings};
+    // The scratch only sizes the shared memory declared above. Leave the program as it came:
+    // the translation cache keeps its metadata, and a program emitted twice (the cache's verify
+    // mode, the offline producers) must not grow its scratch twice.
+    program.shared_memory_size = program_shared_memory_size;
     ctx.tensor_coopmat = tensor_coopmat;
     ctx.tensor_scratch_word = tensor_scratch_bytes / 4U;
     DefineSoftwareMatrixFunctions(ctx, program);
