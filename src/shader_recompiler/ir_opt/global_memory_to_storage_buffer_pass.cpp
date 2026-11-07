@@ -2008,6 +2008,12 @@ private:
         if (value.base != 0 || factor >= COEF_LIMIT || (!exact_factor && value.c < 0)) {
             return std::nullopt;
         }
+        // Before multiplying: |c| is at most 2^40 and the factor below 2^32, so the product can
+        // overflow 64 bits (either sign)
+        const u64 magnitude{static_cast<u64>(value.c < 0 ? -value.c : value.c)};
+        if (magnitude != 0 && factor > static_cast<u64>(CONST_LIMIT) / magnitude) {
+            return std::nullopt;
+        }
         IdBound result{.c = value.c * static_cast<s64>(factor),
                        .exact = value.exact && exact_factor};
         for (size_t i = 0; i < result.coef.size(); ++i) {
@@ -2015,9 +2021,6 @@ private:
                 return std::nullopt;
             }
             result.coef[i] = value.coef[i] * factor;
-        }
-        if (value.c > 0 && factor > static_cast<u64>(CONST_LIMIT / value.c)) {
-            return std::nullopt;
         }
         return Checked(result);
     }

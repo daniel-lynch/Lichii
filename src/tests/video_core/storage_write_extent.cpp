@@ -295,3 +295,20 @@ TEST_CASE("A value that is only an upper bound is not subtracted or used as a mu
     INFO("marked " << (marked ? *marked : 0));
     CHECK((!marked || *marked >= 0x10000 + 4));
 }
+
+TEST_CASE("Scaling a large constant gives up instead of overflowing", "[shader][storage_extent]") {
+    // tid + 4 * 0x80000000 is tid (and tid + 5 * 0x7fffffff is tid + 0x7ffffffb) in 32 bits, but
+    // the analysis sees the constant as -2^33 (or about 2^33.3), and << 31 overflows it in 64 bits
+    KernelProgram fixture;
+    IR::IREmitter ir{fixture.entry};
+    const bool negative = GENERATE(true, false);
+    IR::U32 value{ir.LocalInvocationIdX()};
+    for (int i = 0; i < (negative ? 4 : 5); ++i) {
+        value = IR::U32{ir.IAdd(value, ir.Imm32(negative ? 0x80000000U : 0x7fffffffU))};
+    }
+    ir.WriteGlobal32(Address(ir, 0x170, ir.ShiftLeftLogical(value, ir.Imm32(31))), ir.Imm32(0));
+    const StorageWriteExtent& extent{fixture.Run(0x170).write_extent};
+    // Every invocation stores at 0 or 0x80000000
+    const std::optional<u64> marked{At(extent, {64, 1, 1}, std::array<u32, 3>{1, 1, 1})};
+    CHECK((!marked || *marked >= 0x80000004ULL));
+}
