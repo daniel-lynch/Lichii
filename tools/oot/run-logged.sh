@@ -104,8 +104,25 @@ if [ "${OOT_PRODUCT:-1}" = "1" ]; then
     done
   fi
 fi
-# OOT_PIPELINES: offline pipeline-key product ($OOT/offline-translate/pipeline-live/vulkan.fork-v53.bin
-# + its .sha256): pipeline-tools/pipeline_cache_merge.py appends the product's records whose key the
+# Pipeline cache version: the emulator opens <shader dir>/<title>/vulkan.fork-v<N>.bin, N its build's
+# VulkanPipelineCacheVersion (src/video_core/pipeline_cache_files.h: 53 up to dev c4507a3910, 54 since
+# upstream #432), and DELETES that file at boot when its header holds another version. So every step
+# below works on version N's files only, and the tool refuses to write a file whose name and header
+# disagree. N comes from the binary itself: builds since the nx2 a10e5f5569 merge carry the string
+# "lichii-pipeline-cache=vulkan.fork-v<N>.bin" (VulkanPipelineCacheMarker, logged at boot), so a
+# copied or renamed binary still answers; a binary without it is an older build: 53.
+# OOT_PIPELINE_VERSION=N overrides. A wrong N costs that launch its warm cache, never a file: the
+# emulator only ever opens (and deletes) its own version's name, and the files of every other
+# version are left as they are.
+PC_VERSION="${OOT_PIPELINE_VERSION:-}"
+if [ -z "$PC_VERSION" ]; then
+  PC_VERSION=$(grep -ao 'lichii-pipeline-cache=vulkan\.fork-v[0-9][0-9]*\.bin' "$BIN" 2>/dev/null | head -1 | sed 's/.*fork-v\([0-9]*\)\.bin$/\1/')
+  [ -n "$PC_VERSION" ] || PC_VERSION=53
+fi
+case "$PC_VERSION" in ''|0*|*[!0-9]*) echo "pipeline keys: cache version '$PC_VERSION' is not a version number; using 53" >&2; PC_VERSION=53;; esac
+echo "pipeline keys: $(basename "$BIN") uses cache version v$PC_VERSION" >&2
+# OOT_PIPELINES: offline pipeline-key product ($OOT/offline-translate/pipeline-live/vulkan.fork-v<N>.bin
+# + its .sha256, N as above): pipeline-tools/pipeline_cache_merge.py appends the product's records whose key the
 # live pipeline cache lacks, before the emulator starts, so those pipelines are built at boot instead
 # of mid-play. The live cache's records stay a byte-identical prefix, with one exception: a record
 # cut short at its end (a crash mid-append) is dropped, because the emulator deletes the WHOLE cache
@@ -117,21 +134,72 @@ fi
 # then shared while the game runs -- so a merge never runs under an emulator another launch
 # started (that launch skips it). The tool refuses rather than
 # risk the cache -- 3: an emulator, another session or another merge is using it; 2: live cache
-# unusable; 4: product failed validation -- and every refusal only skips the merge: the game
-# launches anyway. OOT_PIPELINES=0 skips the merge (the session lock is still taken).
-LIVE_PC="$HOME/.cache/eden/shader/0400486024dec000/vulkan.fork-v53.bin"
+# unusable (or a version mismatch); 4: product failed validation -- and every refusal only skips the
+# merge: the game launches anyway. No product of version N: nothing merged (repair still runs).
+# OOT_PIPELINES=0 skips the carry-over, the merge and the repair (the session lock is still taken).
+# Carry-over to a new version (53 -> 54: the record format is the same, only the header's version
+# changed). The old file vulkan.fork-v<N-1>.bin is only ever read -- never changed, renamed or
+# removed: it is the backup, and still the cache of older binaries. It is carried whenever it is not
+# the file <live>.carried-v<N-1> recorded (inode, size, mtime) at the last carry, so a carry that
+# did not happen (busy, refused, OOT_PIPELINES=0, a v<N> binary started some other way -- which
+# then makes its own vulkan.fork-v<N>.bin, from a stale v52 file if one is there) is retried at the
+# next launch, and records a v<N-1> binary added since are carried too:
+#   - no vulkan.fork-v<N>.bin yet: `convert --live` writes it = the old file's whole records under
+#     the new header, verified, installed only while the name is still free (RENAME_NOREPLACE),
+#     with merge's locks and emulator checks plus a lease on the old file;
+#   - vulkan.fork-v<N>.bin exists: `convert` writes the old file's records as a temporary v<N>
+#     product (.carry.vulkan.fork-v<N>.bin + .sha256, removed afterwards) and `merge` appends the
+#     ones v<N> lacks, with all of merge's guarantees (v<N>'s records stay a byte-identical prefix,
+#     backup first, atomic exchange).
+# Then the product merge above runs on the new file, as usual (and takes its own backup). Also
+# carried, as the emulator does for v52: vulkan_used.fork-v<N-1>.bin (the recently used pipeline
+# list that picks what is built at boot; its format has no version), copied when v<N> has none.
+LIVE_PC="$HOME/.cache/eden/shader/0400486024dec000/vulkan.fork-v$PC_VERSION.bin"
+LIVE_PREV="${LIVE_PC%/*}/vulkan.fork-v$((PC_VERSION - 1)).bin"
 if mkdir -p "${LIVE_PC%/*}" 2>/dev/null && exec 9>>"$LIVE_PC.session.lock"; then
   if flock -n -x 9; then
     PC_TOOL="$OOT/offline-translate/pipeline-tools/pipeline_cache_merge.py"
-    PC_PRODUCT="$OOT/offline-translate/pipeline-live/vulkan.fork-v53.bin"
+    PC_PRODUCT="$OOT/offline-translate/pipeline-live/vulkan.fork-v$PC_VERSION.bin"
+    CARRY_STAMP="$LIVE_PC.carried-v$((PC_VERSION - 1))"
+    prev_id=$(stat -c '%i %s %Y' "$LIVE_PREV" 2>/dev/null)
+    if [ "${OOT_PIPELINES:-1}" = "1" ] && [ -s "$LIVE_PREV" ] && [ ! -L "$LIVE_PREV" ] \
+        && [ "$prev_id" != "$(cat "$CARRY_STAMP" 2>/dev/null)" ]; then
+      if [ ! -e "$LIVE_PC" ] && [ ! -L "$LIVE_PC" ]; then
+        echo "pipeline keys: first v$PC_VERSION launch; carrying the v$((PC_VERSION - 1)) cache over" >&2
+        timeout -s INT -k 10 300 python3 -I "$PC_TOOL" convert --live --to "$PC_VERSION" "$LIVE_PREV" "$LIVE_PC" --session-lock
+        crc=$?
+      else
+        echo "pipeline keys: adding the v$((PC_VERSION - 1)) cache's records to the v$PC_VERSION cache (not carried since it changed)" >&2
+        CARRY="${LIVE_PC%/*}/.carry.vulkan.fork-v$PC_VERSION.bin"
+        rm -f "$CARRY" "$CARRY.sha256"
+        timeout -s INT -k 10 300 python3 -I "$PC_TOOL" convert --to "$PC_VERSION" "$LIVE_PREV" "$CARRY" \
+          && timeout -s INT -k 10 300 python3 -I "$PC_TOOL" merge --version "$PC_VERSION" --live "$LIVE_PC" --product "$CARRY" --session-lock
+        crc=$?
+        rm -f "$CARRY" "$CARRY.sha256"
+      fi
+      case $crc in
+        0) echo "$prev_id" > "$CARRY_STAMP.tmp" && mv -f "$CARRY_STAMP.tmp" "$CARRY_STAMP";;
+        3) echo "pipeline keys: emulator busy, v$((PC_VERSION - 1)) cache not carried over (retried next launch)" >&2;;
+        *) echo "pipeline keys: v$((PC_VERSION - 1)) cache not carried over (exit $crc, reason above; retried next launch); launching anyway" >&2;;
+      esac
+    fi
+    USED_PC="${LIVE_PC%/*}/vulkan_used.fork-v$PC_VERSION.bin" USED_PREV="${LIVE_PC%/*}/vulkan_used.fork-v$((PC_VERSION - 1)).bin"
+    if [ "${OOT_PIPELINES:-1}" = "1" ] && [ ! -e "$USED_PC" ] && [ ! -L "$USED_PC" ] && [ -s "$USED_PREV" ] && [ ! -L "$USED_PREV" ]; then
+      cp "$USED_PREV" "$USED_PC.carry.$$" 2>/dev/null && mv -n "$USED_PC.carry.$$" "$USED_PC" \
+        && echo "pipeline keys: used-pipeline list carried over to v$PC_VERSION" >&2
+      rm -f "$USED_PC.carry.$$"
+    fi
     rc=none
+    if [ "${OOT_PIPELINES:-1}" = "1" ] && [ ! -f "$PC_PRODUCT" ]; then
+      echo "pipeline keys: no v$PC_VERSION product ($PC_PRODUCT); nothing merged" >&2
+    fi
     if [ "${OOT_PIPELINES:-1}" = "1" ] && [ -f "$PC_PRODUCT" ]; then
       want=$(cut -c1-64 "$PC_PRODUCT.sha256" 2>/dev/null)
       have=$(cut -c1-64 "$LIVE_PC.merged" 2>/dev/null)
       ino=$(stat -c %i "$LIVE_PC" 2>/dev/null)
       have_ino=$(sed -n 's/.* ino=//p' "$LIVE_PC.merged" 2>/dev/null)
       if [ -z "$want" ] || [ "$want" != "$have" ] || [ "$ino" != "$have_ino" ]; then
-        timeout -s INT -k 10 300 python3 -I "$PC_TOOL" merge --live "$LIVE_PC" --product "$PC_PRODUCT" --session-lock
+        timeout -s INT -k 10 300 python3 -I "$PC_TOOL" merge --version "$PC_VERSION" --live "$LIVE_PC" --product "$PC_PRODUCT" --session-lock
         rc=$?
         case $rc in
           0) echo "$want ino=$(stat -c %i "$LIVE_PC" 2>/dev/null)" > "$LIVE_PC.merged.tmp" \
@@ -144,7 +212,7 @@ if mkdir -p "${LIVE_PC%/*}" 2>/dev/null && exec 9>>"$LIVE_PC.session.lock"; then
     # No merge ran (or it refused the product / an unreadable live cache): still repair a
     # cut-short tail a crashed session left, which the emulator would answer by deleting the cache.
     if [ "${OOT_PIPELINES:-1}" = "1" ] && [ "$rc" != 0 ] && [ "$rc" != 3 ] && [ -s "$LIVE_PC" ]; then
-      timeout -s INT -k 10 120 python3 -I "$PC_TOOL" repair --live "$LIVE_PC" --session-lock \
+      timeout -s INT -k 10 120 python3 -I "$PC_TOOL" repair --version "$PC_VERSION" --live "$LIVE_PC" --session-lock \
         | grep -v '^live .*records$\|^nothing to repair' >&2 9>&-  # 9>&-: the filter holds no session fd
     fi
   elif [ "${OOT_PIPELINES:-1}" = "1" ]; then
