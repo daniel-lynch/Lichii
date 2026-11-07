@@ -21,6 +21,7 @@
 #include "common/settings.h"
 #include "common/swap.h"
 #include "core/core.h"
+#include "core/arm/dynarmic/oot_coop_sync.h"
 #include "core/arm/dynarmic/oot_gamedata_trace.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/arm/exec_coverage.h"
@@ -339,6 +340,10 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         }
     }
     LOG_INFO(Loader, "Module {} loaded at {:#x} (size {:#x})", nso_file.GetName(), load_base, image_size);
+    if (name == "main") {
+        Core::OotCoop::RegisterMain(&process, process.GetProgramId(), load_base + module_start,
+                                  Common::HexToString(std::span{nso_header.build_id}.first(20)));
+    }
     if (name == "main" && Core::OotGameDataTrace::Enabled() &&
         process.GetProgramId() == Core::OotGameDataTrace::ProgramId) {
         // EDEN_NX2_GAMEDATA_TRACE: the quest-step and HavePlayedEvent sites belong to one build.

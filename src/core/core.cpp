@@ -20,6 +20,7 @@
 #include "common/settings_enums.h"
 #include "common/string_util.h"
 #include "core/arm/exclusive_monitor.h"
+#include "core/arm/dynarmic/oot_coop_sync.h"
 #include "core/core.h"
 
 #include "launch_timestamp_cache.h"
@@ -192,6 +193,7 @@ struct System::Impl {
         // core_timing (whose timer thread runs the cheat event) last. Stop the engine first for a
         // System destroyed without ShutdownMainProcess.
         cheat_engine.reset();
+        OotCoop::BeginSession();
     }
 
     u64 program_id;
@@ -381,6 +383,7 @@ struct System::Impl {
         Common::ShaderAotScene::BeginSession();
         // EDEN_NX2_ROMFS_TRACE / EDEN_NX2_GAMEDATA_TRACE: a new trace file and session clock.
         Common::Nx2EventTrace::BeginSession();
+        OotCoop::BeginSession();
 
         const bool switch2_program =
             virtual_filesystem != nullptr &&
@@ -510,6 +513,7 @@ struct System::Impl {
     }
 
     void ShutdownMainProcess() {
+        OotCoop::BeginSession();
         debug_service.reset();
         SetShuttingDown(true);
         Common::ADPF::Shutdown();
