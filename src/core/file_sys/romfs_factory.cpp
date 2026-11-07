@@ -29,6 +29,7 @@ RomFSFactory::RomFSFactory(Loader::AppLoader& app_loader, ContentProvider& provi
     }
 
     updatable = app_loader.IsRomFSUpdatable();
+    layered_by_loader = app_loader.AppliesLayeredFS();
 }
 
 RomFSFactory::~RomFSFactory() = default;
@@ -38,11 +39,19 @@ void RomFSFactory::SetPackedUpdate(VirtualFile update_raw_file) {
 }
 
 VirtualFile RomFSFactory::OpenCurrentProcess(u64 current_process_title_id) const {
-    if (!updatable) {
+    const auto type = ContentRecordType::Program;
+    if (!updatable && layered_by_loader) {
+        // The loader layered the mods itself (the NUP loader, over its unpacked merged tree).
         return file;
     }
+    if (!updatable) {
+        // sergio: a NUP already carries its update merged, but LayeredFS mods
+        // (user/load/<title>/<mod>/romfs) still apply; no NCA, so no update step.
+        const PatchManager mods{current_process_title_id, filesystem_controller,
+                                content_provider};
+        return mods.PatchRomFS(nullptr, file, type, nullptr);
+    }
 
-    const auto type = ContentRecordType::Program;
     const auto nca = content_provider.GetEntry(current_process_title_id, type);
     const PatchManager patch_manager{current_process_title_id, filesystem_controller,
                                      content_provider};

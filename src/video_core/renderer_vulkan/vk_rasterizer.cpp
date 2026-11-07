@@ -294,6 +294,10 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       frame_dump(device, memory_allocator, scheduler) {
     dynamic_state_flags = DynamicStateFlags();
     scheduler.SetQueryCache(query_cache);
+    buffer_cache.SetPendingCpuWrites(
+        [this](const std::function<void(DAddr, size_t)>& callback) {
+            gpu.ForEachPendingCpuWrite(callback);
+        });
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
         &scheduler);
@@ -2180,6 +2184,18 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     }
     pipeline_cache.InvalidateRegion(addr, size);
     return false;
+}
+
+void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    // Out of the GPU-written ranges first: applying one write downloads the GPU's bytes elsewhere
+    // on its pages (WriteMemory), which would write over the next collected write.
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.ClaimCpuWrites(ranges);
+    }
+    for (const auto& [addr, size] : ranges) {
+        OnCacheInvalidation(addr, size);
+    }
 }
 
 void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {

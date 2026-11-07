@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <barrier>
 #include <cstring>
@@ -596,4 +597,30 @@ TEST_CASE("Native uniform uploads stop at holes and keep unaligned bank boundari
     REQUIRE(f.runtime.upload_bytes == 0x11edd);
     REQUIRE(data[0x10122] == 0x6b);
     REQUIRE(data[0x10123] == 0);
+}
+
+TEST_CASE("Downloads keep CPU writes collected and not yet applied", "[buffer_ports]") {
+    Fixture f;
+    const auto staged = Access::Add(*f.cache, 0x20000, 0x10000);
+    const auto mapped = Access::Add(*f.cache, 0x30000, 0x10000, true);
+    std::ranges::fill(Access::Get(*f.cache, staged).bytes, 0x12);
+    std::ranges::fill(Access::Get(*f.cache, mapped).bytes, 0x34);
+    f.cache->SetPendingCpuWrites([](const std::function<void(DAddr, size_t)>& callback) {
+        callback(0x20100, 0x10);
+        callback(0x30ff8, 0x10);
+    });
+    std::memset(f.bytes + 0x10100, 0xee, 0x10);
+    std::memset(f.bytes + 0x20ff8, 0xee, 0x10);
+    Access::Dirty(*f.cache, 0x20000, 0x2000);
+    Access::Dirty(*f.cache, 0x30000, 0x2000);
+    const std::array<std::pair<DAddr, u64>, 1> ranges{{{0x20000, 0x2000}}};
+    Access::Download(*f.cache, ranges);
+    REQUIRE(f.bytes[0x100ff] == 0x12);
+    REQUIRE(std::all_of(f.bytes + 0x10100, f.bytes + 0x10110, [](u8 b) { return b == 0xee; }));
+    REQUIRE(f.bytes[0x10110] == 0x12);
+    REQUIRE(f.bytes[0x11fff] == 0x12);
+    f.cache->DownloadMemory(0x30000, 0x2000);
+    REQUIRE(f.bytes[0x20ff7] == 0x34);
+    REQUIRE(std::all_of(f.bytes + 0x20ff8, f.bytes + 0x21008, [](u8 b) { return b == 0xee; }));
+    REQUIRE(f.bytes[0x21008] == 0x34);
 }

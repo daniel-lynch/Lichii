@@ -44,6 +44,9 @@ public:
 
     ResultStatus ReadRomFS(FileSys::VirtualFile& out_file) override;
     bool IsRomFSUpdatable() const override;
+    bool AppliesLayeredFS() const override {
+        return true;
+    }
     ResultStatus ReadProgramId(u64& out_program_id) override;
     ResultStatus ReadProgramIds(std::vector<u64>& out_program_ids) override;
     ResultStatus ReadIcon(std::vector<u8>& buffer) override;

@@ -309,6 +309,14 @@ public:
     }
 
     /**
+     * Whether ReadRomFS already returns the RomFS with the LayeredFS mods applied, so the
+     * RomFSFactory must not layer them a second time over a RomFS that is not updatable.
+     */
+    virtual bool AppliesLayeredFS() const {
+        return false;
+    }
+
+    /**
      * Get the title of the application
      *
      * @param[out] title Reference to store the application title into

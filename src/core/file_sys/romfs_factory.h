@@ -56,6 +56,7 @@ private:
     VirtualFile base;
 
     bool updatable;
+    bool layered_by_loader;
 
     ContentProvider& content_provider;
     Service::FileSystem::FileSystemController& filesystem_controller;

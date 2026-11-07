@@ -263,6 +263,13 @@ public:
     /// Cancels pending downloads over the range, so a fence can't write them over newer bytes.
     void ClearDownload(DAddr base_addr, u64 size);
 
+    /// CPU writes collected but not yet applied (SetPendingCpuWrites).
+    [[nodiscard]] Common::RangeSet<DAddr> PendingCpuWriteRanges();
+
+    /// Writes downloaded bytes to guest memory, except over `cpu_written`.
+    void WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written, DAddr device_addr,
+                               const u8* data, u64 size);
+
     bool OnCPUWrite(DAddr device_addr, u64 size);
 
     void DownloadMemory(DAddr device_addr, u64 size);
@@ -350,6 +357,18 @@ public:
                                                           ObtainBufferSynchronize sync_info,
                                                           ObtainBufferOperation post_op);
     void FlushCachedWrites();
+
+    /// Where the CPU writes into GPU-written memory that were collected but not applied yet
+    /// (WriteMemory) come from: downloads must not write the GPU's older copy over them.
+    using PendingCpuWrites = std::function<void(const std::function<void(DAddr, size_t)>&)>;
+    void SetPendingCpuWrites(PendingCpuWrites source) {
+        pending_cpu_writes = std::move(source);
+    }
+
+    /// Takes CPU writes about to be applied one by one out of the GPU-written ranges first, so
+    /// applying one doesn't download the GPU's copy over another (WriteMemory keeps the GPU data
+    /// on the pages it writes).
+    void ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> ranges);
 
     /// Return true when there are uncommitted buffers to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
@@ -879,6 +898,7 @@ private:
     /// fence pops. A write to a range after a download was taken removes it from that download
     /// (and every other pending one): its bytes are older than the write.
     std::deque<Common::RangeSet<DAddr>> pending_download_ranges;
+    PendingCpuWrites pending_cpu_writes;
     std::optional<Async_Buffer> current_buffer;
 
     std::deque<Async_Buffer> async_buffers_death_ring;
