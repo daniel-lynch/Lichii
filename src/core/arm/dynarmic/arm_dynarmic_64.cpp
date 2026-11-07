@@ -18,6 +18,7 @@
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#include "core/arm/dynarmic/oot_gamedata_trace.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
@@ -69,6 +70,17 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
         last_code_addr = aligned_vaddr;
     }
     const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
+    if (OotGameDataTrace::Enabled() && m_process->GetProgramId() == OotGameDataTrace::ProgramId) {
+        // The loader registered the session (or none, for another build) before any guest code
+        // ran, so one lookup per JIT is enough.
+        if (!m_gamedata_trace_looked_up) {
+            m_gamedata_trace = OotGameDataTrace::sessions.Find(m_process);
+            m_gamedata_trace_looked_up = true;
+        }
+        if (m_gamedata_trace) {
+            return OotGameDataTrace::InstructionFor(m_gamedata_trace->base, vaddr, instruction);
+        }
+    }
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
         if (!m_window_trace) {
             m_window_trace = WindowTrace::sessions.Find(m_process);
@@ -140,6 +152,12 @@ void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::Instruc
 }
 
 void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) {
+    // EDEN_NX2_GAMEDATA_TRACE: one of the trace's breakpoints logs, does what the instruction it
+    // stands for does, and execution continues after it (the JIT has set the PC to pc + 4).
+    if (m_gamedata_trace && exception == Dynarmic::A64::Exception::Breakpoint &&
+        OotGameDataTrace::Handle(*m_gamedata_trace, pc, *m_parent.m_jit, m_memory)) {
+        return;
+    }
     if (m_window_trace && exception == Dynarmic::A64::Exception::Breakpoint) {
         const auto point = WindowTrace::Identify(m_window_trace->base, pc, m_memory.Read32(pc));
         if (point != WindowTrace::Point::None) {

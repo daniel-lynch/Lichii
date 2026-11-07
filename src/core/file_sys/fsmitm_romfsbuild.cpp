@@ -5,11 +5,14 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <span>
 #include <string_view>
+#include <fmt/format.h>
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/nx2_event_trace.h"
 #include "common/shader_aot_scene.h"
 #include "core/file_sys/fsmitm_romfsbuild.h"
 #include "core/file_sys/ips_layer.h"
@@ -87,14 +90,17 @@ struct RomFSBuildFileContext {
 };
 
 namespace {
-/// A scene placement file that tells the shader AOT translation which scene the game loads
-/// whenever it is read (Common::ShaderAotScene). Everything else is the wrapped file's.
+/// A file whose reads are observed: a scene placement file that tells the shader AOT translation
+/// which scene the game loads whenever it is read (Common::ShaderAotScene), and a progression file
+/// whose reads EDEN_NX2_ROMFS_TRACE logs (Common::Nx2EventTrace). Everything else, the bytes
+/// included, is the wrapped file's.
 class SceneHintFile final : public VfsFile {
 public:
     SceneHintFile(VirtualFile file_, std::string scene_, bool entered_, std::string path_,
-                  bool trace_, u64 session_)
+                  bool trace_, u64 session_,
+                  std::optional<Common::Nx2EventTrace::RomfsKind> romfs_kind_)
         : file{std::move(file_)}, scene{std::move(scene_)}, entered{entered_},
-          path{std::move(path_)}, trace{trace_}, session{session_} {}
+          path{std::move(path_)}, trace{trace_}, session{session_}, romfs_kind{romfs_kind_} {}
 
     std::string GetName() const override {
         return file->GetName();
@@ -129,6 +135,19 @@ public:
         if (read != 0 && !scene.empty()) {
             Common::ShaderAotScene::Post(scene, entered, session);
         }
+        if (read != 0 && romfs_kind) {
+            // EDEN_NX2_ROMFS_TRACE: the game opened the file. Its nn::fs reads the RomFS image
+            // directly, so no open reaches the emulator: the first read after a second without one
+            // stands for it (a file read in chunks logs once).
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_trace.exchange(now) > std::chrono::seconds{1}) {
+                Common::Nx2EventTrace::Write(
+                    Common::Nx2EventTrace::RomfsTarget(),
+                    fmt::format("romfs {} {} size={:#x} read={:#x}+{:#x}",
+                                Common::Nx2EventTrace::Name(*romfs_kind), path, file->GetSize(),
+                                offset, read));
+            }
+        }
         return read;
     }
     std::size_t Write(const u8* data, std::size_t length, std::size_t offset) override {
@@ -148,7 +167,9 @@ private:
     std::string path;
     bool trace;
     u64 session;
+    std::optional<Common::Nx2EventTrace::RomfsKind> romfs_kind;
     mutable std::atomic<std::chrono::steady_clock::time_point> last_read{};
+    mutable std::atomic<std::chrono::steady_clock::time_point> last_trace{};
 };
 } // Anonymous namespace
 
@@ -307,19 +328,29 @@ std::vector<std::pair<u64, VirtualFile>> RomFSBuildContext::Build() {
               [](const auto& a, const auto& b) { return a->path < b->path; });
 
     // Shader AOT translation: the scene placement files say which scene the game loads.
-    if (Common::ShaderAotScene::Wanted()) {
+    // EDEN_NX2_ROMFS_TRACE: the progression files log their reads.
+    const bool aot_scenes = Common::ShaderAotScene::Wanted();
+    const bool romfs_trace = Common::Nx2EventTrace::RomfsTarget().On();
+    if (aot_scenes || romfs_trace) {
         const char* trace_env = std::getenv("EDEN_NX2_AOT_SCENE_TRACE");
-        const bool trace = trace_env != nullptr && trace_env[0] == '1';
+        const bool trace = aot_scenes && trace_env != nullptr && trace_env[0] == '1';
         const u64 session = Common::ShaderAotScene::Session();
         size_t hooked = 0;
+        size_t traced = 0;
         for (const auto& file : files) {
-            auto scene = Common::ShaderAotScene::SceneOfPath(file->path);
+            auto scene = aot_scenes ? Common::ShaderAotScene::SceneOfPath(file->path)
+                                    : std::nullopt;
+            const auto romfs_kind = romfs_trace
+                                        ? Common::Nx2EventTrace::RomfsKindOfPath(file->path)
+                                        : std::nullopt;
             if (file->source != nullptr &&
-                (scene.has_value() || (trace && file->path.starts_with("/Banc/")))) {
+                (scene.has_value() || romfs_kind.has_value() ||
+                 (trace && file->path.starts_with("/Banc/")))) {
                 hooked += scene.has_value() ? 1 : 0;
+                traced += romfs_kind.has_value() ? 1 : 0;
                 file->source = std::make_shared<SceneHintFile>(
                     std::move(file->source), scene ? std::move(scene->scene) : std::string{},
-                    scene && scene->entered, file->path, trace, session);
+                    scene && scene->entered, file->path, trace, session, romfs_kind);
             }
         }
         if (hooked != 0) {
@@ -327,6 +358,11 @@ std::vector<std::pair<u64, VirtualFile>> RomFSBuildContext::Build() {
             LOG_INFO(Loader, "Shader AOT: {} scene files (placement and parameters) report their "
                              "reads",
                      hooked);
+        }
+        if (romfs_trace) {
+            LOG_INFO(Loader, "Event trace: {} RomFS files (event flows, timelines, movies, Banc, "
+                             "GameData) log their reads",
+                     traced);
         }
     }
 
