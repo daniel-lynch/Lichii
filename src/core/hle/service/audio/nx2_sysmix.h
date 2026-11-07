@@ -13,7 +13,7 @@ class System;
 namespace Kernel {
 class KProcess;
 class KReadableEvent;
-}
+} // namespace Kernel
 namespace AudioCore::Sink {
 class Sink;
 }
