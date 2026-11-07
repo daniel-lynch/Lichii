@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <vector>
@@ -14,11 +15,13 @@
 #include "common/game_presets.h"
 #include "common/hex_util.h"
 #include "common/logging.h"
+#include "common/nx2_event_trace.h"
 #include "common/lz4_compression.h"
 #include "common/zbic_compression.h"
 #include "common/settings.h"
 #include "common/swap.h"
 #include "core/core.h"
+#include "core/arm/dynarmic/oot_gamedata_trace.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/arm/exec_coverage.h"
 #include "core/file_sys/patch_manager.h"
@@ -336,6 +339,23 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         }
     }
     LOG_INFO(Loader, "Module {} loaded at {:#x} (size {:#x})", nso_file.GetName(), load_base, image_size);
+    if (name == "main" && Core::OotGameDataTrace::Enabled() &&
+        process.GetProgramId() == Core::OotGameDataTrace::ProgramId) {
+        // EDEN_NX2_GAMEDATA_TRACE: the quest-step and HavePlayedEvent sites belong to one build.
+        const std::string build_id = Common::HexToString(std::span{nso_header.build_id}.first(20));
+        const bool matching = build_id == Core::OotGameDataTrace::BuildId;
+        const u64 base = load_base + module_start;
+        Core::OotGameDataTrace::sessions.Reset(&process, matching ? base : 0);
+        const size_t names =
+            matching ? Common::Nx2EventTrace::LoadNamesFile(std::getenv("EDEN_NX2_GAMEDATA_NAMES"))
+                     : 0;
+        Common::Nx2EventTrace::Write(
+            Common::Nx2EventTrace::GameDataTarget(),
+            matching ? fmt::format("gamedata trace on: main build {} at {:#x}, {} names loaded",
+                                   build_id, base, names)
+                     : fmt::format("gamedata trace off: main build {} is not {}", build_id,
+                                   Core::OotGameDataTrace::BuildId));
+    }
     if (name == "main" && process.GetProgramId() == Service::Nx2OotTime::ProgramId) {
         // Write the delta only into the built-in's own stub: only when PatchNSO applied the
         // real-time patch (all of its records), and the branch and both stub words are still its
