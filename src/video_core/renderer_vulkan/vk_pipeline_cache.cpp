@@ -50,6 +50,7 @@
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+#include "video_core/renderer_vulkan/vk_cooperative_hmma_test.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/offline_shader_producer.h"
@@ -663,6 +664,16 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
         .max_user_clip_distances = device.GetMaxUserClipDistances()
     };
+    profile.support_cooperative_hmma =
+        device.IsCooperativeHmmaSupported() && TestCooperativeHmma(device);
+    // What the shader compiler sees, after the device's checks, its fp16 workarounds and the
+    // self-test (the device-side enable line comes earlier and can be undone by the self-test).
+    if (const char* requested = std::getenv("EDEN_NX2_COOPERATIVE_HMMA");
+        requested != nullptr && requested[0] != '\0' && std::string_view{requested} != "0") {
+        LOG_INFO(Render_Vulkan, "Cooperative HMMA for shaders: {}",
+                 profile.support_cooperative_hmma ? "on (K16 compute HMMA on tensor cores)"
+                                                  : "off (HMMA emulation)");
+    }
 
     host_info = Shader::HostTranslateInfo{
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
