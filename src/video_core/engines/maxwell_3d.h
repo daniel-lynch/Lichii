@@ -3426,6 +3426,10 @@ private:
     /// FrontDmaRead without draining the back, when the words can be known: false otherwise.
     bool FrontDmaReadQueued(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                             GPUVAddr source, u32 words);
+    bool FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
+                        const MacroEngine& engine, u32 start);
+    u32 FrontRegister(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
+    bool FrontTakeOver(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,

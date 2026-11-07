@@ -9,6 +9,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <span>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -37,6 +38,8 @@ enum class DrainSite : u32 {
     FrontVerify,    ///< EDEN_NX2_FRONT_VERIFY
     MacroDmaCheck,  ///< EDEN_NX2_CMDPAGE_DIAG: a macro's memory read repeated after a full drain
     SafeReadFlush,  ///< EDEN_NX2_SPLIT_SAFE_READS: a CPU-side read flushes back-owned caches
+    BackRegister,   ///< A register a macro the back ran may have written (Maxwell3D)
+    BackCode,       ///< The macro code changes under the macros the back has yet to run
     Count,
 };
 
@@ -44,7 +47,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "other",       "fetch drain",     "acquire",    "semaphore flush", "fence release",
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma flush",
     "gp sync fence", "map",           "front start", "front verify",  "macro dma check",
-    "safe read flush",
+    "safe read flush", "back register", "back code",
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -143,6 +146,24 @@ public:
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload);
     }
+    /// Defer, calling `func` with a copy of `words` (a std::span<const u32>).
+    template <typename Func>
+    /// Like Defer, it notes no memory writes: the caller notes what `func` can write.
+    void DeferWords(const Func& func, std::span<const u32> words) {
+        static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
+        constexpr size_t function_words = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+        const size_t payload = function_words + 1 + (words.size() + 1) / 2;
+        u64* const entry = Reserve(2 + payload);
+        entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
+        entry[1] = reinterpret_cast<u64>(&CallWordsThunk<Func>);
+        std::memcpy(entry + 2, &func, sizeof(Func));
+        entry[2 + function_words] = words.size();
+        if (!words.empty()) {
+            entry[1 + payload] = 0; // Padding after an odd count
+            std::memcpy(entry + 3 + function_words, words.data(), words.size_bytes());
+        }
+        Commit(2 + payload);
+    }
     void DeferFunction(std::function<void()>&& func);
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
     /// cache download that records into the Vulkan scheduler. A drained back still submits from
@@ -166,6 +187,15 @@ public:
     void Publish();
     /// Waits until the back executed everything sent so far.
     void Drain(DrainSite site = DrainSite::Other);
+    /// The ring position after the entries sent so far, for WaitUntil.
+    [[nodiscard]] u64 Position() const {
+        return write_position;
+    }
+    /// Waits until the back executed the entries sent before `position`. Returns whether any of
+    /// them was still queued.
+    bool WaitUntil(u64 position, DrainSite site) {
+        return WaitFor((std::min)(position, write_position), site);
+    }
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
@@ -300,6 +330,13 @@ private:
     template <typename Func>
     static void CallThunk(const u64* payload) {
         (*reinterpret_cast<const Func*>(payload))();
+    }
+    template <typename Func>
+    static void CallWordsThunk(const u64* payload) {
+        constexpr size_t function_words = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+        (*reinterpret_cast<const Func*>(payload))(
+            std::span<const u32>{reinterpret_cast<const u32*>(payload + function_words + 1),
+                                 static_cast<size_t>(payload[function_words])});
     }
 
     /// Room for an entry of `words` at the write position (never across the ring's end).

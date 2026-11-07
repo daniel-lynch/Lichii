@@ -204,6 +204,40 @@ u32 RandomArgument(std::mt19937& rng, u32 method, const Maxwell3D& engine) {
     return rng() % 64;
 }
 
+/// A Turing MME instruction from its fields (TuringMacroInterpreter::Decode); a lane left alone
+/// adds the zero register to itself.
+struct Mme {
+    bool end{};
+    std::array<u32, 2> op{}, dst{24, 24}, src_a{24, 24}, src_b{24, 24}, imm{};
+    std::array<u32, 2> out_method{}, out_emit{};
+};
+
+std::array<u32, 3> Encode(const Mme& fields) {
+    std::array<u32, 3> bits{};
+    const auto field = [&bits](u32 offset, u32 count, u32 value) {
+        for (u32 bit = 0; bit < count; ++bit) {
+            bits[(offset + bit) / 32] |= ((value >> bit) & 1) << ((offset + bit) % 32);
+        }
+    };
+    field(0, 1, fields.end ? 1 : 0);
+    for (u32 lane = 0; lane < 2; ++lane) {
+        field(10 + lane * 36, 5, fields.op[lane]);
+        field(15 + lane * 36, 5, fields.dst[lane]);
+        field(20 + lane * 36, 5, fields.src_a[lane]);
+        field(25 + lane * 36, 5, fields.src_b[lane]);
+        field(30 + lane * 36, 16, fields.imm[lane]);
+        field(82 + lane * 7, 3, fields.out_method[lane]);
+        field(85 + lane * 7, 4, fields.out_emit[lane]);
+    }
+    return {bits[2], bits[1], bits[0]};
+}
+
+/// A Turing MME instruction that sends the next macro parameter to `method` (as in
+/// native_macro_fifo.cpp); `end` makes the instruction after it the macro's last.
+std::array<u32, 3> FifoInstruction(u32 method, bool end) {
+    return Encode(Mme{.end = end, .imm = {method, 0}, .out_method = {5, 0}, .out_emit = {3, 0}});
+}
+
 } // Anonymous namespace
 
 TEST_CASE("Maxwell3D fast method dispatch matches CallMethod on random method streams",
@@ -999,4 +1033,201 @@ TEST_CASE("Maxwell3D's split front uploads macro code sent as one multi-method r
     const auto& macros = engine.GetNativeMacroEngine();
     REQUIRE(macros.native_write_offset == pointer * 3 + code.size());
     CHECK(std::equal(code.begin(), code.end(), macros.native_code.begin() + pointer * 3));
+}
+
+// #1056 on play's split: a macro that reads memory into its FIFO and writes only registers the
+// front can do without runs on the back (Maxwell3D::FrontRunOnBack); the others stay on the
+// front and read as before (FrontDmaRead: #243's early reads, ada93cdafc's narrower wait).
+TEST_CASE("Split runs the macros that read memory on the back",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    Kernel::KProcess process{f.system.Kernel()};
+    SCOPE_EXIT {
+        f.system.Kernel().UnregisterKernelObject(&process);
+    };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(20, 12);
+    constexpr VAddr cpu_address = 0x4000;
+    constexpr DAddr device_address = 0x10000;
+    constexpr GPUVAddr gpu_address = 0x100000;
+    auto* backing = f.physical.GetPointerFromRaw<u8>(0x10000);
+    for (u64 page = 0; page < 2; ++page) {
+        const VAddr address = cpu_address + page * 0x1000;
+        table.entries.GetAndFault(address >> 12)
+            .Store(false, Common::PageType::Memory, 1,
+                   reinterpret_cast<uintptr_t>(backing + page * 0x1000) - address);
+    }
+    process.GetMemory().SetCurrentPageTable(process);
+    const auto asid = f.device_memory.RegisterProcess(&process.GetMemory());
+    f.device_memory.BindInterface(&f.rasterizer);
+    f.device_memory.Map(device_address, cpu_address, 0x2000, asid);
+    SCOPE_EXIT {
+        f.device_memory.Unmap(device_address, 0x2000);
+        f.device_memory.UnregisterProcess(asid);
+    };
+    f.memory.BindRasterizer(&f.rasterizer);
+    f.memory.Map(gpu_address, device_address, 0x2000, Tegra::PTEKind::PITCH, false);
+    std::memset(backing, 0, 0x2000);
+    constexpr GPUVAddr word = gpu_address + 0x40;
+
+    // The 3D engine's front, against a running back: macro 0 reads one word with
+    // MME_DMA_READ_FIFOED at the address in its first two parameters and sends it to a scratch
+    // register (the load after the read takes the word). It also clears a data RAM word, which
+    // keeps it on the front. Macro 1 is the same without that and runs on the back; macro 2 (on
+    // the front) copies the scratch register to the next one.
+    auto& engine = f.fast;
+    engine.SetNativeTuringMacroMode(true);
+    constexpr u32 state = MAXWELL3D_REG_INDEX(shadow_scratch) + 1;
+    constexpr u32 copy = state + 1;
+    VideoCommon::GpuSplit split;
+    Access::Start(split, f.system);
+    SCOPE_EXIT {
+        split.Stop();
+    };
+    std::array<std::atomic<bool>, 2> release{};
+    std::atomic<bool> done{};
+    std::thread reader;
+    // Runs before Stop: a failed check must not leave the back in an entry or the reader waiting.
+    SCOPE_EXIT {
+        for (auto& flag : release) {
+            flag = true;
+        }
+        if (reader.joinable()) {
+            reader.join();
+        }
+    };
+    const auto front = [&](u32 method, u32 argument) {
+        engine.FrontCallMethod(f.system, split, method, argument, true, {});
+    };
+    std::vector<u32> code;
+    const Mme clear_data_ram{
+        .op = {0, 31}, .imm = {state, 0}, .out_method = {5, 0}, .out_emit = {3, 0}};
+    // Macro 2: the value of `state` (MME register read) sent to `copy`, then a no-op.
+    const Mme read_state{.end = true,
+                         .op = {22, 0},
+                         .src_a = {25, 24},
+                         .imm = {state, copy},
+                         .out_method = {6, 0},
+                         .out_emit = {1, 0}};
+    for (const auto instruction :
+         {FifoInstruction(0x154, false), FifoInstruction(0x155, false),
+          FifoInstruction(0x158, true), Encode(clear_data_ram), FifoInstruction(0x154, false),
+          FifoInstruction(0x155, false), FifoInstruction(0x158, true),
+          FifoInstruction(state, false), Encode(read_state), Encode(Mme{})}) {
+        code.insert(code.end(), instruction.begin(), instruction.end());
+    }
+    front(MAXWELL3D_REG_INDEX(load_mme.instruction_ptr), 0);
+    engine.FrontCallMultiMethod(f.system, split, MAXWELL3D_REG_INDEX(load_mme.instruction),
+                                code.data(), static_cast<u32>(code.size()),
+                                static_cast<u32>(code.size()), {});
+    front(MAXWELL3D_REG_INDEX(load_mme.start_address_ptr), 0);
+    for (const u32 start : {0U, 4U, 8U}) {
+        front(MAXWELL3D_REG_INDEX(load_mme.start_address), start);
+    }
+    const auto dma_read = [&](GPUVAddr address, u32 macro = 0xe00) {
+        engine.FrontCallMethod(f.system, split, macro, static_cast<u32>(address >> 32), false, {});
+        engine.FrontCallMethod(f.system, split, macro + 1, static_cast<u32>(address), false, {});
+        engine.FrontCallMethod(f.system, split, macro + 1, 1, true, {});
+    };
+    const auto read_on_reader = [&](GPUVAddr address, u32 macro) {
+        done = false;
+        reader = std::thread([&, address, macro] {
+            dma_read(address, macro);
+            done = true;
+        });
+    };
+    const auto copy_on_reader = [&] {
+        done = false;
+        reader = std::thread([&] {
+            front(0xe04, 0);
+            done = true;
+        });
+    };
+    const auto finishes = [&done] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        return done.load();
+    };
+    const auto waits = [&] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        while (!Access::FrontWaits(split) && !done.load() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        return !done.load();
+    };
+    // A constant buffer word, sent through the front.
+    const auto upload = [&](GPUVAddr address, u32 value) {
+        front(CbAddressHigh, static_cast<u32>(address >> 32));
+        front(CbAddressLow, static_cast<u32>(address));
+        front(CbSize, 0x100);
+        front(CbOffset, 0);
+        front(CbData, value);
+    };
+    // An entry the back stays in until its flag is set.
+    const auto blocking = [&split](std::atomic<bool>& flag) {
+        split.Defer([&flag] {
+            while (!flag.load()) {
+                std::this_thread::yield();
+            }
+        });
+        split.Publish();
+    };
+
+    // Macro 0 reads on the front (it uses the data RAM). The first macro also ends the front's
+    // assumption that a draw may be pending.
+    upload(word, 0x11111111);
+    dma_read(word);
+    split.Drain(VideoCommon::DrainSite::Other);
+    REQUIRE(engine.regs.reg_array[state] == 0x11111111);
+
+    // Macro 1 runs on the back: the front goes on past the work queued before it, and the back
+    // reads the word after the upload queued behind that work.
+    front(state, 0x77777777);
+    blocking(release[0]);
+    upload(word, 0x55555555);
+    read_on_reader(word, 0xe02);
+    REQUIRE(finishes());
+    reader.join();
+    release[0] = true;
+    split.Drain(VideoCommon::DrainSite::Other);
+    CHECK(engine.regs.reg_array[state] == 0x55555555);
+
+    // The front's copy of the register is stale: a write of the value it holds is still sent
+    // (the back sinks it until the next macro).
+    front(state, 0x77777777);
+    front(0xe04, 0);
+    split.Drain(VideoCommon::DrainSite::Other);
+    CHECK(engine.regs.reg_array[state] == 0x77777777);
+    CHECK(engine.regs.reg_array[copy] == 0x77777777);
+
+    // A front macro that reads the register waits for the back's macro and gets its value.
+    blocking(release[1]);
+    upload(word, 0x66666666);
+    dma_read(word, 0xe02);
+    copy_on_reader();
+    REQUIRE(waits());
+    release[1] = true;
+    REQUIRE(finishes());
+    reader.join();
+    split.Drain(VideoCommon::DrainSite::Other);
+    CHECK(engine.regs.reg_array[copy] == 0x66666666);
+
+    // A replay takes the shadow RAM entry the back's macro tracked from the back.
+    using Control = Maxwell3D::Regs::ShadowRamControl;
+    front(state, 0x99999999);
+    upload(word, 0x88888888);
+    dma_read(word, 0xe02);
+    front(ShadowControl, static_cast<u32>(Control::Replay));
+    front(state, 0);
+    front(ShadowControl, static_cast<u32>(Control::Track));
+    front(0xe04, 0);
+    split.Drain(VideoCommon::DrainSite::Other);
+    CHECK(engine.regs.reg_array[state] == 0x88888888);
+    CHECK(engine.regs.reg_array[copy] == 0x88888888);
 }
