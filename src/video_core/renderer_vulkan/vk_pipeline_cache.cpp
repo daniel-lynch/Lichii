@@ -2101,7 +2101,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             stage_key = TC::MakeStageKey(env, key.unique_hashes[index], static_cast<u32>(index),
                                          translation_config);
             cached_entries[index] = translation_cache.FindEntry(
-                stage_key, env, &live_answers[index]);
+                stage_key, env, &live_answers[index], hash, key.unique_hashes[index],
+                static_cast<u32>(index));
             from_cache[index] = cached_entries[index] != nullptr;
         }
         if (aot_translation && cacheable) {
@@ -2662,7 +2663,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         env.Dump(hash, key.unique_hashes[index]);
     }
-    LOG_ERROR(Render_Vulkan, "{}", exception.what());
+    LOG_ERROR(Render_Vulkan, "Graphics pipeline compilation failed pipeline={:016x}: {}",
+              hash, exception.what());
     return nullptr;
 }
 
@@ -2898,7 +2900,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     std::shared_ptr<const TC::Entry> entry;
     if (cacheable) {
         stage_key = TC::MakeStageKey(env, key.unique_hash, 5, translation_config);
-        entry = translation_cache.FindEntry(stage_key, env);
+        entry = translation_cache.FindEntry(stage_key, env, nullptr, hash, key.unique_hash, 5);
     }
     const TC::Digest variant_key =
         entry ? TC::MakeVariantKey(entry->id, TC::Digest{}, Shader::Backend::Bindings{})
