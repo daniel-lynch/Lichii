@@ -941,6 +941,13 @@ FN_MAX_LIMIT_LIST
         return extensions.conservative_rasterization;
     }
 
+    /// Returns true if VK_EXT_graphics_pipeline_library is enabled with fast linking and
+    /// independent interpolation decorations. Only EDEN_NX2_PIPELINE_LIBRARY=1 enables it
+    /// (docs/pipeline-library.md); otherwise the extension is never loaded.
+    bool IsExtGraphicsPipelineLibrarySupported() const {
+        return graphics_pipeline_library;
+    }
+
     /// Returns true if the device supports VK_EXT_provoking_vertex.
     bool IsExtProvokingVertexSupported() const {
         return extensions.provoking_vertex;
@@ -1327,6 +1334,8 @@ private:
     bool is_non_gpu{};                         ///< Is SoftwareRasterizer, FPGA, non-GPU device.
     bool has_broken_compute{};                 ///< Compute shaders can cause crashes
     bool has_broken_cube_compatibility{};      ///< Has broken cube compatibility bit
+    bool graphics_pipeline_library{};          ///< VK_EXT_graphics_pipeline_library in use.
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT graphics_pipeline_library_features{};
     bool has_broken_descriptor_aliasing{};     ///< Miscompiles descriptors aliased on one binding
     bool has_broken_parallel_compiling{};      ///< Has broken parallel shader compiling.
     bool has_renderdoc{};                      ///< Has RenderDoc attached

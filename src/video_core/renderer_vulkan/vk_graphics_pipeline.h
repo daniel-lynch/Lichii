@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -69,6 +70,7 @@ struct hash<Vulkan::GraphicsPipelineCacheKey> {
 namespace Vulkan {
 
 class Device;
+class PipelineLibraryCache;
 class PipelineStatistics;
 class RenderPassCache;
 class RescalingPushConstant;
@@ -261,6 +263,10 @@ private:
 
     void MakePipeline(VkRenderPass render_pass);
 
+    /// EDEN_NX2_PIPELINE_LIBRARY=1: links the pipeline from libraries of the parts of ci.
+    /// False if it has to be built monolithic from ci instead.
+    bool MakeLinkedPipeline(const VkGraphicsPipelineCreateInfo& ci);
+
     void Validate();
 
     const GraphicsPipelineCacheKey key;
@@ -309,6 +315,19 @@ private:
     std::array<u32, NUM_STAGES> handle_constant_buffers{};
     std::vector<VideoCommon::ImageViewInOut> delta_views;
     std::vector<VideoCommon::SamplerId> delta_samplers;
+
+    /// EDEN_NX2_PIPELINE_LIBRARY=1 only (null otherwise). Declared before the Vulkan objects
+    /// so that the libraries are destroyed after the pipeline linked from them.
+    std::shared_ptr<PipelineLibraryCache> library_cache;
+    VkPipelineLayout library_layout{};
+    u128 library_layout_identity{};
+    /// How the pipeline was made, for its build log line.
+    enum class LibraryBuild : u8 { Monolithic, Linked, Unsupported, Fallback };
+    LibraryBuild library_build{LibraryBuild::Monolithic};
+    u8 library_built_parts{};
+    u8 library_waited_parts{};
+    double library_ms{};
+    double library_link_ms{};
 
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;

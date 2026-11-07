@@ -60,3 +60,12 @@ EDEN_NX2_FENCE_BATCH=1
 # single Ocarina compute shaders, each a freeze of the whole emulator at its first dispatch.
 # =0 builds the SPIR-V as emitted, as before.
 #EDEN_NX2_COMPUTE_NOINLINE=0
+# Prototype (off by default, docs/pipeline-library.md): build graphics pipelines from
+# VK_EXT_graphics_pipeline_library parts (vertex input, pre-rasterization, fragment shader,
+# fragment output) and fast-link them without link-time optimization, so a program pair meeting
+# new fixed-function state costs a link instead of a full driver compile. Needs fast linking and
+# independent interpolation decorations (NVIDIA: yes); otherwise, and for any part or link that
+# fails, the pipeline is built monolithic as before. Unset or 0 does not load the extension at all.
+# Logs "Nx2Perf pipeline_library:" summaries; =0 for _MESH keeps task/mesh pipelines monolithic.
+#EDEN_NX2_PIPELINE_LIBRARY=1
+#EDEN_NX2_PIPELINE_LIBRARY_MESH=0

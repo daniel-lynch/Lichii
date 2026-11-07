@@ -65,6 +65,7 @@ add_executable(tests
     video_core/ampere_async_copy.cpp
     video_core/ampere_trap_guards.cpp
     video_core/async_draw_policy.cpp
+    video_core/pipeline_library.cpp
     video_core/query_wait.cpp
     video_core/async_shader_emission.cpp
     video_core/pipeline_build.cpp

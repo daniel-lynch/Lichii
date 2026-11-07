@@ -24,6 +24,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_library.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -401,6 +402,14 @@ GraphicsPipeline::GraphicsPipeline(
 
     const VkDescriptorSetLayout set_layout{*descriptor_set_layout};
     pipeline_layout = builder.CreatePipelineLayout(set_layout);
+    if (PipelineLibraryCache::Enabled(device) &&
+        (!IsMeshPipeline() || PipelineLibraryCache::MeshEnabled())) {
+        library_cache = PipelineLibraryCache::Acquire(device);
+        const PipelineLibraryCache::Layout layout =
+            library_cache->LayoutFor(builder, uses_push_descriptor, uses_descriptor_buffer);
+        library_layout = layout.layout;
+        library_layout_identity = layout.identity;
+    }
     if (!uses_descriptor_buffer) {
         descriptor_update_template =
             builder.CreateTemplate(set_layout, *pipeline_layout, uses_push_descriptor);
@@ -421,7 +430,22 @@ GraphicsPipeline::GraphicsPipeline(
         std::chrono::steady_clock::duration emission_time{};
         bool succeeded = false;
         SCOPE_EXIT {
-            if (runtime_build) {
+            if (runtime_build && library_cache) {
+                const auto ms = [](auto duration) {
+                    return std::chrono::duration<double, std::milli>(duration).count();
+                };
+                static constexpr std::array<const char*, 4> build_names{
+                    "monolithic", "linked", "monolithic_unsupported", "monolithic_fallback"};
+                LOG_INFO(Render_Vulkan,
+                         "Nx2Perf async_pipelines: {:016x} translation/emission and driver build {:.1f} ms "
+                         "executor={} translation_emission_ms={:.3f} driver_ms={:.3f} success={} "
+                         "build={} libraries_built={:#x} libraries_waited={:#x} library_ms={:.3f} "
+                         "link_ms={:.3f}",
+                         key.Hash(), ms(std::chrono::steady_clock::now() - begin),
+                         Common::GetCurrentThreadName(), ms(emission_time), ms(driver_time),
+                         succeeded, build_names[static_cast<size_t>(library_build)],
+                         library_built_parts, library_waited_parts, library_ms, library_link_ms);
+            } else if (runtime_build) {
                 const auto ms = [](auto duration) {
                     return std::chrono::duration<double, std::milli>(duration).count();
                 };
@@ -1504,7 +1528,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     {
         const auto driver_begin = std::chrono::steady_clock::now();
         SCOPE_EXIT { driver_time = std::chrono::steady_clock::now() - driver_begin; };
-        pipeline = device.GetLogical().CreateGraphicsPipeline({
+        const VkGraphicsPipelineCreateInfo pipeline_ci{
             .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
             .pNext = nullptr,
             .flags = flags,
@@ -1524,7 +1548,10 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
             .subpass = 0,
             .basePipelineHandle = nullptr,
             .basePipelineIndex = 0,
-        }, *pipeline_cache);
+        };
+        if (!library_cache || !MakeLinkedPipeline(pipeline_ci)) {
+            pipeline = device.GetLogical().CreateGraphicsPipeline(pipeline_ci, *pipeline_cache);
+        }
     }
 
     // Log graphics pipeline creation
@@ -1536,6 +1563,43 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         );
         GPU::Logging::GPULogger::GetInstance().LogPipelineStateChange(pipeline_info);
     }
+}
+
+bool GraphicsPipeline::MakeLinkedPipeline(const VkGraphicsPipelineCreateInfo& ci) {
+    std::array<u128, NUM_STAGES> modules{};
+    bool known_modules = ci.stageCount <= modules.size();
+    for (u32 index = 0; known_modules && index < ci.stageCount; ++index) {
+        const std::optional<u128> content = ShaderModuleContent(ci.pStages[index].module);
+        known_modules = content.has_value();
+        if (content) {
+            modules[index] = *content;
+        }
+    }
+    PipelineLibrary::Plan plan;
+    const PipelineLibrary::Inputs inputs{
+        .stage_modules = std::span<const u128>(modules.data(), known_modules ? ci.stageCount : 0),
+        .layout_identity = library_layout_identity,
+        .render_pass_identity = reinterpret_cast<u64>(ci.renderPass),
+    };
+    if (!known_modules || !plan.Build(ci, inputs)) {
+        library_build = LibraryBuild::Unsupported;
+        library_cache->NoteUnsupported(known_modules ? plan.Reason()
+                                                     : PipelineLibrary::Unsupported::MissingModuleHash);
+        return false;
+    }
+    PipelineLibraryCache::LinkResult result =
+        library_cache->Link(plan, library_layout, *pipeline_layout, *pipeline_cache);
+    library_built_parts = result.built_parts;
+    library_waited_parts = result.waited_parts;
+    library_ms = result.library_ms;
+    library_link_ms = result.link_ms;
+    if (!result.pipeline) {
+        library_build = LibraryBuild::Fallback;
+        return false;
+    }
+    library_build = LibraryBuild::Linked;
+    pipeline = std::move(result.pipeline);
+    return true;
 }
 
 void GraphicsPipeline::Validate() {

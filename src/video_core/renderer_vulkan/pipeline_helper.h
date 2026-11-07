@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <optional>
+#include <span>
 
 #include <boost/container/small_vector.hpp>
 
@@ -243,11 +244,12 @@ public:
         });
     }
 
-    vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout) const {
+    /// The push constant range of the pipeline layout CreatePipelineLayout makes.
+    VkPushConstantRange PushConstantRange() const {
         using Shader::Backend::SPIRV::RenderAreaLayout;
         using Shader::Backend::SPIRV::RescalingLayout;
         const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
-        const VkPushConstantRange range{
+        return VkPushConstantRange{
             .stageFlags = static_cast<VkShaderStageFlags>(
                 is_compute ? VK_SHADER_STAGE_COMPUTE_BIT
                            : (uses_mesh ? VK_SHADER_STAGE_ALL_GRAPHICS |
@@ -261,6 +263,20 @@ public:
                         : static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
                               static_cast<u32>(sizeof(RenderAreaLayout)),
         };
+    }
+
+    /// The descriptor set layout bindings, in binding order (pipeline library layout identity).
+    std::span<const VkDescriptorSetLayoutBinding> Bindings() const noexcept {
+        return {bindings.data(), bindings.size()};
+    }
+
+    /// Whether CreateDescriptorSetLayout marks the bindings partially bound.
+    bool UsesPartiallyBound(bool use_push_descriptor) const noexcept {
+        return !use_push_descriptor && device->IsDescriptorBindingPartiallyBoundSupported();
+    }
+
+    vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout) const {
+        const VkPushConstantRange range{PushConstantRange()};
         return device->GetLogical().CreatePipelineLayout({
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             .pNext = nullptr,

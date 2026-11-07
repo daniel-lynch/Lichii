@@ -1175,6 +1175,61 @@ bool Device::GetSuitability(bool requires_swapchain) {
 #undef FEATURE_EXTENSION
 #undef EXTENSION
 
+    // VK_EXT_graphics_pipeline_library, only when EDEN_NX2_PIPELINE_LIBRARY=1 asks for it: the
+    // extension is not loaded otherwise, so the device is created exactly as before.
+    graphics_pipeline_library = false;
+    if (const char* value = std::getenv("EDEN_NX2_PIPELINE_LIBRARY");
+        value != nullptr && value[0] == '1') {
+        const bool has_extensions =
+            supported_extensions.contains(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+            supported_extensions.contains(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+        VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT library_features{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT,
+            .pNext = nullptr,
+            .graphicsPipelineLibrary = VK_FALSE,
+        };
+        VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT library_properties{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT,
+            .pNext = nullptr,
+            .graphicsPipelineLibraryFastLinking = VK_FALSE,
+            .graphicsPipelineLibraryIndependentInterpolationDecoration = VK_FALSE,
+        };
+        if (has_extensions) {
+            // Queried on their own so that nothing reaches the device's create chain unless
+            // the extension is used.
+            VkPhysicalDeviceFeatures2 query_features{
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                .pNext = &library_features,
+                .features = {},
+            };
+            physical.GetFeatures2(query_features);
+            VkPhysicalDeviceProperties2 query_properties{
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                .pNext = &library_properties,
+                .properties = {},
+            };
+            physical.GetProperties2(query_properties);
+        }
+        // Fast linking is the point; independent interpolation lets a fragment library link
+        // with any pre-rasterization library without matching flat/noperspective decorations.
+        graphics_pipeline_library =
+            has_extensions && library_features.graphicsPipelineLibrary &&
+            library_properties.graphicsPipelineLibraryFastLinking &&
+            library_properties.graphicsPipelineLibraryIndependentInterpolationDecoration;
+        if (graphics_pipeline_library) {
+            loaded_extensions.insert(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+            loaded_extensions.insert(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "EDEN_NX2_PIPELINE_LIBRARY: graphics pipeline libraries {} (extensions={} "
+                 "feature={} fast_linking={} independent_interpolation={})",
+                 graphics_pipeline_library ? "enabled" : "unavailable, monolithic pipelines",
+                 has_extensions, library_features.graphicsPipelineLibrary != VK_FALSE,
+                 library_properties.graphicsPipelineLibraryFastLinking != VK_FALSE,
+                 library_properties.graphicsPipelineLibraryIndependentInterpolationDecoration !=
+                     VK_FALSE);
+    }
+
 // Some extensions are mandatory. Check those.
 #define CHECK_EXTENSION(extension_name)                                                            \
     if (!loaded_extensions.contains(extension_name)) {                                             \
@@ -1246,6 +1301,12 @@ bool Device::GetSuitability(bool requires_swapchain) {
 
 #undef EXT_FEATURE
 #undef FEATURE
+
+    if (graphics_pipeline_library) {
+        graphics_pipeline_library_features.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT;
+        SetNext(next, graphics_pipeline_library_features);
+    }
 
     // Perform the feature test.
     physical.GetFeatures2(features2);
