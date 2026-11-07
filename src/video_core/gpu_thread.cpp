@@ -23,6 +23,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_channel_poll.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
@@ -55,9 +56,12 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
     thread = std::jthread([&](std::stop_token stop_token) {
         const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuCommand};
         Common::SetCurrentThreadName("GPU");
+        const u32 poll_micros = VideoCommon::Nx2ChannelPoll::Micros();
 #ifdef __linux__
         // The pending-channel polls below sleep 50 us; the default timer slack adds up to 50 more.
-        prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
+        if (VideoCommon::Nx2ChannelPoll::WantsLowTimerSlack(poll_micros)) {
+            prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
+        }
 #endif
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
         Common::SetCurrentThreadToPerformanceCores();
@@ -84,11 +88,12 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // second and its present waits for the work behind them: with 1 ms sleeps the
                     // present waited ~17 ms a frame in Kokiri village, with 50 us ~1 ms.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
-                    if (std::chrono::steady_clock::now() - last_progress <
-                        std::chrono::microseconds{500}) {
+                    // EDEN_NX2_CHANNEL_POLL_US sets the sleep (nx2_channel_poll.h).
+                    if (poll_micros == 0 || std::chrono::steady_clock::now() - last_progress <
+                                                std::chrono::microseconds{500}) {
                         std::this_thread::yield();
                     } else {
-                        std::this_thread::sleep_for(std::chrono::microseconds{50});
+                        std::this_thread::sleep_for(std::chrono::microseconds{poll_micros});
                     }
                     continue;
                 }

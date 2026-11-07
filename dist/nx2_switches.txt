@@ -60,3 +60,8 @@ EDEN_NX2_FENCE_BATCH=1
 # single Ocarina compute shaders, each a freeze of the whole emulator at its first dispatch.
 # =0 builds the SPIR-V as emitted, as before.
 #EDEN_NX2_COMPUTE_NOINLINE=0
+# A channel suspended on a semaphore acquire is polled by the GPU thread: 500 us of yielding, then
+# sleeps of this many microseconds (PR 446, 50 by default; Ocarina waits here ~330 times a second
+# and its present waited ~17 ms a frame with 1 ms sleeps). =1000 restores the 1 ms poll and the
+# default timer slack; =0 keeps yielding (busy-polls one core while a channel waits).
+#EDEN_NX2_CHANNEL_POLL_US=1000
