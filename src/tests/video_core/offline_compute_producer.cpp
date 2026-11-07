@@ -298,3 +298,50 @@ TEST_CASE("The recipe catalog keeps each compute entry's storage-pointer answer 
     }
     std::filesystem::remove_all(directory);
 }
+
+TEST_CASE("Compute resume checks the exact transcript after a compatible candidate",
+          "[video_core][translation_cache][archive_environment]") {
+    namespace Offline = VideoCommon::OfflineShaders;
+    const auto directory = std::filesystem::temp_directory_path() / "lichii_compute_exact_resume";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    SyntheticCompute source;
+    Offline::Program row;
+    row.container = directory / "code.bin";
+    row.control = directory / "control.bin";
+    row.stage = Shader::Stage::Compute;
+    row.size = source.bytes.size();
+    row.constants_offset = 0x100;
+    row.constants_size = 4;
+    row.bank1_words = {0x12345678};
+    row.fingerprint = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < 256; ++i)
+        row.fingerprint = (row.fingerprint ^ source.bytes[i]) * 0x100000001b3ULL;
+    {
+        std::ofstream code(row.container, std::ios::binary), control(row.control, std::ios::binary);
+        code.write(reinterpret_cast<const char*>(source.bytes.data()), source.bytes.size());
+        control.write(reinterpret_cast<const char*>(source.control.data()), source.control.size());
+    }
+    const auto profile = TestProfile();
+    const auto config = MakeConfigDigest(profile, {}, 0);
+    auto env = source.Make();
+    const auto key = MakeStageKey(env, *env.Analyze(), 5, config);
+    Store store;
+    store.Open({}, config);
+    const std::vector<Query> answers{{QueryKind::ViewportTransformState, 0, 0, 1}};
+    const auto earlier = store.Insert(key, answers, {.stage = Shader::Stage::Compute}, true);
+    REQUIRE(earlier);
+    REQUIRE(store.InsertVariant(*earlier, MakeVariantKey(earlier->id, {}, {}),
+        {.spirv = {0x07230203, 0x10000, 0, 1, 0}}));
+    RecipeCatalog catalog;
+    catalog.source_config = config;
+    catalog.recorded_answers[key].push_back(answers);
+    // EXIT needs no queries, so current translation selects another exact transcript.
+    const auto first = Offline::ProduceCompute(row, profile, {}, config, store, 0, &catalog);
+    REQUIRE(first.modules == 1);
+    const auto second = Offline::ProduceCompute(row, profile, {}, config, store, 0, &catalog);
+    CHECK(second.recorded_validated == 1);
+    CHECK(second.modules == 0);
+    CHECK(store.VariantMultiplicity().at(1) == 2);
+    std::filesystem::remove_all(directory);
+}

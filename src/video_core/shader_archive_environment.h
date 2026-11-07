@@ -56,7 +56,15 @@ public:
     /// slots hold a mapped pointer, indirect ones do not).
     void SetStoragePointerAnswers(std::span<const TranslationCache::Query> answers);
 
+    /// Strict recorded answers; unknown queries fail instead of inheriting archive guesses.
+    void SetRecordedAnswers(std::span<const TranslationCache::Query> answers);
+
 private:
+    std::optional<u32> Recorded(TranslationCache::QueryKind kind, u32 a = 0,
+                                u32 b = 0, u32 c = 0) const;
+    bool recorded_mode{};
+    std::vector<TranslationCache::Query> recorded_answers;
+    std::map<u32, u32> recorded_handles;
     /// Captures and lowers [code_begin, code_end) of program and adopts the lowered code.
     void LowerProgram(std::span<const u8> program, size_t code_begin, size_t code_end,
                       bool geometry);

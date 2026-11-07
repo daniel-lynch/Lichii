@@ -662,12 +662,13 @@ bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env) {
 }
 
 size_t ReplayQueriesUntilMismatch(std::span<const Query> queries, Shader::Environment& env,
-                                  LiveAnswers* live) {
+                                  LiveAnswers* live, ReplayMismatch* mismatch) {
     if (live) live->clear();
     // Class-level replay: recorded handle -> live handle.
     std::unordered_map<u32, u32> handles;
     for (size_t index = 0; index < queries.size(); ++index) {
         const Query& query = queries[index];
+        if (mismatch) *mismatch = {index, std::nullopt};
         if (query.kind == QueryKind::TextureHandle) {
             const HandleAddress cbuf = UnpackHandleAddress(query);
             if (cbuf.shift_left >= 32 || cbuf.secondary_shift_left >= 32) {
@@ -748,6 +749,7 @@ size_t ReplayQueriesUntilMismatch(std::span<const Query> queries, Shader::Enviro
             return index;
         }
         if (answer != query.answer) {
+            if (mismatch) mismatch->actual = answer;
             return index;
         }
         if (live) {
@@ -1041,9 +1043,7 @@ std::vector<SelectedRecipe> RecipeCatalog::SelectWithSources(
     auto it = classes.find(RecipeClass(stage, &info));
     if (it == classes.end()) it = classes.find(RecipeClass(stage, nullptr));
     if (it != classes.end()) add_top(it->second, RecipeSource::Class);
-    const auto exact_it = exact.find(stage_key);
-    const bool has_exact = exact_it != exact.end() && !exact_it->second.empty();
-    if (baseline == RecipeBaseline::Always || (baseline == RecipeBaseline::Auto && !has_exact))
+    if (baseline != RecipeBaseline::Never)
         add(DefaultEmissionRecipe(stage), RecipeSource::Baseline);
     return result;
 }
@@ -1060,6 +1060,64 @@ std::vector<EmissionRecipe> RecipeCatalog::Select(const Digest& stage_key, Shade
 RecipeCatalog Store::ReadRecipeCatalog(const std::filesystem::path& path, const Digest& config,
                                       u32 entry_limit, u64 byte_budget) {
     RecipeCatalog result;
+    if (std::filesystem::is_directory(path)) {
+        std::vector<std::filesystem::path> files;
+        for (const auto& item : std::filesystem::recursive_directory_iterator(path))
+            if (item.is_regular_file() && item.path().filename().string().starts_with("vulkan_translations.") &&
+                item.path().extension() == ".bin") files.push_back(item.path());
+        std::ranges::sort(files);
+        bool first = true;
+        for (const auto& file : files) {
+            auto part = ReadRecipeCatalog(file, config, entry_limit, byte_budget);
+            if (!first && result.source_config != part.source_config)
+                throw std::runtime_error("Recipe directory contains different source configurations");
+            first = false;
+            result.source_config = part.source_config;
+            auto merge = [](auto& target, auto& source) {
+                for (auto& [key, sets] : source) {
+                    auto& out = target[key];
+                    for (auto& set : sets)
+                        if (std::ranges::find(out, set) == out.end()) out.push_back(std::move(set));
+                }
+            };
+            merge(result.recorded_answers, part.recorded_answers);
+            merge(result.compute_pointers, part.compute_pointers);
+            auto merge_recipes = [&](auto& target, auto& source) {
+                for (auto& [key, list] : source) {
+                    auto& out = target[key];
+                    for (auto& recipe : list) {
+                        const auto found = std::ranges::find(out, recipe.key, &RecipeCatalog::CountedRecipe::key);
+                        if (found != out.end()) {
+                            found->count += recipe.count;
+                        } else if (result.entries < entry_limit) {
+                            out.push_back(std::move(recipe));
+                            ++result.entries;
+                        } else {
+                            ++result.truncated_entries;
+                        }
+                    }
+                    std::ranges::sort(out, [](const auto& a, const auto& b) {
+                        if (a.count != b.count) return a.count > b.count;
+                        return std::tie(a.key.lo, a.key.hi) < std::tie(b.key.lo, b.key.hi);
+                    });
+                }
+            };
+            merge_recipes(result.exact, part.exact);
+            merge_recipes(result.classes, part.classes);
+            result.truncated_entries += part.truncated_entries;
+            result.skipped_records += part.skipped_records;
+            result.imported_bytes += part.imported_bytes;
+            result.invalid_recipes += part.invalid_recipes;
+            result.scanned_records += part.scanned_records;
+            result.eligible_records += part.eligible_records;
+            result.admitted_records += part.admitted_records;
+            result.framing_skipped_bytes += part.framing_skipped_bytes;
+            if (result.imported_bytes > byte_budget)
+                throw std::runtime_error("Recipe directory exceeds byte budget");
+        }
+        if (first) throw std::runtime_error("Recipe directory contains no translation caches");
+        return result;
+    }
     // The source config is used only to recover exact-stage keys from the current archive.
     // All emitted programs, metadata, and variant keys use the destination configuration.
     std::ifstream header(path, std::ios::binary);
@@ -1117,6 +1175,7 @@ RecipeCatalog Store::ReadRecipeCatalog(const std::filesystem::path& path, const 
         }
     }
     result.compute_pointers = std::move(source.compute_pointers);
+    result.recorded_answers = std::move(source.recorded_answers);
     result.invalid_recipes = source.invalid_recipes;
     result.skipped_records = source.skipped_import_records;
     result.imported_bytes = source.imported_bytes;
@@ -1430,6 +1489,7 @@ void Store::Close() {
     recipes.clear();
     entry_recipes.clear();
     compute_pointers.clear();
+    recorded_answers.clear();
     dropped_entries.clear();
     entries_with_modules.clear();
     offline_entry_only_rejected = 0;
@@ -1547,11 +1607,12 @@ bool Store::LoadRecipeRecords(std::ifstream& in, u64 size, u64 byte_budget) {
                 hasher.Add(stage_key.lo);
                 hasher.Add(stage_key.hi);
                 bool ok = true;
-                std::vector<Query> pointers;
+                std::vector<Query> pointers, answers;
                 for (u32 i = 0; i < count && ok; ++i) {
                     Query query;
                     ok = reader.Get(query.kind) && reader.Get(query.a) &&
                          reader.Get(query.b) && reader.Get(query.answer) && reader.Get(query.c);
+                    answers.push_back(query);
                     hasher.Add(query.kind);
                     hasher.Add(query.a);
                     hasher.Add(query.b);
@@ -1563,6 +1624,16 @@ bool Store::LoadRecipeRecords(std::ifstream& in, u64 size, u64 byte_budget) {
                 }
                 if (!ok) break;
                 const auto id = hasher.Finish();
+                if (collect_recipe_entries && !offline && !dropped_entries.contains(id)) {
+                    auto& sets = recorded_answers[stage_key];
+                    if (std::ranges::find(sets, answers) == sets.end()) {
+                        const u64 retained = answers.size() * sizeof(Query);
+                        if (retained > byte_budget - imported_bytes)
+                            throw std::runtime_error("Recorded answer sets exceed recipe byte budget");
+                        imported_bytes += retained;
+                        sets.push_back(std::move(answers));
+                    }
+                }
                 const u64 meta_begin = reader.Position();
                 locations.try_emplace(id, Location{meta_begin, end, stage_key});
                 // Storage-pointer answers of compute translations made at run time (offline
@@ -1602,7 +1673,8 @@ bool Store::LoadRecipeRecords(std::ifstream& in, u64 size, u64 byte_budget) {
                         Reader recipe_reader{bytes};
                         Shader::Stage stage{};
                         EmissionRecipe recipe;
-                        if (!recipe_reader.Get(stage) || static_cast<size_t>(stage) >= Shader::MaxStageTypes ||
+                        if (!recipe_reader.Get(stage) || (static_cast<size_t>(stage) >= Shader::MaxStageTypes &&
+                            stage != Shader::Stage::Task && stage != Shader::Stage::Mesh) ||
                             !ReadRecipe(recipe_reader, recipe) || !bytes.empty()) {
                             ++invalid_recipes;
                         } else {
@@ -1715,7 +1787,8 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
             EmissionRecipe recipe;
             ok = ok && reader.Get(has_recipe);
             if (ok && has_recipe) {
-                ok = reader.Get(stage) && static_cast<size_t>(stage) < Shader::MaxStageTypes &&
+                ok = reader.Get(stage) && (static_cast<size_t>(stage) < Shader::MaxStageTypes ||
+                     stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) &&
                      ReadRecipe(reader, recipe);
                 if (!ok) {
                     ++invalid_recipes;
@@ -1784,13 +1857,28 @@ std::shared_ptr<const Entry> Store::InsertLocked(Entry entry) {
 }
 
 std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::Environment& env,
-                                              LiveAnswers* live) {
+                                              LiveAnswers* live, u64 pipeline_hash,
+                                              u64 shader_hash, u32 slot) {
+    static const bool log_misses = [] {
+        const char* value = std::getenv("EDEN_NX2_TRANSLATION_MISS_LOG");
+        return value && std::string_view{value} == "1";
+    }();
+    const auto log_miss = [&](std::string_view reason, std::string_view difference) {
+        if (log_misses) {
+            LOG_INFO(Render_Vulkan,
+                     "Translation cache miss: pipeline={:016x} slot={} shader={:016x} "
+                     "stage={} stage_key={:016x}{:016x} reason={} first_query={}",
+                     pipeline_hash, slot, shader_hash, static_cast<u32>(env.ShaderStage()),
+                     stage_key.hi, stage_key.lo, reason, difference);
+        }
+    };
     std::vector<std::shared_ptr<const Entry>> candidates;
     {
         std::scoped_lock lock{mutex};
         const auto it = entries.find(stage_key);
         if (it == entries.end()) {
             ++entry_key_misses;
+            log_miss("key", "none");
             return nullptr;
         }
         for (const auto& entry : it->second) {
@@ -1801,26 +1889,76 @@ std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::E
     }
     size_t furthest = 0;
     std::optional<QueryKind> furthest_kind;
+    std::string difference;
+    bool offline_failed = false;
     for (const auto& candidate : candidates) {
+        ReplayMismatch mismatch;
+        std::string failure;
         try {
-            const size_t matched = ReplayQueriesUntilMismatch(candidate->queries, env, live);
+            const size_t matched = ReplayQueriesUntilMismatch(candidate->queries, env, live,
+                                                              &mismatch);
             if (matched == candidate->queries.size()) {
                 return candidate;
             }
-            if (!furthest_kind || matched > furthest) {
-                furthest = matched;
-                furthest_kind = candidate->queries[matched].kind;
-            }
-        } catch (const Shader::Exception&) {
-            // An environment read from the pipeline cache only answers the queries its own
-            // translation made; a question outside them means this entry does not apply.
+        } catch (const Shader::Exception& exception) {
+            // A recorded environment may lack an answer requested by this candidate.
+            failure = exception.what();
         }
-        if (candidate->offline) ++offline_replay_misses;
+        if (candidate->offline) offline_failed = true;
+        if (mismatch.index < candidate->queries.size() &&
+            (!furthest_kind || mismatch.index > furthest)) {
+            furthest = mismatch.index;
+            const Query& query = candidate->queries[furthest];
+            furthest_kind = query.kind;
+            if (log_misses) {
+                constexpr std::array names{"CbufValue", "TextureType", "TexturePixelFormat",
+                    "TexturePixelFormatInteger", "ViewportTransformState",
+                    "CbufStorageBufferPointer", "ReplaceConstBuffer",
+                    "CbufIndirectStorageBufferPointer", "TextureHandle"};
+                const size_t kind = static_cast<size_t>(query.kind);
+                difference = fmt::format(
+                    "index={} kind={} a={:#x} b={:#x} c={:#x} expected={:#x} actual={}{}",
+                    furthest, kind < names.size() ? names[kind] : "unknown", query.a, query.b,
+                    query.c, query.answer,
+                    mismatch.actual ? fmt::format("{:#x}", *mismatch.actual) : "unavailable",
+                    failure.empty() ? "" : fmt::format(" error={}", failure));
+            }
+        }
     }
+    // Count lookup failures, not candidates rejected before a later entry succeeds.
+    if (offline_failed) ++offline_replay_misses;
     if (count_mismatches && furthest_kind) {
         ++first_mismatch[static_cast<size_t>(*furthest_kind) % first_mismatch.size()];
     }
+    log_miss(candidates.empty() ? "dropped" : "replay", difference.empty() ? "none" : difference);
     return nullptr;
+}
+
+Store::ReplayCounts Store::ReplayAllEntries(const Digest& stage_key, Shader::Environment& env) {
+    std::vector<std::shared_ptr<const Entry>> candidates;
+    {
+        std::scoped_lock lock{mutex};
+        if (const auto it = entries.find(stage_key); it != entries.end()) {
+            for (const auto& entry : it->second) {
+                if (!dropped_entries.contains(entry->id)) {
+                    candidates.push_back(entry);
+                }
+            }
+        }
+    }
+    ReplayCounts counts;
+    for (const auto& entry : candidates) {
+        try {
+            if (ReplayQueries(entry->queries, env)) {
+                ++counts.matched;
+            } else {
+                ++counts.mismatched;
+            }
+        } catch (const Shader::Exception&) {
+            ++counts.unavailable;
+        }
+    }
+    return counts;
 }
 
 bool Store::HasStageKey(const Digest& stage_key) {

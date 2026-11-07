@@ -9,8 +9,9 @@ is no separate offline cache or arbitrary GPU profile. Disk shader caching and
 shader translation caching must both be enabled, with Vulkan selected.
 
 The producer supports vertex B, fragment, geometry and compute. Tessellation,
-vertex A, task and mesh are counted as unsupported; their scalar recipes are still
-missing. Graphics requiring layer emulation are rejected. The archive environment
+vertex A and archive-only task/mesh states are counted as unsupported. Recorded
+pipeline environments supply task/mesh state and can be emitted with
+`EDEN_NX2_OFFLINE_PIPELINE_SOURCES`. Graphics requiring layer emulation are rejected. The archive environment
 retains its existing 256-byte bank-1 limit. No game data belongs in this repository.
 
 ## Compute stages
@@ -24,7 +25,7 @@ per-warp scratch, 32 times that). The QMD carries the shared size rounded up to 
 `ArchiveEnvironment::ReadComputeState` decodes them; an archive compute environment
 otherwise matches the runtime's native compute environment (bare instructions with no
 128-byte header, an all-zero header in the key, start address past it, proprietary
-driver, the same Effect array-texture answer as graphics rows). Checked on a recorded session: every one of the 217 recorded compute launches
+driver, the same replay-guarded texture fallback as graphics rows). Checked on a recorded session: every one of the 217 recorded compute launches
 that maps to an archive program has exactly these values, and its texture bank is 0.
 
 Compute translation reads no draw state: the runtime emits with the default runtime info
@@ -74,11 +75,11 @@ source metadata and SPIR-V are never reused. It can be the destination cache.
 Format-9 and earlier inputs are rejected. Use the round-4 product-run cache to capture
 runtime variants; untouched offline fallback modules do not count as observed recipes.
 
-`--shader-recipe-count N` selects at most N observed recipes per stage (default 3, allowed range 1–64),
+`--shader-recipe-count N` selects at most N observed recipes per stage (default 2, allowed range 1–64),
 with most-frequent exact-stage recipes first, then class recipes filling remaining slots.
 The baseline default is included in addition to this limit. `--shader-recipe-limit N`
 caps the total catalog entries across exact and class groups (default 200000).
-The 256 MiB import budget counts only admitted serialized recipe tails, excluding
+The 256 MiB import budget counts recorded answer sets and admitted serialized recipe tails, excluding
 module payloads, entry metadata, and scanned/skipped records.
 The reader seeks over fallback modules, compressed SPIR-V, and unused entry metadata;
 entry keys/queries associate recipe IDs with source stage keys. Only the stage and
@@ -95,7 +96,8 @@ variants are emitted only once, and every emission uses fresh IR. Class frequenc
 count distinct recorded runtime variants, not repeated gameplay draw invocations.
 The producer reports uncompressed emitted SPIR-V bytes as `module_bytes`; `translated`
 counts fresh IR translations, which can exceed the number of archive rows when emitting
-multiple variants. Complete-variant resume still translates zero programs.
+multiple variants. Complete-variant resume skips emission, but recorded answer sets and pipeline records
+are translated again to validate them against the current translator.
 
 Resume fully reads and decompresses each disk-backed module once per open store,
 including its deferred Info, before counting it as complete. A ZSTD frame-header
@@ -545,8 +547,28 @@ a different program's layout. The archive schema does not expose FVTX/shape attr
 inferred from shader code alone. Reports attribute new modules to `partner_stage`
 and `input_layout`; existing exact/class/baseline counts retain precedence on duplicates.
 
-For Effect `.vsetb` containers the archive environment's class replay answer is
-`ColorArray2D`; other containers retain `Color2D`. This is a container-class guess,
-not a decoded sampler dimension: the current index has no sampler metadata. It is
-recorded as a replay query and checked against the live answer before reuse.
-Float format, direct/indirect pointer and viewport guesses are unchanged.
+Container identity (including Effect `.vsetb`) does not determine texture dimension.
+The fallback is Color2D. Runtime answer sets are imported independently of recipe top-k,
+including entries without emission recipes. Each recorded handle retains its own texture
+answers; missing recorded queries fail rather than inheriting guesses. All entries remain
+subject to the runtime replay guard.
+
+Pass 15 accepts a directory for `--shader-recipe-cache`, scanning translation cache copies
+recursively in stable path order. Sources must share a configuration; mixed configurations
+are rejected explicitly. Every recorded answer set is translated and replayed on rerun,
+including when its modules already exist. The auto baseline policy now includes the
+canonical baseline even when exact recipes exist (`never` remains an explicit opt-out).
+
+Set `EDEN_NX2_OFFLINE_PIPELINE_SOURCES` to a pipeline-key cache copy or directory to
+validate every pipeline record with the current translator and produce recorded task,
+mesh, graphics and compute entries. This does not create Vulkan pipelines. Inputs are
+read-only, including malformed files. The JSON `pipeline_validation` section identifies
+failures by source, record, pipeline, slot and shader; missing storage-pointer answers
+require re-capture with live GPU memory. Reruns still translate every record. Recorded
+stages emit baseline and imported recipes, not every possible device-dependent pipeline
+state. Unrecorded task/mesh register states cannot be inferred from the archive alone.
+
+`EDEN_NX2_TRANSLATION_MISS_LOG=1` logs each failed lookup with pipeline, slot, shader,
+stage key and the first differing query. A rejected product candidate followed by a
+session entry hit no longer increments the replay-failure counter. Editing the Vulkan
+pipeline-cache source changes the translator tag, so regenerate products under the new tag.

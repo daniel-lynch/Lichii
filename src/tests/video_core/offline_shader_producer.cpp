@@ -255,7 +255,7 @@ TEST_CASE("Recipe policy defaults to two observations and attributes canonical d
     add(classes, 5);
     add(classes, 6);
     const auto defaults = catalog.SelectWithSources(key, stage, {});
-    REQUIRE(defaults.size() == 2);
+    REQUIRE(defaults.size() == 3);
     REQUIRE(defaults[0].source == RecipeSource::ExactStage);
     REQUIRE(defaults[1].recipe.bindings.texture == 2);
     REQUIRE(catalog.Select(key, stage, {}, 2, RecipeBaseline::Always).size() == 3);
@@ -271,7 +271,7 @@ TEST_CASE("Recipe policy defaults to two observations and attributes canonical d
     // This unused input differs before canonicalization, but produces the same variant key.
     exact[1].recipe.runtime.generic_input_types[0] = Shader::AttributeType::SignedInt;
     const auto deduped = catalog.SelectWithSources(key, stage, {});
-    REQUIRE(deduped.size() == 1);
+    REQUIRE(deduped.size() == 2);
     REQUIRE(deduped[0].source == RecipeSource::ExactStage);
     exact[0].recipe = DefaultEmissionRecipe(stage);
     exact.resize(1);
@@ -393,4 +393,28 @@ TEST_CASE("Canonical donor layouts cannot invent unobserved vertex inputs",
     REQUIRE(CanShareInputLayout(target, observed));
     target.passthrough.Set(Shader::IR::Attribute::Generic2X);
     REQUIRE_FALSE(CanShareInputLayout(target, observed));
+}
+
+TEST_CASE("Recipe import retains every runtime answer set without a recipe or top k admission",
+          "[video_core][translation_cache]") {
+    const auto path = std::filesystem::temp_directory_path() / "lichii_recorded_answers.bin";
+    std::filesystem::remove(path);
+    const Digest config{15, 1}, key{15, 2};
+    ProgramMeta meta{};
+    meta.stage = Shader::Stage::Fragment;
+    {
+        Store store;
+        store.Open(path, config);
+        for (u32 type : {2U, 3U}) {
+            const std::vector<Query> answers{{QueryKind::TextureHandle, 2, 0x20, 99},
+                                            {QueryKind::TextureType, 99, 0, type}};
+            REQUIRE(store.Insert(key, answers, meta));
+        }
+        REQUIRE(store.Insert(key, {{QueryKind::TextureType, 99, 0, 5}}, meta, true));
+    }
+    const auto catalog = Store::ReadRecipeCatalog(path, config, 1);
+    REQUIRE(catalog.recorded_answers.at(key).size() == 2);
+    REQUIRE(catalog.exact.empty());
+    REQUIRE_THROWS(Store::ReadRecipeCatalog(path, config, 1, 1));
+    std::filesystem::remove(path);
 }

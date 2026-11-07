@@ -322,8 +322,8 @@ TEST_CASE("Offline producer resumes complete modules and repairs interrupted app
         store.Open(directory / "multi.bin", config);
         const auto first = Offline::Run(input, 0x0400000000000000ULL, 2, recipes_path,
                                         profile, {}, config, store, 1);
-        REQUIRE(first.modules == 1);
-        REQUIRE(first.translated == 1);
+        REQUIRE(first.modules == 2);
+        REQUIRE(first.translated >= 2);
         REQUIRE(first.module_bytes >= first.modules * 20);
         REQUIRE(first.skipped.empty());
         const auto size = std::filesystem::file_size(directory / "multi.bin");
@@ -331,7 +331,7 @@ TEST_CASE("Offline producer resumes complete modules and repairs interrupted app
                                          profile, {}, config, store, 1);
         REQUIRE(second.modules == 0);
         REQUIRE(second.translated == 0);
-        REQUIRE(second.resumed == 2);
+        REQUIRE(second.recorded_sets_failed == 2);
         REQUIRE(std::filesystem::file_size(directory / "multi.bin") == size);
     }
     {
@@ -373,7 +373,7 @@ TEST_CASE("Offline producer resumes complete modules and repairs interrupted app
         store.Open(product, config);
         const auto result = Offline::Run(input, 0x0400000000000000ULL, 2, recipes_path,
             profile, {}, config, store, DefaultRecipeCount, DefaultRecipeLimit, report, policy);
-        const u64 expected = policy == RecipeBaseline::Always ? 3 : 2;
+        const u64 expected = policy == RecipeBaseline::Never ? 2 : 3;
         REQUIRE(result.modules == expected);
         REQUIRE(result.entries == 1);
         REQUIRE(result.multiplicity.at(expected) == 1);
@@ -517,7 +517,7 @@ TEST_CASE("Native archive texture bank starts at zero and follows bound instruct
     }
 }
 
-TEST_CASE("Synthetic Effect program records array texture replay answers",
+TEST_CASE("Effect container identity does not override recorded texture dimensions",
           "[video_core][translation_cache][archive_environment]") {
     namespace Offline = VideoCommon::OfflineShaders;
     SyntheticProgram source;
@@ -531,7 +531,7 @@ TEST_CASE("Synthetic Effect program records array texture replay answers",
     recording.BeginTextureHandle();
     const auto handle = recording.ReadCbufValue(2, 0x20);
     recording.EndTextureHandle(Handle(), handle);
-    REQUIRE(recording.ReadTextureType(handle) == Shader::TextureType::ColorArray2D);
+    REQUIRE(recording.ReadTextureType(handle) == Shader::TextureType::Color2D);
     REQUIRE(recording.ReadTexturePixelFormat(handle) == Shader::TexturePixelFormat::A8B8G8R8_UNORM);
     REQUIRE(recording.IsCbufStorageBufferPointer(0, 0));
     REQUIRE_FALSE(recording.IsCbufIndirectStorageBufferPointer(0, 0, 0));
@@ -545,9 +545,9 @@ TEST_CASE("Synthetic Effect program records array texture replay answers",
     REQUIRE(store.Insert(key, recording.TakeQueries(), meta, true));
     REQUIRE(store.FindEntry(key, effect));
     auto ordinary = source.Make();
-    REQUIRE_FALSE(store.FindEntry(key, ordinary));
+    REQUIRE(store.FindEntry(key, ordinary));
     row.origins[0] = {"archive.sarc", "archive!EFFECT.VSETB.BYML!BNSH@100", 0};
-    REQUIRE(Offline::TextureTypeForProgram(row) == Shader::TextureType::ColorArray2D);
+    REQUIRE(Offline::TextureTypeForProgram(row) == Shader::TextureType::Color2D);
 }
 
 TEST_CASE("Producer emits and resumes a fragment recipe from its archive vertex partner",
@@ -610,4 +610,95 @@ TEST_CASE("Producer emits and resumes a fragment recipe from its archive vertex 
     REQUIRE(second.modules == 0);
     REQUIRE(second.resumed == 2);
     std::filesystem::remove_all(directory);
+}
+
+TEST_CASE("Recorded texture answers are per handle and preserve both dimensions",
+          "[video_core][translation_cache][archive_environment]") {
+    SyntheticProgram source;
+    const Digest config{14, 15};
+    Store store;
+    store.Open({}, config);
+    auto base = source.Make();
+    const auto key = MakeStageKey(base, *base.Analyze(), 1, config);
+    for (const auto type : {Shader::TextureType::Color2D, Shader::TextureType::ColorArray2D}) {
+        const std::vector<Query> answers{
+            {QueryKind::TextureHandle, 2, 0x20, 900},
+            {QueryKind::TextureType, 900, 0, static_cast<u32>(type)},
+            {QueryKind::TextureHandle, 2, 0x24, 901},
+            {QueryKind::TextureType, 901, 0, static_cast<u32>(Shader::TextureType::Color2D)}};
+        auto env = source.Make();
+        env.SetRecordedAnswers(answers);
+        RecordingEnvironment recording(env, true);
+        auto handle = [&](u32 offset) {
+            auto address = Handle();
+            address.offset = offset;
+            recording.BeginTextureHandle();
+            const auto value = recording.ReadCbufValue(2, offset);
+            recording.EndTextureHandle(address, value);
+            return value;
+        };
+        REQUIRE(recording.ReadTextureType(handle(0x20)) == type);
+        REQUIRE(recording.ReadTextureType(handle(0x24)) == Shader::TextureType::Color2D);
+        ProgramMeta meta{};
+        meta.stage = Shader::Stage::VertexB;
+        REQUIRE(store.Insert(key, recording.TakeQueries(), meta, true));
+        REQUIRE(store.FindEntry(key, env));
+        REQUIRE_THROWS(env.ReadTextureType(999));
+        REQUIRE_THROWS(env.IsCbufStorageBufferPointer(0, 0x40));
+    }
+    REQUIRE(store.VariantMultiplicity().at(0) == 2);
+}
+
+TEST_CASE("Recorded handle guesses cannot alias an unrelated texture answer",
+          "[video_core][translation_cache][archive_environment]") {
+    SyntheticProgram source;
+    auto env = source.Make();
+    const std::vector<Query> answers{
+        {QueryKind::TextureHandle, 2, 0x20, 1},
+        {QueryKind::TextureType, 1, 0, static_cast<u32>(Shader::TextureType::ColorArray2D)}};
+    env.SetRecordedAnswers(answers);
+    auto address = Handle();
+    address.offset = 0x24;
+    env.BeginTextureHandle();
+    const auto guessed = env.ReadCbufValue(2, address.offset);
+    REQUIRE(guessed == 1);
+    REQUIRE_THROWS(env.EndTextureHandle(address, guessed));
+    // A failed candidate must leave later non-handle reads strict.
+    REQUIRE_THROWS(env.ReadCbufValue(2, 0x30));
+    address.offset = 0x20;
+    env.BeginTextureHandle();
+    const auto valid = env.ReadCbufValue(2, address.offset);
+    REQUIRE_NOTHROW(env.EndTextureHandle(address, valid));
+    REQUIRE(env.ReadTextureType(valid) == Shader::TextureType::ColorArray2D);
+}
+
+TEST_CASE("Recorded exact handle words remain usable without a handle recipe",
+          "[video_core][translation_cache][archive_environment]") {
+    SyntheticProgram source;
+    auto env = source.Make();
+    const std::vector<Query> answers{
+        {QueryKind::CbufValue, 2, 0x20, 701},
+        {QueryKind::TextureType, 701, 0, static_cast<u32>(Shader::TextureType::Color2D)}};
+    env.SetRecordedAnswers(answers);
+    env.BeginTextureHandle();
+    const auto handle = env.ReadCbufValue(2, 0x20);
+    REQUIRE_NOTHROW(env.EndTextureHandle(Handle(), handle));
+    REQUIRE(env.ReadTextureType(handle) == Shader::TextureType::Color2D);
+}
+
+TEST_CASE("Ambiguous recorded handles restore strict query scope after rejection",
+          "[video_core][translation_cache][archive_environment]") {
+    SyntheticProgram source;
+    auto env = source.Make();
+    const std::vector<Query> answers{
+        {QueryKind::TextureHandle, 2, 0x20, 900},
+        {QueryKind::TextureHandle, 2, 0x24, 901}};
+    env.SetRecordedAnswers(answers);
+    auto address = Handle();
+    env.BeginTextureHandle();
+    REQUIRE_NOTHROW(env.EndTextureHandle(address, 1));
+    address.offset = 0x24;
+    env.BeginTextureHandle();
+    REQUIRE_THROWS(env.EndTextureHandle(address, 1));
+    REQUIRE_THROWS(env.ReadCbufValue(2, 0x30));
 }

@@ -19,6 +19,7 @@
 #include "video_core/shader_pool_index.h"
 #include "video_core/shader_recipe_histogram.h"
 #include "shader_recompiler/translator_identity.h"
+#include "shader_recompiler/exception.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "video_core/shader_translation_cache.h"
 #include "video_core/shader_archive_environment.h"
@@ -38,6 +39,7 @@ public:
     }
     u32 ReadCbufValue(u32 index, u32 offset) override {
         ++reads;
+        if (fail_cbuf_reads) throw Shader::LogicError("Uncached test constant buffer value");
         return cbufs[(u64{index} << 32) | offset];
     }
     Shader::TextureType ReadTextureType(u32 handle) override {
@@ -83,6 +85,7 @@ public:
     u32 viewport = 1;
     u32 texture_bound = 2;
     u32 reads = 0;
+    bool fail_cbuf_reads{};
     std::set<u32> indirect_pointers;
 };
 
@@ -1498,16 +1501,10 @@ TEST_CASE("Recipe catalogs cap exact selection and total import size",
     REQUIRE(capped.entries == 3);
     REQUIRE(capped.truncated_entries == 15);
     REQUIRE(capped.exact.at(key).size() == 1);
-    const auto budgeted = Store::ReadRecipeCatalog(path, config, 200000, 1);
-    REQUIRE(budgeted.entries == 0);
-    REQUIRE(budgeted.imported_bytes == 0);
-    REQUIRE(budgeted.skipped_records == 8);
+    REQUIRE_THROWS(Store::ReadRecipeCatalog(path, config, 200000, 1));
     const auto lines = Common::Log::ReadRing(0);
     REQUIRE(std::ranges::any_of(lines, [](const auto& line) {
         return line.text.find("3 catalog entries; 15 recipe references truncated by entry limit 3") != std::string::npos;
-    }));
-    REQUIRE(std::ranges::any_of(lines, [](const auto& line) {
-        return line.text.find("8 records skipped by byte budget 1; 0 bytes admitted") != std::string::npos;
     }));
     Common::Log::SetRingCapacity(0);
     std::filesystem::remove(path);
@@ -1842,4 +1839,108 @@ TEST_CASE("Translation cache evicts oldest resident variants only with a disk co
         REQUIRE(memory.ResidentBytes() == 0);
     }
     std::filesystem::remove(path);
+}
+
+TEST_CASE("Offline replay misses count failed lookups rather than rejected candidates",
+          "[translation_cache][video_core]") {
+    FakeEnvironment env;
+    Store store;
+    store.Open({}, {});
+    store.count_mismatches = true;
+    const Digest key{401, 402};
+    REQUIRE(store.Insert(key, {{QueryKind::ViewportTransformState, 0, 0, 2}},
+                         ProgramMeta{}, true));
+    REQUIRE(store.Insert(key, {{QueryKind::ViewportTransformState, 0, 0, 3}},
+                         ProgramMeta{}, true));
+    REQUIRE_FALSE(store.FindEntry(key, env));
+    REQUIRE(store.offline_replay_misses == 1);
+    const auto boot = store.Insert(key, {{QueryKind::ViewportTransformState, 0, 0, 1}},
+                                   ProgramMeta{});
+    REQUIRE(boot);
+    LiveAnswers live;
+    REQUIRE(store.FindEntry(key, env, &live) == boot);
+    REQUIRE(live == boot->queries);
+    REQUIRE(store.offline_replay_misses == 1);
+    REQUIRE(store.first_mismatch[static_cast<size_t>(QueryKind::ViewportTransformState)] == 1);
+    REQUIRE_FALSE(store.FindEntry({403, 404}, env));
+    REQUIRE(store.entry_key_misses == 1);
+    REQUIRE(store.offline_replay_misses == 1);
+}
+
+TEST_CASE("Replay diagnostics identify the first differing query and its actual answer",
+          "[translation_cache][video_core]") {
+    FakeEnvironment env;
+    const std::array queries{
+        Query{QueryKind::ViewportTransformState, 0, 0, 1},
+        Query{QueryKind::TextureType, 8, 0, static_cast<u32>(Shader::TextureType::ColorArray2D)},
+        Query{QueryKind::CbufValue, 0, 0, 99},
+    };
+    ReplayMismatch mismatch;
+    REQUIRE(ReplayQueriesUntilMismatch(queries, env, nullptr, &mismatch) == 1);
+    REQUIRE(mismatch.index == 1);
+    REQUIRE(mismatch.actual == static_cast<u32>(Shader::TextureType::Color2D));
+    REQUIRE(env.reads == 0);
+}
+
+
+TEST_CASE("Full producer replay visits every entry and preserves lookup counters",
+          "[translation_cache][video_core]") {
+    FakeEnvironment env;
+    env.fail_cbuf_reads = true;
+    Store store;
+    store.Open({}, {});
+    const Digest key{405, 406};
+    REQUIRE(store.Insert(key, {{QueryKind::ViewportTransformState, 0, 0, 1}},
+                         ProgramMeta{}, true));
+    const auto different = store.Insert(key, {{QueryKind::ViewportTransformState, 0, 0, 2}},
+                                        ProgramMeta{}, true);
+    REQUIRE(different);
+    REQUIRE(store.Insert(key, {{QueryKind::CbufValue, 0, 0, 99}}, ProgramMeta{}, true));
+    const auto counts = store.ReplayAllEntries(key, env);
+    REQUIRE(counts.matched == 1);
+    REQUIRE(counts.mismatched == 1);
+    REQUIRE(counts.unavailable == 1);
+    REQUIRE(env.reads == 1);
+    REQUIRE(store.entry_key_misses == 0);
+    REQUIRE(store.offline_replay_misses == 0);
+    REQUIRE(store.offline_dropped_misses == 0);
+
+    store.DropEntry(*different);
+    const auto remaining = store.ReplayAllEntries(key, env);
+    REQUIRE(remaining.matched == 1);
+    REQUIRE(remaining.mismatched == 0);
+    REQUIRE(remaining.unavailable == 1);
+    const auto missing = store.ReplayAllEntries({407, 408}, env);
+    REQUIRE(missing.matched == 0);
+    REQUIRE(missing.mismatched == 0);
+    REQUIRE(missing.unavailable == 0);
+    REQUIRE(store.entry_key_misses == 0);
+    REQUIRE(store.offline_replay_misses == 0);
+    REQUIRE(store.offline_dropped_misses == 0);
+}
+
+TEST_CASE("Recipe directories retain all answers while sharing one recipe limit",
+          "[translation_cache][video_core]") {
+    const auto directory = std::filesystem::temp_directory_path() / "eden-recipe-directory-test";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    const Digest config{501, 502}, key{503, 504};
+    for (u32 value : {1, 2}) {
+        Store source;
+        source.Open(directory / ("vulkan_translations.source" + std::to_string(value) + ".bin"), config);
+        ProgramMeta meta{};
+        meta.stage = Shader::Stage::Fragment;
+        const auto entry = source.Insert(key, {{QueryKind::ViewportTransformState, 0, 0, value}}, meta);
+        REQUIRE(entry);
+        auto recipe = DefaultEmissionRecipe(meta.stage);
+        recipe.bindings.texture = value;
+        REQUIRE(source.InsertVariant(*entry,
+            MakeVariantKey(entry->id, DigestRuntimeInfo(recipe.runtime), recipe.bindings),
+            {.spirv = {0x07230203, 0x10000, 0, 1, 0}}, &recipe));
+    }
+    const auto catalog = Store::ReadRecipeCatalog(directory, config, 1);
+    CHECK(catalog.entries == 1);
+    CHECK(catalog.recorded_answers.at(key).size() == 2);
+    CHECK(catalog.exact.at(key).size() == 1);
+    std::filesystem::remove_all(directory);
 }

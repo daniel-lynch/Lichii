@@ -143,6 +143,12 @@ private:
 /// queries with the live environment's words, handles and answers.
 using LiveAnswers = std::vector<Query>;
 
+/// First differing query, including the current index when an environment read throws.
+struct ReplayMismatch {
+    size_t index{};
+    std::optional<u32> actual;
+};
+
 /// Asks the live environment the recorded queries in order; true when every answer matches.
 /// Stops at the first mismatch, so it never makes a query the translation would not make.
 [[nodiscard]] bool ReplayQueries(std::span<const Query> queries, Shader::Environment& env);
@@ -150,7 +156,8 @@ using LiveAnswers = std::vector<Query>;
 /// differently (queries.size() when all matched).
 [[nodiscard]] size_t ReplayQueriesUntilMismatch(std::span<const Query> queries,
                                                 Shader::Environment& env,
-                                                LiveAnswers* live = nullptr);
+                                                LiveAnswers* live = nullptr,
+                                                ReplayMismatch* mismatch = nullptr);
 
 /// Key of a stage: its hash and the environment values the translator reads besides queries.
 [[nodiscard]] Digest MakeStageKey(Shader::Environment& env, u64 unique_hash, u32 slot,
@@ -272,6 +279,8 @@ struct RecipeCatalog {
     /// queries), distinct sets only. Which constant-buffer slots hold mapped pointers depends on
     /// the area, and the answers decide which storage buffers the translation binds.
     std::unordered_map<Digest, std::vector<std::vector<Query>>, DigestHash> compute_pointers;
+    /// All runtime answer sets, without the emission recipe top-k limit.
+    std::unordered_map<Digest, std::vector<std::vector<Query>>, DigestHash> recorded_answers;
     [[nodiscard]] std::vector<SelectedRecipe> SelectWithSources(
         const Digest& stage_key, Shader::Stage stage, const Shader::Info& info, u32 top_k = DefaultRecipeCount,
         RecipeBaseline baseline = RecipeBaseline::Auto) const;
@@ -304,7 +313,16 @@ public:
     /// current answers for worker-side reconstruction.
     [[nodiscard]] std::shared_ptr<const Entry> FindEntry(const Digest& stage_key,
                                                          Shader::Environment& env,
-                                                         LiveAnswers* live = nullptr);
+                                                         LiveAnswers* live = nullptr,
+                                                         u64 pipeline_hash = 0, u64 shader_hash = 0,
+                                                         u32 slot = ~0U);
+    struct ReplayCounts {
+        u64 matched{};
+        u64 mismatched{};
+        u64 unavailable{};
+    };
+    /// Replays every non-dropped entry for producer validation, without updating miss counters.
+    [[nodiscard]] ReplayCounts ReplayAllEntries(const Digest& stage_key, Shader::Environment& env);
     /// True when entries exist for the stage key (whether or not the environment matches them).
     [[nodiscard]] bool HasStageKey(const Digest& stage_key);
     /// Current non-dropped entries grouped by their number of stored modules.
@@ -415,6 +433,8 @@ private:
     u64 scanned_records{}, eligible_records{}, admitted_records{}, framing_skipped_bytes{};
     std::unordered_map<Digest, std::vector<EmissionRecipe>, DigestHash> entry_recipes;
     std::unordered_map<Digest, std::vector<std::vector<Query>>, DigestHash> compute_pointers;
+    /// All runtime answer sets, without the emission recipe top-k limit.
+    std::unordered_map<Digest, std::vector<std::vector<Query>>, DigestHash> recorded_answers;
 
     // Writers serialize publication and append; readers never wait for file I/O.
     std::mutex writer_mutex;

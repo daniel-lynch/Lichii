@@ -13,7 +13,9 @@ struct ComputeOutcome {
     bool invalidated{}; ///< An existing disk module failed its decode check and was re-emitted.
     u64 modules{};      ///< Modules emitted in this run.
     u64 replaced{};     ///< Of those, replacing a module that failed its decode check.
-    u64 pointer_modules{}; ///< Of those, for a storage-pointer answer set recorded at run time.
+    u64 pointer_modules{}; ///< Of those, for a answer set recorded at run time.
+    u64 recorded_validated{}, recorded_failed{};
+    TranslationCache::Store::ReplayCounts replay{};
     u64 recorded_sets{};   ///< Recorded storage-pointer answer sets found for this program.
     u64 module_bytes{}; ///< Uncompressed SPIR-V bytes emitted in this run (0 when none).
 };
@@ -22,8 +24,8 @@ struct ComputeOutcome {
 /// computes at its first dispatch: stage key slot 5 over the control section's dispatch state
 /// (workgroup size, shared and local memory), and a single variant with the zero runtime digest
 /// and default bindings (compute has no emission recipe). With recipes, also one entry per
-/// storage-pointer answer set recorded for the program at run time (see
-/// RecipeCatalog::compute_pointers). Throws std::runtime_error whose message names the skip
+/// answer set recorded for the program at run time (see
+/// RecipeCatalog::recorded_answers). Throws std::runtime_error whose message names the skip
 /// reason.
 /// shared_memory_limit mirrors the runtime clamp on drivers with small shared memory (0: none).
 [[nodiscard]] ComputeOutcome ProduceCompute(const Program& row, const Shader::Profile& profile,

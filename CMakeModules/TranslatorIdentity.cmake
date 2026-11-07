@@ -29,6 +29,8 @@ set(TRANSLATOR_IDENTITY_DIRS
 set(TRANSLATOR_IDENTITY_FILES
     src/video_core/offline_compute_producer.cpp
     src/video_core/offline_compute_producer.h
+    src/video_core/offline_recorded_producer.cpp
+    src/video_core/offline_recorded_producer.h
     src/video_core/offline_shader_producer.cpp
     src/video_core/offline_shader_producer.h
     src/video_core/shader_archive_environment.cpp
