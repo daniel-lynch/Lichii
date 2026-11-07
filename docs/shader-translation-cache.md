@@ -138,8 +138,11 @@ of:
 - every file under `src/shader_recompiler` (frontend, IR passes, SPIR-V backend, native
   lowering, its `CMakeLists.txt`), globbed when the hash runs;
 - the video_core files that drive translation or store its result:
-  `shader_environment.*`, `shader_translation_cache.*`, `shader_cache.*` and
-  `renderer_vulkan/vk_pipeline_cache.*`, plus the module itself;
+  `shader_environment.*`, `shader_archive_environment.*`, `offline_shader_producer.*`,
+  `offline_compute_producer.*` and `shader_translation_cache.*`, plus the module itself
+  (`TRANSLATOR_IDENTITY_FILES`);
+- the marked regions of `shader_cache.*` and `renderer_vulkan/vk_pipeline_cache.*`
+  (`TRANSLATOR_IDENTITY_REGION_FILES`, below);
 - every `common/...` header those files reach through `#include`, followed transitively;
 - build facts: system and processor, compiler id and version, C++ standard, build type,
   `CMAKE_CXX_FLAGS` and the per-configuration flags, LTO, the compile options and definitions
@@ -160,6 +163,54 @@ has to update the list instead of silently dropping out of the key.
 
 Inputs that vary at run time (profile, host info, device, settings, environment variables) stay
 in the configuration digest as before; the identity replaces only the build part.
+
+#### Marked regions
+
+`shader_cache.*` and `vk_pipeline_cache.*` mix the code that decides a translation with code
+that cannot change one: pipeline keys and building, eviction, the used-pipeline list, the
+driver pipeline cache, AOT scheduling, statistics and logging. Hashing them whole made every
+edit of that code a new tag, and so a regeneration of the offline translation product. Only
+the code between `// TRANSLATOR-IDENTITY BEGIN[: what]` and `// TRANSLATOR-IDENTITY END` lines
+of those files is hashed (manifest line `regions <file> <sha256>`, scheme 2): each region from
+its BEGIN token to the end of its END token, followed by a newline, in file order. Inside the
+regions:
+
+- `vk_pipeline_cache.cpp`: the translator entry points (`using` declarations), the runtime
+  info (`MakeRuntimeInfo` and its helpers), `DeferredStages`, `IndirectPointersMode` (in the
+  configuration digest), the profile and host info set up by the constructor, the offline
+  product run (`PrecompileArchiveShaders`), `OpenTranslationCache` (configuration digest) and
+  `IsTranslationCacheable`, `RecordRecipe`, `EmitWaitingSeed` and `BestRecipe`, `SeedStage`,
+  the translation file name in `LoadDiskResources`, both `CreateGraphicsPipeline(pools, ...)`
+  and `CreateComputePipeline(pools, ...)` whole, and the compute environment built by
+  `CreateComputePipeline(key, shader)`;
+- `vk_pipeline_cache.h`: the profile, host info, store and configuration digest members;
+- `shader_cache.cpp`: `MeshStateHash`, `RefreshStages`, `SeedPoolCandidates`, `ComputeShader`,
+  `GetGraphicsEnvironments` and `MakeShaderInfo` (program hashes, lowered code and the
+  environments stages are translated from);
+- `shader_cache.h`: `ShaderInfo` and `GraphicsEnvironments`.
+
+Outside them, and so free to change without a new tag: the functions a region calls that
+cannot change what a cached stage holds, because they only count, log, schedule or build a
+Vulkan object from code that is already final: `BuildStageModule` and `ComputeModuleCode`
+(applied alike to cached and fresh SPIR-V; the cache keeps the SPIR-V as emitted),
+`LogUntrackedGlobal`, `CountStageOutcome`, `AddRuntimeSpirvTime`, `TryReservePending`,
+`ReleasePending`, `ParkSeed`, `EmitWaitingSeeds`, `PumpReadySeeds`, `AotWorkerCount`,
+`LoadRecipes` and `SaveRecipes` (a recipe only chooses which variant to emit ahead of time;
+every variant is keyed by the runtime info and bindings it was emitted with). Also outside:
+invalidation, rejection bookkeeping and lookup in `shader_cache.cpp`, and in
+`vk_pipeline_cache.cpp` the pipeline keys, eviction, used pipelines, the dynamic-state features
+(they reach a translation only through the runtime info, which is digested by value), boot
+loading and the driver pipeline cache.
+
+A region file without a region, an END without a BEGIN, a BEGIN without an END and a nested
+BEGIN fail the build. Code a region relies on to decide a translation, its keys or its file
+must move into a region with it: code that does and sits outside escapes the identity, and a
+build would then load a product that its translator no longer produces. The quoted includes of
+a region file are still followed from the whole file.
+
+`tools/oot/translator-tag.py` computes the manifest, source hash and tag of a working tree or
+a commit from a build's `translator_identity.facts` and the executable's compile facts,
+without building: use it to tell whether an edit needs a new product.
 
 The identity reaches the file in two places, and the file layout does not change
 (`FormatVersion` stays 5, so it merges with branches that bump the version for layout
@@ -183,10 +234,10 @@ cache: translator identity exe (EDEN_NX2_TRANSLATION_CACHE_KEY=exe, commit …)`
 What the identity does not cover:
 
 - Code outside the hashed set that changes translation output without changing any digested
-  input. `vk_pipeline_cache.cpp` is hashed because the steps between translation and emission
-  live there; other video_core code feeds translation only through environment answers, which
-  are recorded and replayed, and through the profile, host info and runtime info, which are
-  digested by value.
+  input. The regions of `vk_pipeline_cache.cpp` are hashed because the steps between
+  translation and emission live there; other video_core code feeds translation only through
+  environment answers, which are recorded and replayed, and through the profile, host info and
+  runtime info, which are digested by value.
 - Headers outside `src/common` (boost containers, fmt, the standard library) other than through
   the compiler and standard library version.
 - A file the translator compiles that lives outside the hashed directories. A new translator

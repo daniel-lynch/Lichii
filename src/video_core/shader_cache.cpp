@@ -4,6 +4,12 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+// Only the code between this file's TRANSLATOR-IDENTITY markers enters the identity of the
+// translated-shader cache (CMakeModules/TranslatorIdentity.cmake), which names the offline
+// translation product: the environments stages are translated from and the hashes that key
+// them. Invalidation and the rejection bookkeeping stay outside; an edit outside them keeps the
+// product. tools/oot/translator-tag.py computes the resulting tag.
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -102,6 +108,7 @@ void ShaderCache::RefreshDebugRejections(bool unrejected) {
 ShaderCache::ShaderCache(Tegra::MaxwellDeviceMemoryManager& device_memory_)
     : device_memory{device_memory_} {}
 
+// TRANSLATOR-IDENTITY BEGIN: program hashes and environments
 // Task and mesh programs are translated with the mesh registers and the header of the pass-through
 // geometry program (per-primitive outputs), so pipelines are keyed by them too.
 u64 ShaderCache::MeshStateHash() const {
@@ -403,6 +410,7 @@ const ShaderInfo* ShaderCache::ComputeShader() {
     }
     return shader;
 }
+// TRANSLATOR-IDENTITY END
 
 void ShaderCache::RethrowIfRejected(VAddr addr) {
     std::scoped_lock lock{rejected_mutex};
@@ -431,6 +439,7 @@ void ShaderCache::RememberRejection(VAddr addr) {
     page_serial.fetch_add(1, std::memory_order_release);
 }
 
+// TRANSLATOR-IDENTITY BEGIN: graphics environments
 void ShaderCache::GetGraphicsEnvironments(GraphicsEnvironments& result,
                                           const std::array<u64, NUM_PROGRAMS>& unique_hashes) {
     size_t env_index{};
@@ -453,6 +462,7 @@ void ShaderCache::GetGraphicsEnvironments(GraphicsEnvironments& result,
         result.env_ptrs[env_index++] = &env;
     }
 }
+// TRANSLATOR-IDENTITY END
 
 ShaderInfo* ShaderCache::TryGet(VAddr addr) const {
     std::scoped_lock lock{lookup_mutex};
@@ -606,6 +616,7 @@ ShaderCache::Entry* ShaderCache::NewEntry(VAddr addr, VAddr addr_end, ShaderInfo
     return entry_pointer;
 }
 
+// TRANSLATOR-IDENTITY BEGIN: program hash and lowered code
 const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr) {
     auto info = std::make_unique<ShaderInfo>();
     if (const std::optional<u64> cached_hash{env.Analyze()}) {
@@ -625,5 +636,6 @@ const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu
     Register(std::move(info), cpu_addr, size_bytes);
     return result;
 }
+// TRANSLATOR-IDENTITY END
 
 } // namespace VideoCommon

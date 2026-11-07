@@ -4,6 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+// Only the code between the TRANSLATOR-IDENTITY markers of this file and of
+// vk_pipeline_cache.cpp enters the identity of the translated-shader cache
+// (CMakeModules/TranslatorIdentity.cmake); see vk_pipeline_cache.cpp.
+
 #pragma once
 
 #include <array>
@@ -210,12 +214,14 @@ private:
     std::mutex spare_pools_mutex;
     std::vector<std::shared_ptr<ShaderPools>> spare_pools;
 
+    // TRANSLATOR-IDENTITY BEGIN: what the translator is configured with
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;
 
     /// Translated shader stages (use_shader_translation_cache), kept across pipeline evictions.
     VideoCommon::TranslationCache::Store translation_cache;
     VideoCommon::TranslationCache::Digest translation_config{};
+    // TRANSLATOR-IDENTITY END
     bool translation_cache_verify{};
     std::atomic<u64> translation_cache_verified{};
     std::atomic<u64> translation_cache_mismatches{};

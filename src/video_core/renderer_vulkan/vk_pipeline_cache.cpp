@@ -4,6 +4,12 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+// Only the code between this file's TRANSLATOR-IDENTITY markers enters the identity of the
+// translated-shader cache (CMakeModules/TranslatorIdentity.cmake), which names the offline
+// translation product. Code that can change what a cached stage holds (its IR metadata, SPIR-V
+// and bindings), the cache keys, or which cache file is read belongs between them; an edit
+// outside them keeps the product. tools/oot/translator-tag.py computes the resulting tag.
+
 #include <algorithm>
 #include <atomic>
 #include <bitset>
@@ -71,6 +77,7 @@
 namespace Vulkan {
 
 namespace {
+// TRANSLATOR-IDENTITY BEGIN: translator entry points
 using Shader::Backend::SPIRV::EmitSPIRV;
 using Shader::Maxwell::ConvertLegacyToGeneric;
 using Shader::Maxwell::GenerateGeometryPassthrough;
@@ -80,6 +87,7 @@ using VideoCommon::ComputeEnvironment;
 using VideoCommon::FileEnvironment;
 using VideoCommon::GenericEnvironment;
 using VideoCommon::GraphicsEnvironment;
+// TRANSLATOR-IDENTITY END
 
 constexpr u32 CACHE_VERSION = VideoCommon::VulkanPipelineCacheVersion;
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
@@ -91,6 +99,7 @@ auto MakeSpan(Container& container) {
     return std::span(container.data(), container.size());
 }
 
+// TRANSLATOR-IDENTITY BEGIN: runtime info of graphics stages
 Shader::OutputTopology MaxwellToOutputTopology(Maxwell::PrimitiveTopology topology) {
     switch (topology) {
     case Maxwell::PrimitiveTopology::Points:
@@ -335,6 +344,7 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     info.y_negate = key.state.y_negate != 0;
     return info;
 }
+// TRANSLATOR-IDENTITY END
 
 std::array<std::atomic<std::chrono::nanoseconds::rep>, 2> runtime_spirv_ns{};
 
@@ -377,6 +387,7 @@ vk::ShaderModule BuildStageModule(const Device& device, std::span<const u32> cod
     return module;
 }
 
+// TRANSLATOR-IDENTITY BEGIN: stages emitted on a pipeline worker
 struct DeferredStages {
     std::unique_ptr<EmissionBudget::Reservation> reservation;
     std::shared_ptr<ShaderPools> pools;
@@ -398,6 +409,7 @@ struct DeferredStages {
     /// A vertex-B + fragment pipeline (its recipes are recorded for seeded variants).
     bool plain{};
 };
+// TRANSLATOR-IDENTITY END
 
 size_t GetTotalPipelineWorkers() {
     const size_t max_core_threads =
@@ -422,6 +434,7 @@ size_t GetTotalPipelineWorkers() {
 // loaded-ptr:l; indirect-bound:l are the ones bound per dispatch (compute) or draw (task, mesh).
 // indirect_pointers: 0 off, 1 compute only (EDEN_NX2_INDIRECT_POINTERS=compute), 2 compute, task
 // and mesh.
+// TRANSLATOR-IDENTITY BEGIN: a translation option in the configuration digest
 /// EDEN_NX2_INDIRECT_POINTERS as the logs and the translation cache id show it: 0 off, 1 compute
 /// programs only, 2 compute, task and mesh programs
 u32 IndirectPointersMode() {
@@ -429,6 +442,7 @@ u32 IndirectPointersMode() {
            : Shader::Optimization::NativeIndirectPointers()       ? 1U
                                                                   : 0U;
 }
+// TRANSLATOR-IDENTITY END
 
 void LogUntrackedGlobal(u64 hash, Shader::Stage stage, const Shader::Info& info) {
     static const bool enabled = [] {
@@ -544,6 +558,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         return SeedStage(env, unique_hash, slot, constants, tier);
     };
     seed_has_room = [this] { return AotHasRoom(); };
+    // TRANSLATOR-IDENTITY BEGIN: the translator's profile and host info
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -687,6 +702,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     };
     host_info.ApplyDescriptorLimitPolicy();
     OpenTranslationCache({});
+    // TRANSLATOR-IDENTITY END
 
     if (device.GetMaxVertexInputAttributes() < Maxwell::NumVertexAttributes) {
         LOG_WARNING(Render_Vulkan, "maxVertexInputAttributes is too low: {} < {}",
@@ -816,6 +832,7 @@ bool PreloadAllPipelines() {
 }
 } // Anonymous namespace
 
+// TRANSLATOR-IDENTITY BEGIN: offline product, configuration digest, cacheable stages
 bool PipelineCache::PrecompileArchiveShaders(const std::filesystem::path& input, u64 title_id,
                                              u32 workers, const std::filesystem::path& recipes,
                                              u32 recipe_count, u32 recipe_limit,
@@ -906,6 +923,7 @@ bool PipelineCache::IsTranslationCacheable(const Shader::Environment& env) const
     }
     return env.CanCacheTranslation();
 }
+// TRANSLATOR-IDENTITY END
 
 void PipelineCache::LoadRecipes() {
     std::scoped_lock lock{recipe_mutex};
@@ -972,6 +990,7 @@ void PipelineCache::SaveRecipes() {
              classes);
 }
 
+// TRANSLATOR-IDENTITY BEGIN: emission recipes
 void PipelineCache::RecordRecipe(Shader::Stage stage, const Shader::Info& info,
                                  const Shader::RuntimeInfo& runtime_info,
                                  const Shader::Backend::Bindings& binding_in) {
@@ -997,6 +1016,7 @@ void PipelineCache::RecordRecipe(Shader::Stage stage, const Shader::Info& info,
         EmitWaitingSeeds(std::move(ready));
     }
 }
+// TRANSLATOR-IDENTITY END
 
 void PipelineCache::ParkSeed(const std::shared_ptr<VideoCommon::ReplayEnvironment>& env,
                              const std::shared_ptr<const VideoCommon::TranslationCache::Entry>& entry,
@@ -1092,6 +1112,7 @@ void PipelineCache::PumpReadySeeds() {
     }
 }
 
+// TRANSLATOR-IDENTITY BEGIN: re-emitted seeds
 void PipelineCache::EmitWaitingSeed(const WaitingSeed& seed) {
     namespace TC = VideoCommon::TranslationCache;
     const auto begin = std::chrono::steady_clock::now();
@@ -1146,6 +1167,7 @@ std::optional<PipelineCache::EmissionRecipe> PipelineCache::BestRecipe(Shader::S
     }
     return best;
 }
+// TRANSLATOR-IDENTITY END
 
 size_t PipelineCache::AotWorkerCount() {
     // EDEN_NX2_AOT_WORKERS: background threads translating recognised programs (default 2, at
@@ -1158,6 +1180,7 @@ size_t PipelineCache::AotWorkerCount() {
     return std::clamp<size_t>(count, 1, limit);
 }
 
+// TRANSLATOR-IDENTITY BEGIN: ahead-of-time translation
 VideoCommon::SeedResult PipelineCache::SeedStage(VideoCommon::GenericEnvironment& env, u64 unique_hash,
                               size_t slot, std::span<const u8> constants, u8 tier) {
     namespace TC = VideoCommon::TranslationCache;
@@ -1332,6 +1355,7 @@ VideoCommon::SeedResult PipelineCache::SeedStage(VideoCommon::GenericEnvironment
     queued = true;
     return SeedResult::Admitted;
 }
+// TRANSLATOR-IDENTITY END
 
 void PipelineCache::CountStageOutcome(StageOutcome outcome, Shader::Stage stage, u64 ns) {
     const bool mesh = stage == Shader::Stage::Task || stage == Shader::Stage::Mesh;
@@ -1599,6 +1623,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                                migration_error);
     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
     used_pipelines_saved = std::chrono::steady_clock::now();
+    // TRANSLATOR-IDENTITY BEGIN: the translation file of this translator
     // Each translator has its own file (vulkan_translations.<tag>.fork-vN.bin), so a rebuild that
     // keeps the translator keeps the cache, and switching between builds does not overwrite the
     // other build's file. Files of older translators are left in place.
@@ -1609,6 +1634,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                                 : fmt::format("vulkan_translations.{}", translation_tag);
     OpenTranslationCache(
         VideoCommon::VersionedPipelineCachePath(base_dir, translation_stem, CACHE_VERSION));
+    // TRANSLATOR-IDENTITY END
     size_t skipped_pipelines = 0;
     size_t deferred_pipelines = 0;
     size_t queued_graphics = 0;
@@ -2033,6 +2059,7 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     return discard ? nullptr : pipeline;
 }
 
+// TRANSLATOR-IDENTITY BEGIN: graphics stage translation and emission
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
@@ -2665,6 +2692,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     LOG_ERROR(Render_Vulkan, "{}", exception.what());
     return nullptr;
 }
+// TRANSLATOR-IDENTITY END
 
 namespace {
 // Where the last compute stage built on this thread came from, for the runtime report: the
@@ -2804,11 +2832,13 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
             LogRuntimeComputeBuilds("run time so far");
         }
     };
+    // TRANSLATOR-IDENTITY BEGIN: the compute environment
     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
     const auto& qmd{kepler_compute->launch_description};
     ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start,
                            shader->lowered_native};
     env.SetCachedSize(shader->size_bytes);
+    // TRANSLATOR-IDENTITY END
 
     main_pools.ReleaseContents();
     auto entry{CreateComputePipeline(main_pools, key, env, nullptr, true)};
@@ -2880,6 +2910,7 @@ std::vector<u32> ComputeModuleCode(std::span<const u32> code, u64 shader_hash) {
 }
 } // Anonymous namespace
 
+// TRANSLATOR-IDENTITY BEGIN: compute stage translation and emission
 ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     ShaderPools& pools, const ComputePipelineCacheKey& key, Shader::Environment& env,
     PipelineStatistics* statistics, bool build_in_parallel) try {
@@ -3028,6 +3059,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
               key.unique_hash, key.Hash(), exception.what());
     return {.failure = exception.what()};
 }
+// TRANSLATOR-IDENTITY END
 
 void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                                  const vk::PipelineCache& pipeline_cache,

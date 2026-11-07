@@ -8,7 +8,8 @@
 # used by a build whose translator would produce the same output, so the cache file carries an
 # identity of the translator. That identity is a SHA-256 over:
 #   - the source of the translator: every file under src/shader_recompiler, the video_core files
-#     that drive translation or store its result (TRANSLATOR_IDENTITY_FILES), and every in-repo
+#     that drive translation or store its result (TRANSLATOR_IDENTITY_FILES), the marked regions
+#     of the files that also hold other code (TRANSLATOR_IDENTITY_REGION_FILES), and every in-repo
 #     "common/..." header those files reach through #include;
 # Nothing about the running process (executable, path, time) enters it, so two executables built
 # from the same source with the same facts (the emulator, shader-sweep) agree on it.
@@ -19,7 +20,7 @@
 # Included from CMake, this file defines lichii_translator_identity(). Run as a script
 # (cmake -P), it computes the identity and writes the generated header.
 
-set(TRANSLATOR_IDENTITY_SCHEME 1)
+set(TRANSLATOR_IDENTITY_SCHEME 2)
 # Directories hashed recursively, every file in them, relative to the source root.
 set(TRANSLATOR_IDENTITY_DIRS
     src/shader_recompiler
@@ -37,11 +38,20 @@ set(TRANSLATOR_IDENTITY_FILES
     src/video_core/shader_environment.h
     src/video_core/shader_translation_cache.cpp
     src/video_core/shader_translation_cache.h
+    CMakeModules/TranslatorIdentity.cmake
+)
+# Files of which only the code between "// TRANSLATOR-IDENTITY BEGIN[: what]" and
+# "// TRANSLATOR-IDENTITY END" lines is hashed: they drive translation among code that cannot
+# change its result (pipeline keys and building, eviction, statistics, logging), and an edit of
+# that code should keep the offline translation product. Each needs at least one region; regions
+# do not nest; an unbalanced or nested marker fails the build. Code a region relies on to decide a
+# translation, its keys or its file must be inside a region too (see the comment at the top of
+# each file). Their quoted includes are followed from the whole file, as for the other files.
+set(TRANSLATOR_IDENTITY_REGION_FILES
     src/video_core/shader_cache.cpp
     src/video_core/shader_cache.h
     src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
     src/video_core/renderer_vulkan/vk_pipeline_cache.h
-    CMakeModules/TranslatorIdentity.cmake
 )
 # Quoted includes with this prefix, resolved under src/, are followed from every hashed file.
 set(TRANSLATOR_IDENTITY_INCLUDE_PREFIX "common/")
@@ -63,7 +73,7 @@ if (CMAKE_SCRIPT_MODE_FILE STREQUAL CMAKE_CURRENT_LIST_FILE)
              "${SOURCE_ROOT}/${dir}/*")
         list(APPEND files ${found})
     endforeach()
-    foreach (file IN LISTS TRANSLATOR_IDENTITY_FILES)
+    foreach (file IN LISTS TRANSLATOR_IDENTITY_FILES TRANSLATOR_IDENTITY_REGION_FILES)
         if (NOT EXISTS "${SOURCE_ROOT}/${file}")
             message(FATAL_ERROR "Translator identity: ${file} does not exist (update CMakeModules/TranslatorIdentity.cmake)")
         endif()
@@ -95,9 +105,57 @@ if (CMAKE_SCRIPT_MODE_FILE STREQUAL CMAKE_CURRENT_LIST_FILE)
     list(LENGTH files file_count)
 
     set(manifest "scheme ${TRANSLATOR_IDENTITY_SCHEME}\n")
+    set(begin_token "TRANSLATOR-IDENTITY BEGIN")
+    set(end_token "TRANSLATOR-IDENTITY END")
+    string(LENGTH "${begin_token}" begin_length)
+    string(LENGTH "${end_token}" end_length)
     foreach (file IN LISTS files)
-        file(SHA256 "${SOURCE_ROOT}/${file}" file_hash)
-        string(APPEND manifest "file ${file} ${file_hash}\n")
+        if (NOT file IN_LIST TRANSLATOR_IDENTITY_REGION_FILES)
+            file(SHA256 "${SOURCE_ROOT}/${file}" file_hash)
+            string(APPEND manifest "file ${file} ${file_hash}\n")
+            continue()
+        endif()
+        # Each region from its BEGIN token to the end of its END token, then a newline, in file
+        # order (tools/oot/translator-tag.py does the same).
+        file(READ "${SOURCE_ROOT}/${file}" rest)
+        set(regions "")
+        set(region_count 0)
+        while (TRUE)
+            string(FIND "${rest}" "${begin_token}" begin_at)
+            string(FIND "${rest}" "${end_token}" end_at)
+            if (begin_at EQUAL -1)
+                if (NOT end_at EQUAL -1)
+                    message(FATAL_ERROR "Translator identity: ${file}: TRANSLATOR-IDENTITY END without BEGIN")
+                endif()
+                break()
+            endif()
+            if (end_at EQUAL -1)
+                message(FATAL_ERROR "Translator identity: ${file}: TRANSLATOR-IDENTITY BEGIN without END")
+            endif()
+            if (end_at LESS begin_at)
+                message(FATAL_ERROR "Translator identity: ${file}: TRANSLATOR-IDENTITY END without BEGIN")
+            endif()
+            math(EXPR after_begin "${begin_at} + ${begin_length}")
+            string(SUBSTRING "${rest}" ${after_begin} -1 after)
+            string(FIND "${after}" "${begin_token}" nested_at)
+            if (NOT nested_at EQUAL -1)
+                math(EXPR nested_at "${nested_at} + ${after_begin}")
+                if (nested_at LESS end_at)
+                    message(FATAL_ERROR "Translator identity: ${file}: nested TRANSLATOR-IDENTITY BEGIN")
+                endif()
+            endif()
+            math(EXPR region_length "${end_at} + ${end_length} - ${begin_at}")
+            string(SUBSTRING "${rest}" ${begin_at} ${region_length} region)
+            string(APPEND regions "${region}\n")
+            math(EXPR after_end "${end_at} + ${end_length}")
+            string(SUBSTRING "${rest}" ${after_end} -1 rest)
+            math(EXPR region_count "${region_count} + 1")
+        endwhile()
+        if (region_count EQUAL 0)
+            message(FATAL_ERROR "Translator identity: ${file} has no TRANSLATOR-IDENTITY regions (it is in TRANSLATOR_IDENTITY_REGION_FILES)")
+        endif()
+        string(SHA256 file_hash "${regions}")
+        string(APPEND manifest "regions ${file} ${file_hash}\n")
     endforeach()
     file(READ "${FACTS_FILE}" facts)
     string(APPEND manifest "${facts}")
@@ -221,7 +279,7 @@ function(lichii_translator_identity)
     # script itself globs again and follows includes, so it never works from a stale list;
     # CONFIGURE_DEPENDS re-runs CMake when a file is added or removed, to refresh these dependencies.
     string(REGEX REPLACE "/$" "" include_dir "src/${TRANSLATOR_IDENTITY_INCLUDE_PREFIX}")
-    set(relative ${TRANSLATOR_IDENTITY_FILES})
+    set(relative ${TRANSLATOR_IDENTITY_FILES} ${TRANSLATOR_IDENTITY_REGION_FILES})
     foreach (dir IN LISTS TRANSLATOR_IDENTITY_DIRS include_dir)
         file(GLOB_RECURSE found CONFIGURE_DEPENDS LIST_DIRECTORIES false RELATIVE "${root}"
              "${root}/${dir}/*")

@@ -4,6 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+// Only the code between the TRANSLATOR-IDENTITY markers of this file and of shader_cache.cpp
+// enters the identity of the translated-shader cache (CMakeModules/TranslatorIdentity.cmake);
+// see shader_cache.cpp.
+
 #pragma once
 
 #include <array>
@@ -37,12 +41,14 @@ namespace VideoCommon {
 
 class GenericEnvironment;
 
+// TRANSLATOR-IDENTITY BEGIN: what a program's environments are built from
 struct ShaderInfo {
     u64 unique_hash{};
     size_t size_bytes{};
     /// Lowered code of a native program, reused when its pipelines are built.
     std::shared_ptr<const LoweredNativeCode> lowered_native;
 };
+// TRANSLATOR-IDENTITY END
 
 /// What a renderer did with a program offered for translation ahead of time.
 enum class SeedResult {
@@ -105,6 +111,7 @@ public:
     void RefreshDebugRejections(bool unrejected);
 
 protected:
+    // TRANSLATOR-IDENTITY BEGIN: the environments of a graphics pipeline
     struct GraphicsEnvironments {
         std::array<GraphicsEnvironment, NUM_PROGRAMS> envs;
         std::array<Shader::Environment*, NUM_PROGRAMS> env_ptrs{};
@@ -113,6 +120,7 @@ protected:
             return std::span(env_ptrs.begin(), std::ranges::find(env_ptrs, nullptr));
         }
     };
+    // TRANSLATOR-IDENTITY END
 
     explicit ShaderCache(Tegra::MaxwellDeviceMemoryManager& device_memory);
 
