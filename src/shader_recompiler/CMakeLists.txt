@@ -194,6 +194,7 @@ add_library(shader_recompiler STATIC
     ir_opt/texture_pass.cpp
     ir_opt/vendor_workaround_pass.cpp
     ir_opt/verification_pass.cpp
+    nx2_switch.h
     object_pool.h
     profile.h
     program_header.h

@@ -149,3 +149,22 @@ TEST_CASE("Semaphore reductions follow the documented ops", "[video_core][native
     REQUIRE(ReduceSemaphore(6, false, 0b1100, 0b1010) == 0b1110);
     REQUIRE(ReduceSemaphore(7, false, 0b1100, 0b1010) == 0b0110);
 }
+
+TEST_CASE("The strict QMD experiment rejects extended releases before completing any slot",
+          "[video_core][native_qmd]") {
+    constexpr Address address = 0x40000;
+    auto qmd = MakeQmd();
+    SetRelease(qmd, 24, 0x1000, Enable | OneWord, 1);
+    SetRelease(qmd, 28, 0x1010, Enable, 2); // timestamped release
+    NativeQmdScheduler normal;
+    CHECK(Schedule(normal, address, {{address, qmd}}).released.size() == 2);
+    NativeQmdScheduler strict;
+    strict.strict_release = true;
+    const auto rejected = Schedule(strict, address, {{address, qmd}});
+    CHECK(rejected.error == "unsupported QMD release format");
+    CHECK(rejected.released.empty());
+    qmd[29] = Enable | OneWord;
+    const auto accepted = Schedule(strict, address, {{address, qmd}});
+    CHECK(accepted.error.empty());
+    CHECK(accepted.released.size() == 2);
+}

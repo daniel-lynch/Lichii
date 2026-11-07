@@ -41,6 +41,7 @@ public:
     std::function<void(std::string_view, Address, std::int32_t)> trace;
     // Optional diagnostics: called with the QMD, slot and raw words of a release it skips.
     std::function<void(Address, std::size_t, std::span<const Word, 4>)> skipped_release;
+    bool strict_release{};
     // QMD V03_00 release flags: 7:0 address high, 19 membar, 22:20 reduction op, 23 enable,
     // 25:24 reduction format, 26 reduction enable, 28:27 non-blocking interrupt, 29 64-bit
     // payload, 31:30 structure size (0 four words with timestamp, 1 one word, 2 two words).
@@ -109,6 +110,15 @@ public:
             if (!read(request.address, state.descriptor)) return "unmapped QMD";
             const auto qmd = state.descriptor;
             if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100)) return "unsupported QMD version or queue";
+            if (strict_release) {
+                for (const Word base : ReleaseSlots) {
+                    const Word flags = qmd[base + 1];
+                    if (!(flags & (1U << 23))) continue;
+                    const bool add = (flags & (1U << 26)) != 0;
+                    if ((flags & (0x3bU << 24)) || (flags >> 30) != 1 ||
+                        (add && (flags & (7U << 20)))) return "unsupported QMD release format";
+                }
+            }
             // A program Eden can't run is skipped, but the QMD still completes: its releases
             // are what other queues and the CPU wait on (the console never fails a launch).
             const bool dispatched = !(qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff)) || dispatch(qmd);

@@ -198,9 +198,10 @@ def read_cache(path, provenance, needed_keys=None):
         if len(header) != 28 or header[:8] != b"LXTRANSC":
             raise ValueError(f"not a translation cache: {path}")
         version, = struct.unpack_from("<I", header, 8)
-        if version not in (9, 10, 11):
+        # 12 changed only what the configuration digest covers: its records are 11's.
+        if version not in (9, 10, 11, 12):
             raise ValueError(f"unsupported format {version}")
-        schemas = {9: [SCHEMA_88], 10: [SCHEMA_88, SCHEMA], 11: [SCHEMA]}[version]
+        schemas = {9: [SCHEMA_88], 10: [SCHEMA_88, SCHEMA], 11: [SCHEMA], 12: [SCHEMA]}[version]
         while frame := stream.read(8):
             magic, length = struct.unpack("<II", frame)
             if magic != 0x52435453 or length < 1:

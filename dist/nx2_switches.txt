@@ -29,6 +29,12 @@ EDEN_NX2_FENCE_BATCH=1
 # Ocarina of Time with =0 (or =2): 30.9 fps against 38.9 unset, same spot and settings.
 #EDEN_NX2_FRAMES_AHEAD=1
 
+# Guest tensor HMMA.16816.F16 (Ocarina of Time's upscaling network) on the host's tensor cores
+# through VK_KHR_cooperative_matrix (#475): registers only, NVIDIA with 32-lane subgroups, checked
+# by a startup self-test that falls back to the shader emulation. Off by default; the result is
+# within 1 ulp of the emulation, not bit-identical. Its translations are cached separately.
+#EDEN_NX2_COOPERATIVE_HMMA=1
+
 # --- Workarounds / Debug ---
 # Terrain/indirect drawing fix for Donkey Kong Bananza: enabled by default. Set to 0 only to leave to GPU.
 #EDEN_NX2_RESETFIX=0
@@ -73,3 +79,37 @@ EDEN_NX2_FENCE_BATCH=1
 # on/true mean =1; any other value is logged as a warning and treated as =0.
 # Applied when the module is built: the translation cache is unchanged.
 #EDEN_NX2_GRAPHICS_NOINLINE=0
+
+# OoT vegetation experiments (PRs 395/421/434). These four fixes default to 1.
+# Restart between runs. Use =0 to restore each pre-port behavior; these are candidate switches,
+# not intended for nx2. Keep the existing compute/graphics NOINLINE and table-pool settings fixed.
+# The on/off switches here (all but AB_TABLE_CAP_MIB) take 1/on/true (or empty) and
+# 0/off/false/none, trimmed, any case; any other value
+# is logged as a warning and means off. =0 always means off.
+# Rebuild native compute translations when a previously null cbuf pointer becomes mapped (max 4).
+#EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD=1
+# Preserve previously bound direct/table pointers during rebuilds and prefer cached supersets.
+# Depends on COMPUTE_NULL_SLOT_REBUILD; =0 retains PR 395's count-only ordering/rebuild behavior.
+#EDEN_NX2_COMPUTE_KEEP_POINTERS=1
+# Charge second-pass table candidates only for bindings not reserved by the first pass (PR 421).
+#EDEN_NX2_POINTER_TABLE_ACCOUNTING=1
+# Permit up to 64 storage buffers, capped by device stage/set limits (PR 434); =0 uses legacy 32.
+#EDEN_NX2_STORAGE_BUFFERS_64=1
+
+# Maintainer grass-ab 748963271c: all four default OFF (unset or =0). Unlike grass-ab, =0 does
+# not enable them. Try one at a time, restarting each run.
+# FMin/FMax/FClamp instead of NaN-defined NMin/NMax (reverts #351 behavior).
+#EDEN_NX2_AB_FMINMAX=1
+# Reject non-triangle mesh output (reverts #432 behavior; may remove draws).
+#EDEN_NX2_AB_MESH_TRI_ONLY=1
+# Read-only table-pointer pool cap in MiB (reverts #436's broad pools); try 8, then 64.
+# Existing TABLE_POOL_FULL=0 still imposes its 64 MiB cap. Values clamp to 1..1024 MiB;
+# unset, empty, 0 or a non-number means no cap.
+#EDEN_NX2_AB_TABLE_CAP_MIB=8
+# Reject QMD releases outside the old strict format (reverts #515 behavior; may stall the game).
+#EDEN_NX2_AB_QMD_STRICT=1
+# POINTER_TABLE_ACCOUNTING, STORAGE_BUFFERS_64, AB_FMINMAX and AB_MESH_TRI_ONLY change
+# translations: their effective values enter the translation-cache config digest, so a run with
+# one flipped away from its default gets no offline-product hits. The rest leave it. Preserve a clean
+# copy of the field tester's pipeline-key cache and restore it before EACH comparison: rebuilds
+# append pointer classifications to that cache, and later runs would otherwise inherit them.

@@ -24,6 +24,7 @@
 #include "common/settings.h"
 #include "common/zstd_compression.h"
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/nx2_switch.h"
 #include "shader_recompiler/translator_identity.h"
 #include "video_core/shader_translation_cache.h"
 
@@ -51,13 +52,15 @@ namespace {
 //     merge inserted the field without a bump, so version-10 files exist in two layouts: 88
 //     Info fields (written before the merge) and 89 (written by builds since). Version-10 files
 //     are still read; their Info layout is recognised from their records (DetectInfoLayout).
-constexpr u32 FormatVersion = 11;
+// 12: The configuration covers storage-buffer capacity/accounting and grass A/B translation
+//     policy, including the device's per-stage storage-buffer limit.
+constexpr u32 FormatVersion = 12;
 // The oldest version still read. Its records keep their meaning; only the Info layout differs.
 constexpr u32 OldestReadableVersion = 10;
 // The version folded into the configuration digest: the last version that changed what records
 // mean. A layout-only bump keeps it, so a version-10 file of the same translator and
 // configuration still matches (and is upgraded to the current layout when opened for writing).
-constexpr u32 DigestFormatVersion = 10;
+constexpr u32 DigestFormatVersion = 12;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
@@ -154,10 +157,11 @@ constexpr size_t InfoFields = 89;
     X(has_gl_bool_ref_bug) X(ignore_nan_fp_comparisons) \
     X(has_broken_spirv_subgroup_mask_vector_extract_dynamic) \
     X(has_broken_spirv_subgroup_shuffle) X(has_broken_spirv_fragment_shuffle) X(max_subgroup_size) X(gl_max_compute_smem_size) \
-    X(has_broken_robust) X(min_ssbo_alignment) X(max_user_clip_distances)
-constexpr size_t ProfileFields = 76;
+    X(has_broken_robust) X(min_ssbo_alignment) X(max_user_clip_distances) \
+    X(support_cooperative_hmma)
+constexpr size_t ProfileFields = 77;
 
-constexpr size_t HostFields = 22;
+constexpr size_t HostFields = 23;
 constexpr size_t RuntimeInfoFields = 19;
 constexpr size_t ProgramFields = 13;
 constexpr size_t BindingsFields = 7;
@@ -843,6 +847,7 @@ Digest MakeConfigDigest(const Shader::Profile& profile, const Shader::HostTransl
     hasher.Add(host_info.min_ssbo_alignment);
     hasher.Add(host_info.max_per_stage_descriptor_sampled_images);
     hasher.Add(host_info.max_per_stage_resources);
+    hasher.Add(host_info.max_per_stage_descriptor_storage_buffers);
     hasher.Add(host_info.max_descriptor_set_samplers);
     hasher.Add(host_info.max_descriptor_set_uniform_buffers);
     hasher.Add(host_info.max_descriptor_set_uniform_buffers_dynamic);
@@ -876,6 +881,21 @@ Digest MakeConfigDigest(const Shader::Profile& profile, const Shader::HostTransl
     for (const char* variable : {"EDEN_NX2_UNDEF_ZERO", "EDEN_NX2_NO_TENSOR"}) {
         const char* value = std::getenv(variable);
         hasher.AddString(value ? value : "\x01unset");
+    }
+    // The translation-affecting vegetation switches by their effective value (nx2_switch.h), so
+    // spelling out a default (=1 for a fix, =0 for an A/B experiment) keeps the default's entries
+    // and offline product. EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD and EDEN_NX2_COMPUTE_KEEP_POINTERS
+    // stay out: they decide when a program is translated again and with which recorded pointer
+    // answers, and an entry is only served to an environment that gives the same answers.
+    constexpr std::pair<const char*, bool> vegetation_switches[]{
+        {"EDEN_NX2_POINTER_TABLE_ACCOUNTING", true},
+        {"EDEN_NX2_STORAGE_BUFFERS_64", true},
+        {"EDEN_NX2_AB_FMINMAX", false},
+        {"EDEN_NX2_AB_MESH_TRI_ONLY", false},
+    };
+    for (const auto& [variable, fallback] : vegetation_switches) {
+        hasher.AddString(variable);
+        hasher.Add(Shader::Nx2Switch(variable, fallback));
     }
     hasher.Add(extra);
     return hasher.Finish();

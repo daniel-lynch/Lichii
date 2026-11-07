@@ -687,6 +687,9 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     RewriteOpcodes(code, ctx.opcode_rewrites);
     PatchArrayLengths(code, ctx);
     PatchMeshInstructions(code, ctx);
+    if (ctx.cooperative_hmma) {
+        PatchCooperativeHmma(code, *ctx.cooperative_hmma);
+    }
     return code;
 }
 

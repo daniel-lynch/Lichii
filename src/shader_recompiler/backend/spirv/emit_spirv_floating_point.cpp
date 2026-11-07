@@ -6,6 +6,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/ir/modifiers.h"
+#include "shader_recompiler/nx2_switch.h"
 
 namespace Shader::Backend::SPIRV {
 namespace {
@@ -17,9 +18,19 @@ Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
     return op;
 }
 
+// Grass A/B experiment (default off): FMin/FMax/FClamp as before upstream #351.
+bool AbFMinMax() {
+    static const bool enabled{Nx2Switch("EDEN_NX2_AB_FMINMAX", false)};
+    return enabled;
+}
+
 // Maxwell's FMNMX and .SAT return the non-NaN operand (NaN saturates to 0). FMin/FMax/FClamp leave
 // NaN undefined and AMD's Windows compiler passes it through, so use the NaN-defined N variants.
+
 Id Clamp(EmitContext& ctx, Id type, Id value, Id zero, Id one) {
+    if (AbFMinMax()) {
+        return ctx.OpFClamp(type, value, zero, one);
+    }
     return ctx.OpNMin(type, ctx.OpNMax(type, value, zero), one);
 }
 
@@ -83,18 +94,30 @@ Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
 }
 
 Id EmitFPMax32(EmitContext& ctx, Id a, Id b) {
+    if (AbFMinMax()) {
+        return ctx.OpFMax(ctx.F32[1], a, b);
+    }
     return ctx.OpNMax(ctx.F32[1], a, b);
 }
 
 Id EmitFPMax64(EmitContext& ctx, Id a, Id b) {
+    if (AbFMinMax()) {
+        return ctx.OpFMax(ctx.F64[1], a, b);
+    }
     return ctx.OpNMax(ctx.F64[1], a, b);
 }
 
 Id EmitFPMin32(EmitContext& ctx, Id a, Id b) {
+    if (AbFMinMax()) {
+        return ctx.OpFMin(ctx.F32[1], a, b);
+    }
     return ctx.OpNMin(ctx.F32[1], a, b);
 }
 
 Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
+    if (AbFMinMax()) {
+        return ctx.OpFMin(ctx.F64[1], a, b);
+    }
     return ctx.OpNMin(ctx.F64[1], a, b);
 }
 

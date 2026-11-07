@@ -14,15 +14,22 @@ TEST_CASE("Buffer cache holds every shader storage binding", "[video_core][stora
     using GraphicsBindings = decltype(std::declval<Channel>().storage_buffers)::value_type;
     STATIC_REQUIRE(std::tuple_size_v<ComputeBindings> == Shader::Info::MAX_SSBOS);
     STATIC_REQUIRE(std::tuple_size_v<GraphicsBindings> == Shader::Info::MAX_SSBOS);
-    STATIC_REQUIRE(Shader::Info::MAX_SSBOS <= 32);
+    STATIC_REQUIRE(Shader::Info::MAX_SSBOS <= 64);
+    STATIC_REQUIRE(sizeof(decltype(Channel::enabled_compute_storage_buffers)) * 8 >= Shader::Info::MAX_SSBOS);
+    STATIC_REQUIRE(sizeof(decltype(Channel::written_compute_storage_buffers)) * 8 >= Shader::Info::MAX_SSBOS);
+    STATIC_REQUIRE(sizeof(decltype(Channel::native_compute_storage_buffers)) * 8 >= Shader::Info::MAX_SSBOS);
+    STATIC_REQUIRE(sizeof(decltype(Channel::bounded_compute_storage_buffers)) * 8 >= Shader::Info::MAX_SSBOS);
+    STATIC_REQUIRE(sizeof(typename decltype(Channel::enabled_storage_buffers)::value_type) * 8 >= Shader::Info::MAX_SSBOS);
+    STATIC_REQUIRE(sizeof(typename decltype(Channel::written_storage_buffers)::value_type) * 8 >= Shader::Info::MAX_SSBOS);
+
 
     ComputeBindings compute{};
     GraphicsBindings graphics{};
-    u32 enabled{};
+    u64 enabled{};
     for (u32 index = 0; index < Shader::Info::MAX_SSBOS; ++index) {
         compute.at(index).size = index + 1;
         graphics.at(index).size = index + 1;
-        enabled |= u32{1} << index;
+        enabled |= u64{1} << index;
     }
     // Bananza's 18-buffer compute shader previously lost slots 16 and 17,
     // shifting the image descriptors that followed them.

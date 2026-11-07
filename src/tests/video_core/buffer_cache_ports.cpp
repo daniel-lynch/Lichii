@@ -229,6 +229,10 @@ struct BufferCacheTestAccess {
         channel.uniform_buffers[0][0] = {.device_addr = address, .size = size, .buffer_id = id};
         cache.BindHostGraphicsUniformBuffer(0, 0, 0, true);
     }
+    static bool Overlaps(Cache& cache, BufferCacheChannelInfo& channel, DAddr address, u64 size) {
+        cache.channel_state = &channel;
+        return cache.OverlapsGraphicsBindings(address, size, false);
+    }
     static void NextFrame(Cache& cache) {
         cache.native_indirect_uniforms_this_frame.clear();
     }
@@ -628,4 +632,19 @@ TEST_CASE("Downloads keep CPU writes collected and not yet applied", "[buffer_po
     REQUIRE(f.bytes[0x20ff7] == 0x34);
     REQUIRE(std::all_of(f.bytes + 0x20ff8, f.bytes + 0x21008, [](u8 b) { return b == 0xee; }));
     REQUIRE(f.bytes[0x21008] == 0x34);
+}
+
+TEST_CASE("Graphics overlap checks include storage bindings above bit 31", "[buffer_ports]") {
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    constexpr size_t index = Shader::Info::MAX_SSBOS - 1;
+    channel.storage_buffers[0][index] = {.device_addr = 0x30000, .size = 0x1000};
+    channel.enabled_storage_buffers[0] = u64{1} << index;
+    CHECK(Access::Overlaps(*f.cache, channel, 0x30800, 0x100));
+    CHECK_FALSE(Access::Overlaps(*f.cache, channel, 0x31000, 0x100));
+    channel.enabled_storage_buffers[0] = 0;
+    CHECK_FALSE(Access::Overlaps(*f.cache, channel, 0x30800, 0x100));
 }

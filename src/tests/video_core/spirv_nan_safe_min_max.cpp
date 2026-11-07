@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstring>
+#include <cstdlib>
 #include <string_view>
 #include <tuple>
 #include <vector>
@@ -10,6 +11,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/frontend/ir/program.h"
+#include "shader_recompiler/nx2_switch.h"
 #include "shader_recompiler/object_pool.h"
 
 namespace {
@@ -107,7 +109,7 @@ void CheckNaNDefined(const GlslOpCounts& counts, size_t nmin, size_t nmax) {
 }
 } // Anonymous namespace
 
-TEST_CASE("SPIR-V float min, max and clamp emit NaN-defined instructions",
+TEST_CASE("SPIR-V float min, max and clamp follow the NaN A/B policy",
           "[video_core][spirv][nan_safe_min_max]") {
     for (const bool broken_clamp : {false, true}) {
         CAPTURE(broken_clamp);
@@ -130,7 +132,17 @@ TEST_CASE("SPIR-V float min, max and clamp emit NaN-defined instructions",
         std::ignore = ir.FPSaturate(a);
         std::ignore = ir.FPClamp(a, b, c);
         // Min32 and min64, plus the min half of one saturate and one clamp; likewise for max.
-        CheckNaNDefined(CountGlslOps(fixture.Emit()), 4, 4);
+        const auto counts = CountGlslOps(fixture.Emit());
+        if (Shader::Nx2Switch("EDEN_NX2_AB_FMINMAX", false)) {
+            CHECK(counts.fmin == 2);
+            CHECK(counts.fmax == 2);
+            CHECK(counts.fclamp == 2);
+            CHECK(counts.nmin == 0);
+            CHECK(counts.nmax == 0);
+            CHECK(counts.nclamp == 0);
+        } else {
+            CheckNaNDefined(counts, 4, 4);
+        }
     }
 }
 

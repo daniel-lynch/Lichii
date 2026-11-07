@@ -20,6 +20,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/nx2_switch.h"
 #include "core/core.h"
 #include "video_core/gpu_split.h"
 #include "video_core/fire_emblem_upscale.h"
@@ -50,6 +51,7 @@ KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
                      fmt::ptr(this), memory_manager.GetID());
         };
     }
+    native_qmd.strict_release = Shader::Nx2Switch("EDEN_NX2_AB_QMD_STRICT", false);
     native_qmd.skipped_release = [](u64 address, std::size_t slot, std::span<const u32, 4> words) {
         static std::unordered_set<u32> logged;
         if (!logged.insert(words[1]).second) return;
