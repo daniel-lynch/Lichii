@@ -312,3 +312,25 @@ TEST_CASE("Scaling a large constant gives up instead of overflowing", "[shader][
     const std::optional<u64> marked{At(extent, {64, 1, 1}, std::array<u32, 3>{1, 1, 1})};
     CHECK((!marked || *marked >= 0x80000004ULL));
 }
+
+TEST_CASE("A store left global between pointers makes every written buffer unbounded",
+          "[shader][storage_extent]") {
+    // The store picks c0[0x150] or c0[0x160] at run time and stays global. The backend routes it to
+    // the descriptor whose pointer is the closest one at or below the address, which can be
+    // c0[0x170]'s, so c0[0x170]'s own stores no longer bound what lands in its binding.
+    KernelProgram fixture;
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 tid{ir.LocalInvocationIdX()};
+    const IR::U32 bytes{ir.ShiftLeftLogical(tid, ir.Imm32(2))};
+    ir.WriteGlobal32(Address(ir, 0x170, bytes), ir.Imm32(0));
+    const IR::U1 first{ir.IEqual(tid, ir.Imm32(0))};
+    const IR::U32 low{ir.IAdd(IR::U32{ir.Select(first, Word(ir, 0x150), Word(ir, 0x160))},
+                              ir.ShiftLeftLogical(ir.WorkgroupIdX(), ir.Imm32(20)))};
+    const IR::U32 high{ir.Select(first, Word(ir, 0x154), Word(ir, 0x164))};
+    ir.WriteGlobal32(ir.PackUint2x32(ir.CompositeConstruct(low, high)), ir.Imm32(0));
+    REQUIRE(fixture.Run(0x150).is_written);
+    CHECK_FALSE(fixture.Run(0x150).write_extent.bounded);
+    CHECK_FALSE(fixture.Run(0x160).write_extent.bounded);
+    REQUIRE(fixture.program.info.native_global_bounds);
+    CHECK_FALSE(fixture.Run(0x170).write_extent.bounded);
+}
