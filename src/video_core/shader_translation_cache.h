@@ -235,9 +235,23 @@ struct Variant {
 /// Field-by-field equality of two infos (byte comparison would include struct padding).
 [[nodiscard]] bool InfoEqual(const Shader::Info& lhs, const Shader::Info& rhs);
 
+/// Serialized layouts of Shader::Info. Format 11 writes every field. Format-10 files hold either
+/// layout: upstream #353 added frag_color_components without a format bump, so files written
+/// before that merge lack it.
+enum class InfoLayout : u8 {
+    Current,               ///< All fields (format 11, and format 10 written since #353).
+    NoFragColorComponents, ///< Format 10 written before #353: 88 fields.
+};
+
+/// frag_color_components for an info read without it: no components for a render target the
+/// shader does not store, all four for one it does (the pre-#353 pipeline write mask).
+void DeriveFragColorComponents(Shader::Info& info);
+
 /// Serialization of the shader info, exposed for tests.
-void WriteInfo(std::vector<u8>& out, const Shader::Info& info);
-[[nodiscard]] bool ReadInfo(std::span<const u8>& in, Shader::Info& info);
+void WriteInfo(std::vector<u8>& out, const Shader::Info& info,
+               InfoLayout layout = InfoLayout::Current);
+[[nodiscard]] bool ReadInfo(std::span<const u8>& in, Shader::Info& info,
+                            InfoLayout layout = InfoLayout::Current);
 
 /// False when Shader::Info (or another serialized structure) gained a field this file does not
 /// write yet; the cache is then off rather than handing pipelines an incomplete info.
@@ -358,7 +372,8 @@ public:
     [[nodiscard]] static std::array<EmissionRecipe, Shader::MaxStageTypes> ReadRecipes(
         const std::filesystem::path& path, const Digest& config);
 
-    /// Read only recipes from any compatible format-10 configuration; never reuse its modules.
+    /// Read only recipes from any compatible format-10 or format-11 configuration (either
+    /// format-10 Info layout); never reuse its modules.
     [[nodiscard]] static RecipeCatalog ReadRecipeCatalog(const std::filesystem::path& path,
                                                         const Digest& config,
                                                         u32 entry_limit = DefaultRecipeLimit,
@@ -401,6 +416,7 @@ private:
         // Backing locations are finalized under mutex before residency can be evicted.
         u64 info_offset{};
         u32 info_size{};
+        InfoLayout info_layout{InfoLayout::Current};
         u32 spirv_words{};
         std::filesystem::path source;
         u64 compressed_offset{};
@@ -429,6 +445,8 @@ private:
     std::unordered_map<Digest, RecipeCount, DigestHash> recipes;
 
     bool collect_recipe_entries{};
+    /// Info layout of the file LoadFile is reading.
+    InfoLayout info_layout{InfoLayout::Current};
     u64 skipped_import_records{}, imported_bytes{}, invalid_recipes{};
     u64 scanned_records{}, eligible_records{}, admitted_records{}, framing_skipped_bytes{};
     std::unordered_map<Digest, std::vector<EmissionRecipe>, DigestHash> entry_recipes;

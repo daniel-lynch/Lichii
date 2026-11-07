@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Read-only field audit of x86-64 translation cache v9/v10 files.
+"""Read-only field audit of x86-64 translation cache v9/v10/v11 files.
 
 No game data is embedded. With --pipeline and --hash-helper, recover stage-key
 preimages from the matching pipeline cache and verify them against live digests.
@@ -43,6 +43,7 @@ POD passthrough 64
 MAP legacy_stores_mapping 8
 POD loads_indexed_attributes 1
 POD stores_frag_color 8
+POD frag_color_components 8
 POD stores_sample_mask 1
 POD stores_frag_depth 1
 POD stores_tess_level_outer 1
@@ -115,6 +116,10 @@ VEC image_descriptors 36
 """
 SCHEMA = [(kind, name, int(size)) for kind, name, size in
           (line.split() for line in SCHEMA.splitlines())]
+# Format 11 writes all 89 fields. Format 10 exists in both layouts: upstream #353 added
+# frag_color_components without a version bump, so files written before it lack the field.
+# Format 9 always lacks it.
+SCHEMA_88 = [field for field in SCHEMA if field[1] != "frag_color_components"]
 STAGES = {0: "vertex", 1: "tess_control", 2: "tess_eval", 3: "geometry",
           4: "fragment", 5: "compute", 6: "vertex_a", 7: "task", 8: "mesh"}
 
@@ -147,9 +152,9 @@ def value(data):
     return [hex(x[0]) for x in struct.iter_unpack("<I", data)] if len(data) % 4 == 0 else data.hex()
 
 
-def read_info(data, pos):
+def read_info(data, pos, schema=SCHEMA):
     fields = {}
-    for kind, name, size in SCHEMA:
+    for kind, name, size in schema:
         if kind == "POD":
             fields[name] = value(data[pos:pos + size])
             pos += size
@@ -189,8 +194,9 @@ def read_cache(path, provenance, needed_keys=None):
         if len(header) != 28 or header[:8] != b"LXTRANSC":
             raise ValueError(f"not a translation cache: {path}")
         version, = struct.unpack_from("<I", header, 8)
-        if version not in (9, 10):
+        if version not in (9, 10, 11):
             raise ValueError(f"unsupported format {version}")
+        schemas = {9: [SCHEMA_88], 10: [SCHEMA_88, SCHEMA], 11: [SCHEMA]}[version]
         while frame := stream.read(8):
             magic, length = struct.unpack("<II", frame)
             if magic != 0x52435453 or length < 1:
@@ -211,15 +217,23 @@ def read_cache(path, provenance, needed_keys=None):
             queries = [struct.unpack_from("<BIIII", data, 20 + i * 17) for i in range(count)]
             pos = 20 + count * 17
             stage, = struct.unpack_from("<I", data, pos)
-            fields, end = read_info(data, pos + 37)
-            if stage in (7, 8):
-                # Task and mesh entries end with their MeshInfo: four u32 sizes, then the
-                # vertex and primitive line maps (u32 count + u32 elements each).
-                end += 16
-                for _ in range(2):
-                    lines, = struct.unpack_from("<I", data, end)
-                    end += 4 + lines * 4
-            if end + 1 != len(data):
+            for schema in schemas:
+                try:
+                    fields, end = read_info(data, pos + 37, schema)
+                    if stage in (7, 8):
+                        # Task and mesh entries end with their MeshInfo: four u32 sizes, then
+                        # the vertex and primitive line maps (u32 count + u32 elements each).
+                        end += 16
+                        for _ in range(2):
+                            lines, = struct.unpack_from("<I", data, end)
+                            end += 4 + lines * 4
+                except (ValueError, struct.error):
+                    continue
+                if end + 1 == len(data):
+                    # One file holds one layout: keep the one that framed.
+                    schemas = [schema]
+                    break
+            else:
                 raise ValueError("unexpected entry size (ABI mismatch)")
             entries.append(dict(key=key, stage=STAGES.get(stage, str(stage)),
                                 info=fields, queries=queries, offline=bool(data[end])))
