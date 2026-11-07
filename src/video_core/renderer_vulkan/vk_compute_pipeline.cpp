@@ -6,12 +6,18 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
 #include <fmt/format.h>
+#ifdef __linux__
+#include <pthread.h>
+#endif
 
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_optimization.h"
@@ -29,6 +35,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/logging.h"
+#include "common/thread_cpu_clock.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 
@@ -198,6 +205,48 @@ void ComputePipeline::TickUpscalerTrace() {
     }
 }
 
+namespace {
+double Milliseconds(std::chrono::steady_clock::duration duration) {
+    return std::chrono::duration<double, std::milli>(duration).count();
+}
+
+std::string CurrentThreadName() {
+    char name[32]{};
+#ifdef __linux__
+    pthread_getname_np(pthread_self(), name, sizeof(name));
+#endif
+    return name[0] != '\0' ? std::string{name} : std::string{"?"};
+}
+
+// Driver compiles over 100 ms, with the thread they ran on: one a dispatch waits for stops the
+// scheduler thread, and everything behind it, for that long.
+void ReportDriverBuild(u64 shader_hash, std::chrono::steady_clock::duration elapsed,
+                       std::optional<u64> cpu_begin) {
+    if (elapsed < std::chrono::milliseconds{100}) {
+        return;
+    }
+    const auto cpu_end = Common::CurrentThreadCpuTimeNs();
+    const double cpu_ms = cpu_begin && cpu_end
+                              ? static_cast<double>(*cpu_end - *cpu_begin) / 1e6
+                              : -1.0;
+    LOG_INFO(Render_Vulkan,
+             "Nx2Perf compute driver build: {:016x} in {:.1f} ms ({:.1f} ms CPU) on {}",
+             shader_hash, Milliseconds(elapsed), cpu_ms, CurrentThreadName());
+}
+
+// A dispatch that reached its pipeline before the build finished waits on the scheduler thread.
+void ReportDispatchWait(u64 shader_hash, std::chrono::steady_clock::duration elapsed,
+                        bool built_here) {
+    if (elapsed < std::chrono::milliseconds{20}) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Nx2Perf compute first dispatch: {:016x} waited {:.1f} ms for its pipeline ({})",
+             shader_hash, Milliseconds(elapsed),
+             built_here ? "built on the scheduler thread" : "built by a worker");
+}
+} // Anonymous namespace
+
 ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk::PipelineCache& pipeline_cache_,
                                  DescriptorPool& descriptor_pool,
                                  GuestDescriptorQueue& guest_descriptor_queue_,
@@ -287,8 +336,12 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             .basePipelineHandle = 0,
             .basePipelineIndex = 0,
         };
+        const auto build_begin = std::chrono::steady_clock::now();
+        const auto cpu_begin = Common::CurrentThreadCpuTimeNs();
         try {
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+            ReportDriverBuild(shader_hash, std::chrono::steady_clock::now() - build_begin,
+                              cpu_begin);
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());
@@ -602,9 +655,12 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
+            const auto begin = std::chrono::steady_clock::now();
+            const bool claimed = !build_claimed.load(std::memory_order::relaxed);
             RunBuild();
             std::unique_lock lock{build_mutex};
             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+            ReportDispatchWait(shader_hash, std::chrono::steady_clock::now() - begin, claimed);
         });
     }
 
