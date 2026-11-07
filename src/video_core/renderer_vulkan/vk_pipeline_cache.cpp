@@ -829,9 +829,17 @@ bool PipelineCache::PrecompileArchiveShaders(const std::filesystem::path& input,
                             baseline == "always" ? RecipeBaseline::Always : RecipeBaseline::Never;
         if (baseline != "auto" && baseline != "always" && baseline != "never")
             throw std::runtime_error("Invalid shader baseline policy");
+        // Compute modules are emitted as CreateComputePipeline emits them, including its clamp.
+        const VkDriverIdKHR driver_id = device.GetDriverID();
+        const bool clamp_shared_memory = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
+                                         driver_id == VK_DRIVER_ID_ARM_PROPRIETARY ||
+                                         driver_id == VK_DRIVER_ID_MOLTENVK;
         (void)VideoCommon::OfflineShaders::Run(input, title_id, workers, recipes, profile, host_info,
                                                translation_config, translation_cache, recipe_count,
-                                               recipe_limit, report, policy);
+                                               recipe_limit, report, policy,
+                                               clamp_shared_memory
+                                                   ? device.GetMaxComputeSharedMemorySize()
+                                                   : 0);
         if (!translation_cache.Persistent()) throw std::runtime_error("Translation cache write failed");
         return true;
     } catch (const std::exception& error) {
@@ -2659,6 +2667,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 }
 
 namespace {
+// Where the last compute stage built on this thread came from, for the runtime report: the
+// offline product, the translation cache (an earlier run), or a fresh translation.
+enum class ComputeSource : u8 { None, Offline, Cached, Translated };
+thread_local ComputeSource compute_source = ComputeSource::None;
+// Compute pipelines built at run time (GPU thread), by where the stage came from.
+std::array<std::atomic<u64>, 4> runtime_compute_builds{};
+
+void LogRuntimeComputeBuilds(std::string_view when) {
+    LOG_INFO(Render_Vulkan,
+             "Runtime compute pipelines ({}): offline={} cached={} translated={} uncached={}",
+             when, runtime_compute_builds[1].load(), runtime_compute_builds[2].load(),
+             runtime_compute_builds[3].load(), runtime_compute_builds[0].load());
+}
+
 // Pipelines built on the GPU thread at run time (shader translation, and the SPIR-V unless a worker
 // emits it). Preparation is logged for every hash so it can be joined with executor,
 // translation/emission, driver and held-wait timings.
@@ -2766,12 +2788,21 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
 ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     const ComputePipelineCacheKey& key, const ShaderInfo* shader) {
     const auto begin = std::chrono::steady_clock::now();
+    compute_source = ComputeSource::None;
     SCOPE_EXIT {
+        constexpr std::array sources{"", " (offline)", " (cached)", " (translated)"};
+        const auto source = static_cast<size_t>(compute_source);
+        const u64 built = ++runtime_compute_builds[source];
         ReportRuntimePipeline("Compute", begin,
-                              fmt::format("pipeline={:016x} s6:{:016x} address={:#x}", key.Hash(),
+                              fmt::format("pipeline={:016x} s6:{:016x} address={:#x}{}", key.Hash(),
                                           key.unique_hash,
                                           kepler_compute->regs.code_loc.Address() +
-                                              kepler_compute->launch_description.program_start));
+                                              kepler_compute->launch_description.program_start,
+                                          sources[source]));
+        // Every translation, and every 25th build otherwise: the totals survive a killed run.
+        if (compute_source == ComputeSource::Translated || built % 25 == 0) {
+            LogRuntimeComputeBuilds("run time so far");
+        }
     };
     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
     const auto& qmd{kepler_compute->launch_description};
@@ -2876,7 +2907,13 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     if (entry && !translation_cache_verify) {
         variant = translation_cache.FindVariant(variant_key);
     }
+    if (entry && entry->offline && !translation_cache_verify) {
+        translation_cache.LogOfflineOutcome(Shader::Stage::Compute, key.unique_hash,
+                                            variant ? TC::OfflineOutcome::FullHit
+                                                    : TC::OfflineOutcome::VariantMiss);
+    }
     if (variant) {
+        compute_source = entry->offline ? ComputeSource::Offline : ComputeSource::Cached;
         if (Settings::values.dump_guest_shaders) {
             env.Dump(hash, key.unique_hash);
         }
@@ -2909,6 +2946,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     }
 
     auto program{TranslateProgram(pools.inst, pools.block, translate_env, cfg, host_info)};
+    compute_source = cacheable ? ComputeSource::Translated : ComputeSource::None;
     if (recording && IsTranslationCacheable(env)) {
         entry = translation_cache.Insert(stage_key, recording->TakeQueries(),
                                          TC::ProgramMeta::From(program));

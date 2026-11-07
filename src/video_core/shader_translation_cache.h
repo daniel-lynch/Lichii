@@ -267,6 +267,11 @@ struct RecipeCatalog {
     u64 scanned_records{}, eligible_records{}, admitted_records{}, framing_skipped_bytes{};
     std::unordered_map<Digest, std::vector<CountedRecipe>, DigestHash> exact;
     std::unordered_map<u64, std::vector<CountedRecipe>> classes;
+    /// Compute entries of the source, by source stage key: the storage-pointer answers each
+    /// recorded translation got (CbufStorageBufferPointer / CbufIndirectStorageBufferPointer
+    /// queries), distinct sets only. Which constant-buffer slots hold mapped pointers depends on
+    /// the area, and the answers decide which storage buffers the translation binds.
+    std::unordered_map<Digest, std::vector<std::vector<Query>>, DigestHash> compute_pointers;
     [[nodiscard]] std::vector<SelectedRecipe> SelectWithSources(
         const Digest& stage_key, Shader::Stage stage, const Shader::Info& info, u32 top_k = DefaultRecipeCount,
         RecipeBaseline baseline = RecipeBaseline::Auto) const;
@@ -409,6 +414,7 @@ private:
     u64 skipped_import_records{}, imported_bytes{}, invalid_recipes{};
     u64 scanned_records{}, eligible_records{}, admitted_records{}, framing_skipped_bytes{};
     std::unordered_map<Digest, std::vector<EmissionRecipe>, DigestHash> entry_recipes;
+    std::unordered_map<Digest, std::vector<std::vector<Query>>, DigestHash> compute_pointers;
 
     // Writers serialize publication and append; readers never wait for file I/O.
     std::mutex writer_mutex;

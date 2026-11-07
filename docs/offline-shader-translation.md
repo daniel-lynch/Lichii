@@ -8,10 +8,35 @@ normal per-title translation-cache file. It implies `--precompile-shaders`. Ther
 is no separate offline cache or arbitrary GPU profile. Disk shader caching and
 shader translation caching must both be enabled, with Vulkan selected.
 
-The producer supports vertex B, fragment and geometry. Compute, tessellation,
+The producer supports vertex B, fragment, geometry and compute. Tessellation,
 vertex A, task and mesh are counted as unsupported; their scalar recipes are still
 missing. Graphics requiring layer emulation are rejected. The archive environment
 retains its existing 256-byte bank-1 limit. No game data belongs in this repository.
+
+## Compute stages
+
+A compute stage key depends on launch state the runtime reads from the QMD at the first
+dispatch: block dimensions, shared memory and local memory (`ComputeEnvironment`), besides
+the texture bank and the native-program flags graphics keys share. The archive control
+section records all three: words `0x58`/`0x5c`/`0x60` are the block dimensions, `0x64` the
+shared memory the program declares and `0x68` its per-thread local memory (`0x50` is the
+per-warp scratch, 32 times that). The QMD carries the shared size rounded up to 256 bytes.
+`ArchiveEnvironment::ReadComputeState` decodes them; an archive compute environment
+otherwise matches the runtime's native compute environment (bare instructions with no
+128-byte header, an all-zero header in the key, start address past it, proprietary
+driver, the same Effect array-texture answer as graphics rows). Checked on a recorded session: every one of the 217 recorded compute launches
+that maps to an archive program has exactly these values, and its texture bank is 0.
+
+Compute translation reads no draw state: the runtime emits with the default runtime info
+and bindings and keys the module with the zero runtime digest. So each compute program
+gets one module, keyed as `CreateComputePipeline` looks it up (stage-key slot 5), and
+recipes are neither imported nor emitted for it. The runtime already consults the
+translation cache for compute: an offline entry is replayed like a runtime one, and a full
+hit skips translation and emission. Offline compute outcomes are logged per stage, and
+`Runtime compute pipelines (...)` lines count run-time compute pipelines by where the stage
+came from (offline, cached, translated). `EDEN_NX2_OFFLINE_COMPUTE=0` makes the producer
+skip compute rows as `unsupported_stage` (for A/B products). On drivers where the runtime
+clamps shared memory (Qualcomm, ARM, MoltenVK) the producer applies the same clamp.
 
 ## Coordinator commands
 
@@ -175,8 +200,7 @@ variant. Both synchronous and deferred gameplay graphics emission record recipes
 Selection counts distinct stored modules per `(stage, runtime digest, bindings)`;
 it does not claim to measure draw frequency. Ties choose the lowest digest pair.
 Vertex-B and fragment recipes without legacy varyings canonicalize unused generic input types/stores and input topology before emission and keying. A stage absent from the
-recipe input uses its default. Compute recipes are currently unnecessary because
-archive compute is unsupported.
+recipe input uses its default. Compute has no recipes: see "Compute stages" below.
 
 Defaults use zero incoming bindings; float vertex/color types; all previous-stage
 stores present; no legacy mapping or per-primitive generics; no depth conversion,
@@ -206,7 +230,8 @@ Offline translation: seen=N translated=N resumed=N skipped=N modules=N module_by
 
 Reasons include `missing_constant` (a value-consumed word outside exact bank 1),
 `unsupported_stage`, `unsupported_lowering`, `base_dependent`, `invalid_range`,
-`fingerprint_mismatch`, `constants_mismatch`, `input_io`, and the fallback
+`fingerprint_mismatch`, `constants_mismatch`, `input_io`, the compute reasons
+`invalid_workgroup`, `unsupported_local_memory` and `unsupported_control`, and the fallback
 `lowering_or_emission_rejected`. Debug logging includes the row index and exception.
 Malformed whole indices, incompatible recipe files and persistence failures fail
 the CLI; individual rejected programs are reported and the run continues.
