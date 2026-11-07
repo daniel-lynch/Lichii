@@ -26,6 +26,9 @@ constexpr u64 ReadOffset = 0x44;
 constexpr u64 WriteOffset = 0x1004;
 constexpr u64 PayloadOffset = 0x1040;
 constexpr u32 BlockFrames = 240;
+// Input streams (device 2, the virtual microphone) are created with these flags; outputs with 0x24.
+constexpr u32 InputCreationFlags = 0x2;
+constexpr u32 OutputCreationFlags = 0x24;
 
 u64 AlignUp(u64 value, u64 alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
@@ -34,10 +37,10 @@ u64 AlignUp(u64 value, u64 alignment) {
 
 struct SysmixOutput::Impl {
     Impl(Core::System& system_, Kernel::KProcess& process_, AudioCore::Sink::Sink& sink_,
-         u32 id_, u64 buffer_, u64 size_, u32 creation_flags_)
+         u32 id_, u64 buffer_, u64 size_, u32 creation_flags_, bool input_)
         : system{system_}, process{system.Kernel(), &process_}, sink{sink_},
           context{system, "sysmix"}, id{id_}, buffer{buffer_}, size{size_},
-          creation_flags{creation_flags_} {
+          creation_flags{creation_flags_}, is_input{input_} {
         state_event = context.CreateEvent("sysmix state");
         data_event = context.CreateEvent("sysmix data");
     }
@@ -76,21 +79,28 @@ struct SysmixOutput::Impl {
         return result;
     }
 
+    // `consumer` is the cursor this side owns: the read cursor of an output ring, the write cursor
+    // of an input ring. The guest must never move it.
     bool ReadOccupancy(u32& read, u32& write, u32& filled) {
         auto& memory = process->GetMemory();
-        if (!memory.Read32Acquire(buffer + ReadOffset, read) || read != consumer ||
-            !memory.Read32Acquire(buffer + WriteOffset, write) || read >= slots || write >= slots) {
+        if (!memory.Read32Acquire(buffer + ReadOffset, read) ||
+            !memory.Read32Acquire(buffer + WriteOffset, write) ||
+            (is_input ? write : read) != consumer || read >= slots || write >= slots) {
             return false;
         }
         filled = static_cast<u32>((u64{write} + slots - read) % slots);
         return true;
     }
 
+    // Output: signal when the guest has room to write; input: when it has frames to read.
     void Notify(u32 filled) {
-        if (data_mode == 2 && slots - 1 - filled >= static_cast<u32>(threshold)) {
+        const u32 available = is_input ? filled : slots - 1 - filled;
+        if (data_mode == 2 && available >= static_cast<u32>(threshold)) {
             data_event->Signal(system.Kernel());
         }
     }
+
+    void PumpSilence(u32 write, u32 filled);
 
     Core::System& system;
     Kernel::KScopedAutoObject<Kernel::KProcess> process;
@@ -104,6 +114,7 @@ struct SysmixOutput::Impl {
     u64 buffer;
     u64 size;
     u32 creation_flags;
+    bool is_input;
     AudioCore::SampleFormat format{};
     u32 frame_bytes{};
     u32 slots{};
@@ -119,16 +130,56 @@ struct SysmixOutput::Impl {
     SysmixOutputCounters counters{};
 };
 
+// One block of silent capture per tick into the input ring, never past the guest's read cursor.
+void SysmixOutput::Impl::PumpSilence(u32 write, u32 filled) {
+    auto& p = *this;
+    const u32 taken = std::min(p.slots - 1 - filled, BlockFrames);
+    if (taken == 0) {
+        ++p.counters.backpressure;
+        p.Notify(filled);
+        return;
+    }
+    p.input.fill(0);
+    const u32 first = std::min(taken, p.slots - write);
+    const u32 second = taken - first;
+    auto& memory = p.process->GetMemory();
+    const u32 next = (write + taken) % p.slots;
+    if (!memory.WriteBlock(p.buffer + PayloadOffset + u64{write} * p.frame_bytes,
+                           p.input.data(), first * p.frame_bytes) ||
+        (second && !memory.WriteBlock(p.buffer + PayloadOffset, p.input.data(),
+                                      second * p.frame_bytes)) ||
+        !memory.WriteExclusive32(p.buffer + WriteOffset, next, write)) {
+        p.Fault();
+        return;
+    }
+    p.consumer = next;
+    p.counters.copied_frames += taken;
+    p.counters.accepted_frames += taken;
+    ++p.counters.admitted_blocks;
+    u32 read{};
+    if (!p.ReadOccupancy(read, write, filled)) {
+        p.Fault();
+        return;
+    }
+    p.Notify(filled);
+    if (p.counters.admitted_blocks <= 3 || p.counters.ticks % 2000 == 0) {
+        LOG_INFO(Service_Audio, "sysmix input {} silence: captured={} filled={}", p.id,
+                 p.counters.accepted_frames, filled);
+    }
+}
+
 SysmixOutput::SysmixOutput(Core::System& system, Kernel::KProcess& process,
                            AudioCore::Sink::Sink& sink, u32 id, u64 buffer, u64 size,
-                           u32 creation_flags)
-    : impl{std::make_unique<Impl>(system, process, sink, id, buffer, size, creation_flags)} {}
+                           u32 creation_flags, bool input)
+    : impl{std::make_unique<Impl>(system, process, sink, id, buffer, size, creation_flags,
+                                  input)} {}
 
 SysmixOutput::~SysmixOutput() = default;
 
 Result SysmixOutput::ValidateRegion(Kernel::KProcess& process, u64 buffer, u64 size,
-                                    u32 creation_flags) {
-    R_UNLESS(creation_flags == 0x24, ResultNotSupported);
+                                    u32 creation_flags, bool input) {
+    R_UNLESS(creation_flags == (input ? InputCreationFlags : OutputCreationFlags),
+             ResultNotSupported);
     R_UNLESS(buffer != 0 && (buffer & 0xfff) == 0 && (size & 0xfff) == 0 && size >= 0x2000 &&
                  size <= std::numeric_limits<u64>::max() - buffer &&
                  process.GetMemory().IsValidVirtualAddressRange(buffer, size),
@@ -142,21 +193,33 @@ bool SysmixOutput::IsFormatSupported(u32 sample_type, u32 channels, u32 rate) {
            channels == 2 && rate == 48000;
 }
 
+bool SysmixOutput::IsInputFormatSupported(u32 sample_type, u32 channels, u32 rate) {
+    return (channels == 1 || channels == 2) && IsFormatSupported(sample_type, 2, rate);
+}
+
+bool SysmixOutput::IsInput() const {
+    return impl->is_input;
+}
+
 Result SysmixOutput::Open(u32 sample_type, u32 channels, u32 rate, u32 frames, u32 prefill,
                           u32 flags) {
     auto& p = *impl;
     std::scoped_lock lock{p.mutex};
     R_UNLESS(!p.open, ResultOperationFailed);
-    R_UNLESS(IsFormatSupported(sample_type, channels, rate) && prefill == 0 && flags == 0,
+    R_UNLESS((p.is_input ? IsInputFormatSupported(sample_type, channels, rate)
+                      : IsFormatSupported(sample_type, channels, rate)) &&
+                 prefill == 0 && flags == 0,
              ResultNotSupported);
     R_UNLESS(frames > 0 && frames < static_cast<u32>(std::numeric_limits<s32>::max()),
              ResultInvalidArgument);
-    R_TRY(ValidateRegion(*p.process, p.buffer, p.size, p.creation_flags));
+    R_TRY(ValidateRegion(*p.process, p.buffer, p.size, p.creation_flags, p.is_input));
     const u64 slots = u64{frames} + 1;
     const auto format = static_cast<AudioCore::SampleFormat>(sample_type);
     const u32 frame_bytes = channels *
         (format == AudioCore::SampleFormat::PcmInt16 ? sizeof(s16) : sizeof(f32));
-    const u64 minimum = AlignUp(0x1000 + AlignUp(0x40 + std::min<u64>(16, slots) * 8, 64) +
+    // Output rings carry up to 16 timestamps after the read cursor block; input rings none.
+    const u64 timestamps = p.is_input ? 0 : std::min<u64>(16, slots) * 8;
+    const u64 minimum = AlignUp(0x1000 + AlignUp(0x40 + timestamps, 64) +
                                    AlignUp(slots * frame_bytes, 64), 0x1000);
     R_UNLESS(p.size >= minimum && PayloadOffset + slots * frame_bytes <= p.size,
              ResultInsufficientBuffer);
@@ -166,6 +229,26 @@ Result SysmixOutput::Open(u32 sample_type, u32 channels, u32 rate, u32 frames, u
     R_UNLESS(memory.Read32Acquire(p.buffer + ReadOffset, read) &&
                  memory.Read32Acquire(p.buffer + WriteOffset, write) && read < slots && write < slots,
              ResultInvalidAddressInfo);
+    if (p.is_input) {
+        // The virtual microphone has no host capture: once engaged it records silence in real
+        // time, like a muted console microphone. Ocarina of Time opens it at boot and aborts
+        // (2153-1600 from PurgeInputStream) when it is missing.
+        p.slots = static_cast<u32>(slots);
+        p.format = format;
+        p.frame_bytes = frame_bytes;
+        p.consumer = write;
+        p.faulted = false;
+        p.open = true;
+        p.engaged = false;
+        p.gain = 1.0f;
+        p.counters = {};
+        p.state_event->Signal(p.system.Kernel());
+        p.Notify(static_cast<u32>((write + slots - read) % slots));
+        LOG_INFO(Service_Audio,
+                 "sysmix input {} ready (silent): sample type {} {} channel(s) 48000 slots={}",
+                 p.id, sample_type, channels, p.slots);
+        R_SUCCEED();
+    }
     p.host = p.sink.AcquireSinkStream(p.system, 2, "sysmix-" + std::to_string(p.id),
                                      AudioCore::Sink::StreamType::Sysmix);
     if (!p.host || !p.host->IsReady()) {
@@ -199,14 +282,15 @@ void SysmixOutput::Close() {
 Result SysmixOutput::SetEngaged(bool engaged) {
     auto& p = *impl;
     std::scoped_lock lock{p.mutex};
-    R_UNLESS(p.open && !p.faulted && p.host && p.host->IsReady(), ResultOperationFailed);
+    R_UNLESS(p.open && !p.faulted && (p.is_input || (p.host && p.host->IsReady())),
+             ResultOperationFailed);
     if (p.engaged == engaged) {
         R_SUCCEED();
     }
-    if (engaged) {
+    if (!p.is_input && engaged) { // an input stream has no host stream to start or stop
         p.host->Start();
         R_UNLESS(p.host->IsReady() && !p.host->IsPaused(), ResultOperationFailed);
-    } else {
+    } else if (!p.is_input) {
         p.host->Stop();
         R_UNLESS(p.host->IsReady(), p.Fault(ResultOperationFailed));
     }
@@ -227,6 +311,30 @@ Result SysmixOutput::SetDataNotification(u32 mode, s32 threshold) {
     p.threshold = threshold;
     p.Notify(filled);
     R_SUCCEED();
+}
+
+Result SysmixOutput::Purge(u32 frames, u32& purged) {
+    auto& p = *impl;
+    std::scoped_lock lock{p.mutex};
+    purged = 0;
+    R_UNLESS(p.is_input, ResultNotSupported);
+    R_UNLESS(p.open && !p.faulted, ResultOperationFailed);
+    auto& memory = p.process->GetMemory();
+    // Discard captured frames by advancing the guest's read cursor; 0 means all of them. The guest
+    // owns that cursor, so a concurrent read is retried rather than overwritten.
+    for (u32 attempt = 0; attempt < 8; ++attempt) {
+        u32 read{}, write{}, filled{};
+        R_UNLESS(p.ReadOccupancy(read, write, filled), p.Fault());
+        const u32 count = frames == 0 ? filled : std::min(frames, filled);
+        if (!memory.WriteExclusive32(p.buffer + ReadOffset, (read + count) % p.slots, read)) {
+            continue;
+        }
+        R_UNLESS(p.ReadOccupancy(read, write, filled), p.Fault());
+        purged = count;
+        p.Notify(filled);
+        R_SUCCEED();
+    }
+    R_RETURN(ResultOperationFailed);
 }
 
 Result SysmixOutput::SetGain(f32 gain, s64 ramp_ns) {
@@ -261,6 +369,10 @@ void SysmixOutput::Pump() {
     }
     if (!p.engaged) {
         p.Notify(filled);
+        return;
+    }
+    if (p.is_input) {
+        p.PumpSilence(write, filled);
         return;
     }
     if (!p.host->IsReady()) {
