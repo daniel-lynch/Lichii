@@ -83,7 +83,8 @@ fi
 # not there yet; the runtime uses the one whose translator tag matches this build and logs the tags
 # it ignores. OOT_PRODUCT=0 skips the step.
 if [ "${OOT_PRODUCT:-1}" = "1" ]; then
-  PRODUCT_DIR="$OOT/offline-translate/product-live"
+  # OOT_PRODUCT_DIR=<dir> installs from a staged product directory instead (candidate builds).
+  PRODUCT_DIR="${OOT_PRODUCT_DIR:-$OOT/offline-translate/product-live}"
   LIVE_SHADER_DIR="$HOME/.cache/eden/shader/0400486024dec000"
   if [ -d "$PRODUCT_DIR" ] && [ -d "$LIVE_SHADER_DIR" ]; then
     for f in "$PRODUCT_DIR"/vulkan_translations.*.bin; do
