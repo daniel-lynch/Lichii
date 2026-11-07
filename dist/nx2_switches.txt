@@ -62,8 +62,8 @@ EDEN_NX2_FENCE_BATCH=1
 # challenge, flag or event name per line, made from your own extract.
 #EDEN_NX2_GAMEDATA_NAMES=/path/to/names.txt
 
-# OoT co-op FIRST DRAFT: LAN relay transport and observation only; remote guest writes disabled.
-# Requires the exact main build above. See docs/nx2/oot-coop.md for protocol and remaining TODOs.
+# OoT co-op v2: relay transport and diagnostics; remote guest writes remain disabled.
+# Requires the exact main build above. See docs/oot-coop/PROTOCOL.md and FIELD-PLAN.md.
 # Explicit relay address, no authentication: trusted LAN only. Unset = off.
 #EDEN_NX2_OOT_COOP=127.0.0.1:43390
 #EDEN_NX2_OOT_COOP_ROOM=default
@@ -73,8 +73,10 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_OOT_COOP_SEED=0
 # Optional JSON array of numeric hashes to keep local; no built-in transient flag list.
 #EDEN_NX2_OOT_COOP_DENY_LIST=/path/to/deny.json
-# Optional HavePlayedEvent observations; key convention still needs runtime validation.
-#EDEN_NX2_OOT_COOP_PLAYED_EVENTS=1
+# Setter-request hooks are diagnostic only; played-event names are not flat bool hashes.
+# Grant classes default empty; selecting a class still cannot enable unverified guest writes.
+#EDEN_NX2_OOT_COOP_ALLOW_CLASSES=bool,bit
+#EDEN_NX2_OOT_COOP_POLICY=or-v2
 
 # Drop reactive-flushing read traps on Switch 2 programs (opt-in; can reduce FPS from 29 to 24 in MKW).
 #EDEN_NX2_NO_REACTIVE=1

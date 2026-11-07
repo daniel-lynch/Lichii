@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""LAN-only, in-memory OoT co-op relay. Protocol details: docs/nx2/oot-coop.md."""
+"""LAN-only, in-memory OoT co-op relay. Protocol details: docs/oot-coop/PROTOCOL.md."""
 
 import argparse
 import asyncio
@@ -12,8 +12,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-VERSION = 1
-MAX_FRAME = 1024 * 1024  # Includes the final newline.
+VERSION = 2
+MAX_FRAME = 1024 * 1024  # JSON payload only; the 4-byte length is additional.
 MAX_SEQ = (1 << 53) - 1
 MAX_KEYS = 2048
 MAX_SENDERS = 256
@@ -23,7 +23,7 @@ MAX_TEAMS = 16
 MAX_REPLAY = 512
 MAX_OUTBOX = 256
 MAX_OUTBOX_BYTES = 2 * MAX_FRAME
-CHANGE_TYPES = {"bool_set", "int_set", "enum_set", "quest_step", "bit_set", "pouch_add"}
+CHANGE_TYPES = {"bool_set", "bit_set"}
 
 
 class ProtocolError(ValueError):
@@ -43,14 +43,30 @@ def identifier(value):
 
 
 def encode(packet):
-    data = (json.dumps(packet, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+    data = json.dumps(packet, separators=(",", ":"), allow_nan=False).encode("utf-8")
     if len(data) > MAX_FRAME:
         raise ProtocolError("frame too large")
-    return data
+    return len(data).to_bytes(4, "big") + data
+
+
+async def read_frame(reader):
+    try:
+        header = await reader.readexactly(4)
+    except asyncio.IncompleteReadError as exc:
+        if not exc.partial:
+            raise EOFError("relay disconnected") from exc
+        raise ProtocolError("incomplete frame header") from exc
+    size = int.from_bytes(header, "big")
+    if not 1 <= size <= MAX_FRAME:
+        raise ProtocolError("invalid frame length")
+    try:
+        return header + await reader.readexactly(size)
+    except asyncio.IncompleteReadError as exc:
+        raise ProtocolError("incomplete frame payload") from exc
 
 
 def decode(data):
-    if len(data) > MAX_FRAME or not data.endswith(b"\n"):
+    if len(data) < 4 or not 1 <= int.from_bytes(data[:4], "big") <= MAX_FRAME or int.from_bytes(data[:4], "big") != len(data) - 4:
         raise ProtocolError("frame too large or incomplete")
     def pairs(items):
         result = {}
@@ -62,7 +78,7 @@ def decode(data):
     def constant(_):
         raise ProtocolError("non-finite number")
     try:
-        text = data.decode("utf-8")
+        text = data[4:].decode("utf-8")
         depth, quoted, escaped = 0, False, False
         for char in text:
             if quoted:
@@ -94,14 +110,14 @@ def fields(packet, required, optional=()):
 
 
 def validate_hello(packet):
-    fields(packet, ("type", "version", "build_id", "seed_hash", "room", "team", "client_id", "name"))
+    fields(packet, ("type", "version", "build_id", "seed_hash", "room", "team", "client_id", "name", "policy_id"))
     if packet["type"] != "hello" or type(packet["version"]) is not int or packet["version"] != VERSION:
         raise ProtocolError("protocol version mismatch")
     if not isinstance(packet["build_id"], str) or not re.fullmatch(r"[0-9A-F]{40}", packet["build_id"]):
         raise ProtocolError("invalid build id")
     if not isinstance(packet["seed_hash"], str) or not re.fullmatch(r"[0-9A-Fa-f]{1,128}", packet["seed_hash"]):
         raise ProtocolError("invalid seed hash")
-    for key in ("room", "team", "client_id"):
+    for key in ("room", "team", "client_id", "policy_id"):
         identifier(packet[key])
     name = packet["name"]
     if not isinstance(name, str) or not 1 <= len(name.encode("utf-8")) <= 96 or any(ord(c) < 32 for c in name):
@@ -111,9 +127,9 @@ def validate_hello(packet):
 def validate_change(packet, origin):
     kind = packet["type"]
     common = ("type", "origin", "seq")
-    extra = {"bool_set": ("hash", "value"), "int_set": ("hash", "value"),
-             "enum_set": ("hash", "value"), "quest_step": ("challenge", "step", "index"),
-             "bit_set": ("actor", "value"), "pouch_add": ("hash", "count")}[kind]
+    if kind not in CHANGE_TYPES:
+        raise ProtocolError("unsupported grant class")
+    extra = {"bool_set": ("hash", "value"), "bit_set": ("actor", "value")}[kind]
     fields(packet, common + extra)
     if packet["origin"] != origin:
         raise ProtocolError("origin mismatch")
@@ -126,27 +142,15 @@ def validate_change(packet, origin):
             raise ProtocolError("expected boolean")
     if kind == "bit_set":
         integer(packet["actor"], 0, (1 << 64) - 1)
-    if kind in ("int_set", "enum_set"):
-        integer(packet["value"], -(1 << 31), (1 << 31) - 1)
-    if kind == "quest_step":
-        integer(packet["index"], 0, 255)
-    if kind == "pouch_add":
-        integer(packet["count"], 1, (1 << 31) - 1)
+
 
 
 def state_key(packet):
-    kind = packet["type"]
-    return ("pouch_total" if kind == "pouch_add" else kind,
-            packet.get("hash", packet.get("challenge", packet.get("actor"))))
+    return packet["type"], packet.get("hash", packet.get("actor"))
 
 
 def fold(state, packet):
-    key = state_key(packet)
-    canonical = {k: v for k, v in packet.items() if k not in ("origin", "seq", "rev")}
-    if packet["type"] == "pouch_add":
-        canonical["type"] = "pouch_total"
-        canonical["count"] += state.get(key, {}).get("count", 0)
-    state[key] = canonical
+    state[state_key(packet)] = {k: v for k, v in packet.items() if k not in ("origin", "seq", "rev")}
 
 
 @dataclass
@@ -160,6 +164,7 @@ class Team:
     checkpoint_revision: int = 0
 
     def accept(self, packet, deny):
+        validate_change(packet, packet["origin"])
         origin, seq = packet["origin"], packet["seq"]
         if seq <= self.seen.get(origin, 0):
             return None
@@ -169,15 +174,9 @@ class Team:
         accepted = key[1] not in deny
         if kind in ("bool_set", "bit_set"):
             accepted &= packet["value"] and old is None
-        elif kind == "quest_step":
-            accepted &= old is None or packet["index"] > old["index"]
-        elif kind in ("int_set", "enum_set"):
-            accepted &= old is None or packet["value"] != old["value"]
         if accepted:
             if old is None and len(self.current) >= MAX_KEYS:
                 raise ProtocolError("team state capacity reached")
-            if kind == "pouch_add" and packet["count"] + (old or {}).get("count", 0) > MAX_SEQ:
-                raise ProtocolError("pouch total overflow")
             if self.revision == MAX_SEQ:
                 raise ProtocolError("team revision exhausted")
         self.seen[origin] = seq  # Also remember ignored false, denied and backward writes.
@@ -205,6 +204,7 @@ class Team:
 class Room:
     build_id: str
     seed_hash: str
+    policy_id: str
     teams: dict = field(default_factory=dict)
     empty_since: float | None = None
 
@@ -283,13 +283,15 @@ class Relay:
         if room is None:
             if len(self.rooms) >= MAX_ROOMS:
                 raise ProtocolError("room capacity reached")
-            room = Room(packet["build_id"], packet["seed_hash"],
+            room = Room(packet["build_id"], packet["seed_hash"], packet["policy_id"],
                         empty_since=asyncio.get_running_loop().time())
             self.rooms[packet["room"]] = room
         if room.build_id != packet["build_id"]:
             raise ProtocolError("build id mismatch")
         if room.seed_hash != packet["seed_hash"]:
             raise ProtocolError("seed hash mismatch")
+        if room.policy_id != packet["policy_id"]:
+            raise ProtocolError("policy id mismatch")
         team = room.teams.get(packet["team"])
         if team is None:
             if len(room.teams) >= MAX_TEAMS:
@@ -307,7 +309,7 @@ class Relay:
         room.empty_since = None
         team.clients[client_id] = client
         client.send({"type": "hello_ack", "version": VERSION, "build_id": room.build_id,
-                     "seed_hash": room.seed_hash, "client_id": client_id})
+                     "seed_hash": room.seed_hash, "policy_id": room.policy_id, "client_id": client_id})
         client.send(team.snapshot())
         for peer in team.clients.values():
             if peer is not client:
@@ -349,9 +351,7 @@ class Relay:
         sending = asyncio.create_task(client.write_loop())
         try:
             while not client.writer.is_closing():
-                data = await asyncio.wait_for(client.reader.readline(), self.idle_timeout)
-                if not data:
-                    break
+                data = await asyncio.wait_for(read_frame(client.reader), self.idle_timeout)
                 packet = decode(data)
                 client.last_receive = asyncio.get_running_loop().time()
                 if client.team is None:
@@ -362,7 +362,7 @@ class Relay:
             client.send({"type": "error", "reason": str(exc)[:160]})
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(client.outbox.join(), 0.5)
-        except OSError:
+        except (OSError, EOFError):
             pass
         finally:
             self.clients.discard(client)

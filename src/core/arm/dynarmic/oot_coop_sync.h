@@ -20,7 +20,7 @@
 
 namespace Core::OotCoop {
 
-inline constexpr u32 ProtocolVersion = 1;
+inline constexpr u32 ProtocolVersion = 2;
 inline constexpr u64 MaxSequence = (u64{1} << 53) - 1;
 inline constexpr size_t MaxFrame = 1 << 20;
 inline constexpr size_t QueueLimit = 4096;
@@ -42,7 +42,10 @@ struct Change {
 [[nodiscard]] std::optional<Change> DecodeChange(const nlohmann::json& packet,
                                                  bool snapshot = false);
 [[nodiscard]] std::optional<nlohmann::json> DecodeLine(std::string_view line);
-[[nodiscard]] std::string EncodeLine(const nlohmann::json& packet);
+[[nodiscard]] std::string EncodeFrame(const nlohmann::json& packet);
+[[nodiscard]] std::optional<u32> FrameLength(std::string_view header);
+[[nodiscard]] bool WireKind(Kind kind);
+[[nodiscard]] std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text);
 
 struct Endpoint {
     std::string host;
@@ -55,6 +58,7 @@ struct Endpoint {
 struct Hello {
     std::string build_id{OotGameDataTrace::BuildId};
     std::string seed_hash{"0"};
+    std::string policy_id{"or-v2"};
     std::string room{"default"};
     std::string team{"default"};
     std::string client_id;
@@ -128,11 +132,12 @@ private:
 class Session {
 public:
     Session(const Kernel::KProcess* owner_, u64 base_, Endpoint endpoint, Hello hello,
-            std::set<u64> denied, bool played_events_);
+            std::set<u64> denied, bool played_events_, std::set<Kind> allowed_classes = {});
     ~Session();
     void Stop();
     void Observe(Change change);
     void Drain();
+    void ObserveDiagnostic();
     const Kernel::KProcess* const owner;
     const u64 base;
     const bool played_events;
@@ -183,37 +188,9 @@ std::optional<u32> StepIndex(Memory& memory, u64 manager, u32 challenge, u32 ste
 
 template <typename Jit, typename Memory>
 void OnHook(Session& session, OotGameDataTrace::Point point, Jit& jit, Memory& memory) {
-    using namespace OotGameDataTrace::Detail;
-    if (!IncomingScope::SuppressSend()) {
-        if (point == OotGameDataTrace::Point::StepSet) {
-            const u32 challenge = static_cast<u32>(jit.GetRegister(1));
-            const u32 step = static_cast<u32>(jit.GetRegister(2));
-            if (const auto index = StepIndex(memory, jit.GetRegister(0), challenge, step)) {
-                session.Observe({Kind::Quest, {}, 0, challenge, *index, step});
-            }
-        } else if (point == OotGameDataTrace::Point::PlayedEvent && session.played_events) {
-            if (const auto task = Read64(memory, jit.GetRegister(0) + 0x10)) {
-                const auto text = Read64(memory, *task + 8);
-                const auto length = Read32(memory, *task + 0x10);
-                if (text && length && *length > 1 && *length <= 4096 &&
-                    memory.IsValidVirtualAddressRange(*text, *length) &&
-                    memory.Read8(*text + *length - 1) == 0) {
-                    std::string name;
-                    for (u32 i = 0; i + 1 < *length; ++i) {
-                        const u8 c = memory.Read8(*text + i);
-                        if (c == 0) {
-                            session.Drain();
-                            return;
-                        }
-                        name.push_back(static_cast<char>(c));
-                    }
-                    // TODO verify whether storage keys use this full name or a namespace/subkey.
-                    const u32 hash = Common::Nx2EventTrace::Murmur3("HavePlayedEvent." + name);
-                    session.Observe({Kind::Bool, {}, 0, hash, 1, 0});
-                }
-            }
-        }
-    }
+    // Requests are not receipts. PlayedEvent is a struct member, not a dotted-name hash.
+    // Until successful mutation hooks exist, the shared breakpoints are diagnostic only.
+    session.ObserveDiagnostic();
     session.Drain();
 }
 

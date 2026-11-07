@@ -144,6 +144,14 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
             return std::nullopt;
         }
         change.key = packet.at(key).get<u64>();
+        if (WireKind(change.kind)) {
+            for (const auto& [field, value] : packet.items()) {
+                if (field == "type" || field == key || field == "value") continue;
+                if (!snapshot && (field == "origin" || field == "seq")) continue;
+                if (!snapshot && field == "rev" && Unsigned(value, MaxSequence) && value != 0) continue;
+                return std::nullopt;
+            }
+        }
         if (change.kind == Kind::Bool || change.kind == Kind::Bit) {
             if (!packet.at("value").is_boolean()) {
                 return std::nullopt;
@@ -174,7 +182,7 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
 }
 
 std::optional<Json> DecodeLine(std::string_view line) {
-    if (line.empty() || line.size() >= MaxFrame || line.find('\0') != std::string_view::npos) {
+    if (line.empty() || line.size() > MaxFrame || line.find('\0') != std::string_view::npos) {
         return std::nullopt;
     }
     // Bound nesting before parsing (JSON strings can contain brackets).
@@ -195,19 +203,57 @@ std::optional<Json> DecodeLine(std::string_view line) {
             --depth;
         }
     }
-    auto packet = Json::parse(line, nullptr, false);
-    if (!packet.is_object()) {
+    bool duplicate = false;
+    std::vector<std::set<std::string>> keys;
+    const auto callback = [&](int, Json::parse_event_t event, Json& parsed) {
+        if (event == Json::parse_event_t::object_start) keys.emplace_back();
+        else if (event == Json::parse_event_t::object_end) keys.pop_back();
+        else if (event == Json::parse_event_t::key &&
+                 !keys.back().insert(parsed.get<std::string>()).second) duplicate = true;
+        return true;
+    };
+    auto packet = Json::parse(line, callback, false);
+    if (duplicate || !packet.is_object()) {
         return std::nullopt;
     }
     return packet;
 }
 
-std::string EncodeLine(const Json& packet) {
-    auto line = packet.dump();
-    if (line.size() >= MaxFrame) {
-        throw std::length_error{"co-op frame too large"};
+bool WireKind(Kind kind) {
+    return kind == Kind::Bool || kind == Kind::Bit;
+}
+
+std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text) {
+    std::set<Kind> result;
+    while (!text.empty()) {
+        const auto comma = text.find(',');
+        const auto name = text.substr(0, comma);
+        if (name == "bool") result.insert(Kind::Bool);
+        else if (name == "bit") result.insert(Kind::Bit);
+        else return std::nullopt;
+        if (comma == std::string_view::npos) break;
+        text.remove_prefix(comma + 1);
+        if (text.empty()) return std::nullopt;
     }
-    return line + '\n';
+    return result;
+}
+
+std::optional<u32> FrameLength(std::string_view header) {
+    if (header.size() != 4) return std::nullopt;
+    u32 length = 0;
+    for (const unsigned char byte : header) length = (length << 8) | byte;
+    return length > 0 && length <= MaxFrame ? std::optional<u32>{length} : std::nullopt;
+}
+
+std::string EncodeFrame(const Json& packet) {
+    auto payload = packet.dump();
+    if (!packet.is_object() || payload.empty() || payload.size() > MaxFrame) {
+        throw std::length_error{"invalid co-op frame"};
+    }
+    const auto length = static_cast<u32>(payload.size());
+    std::string frame(4, '\0');
+    for (size_t i = 0; i < 4; ++i) frame[i] = static_cast<char>(length >> (24 - i * 8));
+    return frame + payload;
 }
 
 std::optional<Endpoint> ParseEndpoint(std::string_view text) {
@@ -243,7 +289,8 @@ bool Enabled() {
 
 Json EncodeHello(const Hello& hello) {
     return {{"type", "hello"}, {"version", ProtocolVersion}, {"build_id", hello.build_id},
-            {"seed_hash", hello.seed_hash}, {"room", hello.room}, {"team", hello.team},
+            {"seed_hash", hello.seed_hash}, {"policy_id", hello.policy_id}, {"room", hello.room},
+            {"team", hello.team},
             {"client_id", hello.client_id}, {"name", hello.name}};
 }
 
@@ -252,7 +299,8 @@ bool MatchesHello(const Json& packet, const Hello& hello) {
         return packet.at("type") == "hello_ack" &&
                Unsigned(packet.at("version"), ProtocolVersion) &&
                packet.at("version") == ProtocolVersion && packet.at("build_id") == hello.build_id &&
-               packet.at("seed_hash") == hello.seed_hash && packet.at("client_id") == hello.client_id;
+               packet.at("seed_hash") == hello.seed_hash && packet.at("policy_id") == hello.policy_id &&
+               packet.at("client_id") == hello.client_id;
     } catch (const Json::exception&) {
         return false;
     }
@@ -384,9 +432,9 @@ ApplyStatus GuestWriter::WriteStorage(const Change&) const {
 
 struct Session::Impl {
     struct Connection;
-    Impl(Endpoint endpoint_, Hello hello_, std::set<u64> denied_)
+    Impl(Endpoint endpoint_, Hello hello_, std::set<u64> denied_, std::set<Kind> allowed_)
         : endpoint{std::move(endpoint_)}, hello{std::move(hello_)}, denied{std::move(denied_)},
-          local{denied}, remote{denied}, retry{io} {}
+          local{denied}, remote{denied}, allowed_classes{std::move(allowed_)}, retry{io} {}
     ~Impl() { Stop(); }
     void Start();
     void Stop();
@@ -399,10 +447,13 @@ struct Session::Impl {
     std::mutex mutex;
     State local;
     State remote;
+    std::set<Kind> allowed_classes;
     std::deque<Change> outgoing;
     std::deque<std::variant<Change, HighWater>> pending;
     u64 next_seq{1};
     bool logged_no_site{};
+    bool logged_diagnostic{};
+    bool logged_class{};
     bool logged_overflow{};
     std::atomic<bool> stopped{};
     boost::asio::io_context io;
@@ -476,7 +527,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
         if (failed) return;
         if (output.size() >= QueueLimit) return Fail();
         const bool writing = !output.empty();
-        output.push_back(EncodeLine(packet));
+        output.push_back(EncodeFrame(packet));
         if (!writing) Write();
     }
 
@@ -491,12 +542,23 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
     }
 
     void Read() {
-        boost::asio::async_read_until(socket, boost::asio::dynamic_buffer(input, MaxFrame), '\n',
-            [self = shared_from_this()](auto error, size_t length) {
+        boost::asio::async_read(socket, boost::asio::buffer(header),
+            [self = shared_from_this()](auto error, size_t) {
                 if (self->failed) return;
                 if (error) return self->Fail();
-                const auto packet = DecodeLine(std::string_view{self->input.data(), length - 1});
-                self->input.erase(0, length);
+                const auto length = FrameLength({self->header.data(), self->header.size()});
+                if (!length) return self->Fail();
+                self->input.resize(*length);
+                self->ReadPayload();
+            });
+    }
+
+    void ReadPayload() {
+        boost::asio::async_read(socket, boost::asio::buffer(input),
+            [self = shared_from_this()](auto error, size_t) {
+                if (self->failed) return;
+                if (error) return self->Fail();
+                const auto packet = DecodeLine(self->input);
                 if (!packet) return self->Fail();
                 try {
                     self->last_receive = Clock::now();
@@ -509,8 +571,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                         self->handshaken = true;
                     } else if (type == "heartbeat") {
                         self->Send({{"type", "heartbeat_ack"}});
-                    } else if (type == "heartbeat_ack" || type == "client_state" ||
-                               type == "all_client_state") {
+                    } else if (type == "heartbeat_ack" || type == "client_state") {
                         // Presence has no guest representation in this draft.
                     } else if (type == "error") {
                         LOG_WARNING(Core_ARM, "OoT co-op: relay rejected a packet");
@@ -542,6 +603,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
     bool handshaken{};
     bool ready{};
     u64 sent_seq{};
+    std::array<char, 4> header{};
     std::string input;
     std::deque<std::string> output;
 };
@@ -581,7 +643,7 @@ void Session::Impl::Connect() {
 bool Session::Impl::Receive(const Json& packet) {
     const auto type = packet.at("type").get<std::string>();
     if (type == "ack") {
-        if (!Unsigned(packet.at("seq"), MaxSequence)) return false;
+        if (!Unsigned(packet.at("seq"), MaxSequence) || packet.at("seq") == 0) return false;
         const u64 seq = packet.at("seq").get<u64>();
         std::scoped_lock lock{mutex};
         if (seq >= next_seq) return false;
@@ -602,20 +664,21 @@ bool Session::Impl::Receive(const Json& packet) {
         }
         for (const auto& value : packet.at("changes")) {
             const auto change = DecodeChange(value, true);
-            if (!change || change->kind == Kind::PouchAdd) return false;
+            if (!change || !WireKind(change->kind)) return false;
             checkpoint.Merge(*change, false);
         }
         u64 revision = packet.at("revision").get<u64>();
         for (const auto& value : packet.at("replay")) {
             const auto change = DecodeChange(value);
-            if (!change || !Unsigned(value.at("rev"), MaxSequence) ||
+            if (!change || !WireKind(change->kind) || !Unsigned(value.at("rev"), MaxSequence) ||
                 value.at("rev").get<u64>() != ++revision) return false;
             checkpoint.Merge(*change);
         }
         changes = checkpoint.Snapshot();
     } else {
         const auto change = DecodeChange(packet);
-        if (!change) return false;
+        if (!change || !WireKind(change->kind) || !Unsigned(packet.at("rev"), MaxSequence) ||
+            packet.at("rev") == 0) return false;
         changes.push_back(*change);
     }
     std::scoped_lock lock{mutex};
@@ -632,16 +695,17 @@ bool Session::Impl::Receive(const Json& packet) {
 }
 
 Session::Session(const Kernel::KProcess* owner_, u64 base_, Endpoint endpoint, Hello hello,
-                 std::set<u64> denied, bool played_events_)
+                 std::set<u64> denied, bool played_events_, std::set<Kind> allowed_classes)
     : owner{owner_}, base{base_}, played_events{played_events_},
-      impl{std::make_unique<Impl>(std::move(endpoint), std::move(hello), std::move(denied))} {
+      impl{std::make_unique<Impl>(std::move(endpoint), std::move(hello), std::move(denied),
+                                   std::move(allowed_classes))} {
     impl->Start();
 }
 Session::~Session() = default;
 void Session::Stop() { impl->Stop(); }
 
 void Session::Observe(Change change) {
-    if (impl->stopped || IncomingScope::SuppressSend()) return;
+    if (impl->stopped || IncomingScope::SuppressSend() || !WireKind(change.kind)) return;
     std::scoped_lock lock{impl->mutex};
     if (impl->outgoing.size() >= QueueLimit || impl->next_seq > MaxSequence) {
         if (!impl->logged_overflow) {
@@ -654,6 +718,14 @@ void Session::Observe(Change change) {
     change.origin = impl->hello.client_id;
     change.seq = impl->next_seq++;
     impl->outgoing.push_back(std::move(change));
+}
+
+void Session::ObserveDiagnostic() {
+    std::scoped_lock lock{impl->mutex};
+    if (!impl->logged_diagnostic) {
+        LOG_INFO(Core_ARM, "OoT co-op: observation only; setter request is not a grant receipt");
+        impl->logged_diagnostic = true;
+    }
 }
 
 void Session::Drain() {
@@ -677,6 +749,13 @@ void Session::Drain() {
         // TODO read authoritative guest values here before enabling either writer. Observations
         // alone cannot account for pre-session saves, local resets or rejected setter requests.
         if (change.kind != Kind::PouchTotal && !ShouldApply(change, impl->local)) continue;
+        if (!impl->allowed_classes.contains(change.kind)) {
+            if (!impl->logged_class) {
+                LOG_INFO(Core_ARM, "OoT co-op: not applied: grant class disabled");
+                impl->logged_class = true;
+            }
+            continue;
+        }
         IncomingScope incoming;
         const auto status = writer.Apply(change);
         if (status != ApplyStatus::Applied && !impl->logged_no_site) {
@@ -717,15 +796,18 @@ void RegisterMain(const Kernel::KProcess* owner, u64 program_id, u64 base,
             if (!list) throw std::runtime_error{"invalid deny-list"};
             denied = *list;
         }
+        const auto allowed = DecodeAllowClasses(Env("EDEN_NX2_OOT_COOP_ALLOW_CLASSES"));
+        if (!allowed) throw std::runtime_error{"invalid grant class allow-list"};
         Hello hello;
         hello.seed_hash = Env("EDEN_NX2_OOT_COOP_SEED", "0");
+        hello.policy_id = Env("EDEN_NX2_OOT_COOP_POLICY", "or-v2");
         hello.room = Env("EDEN_NX2_OOT_COOP_ROOM", "default");
         hello.team = Env("EDEN_NX2_OOT_COOP_TEAM", "default");
         hello.name = Env("EDEN_NX2_OOT_COOP_NAME", "Player");
         std::random_device random;
         hello.client_id = fmt::format("{:08x}{:08x}{:08x}{:08x}", random(), random(), random(), random());
         auto session = std::make_shared<Session>(owner, base, *ParseEndpoint(endpoint_text),
-            std::move(hello), std::move(denied), Env("EDEN_NX2_OOT_COOP_PLAYED_EVENTS") == "1");
+            std::move(hello), std::move(denied), false, *allowed);
         std::scoped_lock lock{sessions_mutex};
         current_session = std::move(session);
     } catch (const std::exception& error) {

@@ -7,6 +7,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "core/arm/dynarmic/oot_coop_sync.h"
+#include "core/arm/dynarmic/oot_coop_apply.h"
 
 namespace {
 namespace Coop = Core::OotCoop;
@@ -26,9 +27,9 @@ TEST_CASE("OoT co-op change codecs preserve opaque hashes", "[core][oot_coop]") 
         Change{Kind::PouchAdd, "a", 6, 106, 3, 0},
     };
     for (const auto& change : changes) {
-        const auto line = Coop::EncodeLine(Coop::EncodeChange(change));
-        REQUIRE(line.back() == '\n');
-        const auto packet = Coop::DecodeLine(line.substr(0, line.size() - 1));
+        const auto line = Coop::EncodeFrame(Coop::EncodeChange(change));
+        REQUIRE(Coop::FrameLength(line.substr(0, 4)) == line.size() - 4);
+        const auto packet = Coop::DecodeLine(line.substr(4));
         REQUIRE(packet);
         REQUIRE(Coop::DecodeChange(*packet) == change);
     }
@@ -40,7 +41,8 @@ TEST_CASE("OoT co-op change codecs preserve opaque hashes", "[core][oot_coop]") 
 TEST_CASE("OoT co-op rejects malformed or out of range wire values", "[core][oot_coop]") {
     REQUIRE_FALSE(Coop::DecodeLine("[1,2]"));
     REQUIRE_FALSE(Coop::DecodeLine("{"));
-    REQUIRE_FALSE(Coop::DecodeLine(std::string(Coop::MaxFrame, ' ')));
+    REQUIRE_FALSE(Coop::DecodeLine(R"({"value":true,"value":false})"));
+    REQUIRE_FALSE(Coop::DecodeLine(std::string(Coop::MaxFrame + 1, ' ')));
     REQUIRE_FALSE(Coop::DecodeLine(std::string{"{\"x\":\"a\0b\"}", 11}));
     auto packet = Coop::EncodeChange({Kind::Bool, "a", 1, 101, 1, 0});
     packet["value"] = 1;
@@ -161,7 +163,7 @@ TEST_CASE("OoT co-op requires endpoint title build and matching handshake", "[co
     packet["build_id"] = "different";
     REQUIRE_FALSE(Coop::MatchesHello(packet, hello));
     packet["build_id"] = Trace::BuildId;
-    packet["version"] = 2;
+    packet["version"] = 1;
     REQUIRE_FALSE(Coop::MatchesHello(packet, hello));
 }
 
@@ -235,4 +237,258 @@ TEST_CASE("OoT co-op only observes a resolved forward step request", "[core][oot
     REQUIRE_FALSE(Coop::StepIndex(memory, manager, 123, 777));
     memory.words.clear();
     REQUIRE_FALSE(Coop::StepIndex(memory, manager, 123, 777));
+}
+
+TEST_CASE("OoT co-op v2 frames are bounded and policy matched", "[core][oot_coop]") {
+    REQUIRE_FALSE(Coop::FrameLength(""));
+    REQUIRE_FALSE(Coop::FrameLength(std::string(4, '\0')));
+    REQUIRE_FALSE(Coop::FrameLength(std::string(4, '\xff')));
+    REQUIRE(Coop::FrameLength(std::string{"\0\x10\0\0", 4}) == Coop::MaxFrame);
+    REQUIRE_FALSE(Coop::FrameLength(std::string{"\0\x10\0\1", 4}));
+    REQUIRE(Coop::EncodeFrame(Json{{"type", "heartbeat"}}) ==
+            std::string("\0\0\0\x14", 4) + "{\"type\":\"heartbeat\"}");
+    Coop::Hello hello;
+    hello.client_id = "a";
+    auto ack = Coop::EncodeHello(hello);
+    ack["type"] = "hello_ack";
+    REQUIRE(Coop::MatchesHello(ack, hello));
+    ack["policy_id"] = "other";
+    REQUIRE_FALSE(Coop::MatchesHello(ack, hello));
+    REQUIRE(Coop::WireKind(Kind::Bool));
+    REQUIRE(Coop::WireKind(Kind::Bit));
+    REQUIRE_FALSE(Coop::WireKind(Kind::Quest));
+    REQUIRE_FALSE(Coop::WireKind(Kind::PouchAdd));
+}
+
+namespace {
+struct FakeGuest {
+    struct Context {
+        std::array<u64, 31> x{};
+        std::array<std::array<u64, 2>, 32> v{};
+        u64 pc{0x100}, sp{0x1000}, tls{0x2000};
+        u32 pstate{0xf0000000}, fpcr{0x123}, fpsr{0x456};
+        bool operator==(const Context&) const = default;
+    } cpu;
+    Coop::ApplyTarget target{true, false, 0, 0, 0x400, 0x800, 0x3000, {0x6000, 1, 101}};
+    std::map<u64, u64> memory{{0x9000, 0xa0}};
+    bool readable{true}, redirect_ok{true}, restore_ok{true}, recoverable{true}, return_stack{true};
+    int writes{}, calls{}, restores{};
+    using ContextType = Context;
+    std::optional<Context> Capture() { return cpu; }
+    std::optional<bool> ReadFlag(const Change&) {
+        return readable ? std::optional<bool>{(memory.at(0x9000) & 1) != 0} : std::nullopt;
+    }
+    std::optional<Coop::ApplyTarget> Resolve(const Change&) { return target; }
+    bool OrFlag(const Coop::ApplyTarget& t) {
+        ++writes;
+        memory.at(t.address) |= t.mask;
+        return true;
+    }
+    bool Redirect(const Coop::ApplyTarget& t) {
+        if (!redirect_ok) return false;
+        ++calls;
+        std::copy(t.arguments.begin(), t.arguments.end(), cpu.x.begin());
+        cpu.x[30] = t.sentinel;
+        cpu.pc = t.entry;
+        cpu.sp = t.stack;
+        return true;
+    }
+    bool AtReturnStack(const Coop::ApplyTarget&) { return return_stack; }
+    bool CanRestore() { return recoverable; }
+    bool Restore(const Context& saved) {
+        if (!restore_ok) return false;
+        ++restores;
+        cpu = saved;
+        return true;
+    }
+};
+Coop::ApplyPolicy Allowed() { return {true, {Kind::Bool}, {{Kind::Bool, 101}}}; }
+const Change Grant{Kind::Bool, "remote", 1, 101, 1, 0};
+const Coop::DrainContext Safe{7, 9, 1, true};
+} // namespace
+
+TEST_CASE("OoT co-op application requires class key and proof gates", "[core][oot_coop]") {
+    FakeGuest guest;
+    Coop::GrantApplier<FakeGuest> off{{}};
+    REQUIRE_FALSE(off.Queue(Grant));
+    auto policy = Allowed();
+    policy.classes.clear();
+    Coop::GrantApplier<FakeGuest> no_class{policy};
+    REQUIRE_FALSE(no_class.Queue(Grant));
+    Coop::GrantApplier<FakeGuest> apply{Allowed()};
+    REQUIRE_FALSE(apply.Queue({Kind::Bool, "remote", 2, 102, 1, 0}));
+    REQUIRE_FALSE(apply.Queue({Kind::PouchAdd, "remote", 2, 101, 1, 0}));
+    REQUIRE(apply.Queue(Grant));
+    REQUIRE_FALSE(apply.Queue(Grant));
+    REQUIRE(apply.Drain(guest, {7, 9, 1, false}) == Coop::ApplyEvent::Blocked);
+    guest.target.verified = false;
+    REQUIRE(apply.Drain(guest, Safe) == Coop::ApplyEvent::Blocked);
+    REQUIRE(guest.calls == 0);
+    REQUIRE(guest.writes == 0);
+    REQUIRE(apply.Pending() == 1);
+}
+
+TEST_CASE("OoT co-op pure writes preserve unrelated save bits", "[core][oot_coop]") {
+    FakeGuest guest;
+    guest.target.pure_flag = true;
+    guest.target.address = 0x9000;
+    guest.target.mask = 1;
+    Coop::GrantApplier<FakeGuest> apply{Allowed()};
+    REQUIRE(apply.Queue(Grant));
+    REQUIRE(apply.Drain(guest, Safe) == Coop::ApplyEvent::Committed);
+    REQUIRE(guest.memory.at(0x9000) == 0xa1);
+    REQUIRE(guest.writes == 1);
+    REQUIRE(guest.calls == 0);
+    REQUIRE(apply.Suppress(Grant));
+    REQUIRE_FALSE(apply.Queue({Kind::Bool, "another", 99, 101, 1, 0}));
+}
+
+TEST_CASE("OoT co-op reads an existing baseline before granting", "[core][oot_coop]") {
+    FakeGuest guest;
+    guest.memory.at(0x9000) |= 1;
+    Coop::GrantApplier<FakeGuest> apply{Allowed()};
+    REQUIRE(apply.Queue(Grant));
+    REQUIRE(apply.Drain(guest, Safe) == Coop::ApplyEvent::Committed);
+    REQUIRE(guest.calls == 0);
+    REQUIRE(guest.writes == 0);
+    REQUIRE(apply.Pending() == 0);
+}
+
+TEST_CASE("OoT co-op sentinel restores context but waits for deferred storage", "[core][oot_coop]") {
+    FakeGuest guest;
+    guest.cpu.x[8] = 123;
+    guest.cpu.v[31] = {456, 789};
+    const auto saved = guest.cpu;
+    Coop::GrantApplier<FakeGuest> apply{Allowed()};
+    REQUIRE(apply.Queue(Grant));
+    REQUIRE(apply.Drain(guest, Safe) == Coop::ApplyEvent::Started);
+    REQUIRE(guest.cpu.x[0] == 0x6000);
+    REQUIRE(guest.cpu.x[1] == 1);
+    REQUIRE(guest.cpu.x[2] == 101);
+    REQUIRE(guest.cpu.x[30] == 0x800);
+    REQUIRE(guest.cpu.sp == 0x3000);
+    REQUIRE(apply.Suppress(Grant));
+    REQUIRE(apply.Drain(guest, Safe) == Coop::ApplyEvent::Blocked);
+    REQUIRE(apply.Sentinel(guest, {8, 9, 2, true}, 0x800) == Coop::ApplyEvent::Blocked);
+    REQUIRE(apply.Sentinel(guest, Safe, 0x804) == Coop::ApplyEvent::Blocked);
+    guest.cpu = {};
+    REQUIRE(apply.Sentinel(guest, Safe, 0x800) == Coop::ApplyEvent::Returned);
+    REQUIRE(guest.cpu == saved);
+    REQUIRE(apply.Phase() == Coop::ApplyPhase::AwaitingCommit);
+    REQUIRE(apply.Drain(guest, {7, 9, 2, true}) == Coop::ApplyEvent::Blocked);
+    REQUIRE(apply.Suppress(Grant));
+    guest.memory.at(0x9000) |= 1;
+    REQUIRE(apply.Drain(guest, {7, 9, 3, true}) == Coop::ApplyEvent::Committed);
+    REQUIRE(apply.Suppress(Grant));
+    REQUIRE(guest.calls == 1);
+    REQUIRE(guest.restores == 1);
+}
+
+TEST_CASE("OoT co-op failed reads and redirects do not lose a pending grant", "[core][oot_coop]") {
+    FakeGuest guest;
+    const auto saved = guest.cpu;
+    Coop::GrantApplier<FakeGuest> apply{Allowed()};
+    REQUIRE(apply.Queue(Grant));
+    guest.readable = false;
+    REQUIRE(apply.Drain(guest, Safe) == Coop::ApplyEvent::Blocked);
+    guest.readable = true;
+    guest.redirect_ok = false;
+    REQUIRE(apply.Drain(guest, Safe) == Coop::ApplyEvent::Blocked);
+    REQUIRE(guest.cpu == saved);
+    REQUIRE(apply.Pending() == 1);
+    guest.redirect_ok = true;
+    guest.target.stack = 0x3001;
+    REQUIRE(apply.Drain(guest, Safe) == Coop::ApplyEvent::Blocked);
+    guest.target.stack = 0x3000;
+    REQUIRE(apply.Drain(guest, Safe) == Coop::ApplyEvent::Started);
+}
+
+TEST_CASE("OoT co-op watchdog restores only at a recoverable boundary", "[core][oot_coop]") {
+    FakeGuest guest;
+    const auto saved = guest.cpu;
+    Coop::GrantApplier<FakeGuest> apply{Allowed()};
+    REQUIRE(apply.Queue(Grant));
+    REQUIRE(apply.Drain(guest, Safe) == Coop::ApplyEvent::Started);
+    REQUIRE(apply.Watchdog(guest, {7, 9, 2, true}) == Coop::ApplyEvent::None);
+    SECTION("safe recovery") {
+        REQUIRE(apply.Watchdog(guest, {7, 9, 121, true}) == Coop::ApplyEvent::Recovered);
+        REQUIRE(guest.cpu == saved);
+        REQUIRE(guest.restores == 1);
+    }
+    SECTION("guest may hold a lock") {
+        guest.recoverable = false;
+        REQUIRE(apply.Watchdog(guest, {7, 9, 121, true}) == Coop::ApplyEvent::Quarantined);
+        REQUIRE(guest.restores == 0);
+    }
+    REQUIRE(apply.Phase() == Coop::ApplyPhase::Quarantined);
+    REQUIRE(apply.Suppress(Grant));
+    REQUIRE(apply.Pending() == 1);
+    REQUIRE(apply.Drain(guest, Safe) == Coop::ApplyEvent::Quarantined);
+}
+
+TEST_CASE("OoT co-op invalid sentinel and changed save quarantine the call", "[core][oot_coop]") {
+    FakeGuest guest;
+    Coop::GrantApplier<FakeGuest> apply{Allowed()};
+    REQUIRE(apply.Queue(Grant));
+    REQUIRE(apply.Drain(guest, Safe) == Coop::ApplyEvent::Started);
+    SECTION("wrong return stack") { guest.return_stack = false; }
+    SECTION("restore failure") { guest.restore_ok = false; }
+    SECTION("generation changed") {
+        REQUIRE(apply.Sentinel(guest, {7, 10, 2, true}, 0x800) == Coop::ApplyEvent::Quarantined);
+    }
+    if (apply.Phase() == Coop::ApplyPhase::Calling) {
+        REQUIRE(apply.Sentinel(guest, Safe, 0x800) == Coop::ApplyEvent::Quarantined);
+    }
+    REQUIRE(apply.Suppress(Grant));
+    REQUIRE(guest.restores == 0);
+    apply.ResetAfterGuestStopped();
+    REQUIRE_FALSE(apply.Suppress(Grant));
+    REQUIRE(apply.Pending() == 0);
+    REQUIRE(apply.Phase() == Coop::ApplyPhase::Idle);
+}
+
+TEST_CASE("OoT co-op a queued setter that never commits is not retried", "[core][oot_coop]") {
+    FakeGuest guest;
+    Coop::GrantApplier<FakeGuest> apply{Allowed()};
+    REQUIRE(apply.Queue(Grant));
+    REQUIRE(apply.Drain(guest, Safe) == Coop::ApplyEvent::Started);
+    REQUIRE(apply.Sentinel(guest, Safe, 0x800) == Coop::ApplyEvent::Returned);
+    REQUIRE(apply.Drain(guest, {7, 9, 121, true}) == Coop::ApplyEvent::Quarantined);
+    REQUIRE(guest.calls == 1);
+    REQUIRE(apply.Suppress(Grant));
+}
+
+TEST_CASE("OoT co-op grant classes default closed", "[core][oot_coop]") {
+    REQUIRE(Coop::DecodeAllowClasses("")->empty());
+    REQUIRE(Coop::DecodeAllowClasses("bool") == std::set{Kind::Bool});
+    REQUIRE(Coop::DecodeAllowClasses("bool,bit") == std::set{Kind::Bool, Kind::Bit});
+    REQUIRE_FALSE(Coop::DecodeAllowClasses("pouch"));
+    REQUIRE_FALSE(Coop::DecodeAllowClasses("bool,"));
+    REQUIRE_FALSE(Coop::DecodeAllowClasses("bool,quest"));
+}
+
+TEST_CASE("OoT co-op receipts cannot cross a loaded-save generation", "[core][oot_coop]") {
+    FakeGuest guest;
+    guest.memory.at(0x9000) |= 1;
+    Coop::GrantApplier<FakeGuest> apply{Allowed()};
+    REQUIRE(apply.Queue(Grant));
+    REQUIRE(apply.Drain(guest, Safe) == Coop::ApplyEvent::Committed);
+    REQUIRE(apply.Drain(guest, {7, 10, 3, true}) == Coop::ApplyEvent::Quarantined);
+    apply.ResetAfterGuestStopped();
+    REQUIRE(apply.Queue(Grant));
+    REQUIRE(apply.Drain(guest, {7, 10, 3, true}) == Coop::ApplyEvent::Committed);
+}
+
+TEST_CASE("OoT co-op v2 grant fields cannot carry unchecked extensions", "[core][oot_coop]") {
+    auto packet = Coop::EncodeChange(Grant);
+    packet["extra"] = 1;
+    REQUIRE_FALSE(Coop::DecodeChange(packet));
+    packet.erase("extra");
+    packet["rev"] = 1;
+    REQUIRE(Coop::DecodeChange(packet));
+    packet["rev"] = -1;
+    REQUIRE_FALSE(Coop::DecodeChange(packet));
+    REQUIRE_FALSE(Coop::DecodeChange(packet, true));
+    packet = {{"type", "bool_set"}, {"hash", 101}, {"value", true}};
+    REQUIRE(Coop::DecodeChange(packet, true));
 }

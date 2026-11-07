@@ -8,6 +8,7 @@ add_library(core STATIC
     arm/arm_interface.cpp
     arm/arm_interface.h
     arm/dynarmic/oot_coop_sync.cpp
+    arm/dynarmic/oot_coop_apply.h
     arm/dynarmic/oot_coop_sync.h
     arm/exec_coverage.cpp
     arm/exec_coverage.h

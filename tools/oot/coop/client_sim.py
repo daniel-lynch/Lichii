@@ -7,18 +7,26 @@ import argparse
 import asyncio
 import contextlib
 import json
+import importlib.util
+from pathlib import Path
+import sys
 import uuid
 
 BUILD_ID = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348"
-MAX_FRAME = 1024 * 1024
+# Explicit sibling loading keeps the documented python3 -I entry point isolated.
+_spec = importlib.util.spec_from_file_location("oot_coop_relay", Path(__file__).with_name("relay.py"))
+wire = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = wire
+_spec.loader.exec_module(wire)
+MAX_FRAME = wire.MAX_FRAME
 
 
 class ClientSim:
     def __init__(self, client_id=None, *, room="default", team="default", name="Player",
-                 build_id=BUILD_ID, seed_hash="0", auto_heartbeat=True):
-        self.hello = {"type": "hello", "version": 1, "build_id": build_id,
+                 build_id=BUILD_ID, seed_hash="0", policy_id="or-v2", auto_heartbeat=True):
+        self.hello = {"type": "hello", "version": wire.VERSION, "build_id": build_id,
                       "seed_hash": seed_hash, "room": room, "team": team,
-                      "client_id": client_id or uuid.uuid4().hex, "name": name}
+                      "client_id": client_id or uuid.uuid4().hex, "name": name, "policy_id": policy_id}
         self.auto_heartbeat = auto_heartbeat
         self.seq = 0
         self.messages = asyncio.Queue(2048)
@@ -42,12 +50,7 @@ class ClientSim:
         return self
 
     async def read(self):
-        data = await self.reader.readline()
-        if not data:
-            raise EOFError("relay disconnected")
-        if len(data) > MAX_FRAME or not data.endswith(b"\n"):
-            raise ValueError("invalid frame")
-        return json.loads(data)
+        return wire.decode(await wire.read_frame(self.reader))
 
     async def pump(self):
         try:
@@ -60,7 +63,7 @@ class ClientSim:
             await self.messages.put(exc)
 
     async def send(self, packet):
-        self.writer.write((json.dumps(packet, separators=(",", ":"), allow_nan=False) + "\n").encode())
+        self.writer.write(wire.encode(packet))
         await self.writer.drain()
 
     async def change(self, kind, **values):
@@ -100,14 +103,14 @@ class ClientSim:
 
 async def run(args):
     client = ClientSim(args.client_id, room=args.room, team=args.team, name=args.name,
-                       build_id=args.build_id, seed_hash=args.seed)
+                       build_id=args.build_id, seed_hash=args.seed, policy_id=args.policy)
     try:
         await client.connect(args.host, args.port)
         print(json.dumps(client.ack), flush=True)
         print(json.dumps(client.snapshot), flush=True)
         for raw in args.send:
             packet = json.loads(raw)
-            if packet.get("type") in {"bool_set", "int_set", "enum_set", "quest_step", "bit_set", "pouch_add"}:
+            if packet.get("type") in wire.CHANGE_TYPES:
                 kind = packet.pop("type")
                 await client.change(kind, **packet)
             else:
@@ -133,6 +136,7 @@ def main():
     parser.add_argument("--client-id", help="reuse only with the original sender's sequence history")
     parser.add_argument("--build-id", default=BUILD_ID)
     parser.add_argument("--seed", default="0")
+    parser.add_argument("--policy", default="or-v2")
     parser.add_argument("--duration", type=float, default=30)
     parser.add_argument("--send", action="append", default=[], help="JSON packet; change origin/seq are automatic")
     args = parser.parse_args()

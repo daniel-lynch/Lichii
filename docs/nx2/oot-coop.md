@@ -1,3 +1,7 @@
+> Historical skeleton design. Protocol and conflict rules are superseded by
+> [protocol v2](../oot-coop/PROTOCOL.md); see [static evidence and application plan](../oot-coop/HOOKS.md)
+> and [field plan](../oot-coop/FIELD-PLAN.md). StepSet/PlayedEvent no longer emit grants.
+
 # Ocarina of Time co-op: first draft
 
 This is a protocol and emulator skeleton, **not playable co-op**. The relay and simulated
