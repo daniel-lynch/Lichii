@@ -160,7 +160,7 @@ fi
 # NVIDIA driver shader cache: large and never cleaned up, so pipelines compiled once stay warm
 # across sessions (the driver cache is where the 0.7-0.9 s runtime builds end up). OOT_GL_CACHE=0 leaves the driver defaults.
 if [ "${OOT_GL_CACHE:-1}" = "1" ]; then export __GL_SHADER_DISK_CACHE_SIZE=8589934592 __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1; fi
-export MANGOHUD="${OOT_MANGOHUD:-1}"
+export MANGOHUD="${OOT_MANGOHUD:-0}"  # default off since 2026-11-06: the in-process layer aborts lichii at GUI start on this host
 MH_CFG="fps,frametime,cpu_stats,output_folder=$OOT/logs,autostart_log=5,log_duration=0,log_interval=100"
 [ "${OOT_MANGOHUD_GPU_STATS:-0}" = "1" ] && MH_CFG="$MH_CFG,gpu_stats"
 export MANGOHUD_CONFIG="$MH_CFG"
