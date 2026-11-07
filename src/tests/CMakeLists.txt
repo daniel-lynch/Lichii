@@ -26,6 +26,8 @@ add_executable(tests
     common/dkb_frame_trace.cpp
     audio_core/nx2_sysmix.cpp
     audio_core/nx2_input_service.cpp
+    audio_core/nx2_audio_service.cpp
+    audio_core/nx2_audio_output.cpp
     audio_core/audio_in.cpp
     audio_core/sysmix_sink.cpp
     audio_core/sysmix_test_context.h
