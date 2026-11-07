@@ -671,7 +671,27 @@ void PatchMeshInstructions(std::vector<u32>& code, const EmitContext& ctx) {
 } // Anonymous namespace
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings) {
+    // The cooperative-matrix HMMA path needs per-subgroup scratch past the program's own shared
+    // memory (explicit workgroup layouts alias every shared variable at offset 0).
+    bool tensor_coopmat{};
+    u32 tensor_scratch_bytes{};
+    if (profile.support_cooperative_matrix_f16 && program.stage == Stage::Compute) {
+        for (const auto* block : program.blocks) {
+            for (const auto& inst : block->Instructions()) {
+                tensor_coopmat |= inst.GetOpcode() == IR::Opcode::TensorMulAdd;
+            }
+        }
+        if (tensor_coopmat) {
+            const u32 invocations = program.workgroup_size[0] * program.workgroup_size[1] *
+                                    program.workgroup_size[2];
+            const u32 subgroups = (invocations + 31) / 32;
+            tensor_scratch_bytes = (program.shared_memory_size + 15U) & ~15U;
+            program.shared_memory_size = tensor_scratch_bytes + subgroups * 384U * 4U;
+        }
+    }
     EmitContext ctx{profile, runtime_info, program, bindings};
+    ctx.tensor_coopmat = tensor_coopmat;
+    ctx.tensor_scratch_word = tensor_scratch_bytes / 4U;
     DefineSoftwareMatrixFunctions(ctx, program);
     const Id main{DefineMain(ctx, program)};
     DefineEntryPoint(program, ctx, main);
@@ -687,6 +707,7 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     RewriteOpcodes(code, ctx.opcode_rewrites);
     PatchArrayLengths(code, ctx);
     PatchMeshInstructions(code, ctx);
+    PatchCooperativeMatrixInstructions(code, ctx);
     return code;
 }
 

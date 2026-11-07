@@ -58,6 +58,7 @@ VK_DEFINE_HANDLE(VmaPool)
 // Define all features which may be used by the implementation and require an extension here.
 #define FOR_EACH_VK_FEATURE_EXT(FEATURE)                                                           \
     FEATURE(EXT, BorderColorSwizzle, BORDER_COLOR_SWIZZLE, border_color_swizzle)                   \
+    FEATURE(KHR, CooperativeMatrix, COOPERATIVE_MATRIX, cooperative_matrix)                        \
     FEATURE(EXT, ColorWriteEnable, COLOR_WRITE_ENABLE, color_write_enable)                         \
     FEATURE(EXT, CustomBorderColor, CUSTOM_BORDER_COLOR, custom_border_color)                      \
     FEATURE(EXT, DepthBiasControl, DEPTH_BIAS_CONTROL, depth_bias_control)                         \
@@ -484,7 +485,7 @@ FN_MAX_LIMIT_LIST
 
     /// Returns true if the device supports float16 natively.
     bool IsFloat16Supported() const {
-        return features.shader_float16_int8.shaderFloat16;
+        return features.shader_float16_int8.shaderFloat16 && !has_broken_float16_math;
     }
 
     /// Returns true if the device can run shaders built against the Vulkan memory model.
@@ -629,6 +630,13 @@ FN_MAX_LIMIT_LIST
     /// Returns true if the device supports VK_KHR_push_descriptor.
     bool IsKhrPushDescriptorSupported() const {
         return extensions.push_descriptor;
+    }
+
+    /// Returns true if HMMA can run on VK_KHR_cooperative_matrix (EDEN_NX2_TENSOR_COOPMAT=1): fp16
+    /// matrices need shaderFloat16 on the device even where fp16 arithmetic is avoided.
+    bool IsCooperativeMatrixF16Supported() const {
+        return extensions.cooperative_matrix && features.cooperative_matrix.cooperativeMatrix &&
+               features.shader_float16_int8.shaderFloat16;
     }
 
     /// Returns true if VK_KHR_pipeline_executable_properties is enabled.
@@ -1331,6 +1339,7 @@ private:
     bool is_non_gpu{};                         ///< Is SoftwareRasterizer, FPGA, non-GPU device.
     bool has_broken_compute{};                 ///< Compute shaders can cause crashes
     bool has_broken_cube_compatibility{};      ///< Has broken cube compatibility bit
+    bool has_broken_float16_math{};            ///< Don't emit fp16 arithmetic (AMD 2026+ drivers).
     bool has_broken_descriptor_aliasing{};     ///< Miscompiles descriptors aliased on one binding
     bool has_broken_parallel_compiling{};      ///< Has broken parallel shader compiling.
     bool has_renderdoc{};                      ///< Has RenderDoc attached

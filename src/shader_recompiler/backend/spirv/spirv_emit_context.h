@@ -378,6 +378,21 @@ public:
     Id frag_depth{};
 
     std::array<Id, 2> software_matrix_functions{};
+    /// HMMA through SPV_KHR_cooperative_matrix: each 32-lane subgroup owns 384 words of shared
+    /// memory from tensor_scratch_word (A, B and C/D tiles of 16x16 fp16, 128 words each).
+    bool tensor_coopmat{};
+    u32 tensor_scratch_word{};
+    Id tensor_type_a{};
+    Id tensor_type_b{};
+    Id tensor_type_acc{};
+    Id tensor_subgroup_id{};
+    /// Sirit has no SPV_KHR_cooperative_matrix instructions: they are emitted as same-sized
+    /// markers and get their real opcode in PatchCooperativeMatrixInstructions. Types are
+    /// OpTypeStruct (keyed by result id), load and multiply-add are OpSelect (keyed by result
+    /// id), and the store is a 5-word OpStore (keyed by its pointer).
+    std::vector<u32> coopmat_type_markers;
+    std::vector<std::pair<u32, spv::Op>> coopmat_op_markers;
+    std::vector<u32> coopmat_store_markers;
     std::vector<Id> interfaces;
     std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
 
