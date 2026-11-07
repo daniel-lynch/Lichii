@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -90,7 +91,7 @@ void CollectInterpolationInfo(Environment& env, IR::Program& program) {
     }
 }
 
-void AddNVNStorageBuffers(IR::Program& program) {
+void AddNVNStorageBuffers(IR::Program& program, const HostTranslateInfo& host_info) {
     if (!program.info.uses_global_memory) {
         return;
     }
@@ -134,6 +135,15 @@ void AddNVNStorageBuffers(IR::Program& program) {
                 it->write_extent = {};
             }
             continue;
+        }
+        if (!Optimization::StorageBuffers64() && descs.size() >= 32) {
+            throw std::bad_alloc{};
+        }
+        if (Optimization::StorageBuffers64() &&
+            descs.size() >= Optimization::StorageBufferLimit(host_info)) {
+            throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
+                                          descs.size() + 1,
+                                          Optimization::StorageBufferLimit(host_info));
         }
         // Native read-only bindings for loaded pointers stay last (the compute pipeline binds
         // them after the others).
@@ -420,7 +430,8 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         const u32 threads{program.stage == Stage::Task ? init & 0x3f : (shader_b >> 20) & 0x3f};
         program.workgroup_size = {(std::max)(threads, 1U), 1, 1};
         if (program.stage == Stage::Mesh) {
-            if (program.mesh.topology != 0 && program.mesh.topology != 1 &&
+            static const bool ab_tri_only{std::getenv("EDEN_NX2_AB_MESH_TRI_ONLY") != nullptr};
+            if ((ab_tri_only || (program.mesh.topology != 0 && program.mesh.topology != 1)) &&
                 program.mesh.topology != 4) {
                 throw NotImplementedException("Mesh output topology {} (SET_MESH_SHADER_A {:#010x})",
                                               program.mesh.topology, shader_a);
@@ -484,13 +495,13 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     Optimization::VendorWorkaroundPass(program);
 
     CollectInterpolationInfo(env, program);
-    AddNVNStorageBuffers(program);
+    AddNVNStorageBuffers(program, normalized_host_info);
     Optimization::LimitSampledTextureArrays(program, normalized_host_info);
     return program;
 }
 
 IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b,
-                                    Environment& env_vertex_b) {
+                                    Environment& env_vertex_b, const HostTranslateInfo& host_info) {
     IR::Program result{};
     Optimization::VertexATransformPass(vertex_a);
     Optimization::VertexBTransformPass(vertex_b);
@@ -513,7 +524,9 @@ IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b
     result.info.stores.mask |= vertex_b.info.stores.mask;
 
     Optimization::JoinTextureInfo(result.info, vertex_b.info);
-    Optimization::JoinStorageInfo(result.info, vertex_b.info);
+    // The two halves are one stage: their storage buffers share its limit.
+    Optimization::JoinStorageInfo(result.info, vertex_b.info,
+                                  Optimization::StorageBufferLimit(host_info));
     Optimization::DeadCodeEliminationPass(result);
     if (Settings::values.renderer_debug) {
         Optimization::VerificationPass(result);

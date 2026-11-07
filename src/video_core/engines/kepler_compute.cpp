@@ -50,6 +50,7 @@ KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
                      fmt::ptr(this), memory_manager.GetID());
         };
     }
+    native_qmd.strict_release = std::getenv("EDEN_NX2_AB_QMD_STRICT") != nullptr;
     native_qmd.skipped_release = [](u64 address, std::size_t slot, std::span<const u32, 4> words) {
         static std::unordered_set<u32> logged;
         if (!logged.insert(words[1]).second) return;

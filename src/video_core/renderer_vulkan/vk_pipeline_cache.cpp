@@ -17,6 +17,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <type_traits>
 #include <unordered_set>
 #include <thread>
@@ -666,6 +667,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
         .max_per_stage_descriptor_sampled_images = device.GetMaxPerStageDescriptorSampledImages(),
         .max_per_stage_resources = device.GetMaxPerStageResources(),
+        .max_per_stage_descriptor_storage_buffers = device.GetMaxPerStageDescriptorStorageBuffers(),
         .max_descriptor_set_samplers = device.GetMaxDescriptorSetSamplers(),
         .max_descriptor_set_uniform_buffers = device.GetMaxDescriptorSetUniformBuffers(),
         .max_descriptor_set_uniform_buffers_dynamic = device.GetMaxDescriptorSetUniformBuffersDynamic(),
@@ -1546,6 +1548,150 @@ ComputePipeline* ComputePipelineCacheEntry::Get(bool native, GPUVAddr address,
     return pipeline.get();
 }
 
+bool ParseComputeNullSlotRebuild(const char* value) {
+    if (value == nullptr) {
+        return true;
+    }
+    // Trimmed and case-folded, as EDEN_NX2_GRAPHICS_NOINLINE (spirv_inline_control.cpp).
+    std::string_view raw{value};
+    constexpr std::string_view whitespace{" \t\r\n\v\f"};
+    const size_t first = raw.find_first_not_of(whitespace);
+    raw = first == std::string_view::npos
+              ? std::string_view{}
+              : raw.substr(first, raw.find_last_not_of(whitespace) - first + 1);
+    std::string word{raw};
+    for (char& letter : word) {
+        if (letter >= 'A' && letter <= 'Z') {
+            letter = static_cast<char>(letter - 'A' + 'a');
+        }
+    }
+    if (word.empty() || word == "1" || word == "on" || word == "true") {
+        return true;
+    }
+    if (word != "0" && word != "off" && word != "false" && word != "none") {
+        LOG_WARNING(Render_Vulkan,
+                    "EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD=\"{}\" is not a switch value; treated as 0",
+                    value);
+    }
+    return false;
+}
+
+bool ComputeNullSlotRebuild() {
+    static const bool enabled = [] {
+        const bool on =
+            ParseComputeNullSlotRebuild(std::getenv("EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD"));
+        LOG_INFO(Render_Vulkan, "Native compute rebuild when a null pointer slot is filled: {}",
+                 on ? "on" : "off (EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD)");
+        return on;
+    }();
+    return enabled;
+}
+
+std::vector<std::pair<u32, u32>> NullSlotsAskedBy(
+    std::vector<std::pair<u32, u32>> slots,
+    std::span<const VideoCommon::TranslationCache::Query> queries) {
+    using VideoCommon::TranslationCache::QueryKind;
+    std::erase_if(slots, [queries](const std::pair<u32, u32>& slot) {
+        return std::ranges::none_of(queries, [&slot](const auto& query) {
+            return (query.kind == QueryKind::CbufStorageBufferPointer ||
+                    query.kind == QueryKind::CbufIndirectStorageBufferPointer) &&
+                   query.a == slot.first && query.b == slot.second;
+        });
+    });
+    return slots;
+}
+
+std::vector<u64> MappedPointersAskedBy(
+    std::vector<u64> keys, std::span<const VideoCommon::TranslationCache::Query> queries) {
+    using VideoCommon::TranslationCache::QueryKind;
+    std::erase_if(keys, [queries](u64 key) {
+        return std::ranges::none_of(queries, [key](const auto& query) {
+            if ((key >> 63) == 0) {
+                // An indirect query also classifies and binds its direct holder.
+                return (query.kind == QueryKind::CbufStorageBufferPointer ||
+                        query.kind == QueryKind::CbufIndirectStorageBufferPointer) &&
+                       query.a == u32(key >> 32) && query.b == u32(key);
+            }
+            return query.kind == QueryKind::CbufIndirectStorageBufferPointer &&
+                   query.a == u32((key >> 32) & 0xff) && query.b == u32(key) &&
+                   query.c == u32((key >> 40) & 0x3fffff);
+        });
+    });
+    return keys;
+}
+
+bool ComputeKeepPointers() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_COMPUTE_KEEP_POINTERS");
+        return value == nullptr || std::string_view{value} != "0";
+    }();
+    return enabled;
+}
+
+constexpr u32 MaxComputeRebuilds = 4;
+
+/// Which pointer slots a native program's arguments fill depends on the area (Ocarina of Time's
+/// foliage culling fills different list slots in Hyrule Field and Castle Town), so a translation
+/// rebuilt in one area may lack pointers the first cached one binds. Try first the translations
+/// that bind every pointer the first one binds, those binding the most first, then the others in
+/// cache order.
+void OrderComputeTranslations(std::vector<FileEnvironment>& candidates, bool rebuild, bool keep) {
+    if (!rebuild || candidates.size() < 2) {
+        return;
+    }
+    std::vector<std::vector<u64>> keys;
+    keys.reserve(candidates.size());
+    for (const FileEnvironment& env : candidates) {
+        keys.push_back(env.MappedStoragePointerKeys());
+    }
+    std::vector<size_t> order(candidates.size());
+    std::iota(order.begin(), order.end(), size_t{0});
+    const auto keeps_first = [&](size_t index) {
+        return !keep || std::ranges::includes(keys[index], keys.front());
+    };
+    std::ranges::stable_sort(order, [&](size_t lhs, size_t rhs) {
+        const bool lhs_keeps{keeps_first(lhs)};
+        if (lhs_keeps != keeps_first(rhs)) {
+            return lhs_keeps;
+        }
+        return lhs_keeps && keys[lhs].size() > keys[rhs].size();
+    });
+    std::vector<FileEnvironment> ordered;
+    ordered.reserve(candidates.size());
+    for (const size_t index : order) {
+        ordered.push_back(std::move(candidates[index]));
+    }
+    candidates = std::move(ordered);
+}
+
+bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const {
+    const auto& qmd{kepler_compute->launch_description};
+    for (const auto& [index, offset] : entry.null_pointer_slots) {
+        if (index >= qmd.const_buffer_config.size() ||
+            ((qmd.const_buffer_enable_mask >> index) & 1) == 0) {
+            continue;
+        }
+        const auto& cbuf{qmd.const_buffer_config[index]};
+        if (offset + sizeof(u64) > cbuf.size) {
+            continue; // The translator reads past the bound size as zero, too
+        }
+        const GPUVAddr slot{cbuf.Address() + offset};
+        if (!gpu_memory->IsFullyMappedRange(slot, sizeof(u64))) {
+            continue;
+        }
+        const GPUVAddr address{gpu_memory->Read<u64>(slot)};
+        if (address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
+            gpu_memory->IsFullyMappedRange(address, 1)) {
+            LOG_INFO(Render_Vulkan,
+                     "Rebuilding compute program {:#x}: c{}[{:#x}] was null at translation and "
+                     "now points to {:#x}",
+                     kepler_compute->regs.code_loc.Address() + qmd.program_start, index, offset, address);
+            return true;
+        }
+    }
+    return false;
+}
+
 ComputePipeline* PipelineCache::CurrentComputePipeline() {
 
     const ShaderInfo* const shader{ComputeShader()};
@@ -1562,6 +1708,28 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     auto& entry{pair->second};
     if (is_new) {
         entry = CreateComputePipeline(key, shader);
+    } else if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
+               StaleNullPointerSlot(entry)) {
+        // The translation dropped accesses through a pointer that was null back then. Which slots
+        // the game fills depends on the area, so the new one keeps binding every pointer this one
+        // binds, null now or not: a null pointer binds nothing.
+        auto rebuilt{CreateComputePipeline(
+            key, shader, ComputeKeepPointers() ? std::span<const u64>{entry.mapped_pointers}
+                                               : std::span<const u64>{})};
+        if (rebuilt.pipeline) {
+            if (entry.pipeline) {
+                retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                       std::move(entry.pipeline));
+            }
+            rebuilt.rebuilds = entry.rebuilds + 1;
+            entry = std::move(rebuilt);
+        } else {
+            // Keep the working translation when the new one cannot be built (for example a
+            // narrow access that now stays global across two buffers), and stop retrying.
+            LOG_WARNING(Render_Vulkan, "Keeping compute shader {:016x}: rebuild failed: {}",
+                        key.unique_hash, rebuilt.failure);
+            entry.rebuilds = MaxComputeRebuilds;
+        }
     }
     return entry.Get(kepler_compute->IsNativeMode(),
                      kepler_compute->regs.code_loc.Address() + qmd.program_start, key);
@@ -1641,17 +1809,27 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         bool has_loaded{};
         std::unique_ptr<PipelineStatistics> statistics;
     } state;
+    // A rebuilt translation is cached beside the stale one. Choose between them before building, so
+    // loading only ever adds entries (see OrderComputeTranslations), and take the next when a
+    // translation fails.
+    ::Common::unordered_map<ComputePipelineCacheKey, std::vector<FileEnvironment>> compute_envs;
 
     if (device.IsKhrPipelineExecutablePropertiesEnabled()) {
         state.statistics = std::make_unique<PipelineStatistics>(device);
     }
-    const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
-        ComputePipelineCacheKey key;
-        file.read(reinterpret_cast<char*>(&key), sizeof(key));
-
-        workers.QueueWork([this, key, env_ = std::move(env), &state, &callback]() mutable {
+    const auto queue_compute{[&](const ComputePipelineCacheKey& key,
+                                 std::vector<FileEnvironment> candidates) {
+        workers.QueueWork([this, key, envs_ = std::move(candidates), &state,
+                           &callback]() mutable {
             ShaderPools pools;
-            auto entry{CreateComputePipeline(pools, key, env_, state.statistics.get(), false)};
+            ComputePipelineCacheEntry entry;
+            for (auto& env : envs_) {
+                pools.ReleaseContents();
+                entry = CreateComputePipeline(pools, key, env, state.statistics.get(), false);
+                if (entry.pipeline) {
+                    break;
+                }
+            }
             std::scoped_lock lock{state.mutex};
             if (entry.pipeline) {
                 compute_cache.emplace(key, std::move(entry));
@@ -1662,6 +1840,18 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             }
         });
         ++state.total;
+    }};
+    const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
+        ComputePipelineCacheKey key;
+        file.read(reinterpret_cast<char*>(&key), sizeof(key));
+        if (ComputeNullSlotRebuild()) {
+            compute_envs[key].push_back(std::move(env));
+        } else {
+            // Keep dev's one-job-per-record loader when the experiment is disabled.
+            std::vector<FileEnvironment> candidate;
+            candidate.push_back(std::move(env));
+            queue_compute(key, std::move(candidate));
+        }
     }};
     const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
         GraphicsPipelineCacheKey key;
@@ -1771,6 +1961,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }};
     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
                                load_graphics);
+    if (!stop_loading.stop_requested()) {
+        for (auto& [key, candidates] : compute_envs) {
+            OrderComputeTranslations(candidates, ComputeNullSlotRebuild(), ComputeKeepPointers());
+            queue_compute(key, std::move(candidates));
+        }
+    }
+    compute_envs.clear();
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
     if (skipped_pipelines != 0) {
@@ -1944,6 +2141,11 @@ void PipelineCache::TickFrame() {
     ++frame_count;
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
         evicted_pipelines.pop_front();
+    }
+    while (!retired_compute_pipelines.empty() &&
+           scheduler.IsFree(retired_compute_pipelines.front().first) &&
+           retired_compute_pipelines.front().second->IsBuildTaskDone()) {
+        retired_compute_pipelines.pop_front();
     }
     constexpr u64 EvictCheckFrames = 600;
     if (frame_count % EvictCheckFrames == 0) {
@@ -2178,7 +2380,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 // VertexB path when VertexA is present.
                 auto& program_va{programs[0]};
                 auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
-                programs[index] = MergeDualVertexPrograms(program_va, program_vb, env);
+                programs[index] = MergeDualVertexPrograms(program_va, program_vb, env, host_info);
             }
 
             if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY && Shader::Optimization::HasBrokenPattern(programs[index])) {
@@ -2803,7 +3005,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
 }
 
 ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
-    const ComputePipelineCacheKey& key, const ShaderInfo* shader) {
+    const ComputePipelineCacheKey& key, const ShaderInfo* shader,
+    std::span<const u64> keep_pointers) {
     const auto begin = std::chrono::steady_clock::now();
     compute_source = ComputeSource::None;
     SCOPE_EXIT {
@@ -2826,9 +3029,10 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start,
                            shader->lowered_native};
     env.SetCachedSize(shader->size_bytes);
+    env.KeepStoragePointers(keep_pointers);
 
     main_pools.ReleaseContents();
-    auto entry{CreateComputePipeline(main_pools, key, env, nullptr, true)};
+    auto entry{CreateComputePipeline(main_pools, key, env, nullptr, true, !keep_pointers.empty())};
     if (const char* directory = std::getenv("EDEN_NX2_SHADER_DUMP");
         directory && !entry.pipeline && env.CanBeSerialized()) {
         const auto path = std::filesystem::path{directory} /
@@ -2899,7 +3103,7 @@ std::vector<u32> ComputeModuleCode(std::span<const u32> code, u64 shader_hash) {
 
 ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     ShaderPools& pools, const ComputePipelineCacheKey& key, Shader::Environment& env,
-    PipelineStatistics* statistics, bool build_in_parallel) try {
+    PipelineStatistics* statistics, bool build_in_parallel, bool force_translation) try {
     auto hash = key.Hash();
     if (device.HasBrokenCompute()) {
         LOG_ERROR(Render_Vulkan, "Skipping {:#016x}", hash);
@@ -2915,7 +3119,9 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     std::shared_ptr<const TC::Entry> entry;
     if (cacheable) {
         stage_key = TC::MakeStageKey(env, key.unique_hash, 5, translation_config);
-        entry = translation_cache.FindEntry(stage_key, env, nullptr, hash, key.unique_hash, 5);
+        if (!force_translation) {
+            entry = translation_cache.FindEntry(stage_key, env, nullptr, hash, key.unique_hash, 5);
+        }
     }
     const TC::Digest variant_key =
         entry ? TC::MakeVariantKey(entry->id, TC::Digest{}, Shader::Backend::Bindings{})
@@ -2924,6 +3130,24 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     if (entry && !translation_cache_verify) {
         variant = translation_cache.FindVariant(variant_key);
     }
+    // The null pointer slots the translation depends on: CurrentComputePipeline rebuilds the
+    // pipeline once one of them holds a mapped pointer. A translation served from the translation
+    // cache (runtime or offline) has them too: it was found by replaying its recorded answers,
+    // null classifications included, against this environment.
+    const auto null_pointer_slots = [&]() -> std::vector<std::pair<u32, u32>> {
+        if (!ComputeNullSlotRebuild() || !env.IsNativeProgram()) {
+            return {};
+        }
+        auto slots = env.NullStoragePointerSlots();
+        return entry ? NullSlotsAskedBy(std::move(slots), entry->queries) : slots;
+    };
+    const auto mapped_pointers = [&]() -> std::vector<u64> {
+        if (!ComputeNullSlotRebuild() || !env.IsNativeProgram()) {
+            return {};
+        }
+        return entry ? MappedPointersAskedBy(env.MappedStoragePointerKeys(), entry->queries)
+                     : env.MappedStoragePointerKeys();
+    };
     if (entry && entry->offline && !translation_cache_verify) {
         translation_cache.LogOfflineOutcome(Shader::Stage::Compute, key.unique_hash,
                                             variant ? TC::OfflineOutcome::FullHit
@@ -2946,7 +3170,9 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         return {.pipeline = std::make_unique<ComputePipeline>(
                     device, scheduler, vulkan_pipeline_cache, descriptor_pool,
                     guest_descriptor_queue, descriptor_buffer_ring, cached_worker, statistics,
-                    &shader_notify, variant->info, std::move(cached_module), key.unique_hash)};
+                    &shader_notify, variant->info, std::move(cached_module), key.unique_hash),
+                .null_pointer_slots = null_pointer_slots(),
+                .mapped_pointers = mapped_pointers()};
     }
     std::optional<TC::RecordingEnvironment> recording;
     if (cacheable && !entry) {
@@ -3038,7 +3264,9 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     return {.pipeline = std::make_unique<ComputePipeline>(
                 device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
                 descriptor_buffer_ring, thread_worker, statistics, &shader_notify, program.info,
-                std::move(spv_module), key.unique_hash)};
+                std::move(spv_module), key.unique_hash),
+            .null_pointer_slots = null_pointer_slots(),
+            .mapped_pointers = mapped_pointers()};
 
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "Compute pipeline compilation failed shader={:#016x} pipeline={:#016x}: {}",

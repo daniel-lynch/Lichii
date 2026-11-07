@@ -328,7 +328,7 @@ struct NativeGlobalStats {
 struct Info {
     static constexpr size_t MAX_INDIRECT_CBUFS{14};
     static constexpr size_t MAX_CBUFS{18};
-    static constexpr size_t MAX_SSBOS{32};
+    static constexpr size_t MAX_SSBOS{64};
     /// Read-only storage buffers for pointers loaded from records, and records read per program
     static constexpr size_t MAX_NATIVE_INDIRECT_BINDINGS{8};
     static constexpr size_t MAX_NATIVE_INDIRECT_SLOTS{32};

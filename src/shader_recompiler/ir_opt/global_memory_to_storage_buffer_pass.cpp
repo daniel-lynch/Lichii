@@ -23,6 +23,7 @@
 #include "common/alignment.h"
 #include "common/logging.h"
 #include "shader_recompiler/environment.h"
+#include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/breadth_first_search.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
@@ -117,6 +118,9 @@ struct StorageInfo {
     bool tables_seen{};
     size_t table_budget{};
     size_t table_used{};
+    /// The storage buffers the pass without table entries bound; bound again, they take nothing
+    /// from table_budget, which they were left out of.
+    StorageBufferSet counted;
     small_vector<StorageBufferAddr, 8> table_candidates;
 };
 
@@ -1771,11 +1775,13 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
                     info.table_candidates.end()) {
                     const StorageBufferAddr holder{.index = candidate.index,
                                                    .offset = candidate.offset};
+                    const auto takes_binding = [&info](const StorageBufferAddr& buffer) {
+                        return info.set.find(buffer) == info.set.end() &&
+                               !info.counted.contains(buffer);
+                    };
                     const size_t added{
-                        (info.set.find(candidate) == info.set.end() ? 1U : 0U) +
-                        (candidate.indirect != ~0U && info.set.find(holder) == info.set.end()
-                             ? 1U
-                             : 0U)};
+                        (takes_binding(candidate) ? 1U : 0U) +
+                        (candidate.indirect != ~0U && takes_binding(holder) ? 1U : 0U)};
                     if (info.table_used + added > info.table_budget) {
                         continue;
                     }
@@ -2470,6 +2476,8 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     if (!has_global_memory) {
         return;
     }
+    const size_t max_ssbos{StorageBufferLimit(host_info)};
+    const bool table_accounting{PointerTableAccounting()};
     TrackingConditions conditions{program};
     StorageInfo info;
     // Without 64-bit integers the backend cannot route global accesses among bound buffers.
@@ -2489,7 +2497,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         }
     };
     collect();
-    if (info.competing_loaded_bound && info.set.size() > Info::MAX_SSBOS) {
+    if (info.competing_loaded_bound && info.set.size() > max_ssbos) {
         // Not enough bindings for the loaded pointers that compete with paired ones: keep the
         // pairs, as if no loaded pointer competed.
         StorageInfo paired;
@@ -2499,21 +2507,34 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         info = std::move(paired);
         collect();
     }
-    if (info.tables_seen && info.set.size() < Info::MAX_SSBOS) {
+    if (info.tables_seen && info.set.size() < max_ssbos) {
         // Again with pointer table entries, in the bindings the first pass left free.
         StorageInfo with_tables;
-        with_tables.iterator_words = std::move(info.iterator_words);
-        with_tables.atomic_pointers = std::move(info.atomic_pointers);
+        with_tables.iterator_words = info.iterator_words;
+        with_tables.atomic_pointers = info.atomic_pointers;
         with_tables.bind_competing_loaded = info.bind_competing_loaded;
         with_tables.tables_enabled = true;
-        with_tables.table_budget = Info::MAX_SSBOS - info.set.size();
-        info = std::move(with_tables);
+        with_tables.table_budget = max_ssbos - info.set.size();
+        if (table_accounting) {
+            with_tables.counted = info.set;
+        }
+        std::swap(info, with_tables);
         collect();
+        if (table_accounting && info.set.size() > max_ssbos) {
+            info = std::move(with_tables);
+        }
+    }
+    if (!StorageBuffers64() && info.set.size() > max_ssbos) {
+        throw std::bad_alloc{};
+    }
+    if (StorageBuffers64() && info.set.size() > max_ssbos) {
+        throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
+                                      info.set.size(), max_ssbos);
     }
     if (!info.dynamic_set.empty()) {
         // A pointer slot over the limit stays unbound: accesses through it are dropped, as they
         // were before these slots were bound at all.
-        const size_t limit{std::min<size_t>(Info::MAX_SSBOS,
+        const size_t limit{std::min<size_t>(max_ssbos,
                                             host_info.max_descriptor_set_storage_buffers)};
         for (const StorageBufferAddr& slot : info.dynamic_set) {
             if (!info.set.contains(slot) && info.set.size() >= limit) {
@@ -2542,7 +2563,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         // as the storage buffer limit and MAX_NATIVE_INDIRECT_BINDINGS allow. The dispatch binds
         // the distinct targets of the first records that have one.
         auto& stats{info.stats};
-        const size_t limit{std::min<size_t>(Info::MAX_SSBOS,
+        const size_t limit{std::min<size_t>(max_ssbos,
                                             host_info.max_descriptor_set_storage_buffers)};
         const size_t room{limit > info.set.size() ? limit - info.set.size() : 0};
         const size_t slots{std::min(info.indirect_slots.size(), Info::MAX_NATIVE_INDIRECT_SLOTS)};
@@ -2670,7 +2691,37 @@ bool NativeIndirectGraphicsPointers() {
     return enabled;
 }
 
-void JoinStorageInfo(Info& base, Info& source) {
+bool PointerTableAccounting() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_POINTER_TABLE_ACCOUNTING");
+        return value == nullptr || std::string_view{value} != "0";
+    }();
+    return enabled;
+}
+
+bool StorageBuffers64() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_STORAGE_BUFFERS_64");
+        return value == nullptr || std::string_view{value} != "0";
+    }();
+    return enabled;
+}
+
+size_t StorageBufferLimit(const HostTranslateInfo& host_info) {
+    if (!StorageBuffers64()) {
+        return 32;
+    }
+    size_t limit{Info::MAX_SSBOS};
+    for (const u32 device_limit : {host_info.max_per_stage_descriptor_storage_buffers,
+                                  host_info.max_descriptor_set_storage_buffers}) {
+        if (device_limit != 0) {
+            limit = (std::min)(limit, size_t{device_limit});
+        }
+    }
+    return limit;
+}
+
+void JoinStorageInfo(Info& base, Info& source, size_t limit) {
     base.requires_coherent_global_memory |= source.requires_coherent_global_memory;
     base.native_global_bounds |= source.native_global_bounds;
     {
@@ -2711,6 +2762,13 @@ void JoinStorageInfo(Info& base, Info& source) {
             }
             it->is_written |= desc.is_written;
             continue;
+        }
+        if (!StorageBuffers64() && descriptors.size() >= 32) {
+            throw std::bad_alloc{};
+        }
+        if (StorageBuffers64() && descriptors.size() >= limit) {
+            throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
+                                          descriptors.size() + 1, limit);
         }
         descriptors.push_back(desc);
     }

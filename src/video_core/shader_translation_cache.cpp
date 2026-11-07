@@ -51,13 +51,15 @@ namespace {
 //     merge inserted the field without a bump, so version-10 files exist in two layouts: 88
 //     Info fields (written before the merge) and 89 (written by builds since). Version-10 files
 //     are still read; their Info layout is recognised from their records (DetectInfoLayout).
-constexpr u32 FormatVersion = 11;
+// 12: The configuration covers storage-buffer capacity/accounting and grass A/B translation
+//     policy, including the device's per-stage storage-buffer limit.
+constexpr u32 FormatVersion = 12;
 // The oldest version still read. Its records keep their meaning; only the Info layout differs.
 constexpr u32 OldestReadableVersion = 10;
 // The version folded into the configuration digest: the last version that changed what records
 // mean. A layout-only bump keeps it, so a version-10 file of the same translator and
 // configuration still matches (and is upgraded to the current layout when opened for writing).
-constexpr u32 DigestFormatVersion = 10;
+constexpr u32 DigestFormatVersion = 12;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
@@ -157,7 +159,7 @@ constexpr size_t InfoFields = 89;
     X(has_broken_robust) X(min_ssbo_alignment) X(max_user_clip_distances)
 constexpr size_t ProfileFields = 76;
 
-constexpr size_t HostFields = 22;
+constexpr size_t HostFields = 23;
 constexpr size_t RuntimeInfoFields = 19;
 constexpr size_t ProgramFields = 13;
 constexpr size_t BindingsFields = 7;
@@ -843,6 +845,7 @@ Digest MakeConfigDigest(const Shader::Profile& profile, const Shader::HostTransl
     hasher.Add(host_info.min_ssbo_alignment);
     hasher.Add(host_info.max_per_stage_descriptor_sampled_images);
     hasher.Add(host_info.max_per_stage_resources);
+    hasher.Add(host_info.max_per_stage_descriptor_storage_buffers);
     hasher.Add(host_info.max_descriptor_set_samplers);
     hasher.Add(host_info.max_descriptor_set_uniform_buffers);
     hasher.Add(host_info.max_descriptor_set_uniform_buffers_dynamic);
@@ -873,7 +876,10 @@ Digest MakeConfigDigest(const Shader::Profile& profile, const Shader::HostTransl
     hasher.Add(Settings::values.disable_shader_loop_safety_checks.GetValue());
     hasher.Add(Settings::values.renderer_debug.GetValue());
     hasher.Add(Settings::values.fix_bloom_effects.GetValue());
-    for (const char* variable : {"EDEN_NX2_UNDEF_ZERO", "EDEN_NX2_NO_TENSOR"}) {
+    for (const char* variable : {"EDEN_NX2_UNDEF_ZERO", "EDEN_NX2_NO_TENSOR",
+                                 "EDEN_NX2_POINTER_TABLE_ACCOUNTING", "EDEN_NX2_STORAGE_BUFFERS_64",
+                                 "EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD", "EDEN_NX2_COMPUTE_KEEP_POINTERS",
+                                 "EDEN_NX2_AB_FMINMAX", "EDEN_NX2_AB_MESH_TRI_ONLY"}) {
         const char* value = std::getenv(variable);
         hasher.AddString(value ? value : "\x01unset");
     }

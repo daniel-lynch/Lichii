@@ -3,6 +3,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/ir/modifiers.h"
@@ -19,7 +21,15 @@ Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
 
 // Maxwell's FMNMX and .SAT return the non-NaN operand (NaN saturates to 0). FMin/FMax/FClamp leave
 // NaN undefined and AMD's Windows compiler passes it through, so use the NaN-defined N variants.
+bool AbFMinMax() {
+    static const bool enabled{std::getenv("EDEN_NX2_AB_FMINMAX") != nullptr};
+    return enabled;
+}
+
 Id Clamp(EmitContext& ctx, Id type, Id value, Id zero, Id one) {
+    if (AbFMinMax()) {
+        return ctx.OpFClamp(type, value, zero, one);
+    }
     return ctx.OpNMin(type, ctx.OpNMax(type, value, zero), one);
 }
 
@@ -83,18 +93,30 @@ Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
 }
 
 Id EmitFPMax32(EmitContext& ctx, Id a, Id b) {
+    if (AbFMinMax()) {
+        return ctx.OpFMax(ctx.F32[1], a, b);
+    }
     return ctx.OpNMax(ctx.F32[1], a, b);
 }
 
 Id EmitFPMax64(EmitContext& ctx, Id a, Id b) {
+    if (AbFMinMax()) {
+        return ctx.OpFMax(ctx.F64[1], a, b);
+    }
     return ctx.OpNMax(ctx.F64[1], a, b);
 }
 
 Id EmitFPMin32(EmitContext& ctx, Id a, Id b) {
+    if (AbFMinMax()) {
+        return ctx.OpFMin(ctx.F32[1], a, b);
+    }
     return ctx.OpNMin(ctx.F32[1], a, b);
 }
 
 Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
+    if (AbFMinMax()) {
+        return ctx.OpFMin(ctx.F64[1], a, b);
+    }
     return ctx.OpNMin(ctx.F64[1], a, b);
 }
 

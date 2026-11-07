@@ -785,6 +785,23 @@ private:
 };
 } // Anonymous namespace
 
+TEST_CASE("Translation cache separates vegetation policies and device storage limits",
+          "[video_core][translation_cache]") {
+    const Shader::Profile profile{};
+    Shader::HostTranslateInfo host{};
+    const auto original = MakeConfigDigest(profile, host, 0);
+    host.max_per_stage_descriptor_storage_buffers = 31;
+    CHECK(MakeConfigDigest(profile, host, 0) != original);
+    for (const char* variable : {"EDEN_NX2_POINTER_TABLE_ACCOUNTING", "EDEN_NX2_STORAGE_BUFFERS_64",
+                                 "EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD", "EDEN_NX2_COMPUTE_KEEP_POINTERS",
+                                 "EDEN_NX2_AB_FMINMAX", "EDEN_NX2_AB_MESH_TRI_ONLY"}) {
+        ScopedEnvironmentVariable off{variable, "0"};
+        const auto disabled = MakeConfigDigest(profile, host, 0);
+        ScopedEnvironmentVariable on{variable, "1"};
+        CHECK(MakeConfigDigest(profile, host, 0) != disabled);
+    }
+}
+
 TEST_CASE("Translation cache identifies the translator by its source",
           "[video_core][translation_cache]") {
     // The generated header holds a SHA-256 in lowercase hexadecimal.
@@ -2045,15 +2062,15 @@ struct FormatFixture {
 };
 } // Anonymous namespace
 
-TEST_CASE("Translation cache writes format 11 and round-trips frag_color_components",
+TEST_CASE("Translation cache writes format 12 and round-trips frag_color_components",
           "[video_core][translation_cache]") {
-    const auto directory = TempPath("lichii_translation_format11_test");
+    const auto directory = TempPath("lichii_translation_format12_test");
     std::filesystem::remove_all(directory);
     std::filesystem::create_directories(directory);
     const auto path = directory / "vulkan_translations.1111111111111111.fork-v53.bin";
     FormatFixture fixture;
     fixture.Write(path);
-    REQUIRE(FileVersion(path) == 11);
+    REQUIRE(FileVersion(path) == 12);
     {
         Store store;
         store.Open(path, fixture.config);
@@ -2067,7 +2084,7 @@ TEST_CASE("Translation cache writes format 11 and round-trips frag_color_compone
         REQUIRE(found->info.frag_color_components[2] == 0x7);
         REQUIRE(InfoEqual(found->info, fixture.variant.info));
     }
-    REQUIRE(FileVersion(path) == 11);
+    REQUIRE(FileVersion(path) == 12);
     const auto catalog = Store::ReadRecipeCatalog(path, {1, 2});
     REQUIRE(catalog.scanned_records == 2);
     REQUIRE(catalog.eligible_records == 1);
@@ -2154,7 +2171,7 @@ TEST_CASE("Translation cache reads version-10 files written before frag_color_co
         REQUIRE(recipes[static_cast<size_t>(Shader::Stage::Fragment)].bindings.texture == 5);
         REQUIRE(ReadFileBytes(other_tag) == legacy_bytes);
     }
-    SECTION("a live cache of the same configuration loads and is upgraded to format 11") {
+    SECTION("a live cache of the same configuration loads and is upgraded to format 12") {
         std::filesystem::remove(current_path);
         const auto live = directory / "vulkan_translations.2222222222222222.fork-v53.bin";
         WriteFileBytes(live, legacy_bytes);
@@ -2180,7 +2197,7 @@ TEST_CASE("Translation cache reads version-10 files written before frag_color_co
                                         recipe.bindings);
             REQUIRE(store.InsertVariant(*entry, second_key, fixture.variant, &recipe));
         }
-        REQUIRE(FileVersion(live) == 11);
+        REQUIRE(FileVersion(live) == 12);
         {
             Store store;
             store.Open(live, fixture.config);
@@ -2217,14 +2234,14 @@ TEST_CASE("Translation cache reads version-10 files written before frag_color_co
             REQUIRE(InfoEqual(found->info, fixture.variant.info));
         }
         // Only the version changes: the layout already is the current one.
-        REQUIRE(FileVersion(since) == 11);
+        REQUIRE(FileVersion(since) == 12);
         REQUIRE(ReadFileBytes(since) == current_bytes);
     }
     SECTION("another configuration still starts over") {
         Store store;
         store.Open(other_tag, Digest{0x353, 0x89});
         REQUIRE_FALSE(store.FindEntry(fixture.stage_key, fixture.env));
-        REQUIRE(FileVersion(other_tag) == 11);
+        REQUIRE(FileVersion(other_tag) == 12);
     }
     std::filesystem::remove_all(directory);
 }
