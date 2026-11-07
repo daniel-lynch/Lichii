@@ -249,3 +249,49 @@ TEST_CASE("Store extents merge to cover both", "[shader][storage_extent]") {
     Shader::MergeStorageWriteExtent(lhs, StorageWriteExtent{});
     CHECK_FALSE(lhs.bounded);
 }
+
+TEST_CASE("An offset that can wrap below zero does not shrink the extent",
+          "[shader][storage_extent]") {
+    // Invocation 0 computes 0 - 8192 = 0xffffe000 (or 0 - 255), whose low 16 bits times 4 put the
+    // store at byte 0x38000 (or 0x3fc04). Neither a select nor a mask may hide that.
+    KernelProgram fixture;
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 tid{ir.LocalInvocationIdX()};
+    const bool masked = GENERATE(false, true);
+    IR::U32 value;
+    u32 reach;
+    if (masked) {
+        // tid & 0xff is at most 255, but 255 is no lower bound: (tid & 0xff) - 255 wraps
+        value = IR::U32{ir.ISub(ir.BitwiseAnd(tid, ir.Imm32(0xff)), ir.Imm32(255))};
+        reach = 0xff01 * 4 + 4;
+    } else {
+        const IR::U1 first{ir.IEqual(tid, ir.Imm32(0))};
+        value = IR::U32{ir.Select(first, ir.ISub(tid, ir.Imm32(8192)), ir.Imm32(0))};
+        reach = 0xe000 * 4 + 4;
+    }
+    const IR::U32 low_half{ir.BitFieldExtract(value, ir.Imm32(0), ir.Imm32(16), false)};
+    ir.WriteGlobal32(Address(ir, 0x170, ir.IMul(low_half, ir.Imm32(4))), ir.Imm32(0));
+    const StorageWriteExtent& extent{fixture.Run(0x170).write_extent};
+    const std::optional<u64> marked{At(extent, {64, 1, 1}, std::array<u32, 3>{1, 1, 1})};
+    INFO("marked " << (marked ? *marked : 0) << " of " << reach);
+    CHECK((!marked || *marked >= reach));
+}
+
+TEST_CASE("A value that is only an upper bound is not subtracted or used as a multiplier",
+          "[shader][storage_extent]") {
+    // 0x10000 - (tid & 0xff), also as 0xffffffff * (tid & 0xff) + 0x10000: 255 bounds tid & 0xff
+    // from above only, so invocation 0 stores at 0x10000, past 0x10000 - 255
+    KernelProgram fixture;
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 lane{ir.BitwiseAnd(ir.LocalInvocationIdX(), ir.Imm32(0xff))};
+    const bool multiplied = GENERATE(false, true);
+    const IR::U32 offset{multiplied
+                             ? IR::U32{ir.IAdd(ir.IMul(ir.Imm32(0xffffffff), lane),
+                                               ir.Imm32(0x10000))}
+                             : IR::U32{ir.ISub(ir.Imm32(0x10000), lane)}};
+    ir.WriteGlobal32(Address(ir, 0x170, offset), ir.Imm32(0));
+    const StorageWriteExtent& extent{fixture.Run(0x170).write_extent};
+    const std::optional<u64> marked{At(extent, {64, 1, 1}, std::array<u32, 3>{1, 1, 1})};
+    INFO("marked " << (marked ? *marked : 0));
+    CHECK((!marked || *marked >= 0x10000 + 4));
+}

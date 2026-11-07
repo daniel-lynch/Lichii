@@ -1871,10 +1871,15 @@ u32 StoreSize(IR::Opcode opcode) {
 /// c + sum(coef[i] * id[i]) over gl_LocalInvocationID.xyz (0-2) and gl_WorkGroupID.xyz (3-5),
 /// plus `base` times the storage buffer's pointer word. All coefficients are non-negative, so the
 /// bound is largest at the largest ids.
+/// An exact bound is the value itself modulo 2^32, so a negative c means the value can wrap below
+/// zero and is no bound for an unsigned operation. An inexact bound (a select, mask, shift or field
+/// extract) is only an upper bound, with c >= 0: subtracting from it or scaling a value that can
+/// wrap by it can wrap too, so those leave the value unknown.
 struct IdBound {
     s64 c{};
     std::array<u64, 6> coef{};
     u32 base{};
+    bool exact{true};
 
     bool IsConstant() const {
         return base == 0 && std::ranges::all_of(coef, [](u64 value) { return value == 0; });
@@ -1965,31 +1970,46 @@ private:
         return IdBound{.c = value};
     }
 
+    static std::optional<IdBound> Inexact(IdBound value) {
+        value.exact = false;
+        return value;
+    }
+
     static std::optional<IdBound> Sum(const IdBound& lhs, const IdBound& rhs) {
-        IdBound result{.c = lhs.c + rhs.c, .base = lhs.base + rhs.base};
+        // An upper bound minus a constant: the value itself can be below the constant
+        if ((!lhs.exact && rhs.c < 0) || (!rhs.exact && lhs.c < 0)) {
+            return std::nullopt;
+        }
+        IdBound result{
+            .c = lhs.c + rhs.c, .base = lhs.base + rhs.base, .exact = lhs.exact && rhs.exact};
         for (size_t i = 0; i < result.coef.size(); ++i) {
             result.coef[i] = lhs.coef[i] + rhs.coef[i];
         }
         return Checked(result);
     }
 
-    /// Component-wise maximum: a bound of either value (ids are non-negative)
+    /// Component-wise maximum: a bound of either value (ids are non-negative). A value that can
+    /// wrap below zero is larger than any bound of the other.
     static std::optional<IdBound> Max(const IdBound& lhs, const IdBound& rhs) {
-        if (lhs.base != rhs.base) {
+        if (lhs.base != rhs.base || lhs.c < 0 || rhs.c < 0) {
             return std::nullopt;
         }
-        IdBound result{.c = (std::max)(lhs.c, rhs.c), .base = lhs.base};
+        IdBound result{.c = (std::max)(lhs.c, rhs.c), .base = lhs.base, .exact = false};
         for (size_t i = 0; i < result.coef.size(); ++i) {
             result.coef[i] = (std::max)(lhs.coef[i], rhs.coef[i]);
         }
         return result;
     }
 
-    static std::optional<IdBound> Scale(const IdBound& value, u64 factor) {
-        if (value.base != 0 || factor >= COEF_LIMIT) {
+    /// value * factor, where an inexact factor only bounds the multiplier: then the value must not
+    /// wrap below zero
+    static std::optional<IdBound> Scale(const IdBound& value, u64 factor,
+                                        bool exact_factor = true) {
+        if (value.base != 0 || factor >= COEF_LIMIT || (!exact_factor && value.c < 0)) {
             return std::nullopt;
         }
-        IdBound result{.c = value.c * static_cast<s64>(factor)};
+        IdBound result{.c = value.c * static_cast<s64>(factor),
+                       .exact = value.exact && exact_factor};
         for (size_t i = 0; i < result.coef.size(); ++i) {
             if (value.coef[i] != 0 && factor > (COEF_LIMIT - 1) / value.coef[i]) {
                 return std::nullopt;
@@ -2008,7 +2028,7 @@ private:
             return std::nullopt;
         }
         const auto up = [shift](u64 x) { return (x + (u64{1} << shift) - 1) >> shift; };
-        IdBound result{.c = static_cast<s64>(up(static_cast<u64>(value.c)))};
+        IdBound result{.c = static_cast<s64>(up(static_cast<u64>(value.c))), .exact = false};
         for (size_t i = 0; i < result.coef.size(); ++i) {
             result.coef[i] = up(value.coef[i]);
         }
@@ -2064,7 +2084,7 @@ private:
         }
         const std::optional<IdBound> source{Evaluate(inst.Arg(0), depth + 1)};
         const std::optional<IdBound> field_max{
-            count <= 24 ? Constant((s64{1} << count) - 1) : std::nullopt};
+            count <= 24 ? Inexact(IdBound{.c = (s64{1} << count) - 1}) : std::nullopt};
         if (!source || source->base != 0 || source->c < 0) {
             return field_max;
         }
@@ -2075,7 +2095,7 @@ private:
         }
         if (offset == 0) {
             // A low field is at most the whole value
-            return source;
+            return count == 32 ? source : Inexact(*source);
         }
         if (offset >= 16) {
             // The high half of a lowered 32-bit multiplication's operand: zero while the operand
@@ -2143,7 +2163,8 @@ private:
         case IR::Opcode::ISub32: {
             const auto lhs{arg(0)};
             const auto rhs{lhs ? arg(1) : std::nullopt};
-            if (!lhs || !rhs || !rhs->IsConstant()) {
+            // Subtracting a bound of the subtrahend bounds nothing
+            if (!lhs || !rhs || !rhs->IsConstant() || !rhs->exact) {
                 return std::nullopt;
             }
             return Sum(*lhs, IdBound{.c = -rhs->c});
@@ -2155,10 +2176,10 @@ private:
                 return std::nullopt;
             }
             if (rhs->IsConstant() && rhs->c >= 0) {
-                return Scale(*lhs, static_cast<u64>(rhs->c));
+                return Scale(*lhs, static_cast<u64>(rhs->c), rhs->exact);
             }
             if (lhs->IsConstant() && lhs->c >= 0) {
-                return Scale(*rhs, static_cast<u64>(lhs->c));
+                return Scale(*rhs, static_cast<u64>(lhs->c), lhs->exact);
             }
             return std::nullopt;
         }
@@ -2185,12 +2206,12 @@ private:
             }};
             for (const auto* side : {&rhs, &lhs}) {
                 if (usable(*side) && (*side)->IsConstant() && (*side)->c <= 0xffffff) {
-                    return *side;
+                    return Inexact(**side);
                 }
             }
             for (const auto* side : {&lhs, &rhs}) {
                 if (usable(*side)) {
-                    return *side;
+                    return Inexact(**side);
                 }
             }
             return std::nullopt;
@@ -2204,14 +2225,15 @@ private:
             if (!lhs || !rhs || lhs->base != 0 || rhs->base != 0 || lhs->c < 0 || rhs->c < 0) {
                 return std::nullopt;
             }
-            return Sum(*lhs, *rhs);
+            const auto sum{Sum(*lhs, *rhs)};
+            return sum ? Inexact(*sum) : std::nullopt;
         }
         case IR::Opcode::UMin32: {
             const auto lhs{arg(0)};
             const auto rhs{arg(1)};
             for (const auto* side : {&rhs, &lhs}) {
                 if (*side && (*side)->base == 0 && (*side)->c >= 0) {
-                    return *side;
+                    return Inexact(**side);
                 }
             }
             return std::nullopt;
@@ -2231,7 +2253,8 @@ private:
                 return std::nullopt;
             }
             const auto shifted{Scale(*insert, u64{1} << inst.Arg(2).U32())};
-            return shifted ? Sum(*base_value, *shifted) : std::nullopt;
+            const auto sum{shifted ? Sum(*base_value, *shifted) : std::nullopt};
+            return sum ? Inexact(*sum) : std::nullopt;
         }
         case IR::Opcode::SelectU32: {
             const auto lhs{arg(1)};
