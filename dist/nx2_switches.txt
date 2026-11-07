@@ -55,3 +55,8 @@ EDEN_NX2_FENCE_BATCH=1
 # GPU thread instead of waiting behind every pipeline queued on the FIFO workers before it
 # (PR 321; single held frames of 1.1-2.2 s in Ocarina). =0 waits for the worker, as after #184.
 #EDEN_NX2_HELD_BUILD_INLINE=0
+# Compute shaders build the functions they call from several places (a native program's global
+# memory functions) as calls instead of inlining them at every call site: NVIDIA spent 2-13 s on
+# single Ocarina compute shaders, each a freeze of the whole emulator at its first dispatch.
+# =0 builds the SPIR-V as emitted, as before.
+#EDEN_NX2_COMPUTE_NOINLINE=0

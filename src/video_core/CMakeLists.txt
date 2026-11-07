@@ -289,6 +289,8 @@ add_library(video_core STATIC
     shader_handle_program.h
     shader_notify.cpp
     shader_notify.h
+    spirv_inline_control.cpp
+    spirv_inline_control.h
     smaa_area_tex.h
     smaa_search_tex.h
     surface.cpp
