@@ -6,6 +6,8 @@
 
 #include <fstream>
 
+#include "audio_core/nx2_audio_options.h"
+
 #include "common/assert.h"
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
@@ -797,6 +799,11 @@ Result ISystemSettingsServer::SetTvSettings(TvSettings tv_settings) {
 
 Result ISystemSettingsServer::GetAudioOutputMode(Out<AudioOutputMode> out_output_mode,
                                                  AudioOutputModeTarget target) {
+    if (AudioCore::Nx2AudioOptions::StereoOutputEnabled()) {
+        *out_output_mode = AudioOutputMode::ch_2;
+        LOG_INFO(Service_SET, "NX2 forced stereo, target={}", target);
+        R_SUCCEED();
+    }
     switch (target) {
     case AudioOutputModeTarget::Hdmi:
         *out_output_mode = m_system_settings.audio_output_mode_hdmi;

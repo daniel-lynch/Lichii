@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "audio_core/common/common.h"
+#include "audio_core/nx2_audio_options.h"
 #include "audio_core/sink/cubeb_sink.h"
 #include "audio_core/sink/sink_stream.h"
 #include "common/logging.h"
@@ -266,6 +267,11 @@ CubebSink::CubebSink(std::string_view target_device_name) {
 
     cubeb_get_max_channel_count(ctx, &device_channels);
     device_channels = device_channels >= 6U ? 6U : 2U;
+    if (Nx2AudioOptions::StereoOutputEnabled()) {
+        LOG_INFO(Audio, "EDEN_NX2_AUDIO_STEREO: forcing stereo output (host channels {})",
+                 device_channels);
+        device_channels = 2;
+    }
 }
 
 CubebSink::~CubebSink() {

@@ -346,6 +346,7 @@ private:
     SplitterContext& splitter_context;
     /// Used for generating performance
     PerformanceManager* performance_manager;
+    const bool ramp_fix;
 };
 
 } // namespace Renderer

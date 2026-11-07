@@ -3,11 +3,14 @@
 
 #pragma once
 
+#include "audio_core/nx2_audio_options.h"
 #include "core/hle/service/audio/audio_in_manager.h"
 #include "core/hle/service/audio/audio_out_manager.h"
 #include "core/hle/service/audio/audio_renderer_manager.h"
+#include "core/hle/service/audio/errors.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/service.h"
+#include "core/hle/service/sm/sm.h"
 
 namespace Service::Audio {
 
@@ -19,8 +22,9 @@ namespace Service::Audio {
 // keeps unknown commands auto-stubbed and logged.
 class INx2AudioUserClient final : public ServiceFramework<INx2AudioUserClient> {
 public:
-    explicit INx2AudioUserClient(Core::System& system_)
-        : ServiceFramework{system_, "nx2:aud:u"} {
+    explicit INx2AudioUserClient(Core::System& system_, SM::ServiceManager& service_manager_)
+        : ServiceFramework{system_, "nx2:aud:u"}, service_manager{service_manager_},
+          shared_managers{AudioCore::Nx2AudioOptions::SharedManagersEnabled()} {
         // clang-format off
         static const FunctionInfo functions[] = {
             {0, &INx2AudioUserClient::GetAudioInManager, "GetAudioInManager"},
@@ -32,31 +36,44 @@ public:
     }
 
 private:
-    void GetAudioInManager(HLERequestContext& ctx) {
+    template <typename T>
+    void ReplyManager(HLERequestContext& ctx, const char* name) {
+        // AudioManager has one release callback per direction. Private managers cannot share it.
+        auto manager = shared_managers ? service_manager.GetService<T>(name)
+                                       : std::make_shared<T>(system);
+        if (!manager) {
+            LOG_ERROR(Service_Audio, "Switch 2 aud:u: {} is not registered", name);
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(ResultOperationFailed);
+            return;
+        }
+        LOG_INFO(Service_Audio, "Switch 2 aud:u returning {} {}",
+                 shared_managers ? "shared" : "private", name);
         IPC::ResponseBuilder rb{ctx, 2, 0, 1};
         rb.Push(ResultSuccess);
-        rb.PushIpcInterface<IAudioInManager>(ctx, system);
+        rb.PushIpcInterface<T>(ctx, std::move(manager));
+    }
+
+    void GetAudioInManager(HLERequestContext& ctx) {
+        ReplyManager<IAudioInManager>(ctx, "audin:u");
     }
 
     void GetAudioOutManager(HLERequestContext& ctx) {
         IPC::RequestParser rp{ctx};
         const u32 arg = rp.Pop<u32>();
-        LOG_WARNING(Service_Audio, "(STUBBED) Switch 2 aud:u 1 arg={}, returning IAudioOutManager",
-                    arg);
-        IPC::ResponseBuilder rb{ctx, 2, 0, 1};
-        rb.Push(ResultSuccess);
-        rb.PushIpcInterface<IAudioOutManager>(ctx, system);
+        LOG_DEBUG(Service_Audio, "Switch 2 aud:u 1 arg={}", arg);
+        ReplyManager<IAudioOutManager>(ctx, "audout:u");
     }
 
     void GetAudioRendererManager(HLERequestContext& ctx) {
         IPC::RequestParser rp{ctx};
         const u32 arg = rp.Pop<u32>();
-        LOG_WARNING(Service_Audio, "(STUBBED) Switch 2 aud:u 2 arg={}, returning IAudioRendererManager",
-                    arg);
-        IPC::ResponseBuilder rb{ctx, 2, 0, 1};
-        rb.Push(ResultSuccess);
-        rb.PushIpcInterface<IAudioRendererManager>(ctx, system);
+        LOG_DEBUG(Service_Audio, "Switch 2 aud:u 2 arg={}", arg);
+        ReplyManager<IAudioRendererManager>(ctx, "audren:u");
     }
+
+    SM::ServiceManager& service_manager;
+    const bool shared_managers;
 };
 
 } // namespace Service::Audio

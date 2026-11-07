@@ -32,6 +32,7 @@ add_library(audio_core STATIC
     audio_out_manager.h
     audio_manager.cpp
     audio_manager.h
+    nx2_audio_options.h
     common/audio_renderer_parameter.h
     common/common.h
     common/feature_support.h

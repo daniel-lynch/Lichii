@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "audio_core/nx2_audio_options.h"
 #include "core/hle/service/audio/audio_renderer.h"
 #include "core/hle/service/cmif_serialization.h"
 
@@ -38,6 +39,14 @@ IAudioRenderer::IAudioRenderer(Core::System& system_, std::shared_ptr<Manager> m
     };
     // clang-format on
     RegisterHandlers(functions);
+
+    if (AudioCore::Nx2AudioOptions::AsyncMemoryPoolControlEnabled()) {
+        static const FunctionInfo async_functions[] = {
+            {14, D<&IAudioRenderer::SetAsyncMemoryPoolControlEnabled>,
+             "SetAsyncMemoryPoolControlEnabled"},
+        };
+        RegisterHandlers(async_functions);
+    }
 
     process_handle->Open(system_.Kernel());
     impl->Initialize(params, transfer_memory, transfer_memory_size, process_handle,
@@ -130,6 +139,12 @@ Result IAudioRenderer::GetRenderingTimeLimit(Out<u32> out_rendering_time_limit) 
 Result IAudioRenderer::SetVoiceDropParameter(f32 voice_drop_parameter) {
     LOG_DEBUG(Service_Audio, "called");
     impl->GetSystem().SetVoiceDropParameter(voice_drop_parameter);
+    R_SUCCEED();
+}
+
+Result IAudioRenderer::SetAsyncMemoryPoolControlEnabled(bool enabled) {
+    // Pool attach/detach completes synchronously in RequestUpdate; no pending work to enable.
+    LOG_INFO(Service_Audio, "SetAsyncMemoryPoolControlEnabled enabled={} (synchronous pools)", enabled);
     R_SUCCEED();
 }
 

@@ -14,6 +14,7 @@
 #include "audio_core/common/common.h"
 #include "audio_core/common/feature_support.h"
 #include "audio_core/common/workbuffer_allocator.h"
+#include "audio_core/nx2_audio_options.h"
 #include "audio_core/renderer/behavior/info_updater.h"
 #include "audio_core/renderer/command/command_buffer.h"
 #include "audio_core/renderer/command/command_generator.h"
@@ -657,7 +658,7 @@ u64 System::GenerateCommand(std::span<u8> in_command_buffer,
     }
 
     s8 channel_count{2};
-    if (execution_mode == ExecutionMode::Auto) {
+    if (execution_mode == ExecutionMode::Auto && !Nx2AudioOptions::StereoOutputEnabled()) {
         const auto& sink{core.AudioCore().GetOutputSink()};
         channel_count = static_cast<s8>(sink.GetDeviceChannels());
     }

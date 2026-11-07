@@ -207,7 +207,7 @@ void LoopProcess(Core::System& system) {
     server_manager->RegisterNamedService("audrec:u", std::make_shared<IFinalOutputRecorderManager>(system), 30);
     server_manager->RegisterNamedService("audren:u", std::make_shared<IAudioRendererManager>(system), 30);
     // Switch 2 audio entry point (nn::audio::CreateUserClientSessionByHipc).
-    server_manager->RegisterNamedService("aud:u", std::make_shared<INx2AudioUserClient>(system), 30);
+    server_manager->RegisterNamedService("aud:u", std::make_shared<INx2AudioUserClient>(system, system.ServiceManager()), 30);
     server_manager->RegisterNamedService("auddmg:u", std::make_shared<INx2AudioDeviceManagerService>(system, sysmix), 30);
     server_manager->RegisterNamedService("audsmx:u", std::make_shared<INx2AudioSoundMixerService>(system, sysmix), 30);
     server_manager->RegisterNamedService("audren:a", std::make_shared<IAudioRendererManagerForApplet>(system), 30);

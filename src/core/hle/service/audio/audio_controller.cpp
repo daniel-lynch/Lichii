@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "audio_core/audio_core.h"
+#include "audio_core/nx2_audio_options.h"
 #include "core/hle/service/audio/audio_controller.h"
 #include "core/hle/service/audio/audio_out_manager.h"
 #include "core/core.h"
@@ -18,7 +19,13 @@
 namespace Service::Audio {
 
 IAudioController::IAudioController(Core::System& system_)
-    : ServiceFramework{system_, "audctl"}, service_context{system, "audctl"} {
+    : IAudioController{system_, system_.ServiceManager().GetService<Set::ISystemSettingsServer>(
+                                   "set:sys", true)} {}
+
+IAudioController::IAudioController(Core::System& system_,
+                                   std::shared_ptr<Set::ISystemSettingsServer> settings)
+    : ServiceFramework{system_, "audctl"}, service_context{system, "audctl"},
+      m_set_sys{std::move(settings)} {
     // clang-format off
     static const FunctionInfo functions[] = {
         {0, D<&IAudioController::GetTargetVolume>, "GetTargetVolume"},
@@ -86,8 +93,6 @@ IAudioController::IAudioController(Core::System& system_)
 
     RegisterHandlers(functions);
 
-    m_set_sys =
-        system.ServiceManager().GetService<Service::Set::ISystemSettingsServer>("set:sys", true);
     notification_event = service_context.CreateEvent("IAudioController:NotificationEvent");
 
     // Probably shouldn't do this in constructor?
@@ -170,15 +175,24 @@ Result IAudioController::GetForceMutePolicy(Out<ForceMutePolicy> out_mute_policy
 
 Result IAudioController::GetOutputModeSetting(Out<Set::AudioOutputMode> out_output_mode,
                                               Set::AudioOutputModeTarget target) {
-    LOG_WARNING(Audio, "(STUBBED) called, target={}", target);
-
-    *out_output_mode = Set::AudioOutputMode::ch_7_1;
+    const auto index = static_cast<size_t>(target);
+    *out_output_mode = index < m_output_mode_settings.size()
+                           ? m_output_mode_settings[index]
+                           : Set::AudioOutputMode::ch_7_1;
+    if (AudioCore::Nx2AudioOptions::StereoOutputEnabled()) {
+        *out_output_mode = Set::AudioOutputMode::ch_2;
+    }
+    LOG_INFO(Audio, "called, target={}, output_mode={}", target, *out_output_mode);
     R_SUCCEED();
 }
 
 Result IAudioController::SetOutputModeSetting(Set::AudioOutputModeTarget target,
                                               Set::AudioOutputMode output_mode) {
     LOG_INFO(Service_SET, "called, target={}, output_mode={}", target, output_mode);
+    const auto index = static_cast<size_t>(target);
+    if (index < m_output_mode_settings.size()) {
+        m_output_mode_settings[index] = output_mode;
+    }
     R_SUCCEED();
 }
 
