@@ -38,6 +38,8 @@ add_library(
     common_types.h
     concepts.h
     container_hash.h
+    core_pinning.cpp
+    core_pinning.h
     demangle.cpp
     demangle.h
     device_power_state.cpp

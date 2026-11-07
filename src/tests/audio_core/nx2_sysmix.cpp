@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
 #include <catch2/catch_test_macros.hpp>
 #include "core/core_timing.h"
@@ -164,11 +166,37 @@ TEST_CASE("sysmix backpressure leaves guest ownership unchanged and resumes in o
     REQUIRE(ReadCursor(context) == 720);
     REQUIRE(stream.GetCounters().accepted_frames == 720);
     REQUIRE(stream.GetCounters().backpressure == 1);
+    REQUIRE(stream.GetCounters().copied_frames == 960);
+    REQUIRE(stream.GetCounters().retried_frames == 240);
     std::array<s16, 480> output{};
     context.sink.last->ProcessAudioOutAndRender(output, 240);
     stream.Pump();
     REQUIRE(ReadCursor(context) == 960);
     REQUIRE(context.sink.last->GetQueueSize() == 3);
+}
+
+TEST_CASE("sysmix pads a short guest block with silence for the host", "[sysmix]") {
+    Context context;
+    Cursor(context, 0, 100);
+    for (u32 i = 0; i < 100; ++i) {
+        Sample(context, i, 0.25f, -0.25f);
+    }
+    SysmixOutput stream{context.system, *context.process, context.sink, 1, Context::Base,
+                        Context::Size, 0x24};
+    REQUIRE(stream.Open(5, 2, 48000, 2048, 0, 0).IsSuccess());
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    stream.Pump();
+    REQUIRE(ReadCursor(context) == 100);
+    REQUIRE(stream.GetCounters().accepted_frames == 100);
+    REQUIRE(stream.GetCounters().padded_frames == 140);
+    REQUIRE(stream.GetCounters().admitted_blocks == 1);
+    std::array<s16, 480> output{};
+    context.sink.last->ProcessAudioOutAndRender(output, 240);
+    for (u32 i = 0; i < 200; ++i) {
+        REQUIRE(output[i] == (i % 2 == 0 ? 8192 : -8192));
+    }
+    REQUIRE(std::ranges::all_of(std::span{output}.subspan(200),
+                                [](s16 value) { return value == 0; }));
 }
 
 TEST_CASE("sysmix detects unmapped cursor publication even though exclusive store reports success", "[sysmix]") {
@@ -322,4 +350,122 @@ TEST_CASE("sysmix does not report successful disengage after backend stop failur
     REQUIRE(stream.GetCounters().faults == 1);
     stream.Pump();
     REQUIRE(stream.GetCounters().admitted_blocks == 0);
+}
+
+namespace {
+u32 WriteCursor(Context& context) {
+    u32 write{};
+    REQUIRE(context.Memory().Read32Acquire(Context::Base + 0x1004, write));
+    return write;
+}
+}
+
+TEST_CASE("sysmix input advertises the formats the virtual microphone accepts", "[sysmix]") {
+    REQUIRE(SysmixOutput::IsInputFormatSupported(2, 1, 48000));
+    REQUIRE(SysmixOutput::IsInputFormatSupported(2, 2, 48000));
+    REQUIRE(SysmixOutput::IsInputFormatSupported(5, 1, 48000));
+    REQUIRE_FALSE(SysmixOutput::IsInputFormatSupported(2, 6, 48000));
+    REQUIRE_FALSE(SysmixOutput::IsInputFormatSupported(2, 1, 16000));
+    REQUIRE_FALSE(SysmixOutput::IsInputFormatSupported(3, 1, 48000));
+}
+
+TEST_CASE("sysmix input opens without a host stream and validates its creation flags", "[sysmix]") {
+    Context context;
+    REQUIRE(SysmixOutput::ValidateRegion(*context.process, Context::Base, Context::Size, 2, true)
+                .IsSuccess());
+    REQUIRE(SysmixOutput::ValidateRegion(*context.process, Context::Base, Context::Size, 0x24, true)
+                .IsFailure());
+    REQUIRE(SysmixOutput::ValidateRegion(*context.process, Context::Base, Context::Size, 2)
+                .IsFailure());
+    SysmixOutput stream{context.system, *context.process, context.sink, 1, Context::Base,
+                        Context::Size, 2, true};
+    REQUIRE(stream.IsInput());
+    REQUIRE(stream.Open(2, 1, 48000, 4800, 0, 0).IsSuccess());
+    REQUIRE(context.sink.last == nullptr);
+    REQUIRE(stream.GetState() == 1);
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    REQUIRE(stream.GetState() == 2);
+    REQUIRE(stream.SetEngaged(false).IsSuccess());
+    REQUIRE(stream.GetState() == 1);
+    stream.Close();
+    REQUIRE(stream.GetState() == 0);
+}
+
+TEST_CASE("sysmix input records silence up to the guest's read cursor, with wrap", "[sysmix]") {
+    Context context;
+    Cursor(context, 4790, 4790);
+    std::memset(context.backing + 0x1040, 0x5a, Context::Size - 0x1040);
+    SysmixOutput stream{context.system, *context.process, context.sink, 1, Context::Base,
+                        Context::Size, 2, true};
+    REQUIRE(stream.Open(2, 1, 48000, 4800, 0, 0).IsSuccess());
+    REQUIRE(stream.SetDataNotification(2, 100).IsSuccess());
+    REQUIRE_FALSE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()));
+    stream.Pump(); // not engaged: nothing recorded
+    REQUIRE(WriteCursor(context) == 4790);
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    stream.Pump();
+    REQUIRE(WriteCursor(context) == 229); // 11 frames to the end of the ring, 229 after the wrap
+    REQUIRE(ReadCursor(context) == 4790);
+    REQUIRE(stream.GetCounters().accepted_frames == 240);
+    REQUIRE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()));
+    const u8* payload = context.backing + 0x1040;
+    REQUIRE(std::all_of(payload + 4790 * 2, payload + 4801 * 2, [](u8 b) { return b == 0; }));
+    REQUIRE(std::all_of(payload, payload + 229 * 2, [](u8 b) { return b == 0; }));
+    REQUIRE(payload[229 * 2] == 0x5a);
+    REQUIRE(payload[4789 * 2 + 1] == 0x5a);
+}
+
+TEST_CASE("sysmix input purge discards captured frames and stops at the producer", "[sysmix]") {
+    Context context;
+    Cursor(context, 0, 0);
+    SysmixOutput stream{context.system, *context.process, context.sink, 1, Context::Base,
+                        Context::Size, 2, true};
+    u32 purged{99};
+    REQUIRE(stream.Purge(0, purged).IsFailure()); // not open yet
+    REQUIRE(purged == 0);
+    REQUIRE(stream.Open(2, 1, 48000, 4800, 0, 0).IsSuccess());
+    REQUIRE(stream.Purge(0, purged).IsSuccess()); // nothing captured: a no-op
+    REQUIRE(purged == 0);
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    stream.Pump();
+    stream.Pump();
+    REQUIRE(WriteCursor(context) == 480);
+    REQUIRE(stream.Purge(100, purged).IsSuccess());
+    REQUIRE(purged == 100);
+    REQUIRE(ReadCursor(context) == 100);
+    REQUIRE(stream.Purge(1000, purged).IsSuccess());
+    REQUIRE(purged == 380);
+    REQUIRE(ReadCursor(context) == 480);
+    stream.Pump();
+    REQUIRE(stream.Purge(0, purged).IsSuccess());
+    REQUIRE(purged == 240);
+    REQUIRE(ReadCursor(context) == 720);
+    REQUIRE(stream.GetCounters().faults == 0);
+}
+
+TEST_CASE("sysmix input waits for a full ring and faults when the guest moves its cursor", "[sysmix]") {
+    Context context;
+    Cursor(context, 1, 0); // full: the producer is one slot behind the consumer
+    SysmixOutput stream{context.system, *context.process, context.sink, 1, Context::Base,
+                        Context::Size, 2, true};
+    REQUIRE(stream.Open(5, 2, 48000, 960, 0, 0).IsSuccess());
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    stream.Pump();
+    REQUIRE(WriteCursor(context) == 0);
+    REQUIRE(stream.GetCounters().backpressure == 1);
+    Cursor(context, 1, 5); // the guest must never write the producer cursor
+    stream.Pump();
+    REQUIRE(stream.GetCounters().faults == 1);
+    REQUIRE(stream.GetState() == 0);
+}
+
+TEST_CASE("sysmix output streams still refuse purge", "[sysmix]") {
+    Context context;
+    SysmixOutput stream{context.system, *context.process, context.sink, 1, Context::Base,
+                        Context::Size, 0x24};
+    REQUIRE_FALSE(stream.IsInput());
+    REQUIRE(stream.Open(5, 2, 48000, 2048, 0, 0).IsSuccess());
+    u32 purged{7};
+    REQUIRE(stream.Purge(0, purged).IsFailure());
+    REQUIRE(purged == 0);
 }
