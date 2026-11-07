@@ -61,11 +61,11 @@ struct Runtime {
     u64 GetDeviceLocalMemory() const {
         return 0;
     }
+    u64 GetMaxStorageBufferRange() const {
+        return 1ULL << 30;
+    }
     u32 GetStorageBufferAlignment() const {
         return alignment;
-    }
-    u64 GetMaxStorageBufferRange() const {
-        return 0xffffffffULL;
     }
     u32 GetUniformBufferAlignment() const {
         return 1;
