@@ -202,6 +202,13 @@ u32 ArchiveEnvironment::ExactWord(u32 index, u32 offset) const {
 }
 
 u32 ArchiveEnvironment::ReadCbufValue(u32 index, u32 offset) {
+    if (recorded_mode) {
+        for (const auto& query : recorded_answers)
+            if (query.kind == TranslationCache::QueryKind::CbufValue &&
+                query.a == index && query.b == offset) return query.answer;
+        if (handle_depth == 0)
+            return *Recorded(TranslationCache::QueryKind::CbufValue, index, offset);
+    }
     if (index == 1 && offset <= constants.size() && constants.size() - offset >= sizeof(u32)) {
         return ExactWord(index, offset);
     }
@@ -215,32 +222,73 @@ u32 ArchiveEnvironment::ReadCbufValue(u32 index, u32 offset) {
 }
 
 void ArchiveEnvironment::NoteExactCbufWord(u32 index, u32 offset) {
-    (void)ExactWord(index, offset);
+    if (recorded_mode) (void)Recorded(TranslationCache::QueryKind::CbufValue, index, offset);
+    else (void)ExactWord(index, offset);
 }
 
 void ArchiveEnvironment::BeginTextureHandle() {
     ++handle_depth;
 }
 
-void ArchiveEnvironment::EndTextureHandle(const Shader::ConstBufferAddr&, u32) {
-    if (handle_depth != 0) {
-        --handle_depth;
+void ArchiveEnvironment::EndTextureHandle(const Shader::ConstBufferAddr& address, u32 handle) {
+    // Replay catches candidate failures and keeps using this environment.
+    if (handle_depth != 0) --handle_depth;
+    if (!recorded_mode) return;
+    using TranslationCache::QueryKind;
+    const u32 a = (address.index & 0xff) | ((address.shift_left & 0xff) << 8) |
+                  ((address.secondary_shift_left & 0xff) << 16) |
+                  (address.has_secondary ? 1U << 24 : 0U);
+    const u32 c = ((address.secondary_index & 0xffff) << 16) |
+                  (address.secondary_offset & 0xffff);
+    std::optional<u32> recorded_handle;
+    for (const auto& query : recorded_answers) {
+        if (query.kind == QueryKind::TextureHandle && query.a == a &&
+            query.b == address.offset && query.c == c) {
+            if (recorded_handle && *recorded_handle != query.answer)
+                throw Shader::RuntimeError("Archive environment: ambiguous recorded handle recipe");
+            recorded_handle = query.answer;
+        }
     }
+    if (!recorded_handle) {
+        // Older exact-replay records retain handle words instead of TextureHandle recipes.
+        // An unrecorded guessed handle must never alias a recorded raw texture identifier.
+        if (address.shift_left >= 32 || address.secondary_shift_left >= 32)
+            throw Shader::RuntimeError("Archive environment: invalid recorded handle shift");
+        const u32 lhs = *Recorded(QueryKind::CbufValue, address.index, address.offset);
+        const u32 rhs = *Recorded(QueryKind::CbufValue,
+            address.has_secondary ? address.secondary_index : address.index,
+            address.has_secondary ? address.secondary_offset : address.offset);
+        recorded_handle = (lhs << address.shift_left) | (rhs << address.secondary_shift_left);
+        if (*recorded_handle != handle)
+            throw Shader::RuntimeError("Archive environment: recorded handle words differ");
+    }
+    const auto [it, inserted] = recorded_handles.emplace(handle, *recorded_handle);
+    if (!inserted && it->second != *recorded_handle)
+        throw Shader::RuntimeError("Archive environment: ambiguous recorded handle");
 }
 
-Shader::TextureType ArchiveEnvironment::ReadTextureType(u32) {
+Shader::TextureType ArchiveEnvironment::ReadTextureType(u32 handle) {
+    if (auto value = Recorded(TranslationCache::QueryKind::TextureType, handle))
+        return static_cast<Shader::TextureType>(*value);
     return texture_type;
 }
-Shader::TexturePixelFormat ArchiveEnvironment::ReadTexturePixelFormat(u32) {
+Shader::TexturePixelFormat ArchiveEnvironment::ReadTexturePixelFormat(u32 handle) {
+    if (auto value = Recorded(TranslationCache::QueryKind::TexturePixelFormat, handle))
+        return static_cast<Shader::TexturePixelFormat>(*value);
     return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
 }
-bool ArchiveEnvironment::IsTexturePixelFormatInteger(u32) {
+bool ArchiveEnvironment::IsTexturePixelFormatInteger(u32 handle) {
+    if (auto value = Recorded(TranslationCache::QueryKind::TexturePixelFormatInteger, handle)) return *value != 0;
     return false;
 }
 u32 ArchiveEnvironment::ReadViewportTransformState() {
+    if (auto value = Recorded(TranslationCache::QueryKind::ViewportTransformState)) return *value;
     return 1;
 }
-std::optional<Shader::ReplaceConstant> ArchiveEnvironment::GetReplaceConstBuffer(u32, u32) {
+std::optional<Shader::ReplaceConstant> ArchiveEnvironment::GetReplaceConstBuffer(u32 bank, u32 offset) {
+    if (auto value = Recorded(TranslationCache::QueryKind::ReplaceConstBuffer, bank, offset)) {
+        if (*value != ~0U) return static_cast<Shader::ReplaceConstant>(*value);
+    }
     return std::nullopt;
 }
 void ArchiveEnvironment::SetStoragePointerAnswers(
@@ -256,14 +304,37 @@ void ArchiveEnvironment::SetStoragePointerAnswers(
 }
 
 bool ArchiveEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
+    if (auto value = Recorded(TranslationCache::QueryKind::CbufStorageBufferPointer, index, offset)) return *value != 0;
     if (const auto it = pointer_answers.find({index, offset, 0, false}); it != pointer_answers.end())
         return it->second;
     return true;
 }
 bool ArchiveEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
+    if (auto value = Recorded(TranslationCache::QueryKind::CbufIndirectStorageBufferPointer, index, offset, indirect)) return *value != 0;
     if (const auto it = pointer_answers.find({index, offset, indirect, true});
         it != pointer_answers.end())
         return it->second;
     return false;
+}
+void ArchiveEnvironment::SetRecordedAnswers(std::span<const TranslationCache::Query> answers) {
+    recorded_mode = true;
+    recorded_answers.assign(answers.begin(), answers.end());
+    recorded_handles.clear();
+    guessed_words.clear();
+}
+
+std::optional<u32> ArchiveEnvironment::Recorded(TranslationCache::QueryKind kind,
+                                               u32 a, u32 b, u32 c) const {
+    using TranslationCache::QueryKind;
+    if (!recorded_mode) return std::nullopt;
+    if (kind == QueryKind::TextureType || kind == QueryKind::TexturePixelFormat ||
+        kind == QueryKind::TexturePixelFormatInteger) {
+        if (const auto it = recorded_handles.find(a); it != recorded_handles.end()) a = it->second;
+    }
+    for (const auto& query : recorded_answers)
+        if (query.kind == kind && query.a == a && query.b == b && query.c == c)
+            return query.answer;
+    throw Shader::RuntimeError("Archive environment: recorded query missing kind={} a={} b={} c={}",
+                               static_cast<u32>(kind), a, b, c);
 }
 } // namespace VideoCommon

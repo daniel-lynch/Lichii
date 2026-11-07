@@ -65,6 +65,9 @@ struct Summary {
     u64 entries{}, product_modules{};
     u64 validated_modules{}, invalidated_modules{}, replaced_modules{};
     bool cancelled{};
+    u64 recorded_sets_validated{}, recorded_sets_failed{};
+    TranslationCache::Store::ReplayCounts recorded_replay{};
+    std::string pipeline_validation = "{}";
     std::array<SourceSummary, 5> sources{};
     // Entire current product, including modules retained from previous runs.
     std::map<u64, u64> multiplicity;
