@@ -11,6 +11,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/frontend/ir/program.h"
+#include "shader_recompiler/nx2_switch.h"
 #include "shader_recompiler/object_pool.h"
 
 namespace {
@@ -132,7 +133,7 @@ TEST_CASE("SPIR-V float min, max and clamp follow the NaN A/B policy",
         std::ignore = ir.FPClamp(a, b, c);
         // Min32 and min64, plus the min half of one saturate and one clamp; likewise for max.
         const auto counts = CountGlslOps(fixture.Emit());
-        if (std::getenv("EDEN_NX2_AB_FMINMAX") != nullptr) {
+        if (Shader::Nx2Switch("EDEN_NX2_AB_FMINMAX", false)) {
             CHECK(counts.fmin == 2);
             CHECK(counts.fmax == 2);
             CHECK(counts.fclamp == 2);

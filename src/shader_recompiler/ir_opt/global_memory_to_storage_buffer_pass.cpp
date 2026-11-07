@@ -24,6 +24,7 @@
 #include "common/logging.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/nx2_switch.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/breadth_first_search.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
@@ -2692,18 +2693,12 @@ bool NativeIndirectGraphicsPointers() {
 }
 
 bool PointerTableAccounting() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_POINTER_TABLE_ACCOUNTING");
-        return value == nullptr || std::string_view{value} != "0";
-    }();
+    static const bool enabled{Nx2Switch("EDEN_NX2_POINTER_TABLE_ACCOUNTING", true)};
     return enabled;
 }
 
 bool StorageBuffers64() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_STORAGE_BUFFERS_64");
-        return value == nullptr || std::string_view{value} != "0";
-    }();
+    static const bool enabled{Nx2Switch("EDEN_NX2_STORAGE_BUFFERS_64", true)};
     return enabled;
 }
 

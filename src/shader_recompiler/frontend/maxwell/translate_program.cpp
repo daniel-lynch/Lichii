@@ -23,6 +23,7 @@
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
+#include "shader_recompiler/nx2_switch.h"
 
 namespace Shader::Maxwell {
 namespace {
@@ -430,7 +431,7 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         const u32 threads{program.stage == Stage::Task ? init & 0x3f : (shader_b >> 20) & 0x3f};
         program.workgroup_size = {(std::max)(threads, 1U), 1, 1};
         if (program.stage == Stage::Mesh) {
-            static const bool ab_tri_only{std::getenv("EDEN_NX2_AB_MESH_TRI_ONLY") != nullptr};
+            static const bool ab_tri_only{Nx2Switch("EDEN_NX2_AB_MESH_TRI_ONLY", false)};
             if ((ab_tri_only || (program.mesh.topology != 0 && program.mesh.topology != 1)) &&
                 program.mesh.topology != 4) {
                 throw NotImplementedException("Mesh output topology {} (SET_MESH_SHADER_A {:#010x})",

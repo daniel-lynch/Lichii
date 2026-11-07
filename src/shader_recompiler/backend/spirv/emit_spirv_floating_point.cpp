@@ -3,11 +3,10 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdlib>
-
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/ir/modifiers.h"
+#include "shader_recompiler/nx2_switch.h"
 
 namespace Shader::Backend::SPIRV {
 namespace {
@@ -19,12 +18,14 @@ Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
     return op;
 }
 
-// Maxwell's FMNMX and .SAT return the non-NaN operand (NaN saturates to 0). FMin/FMax/FClamp leave
-// NaN undefined and AMD's Windows compiler passes it through, so use the NaN-defined N variants.
+// Grass A/B experiment (default off): FMin/FMax/FClamp as before upstream #351.
 bool AbFMinMax() {
-    static const bool enabled{std::getenv("EDEN_NX2_AB_FMINMAX") != nullptr};
+    static const bool enabled{Nx2Switch("EDEN_NX2_AB_FMINMAX", false)};
     return enabled;
 }
+
+// Maxwell's FMNMX and .SAT return the non-NaN operand (NaN saturates to 0). FMin/FMax/FClamp leave
+// NaN undefined and AMD's Windows compiler passes it through, so use the NaN-defined N variants.
 
 Id Clamp(EmitContext& ctx, Id type, Id value, Id zero, Id one) {
     if (AbFMinMax()) {

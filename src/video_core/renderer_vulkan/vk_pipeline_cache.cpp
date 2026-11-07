@@ -33,6 +33,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
+#include "shader_recompiler/nx2_switch.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/program_header.h"
@@ -1549,31 +1550,7 @@ ComputePipeline* ComputePipelineCacheEntry::Get(bool native, GPUVAddr address,
 }
 
 bool ParseComputeNullSlotRebuild(const char* value) {
-    if (value == nullptr) {
-        return true;
-    }
-    // Trimmed and case-folded, as EDEN_NX2_GRAPHICS_NOINLINE (spirv_inline_control.cpp).
-    std::string_view raw{value};
-    constexpr std::string_view whitespace{" \t\r\n\v\f"};
-    const size_t first = raw.find_first_not_of(whitespace);
-    raw = first == std::string_view::npos
-              ? std::string_view{}
-              : raw.substr(first, raw.find_last_not_of(whitespace) - first + 1);
-    std::string word{raw};
-    for (char& letter : word) {
-        if (letter >= 'A' && letter <= 'Z') {
-            letter = static_cast<char>(letter - 'A' + 'a');
-        }
-    }
-    if (word.empty() || word == "1" || word == "on" || word == "true") {
-        return true;
-    }
-    if (word != "0" && word != "off" && word != "false" && word != "none") {
-        LOG_WARNING(Render_Vulkan,
-                    "EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD=\"{}\" is not a switch value; treated as 0",
-                    value);
-    }
-    return false;
+    return Shader::ParseNx2Switch("EDEN_NX2_COMPUTE_NULL_SLOT_REBUILD", value).value_or(true);
 }
 
 bool ComputeNullSlotRebuild() {
@@ -1621,10 +1598,7 @@ std::vector<u64> MappedPointersAskedBy(
 }
 
 bool ComputeKeepPointers() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_COMPUTE_KEEP_POINTERS");
-        return value == nullptr || std::string_view{value} != "0";
-    }();
+    static const bool enabled{Shader::Nx2Switch("EDEN_NX2_COMPUTE_KEEP_POINTERS", true)};
     return enabled;
 }
 

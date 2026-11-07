@@ -3646,11 +3646,28 @@ Binding BufferCache<P>::StorageBufferBindingAt(GPUVAddr gpu_addr, GPUVAddr ssbo_
             const char* value = std::getenv("EDEN_NX2_TABLE_POOL_FULL");
             return !(value != nullptr && value[0] == '0');
         }();
+        // Grass A/B experiment (default off): EDEN_NX2_AB_TABLE_CAP_MIB=N caps those pools at
+        // N MiB (1..1024). Unset, empty, 0 or not a number leaves them uncapped: "=0" must not
+        // shrink every pool to nothing.
         static const u64 ab_table_cap = [] {
             const char* value = std::getenv("EDEN_NX2_AB_TABLE_CAP_MIB");
-            // Clamp before converting MiB so malformed/oversized experiments cannot wrap.
-            return value ? (std::min)(std::strtoull(value, nullptr, 10), 1024ULL) << 20
-                         : 1_GiB;
+            if (value == nullptr) {
+                return u64{1_GiB};
+            }
+            char* end{};
+            const unsigned long long mib = std::strtoull(value, &end, 10);
+            if (end == value || mib == 0) {
+                if (end == value && *value != '\0') {
+                    LOG_WARNING(HW_GPU, "EDEN_NX2_AB_TABLE_CAP_MIB=\"{}\" is not a MiB count; "
+                                        "treated as unset", value);
+                }
+                return u64{1_GiB};
+            }
+            // Clamp before converting MiB so oversized values cannot wrap.
+            const u64 cap = u64{(std::min)(mib, 1024ULL)} << 20;
+            LOG_INFO(HW_GPU, "EDEN_NX2_AB_TABLE_CAP_MIB: read-only table pools capped at {} MiB",
+                     cap >> 20);
+            return cap;
         }();
         const u64 table_pool_reach = (std::min)(
             TablePoolReach(runtime.GetMaxStorageBufferRange(), table_pool_full), ab_table_cap);
