@@ -73,6 +73,7 @@ add_executable(tests
     video_core/spirv_fragment_shuffle.cpp
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
+    video_core/gpu_written_pages.cpp
     video_core/command_writer.cpp
     video_core/split_fence_wait.cpp
     video_core/command_snapshot_suspensions.cpp
@@ -83,6 +84,7 @@ add_executable(tests
     common/queue_lifetime.cpp
     common/queue_timed_wait.cpp
     common/range_set_move.cpp
+    common/range_set_subtract.cpp
     video_core/uniform_cache_history.cpp
     video_core/x8d24_conversion.cpp
     video_core/ampere_ported_half_compare.cpp

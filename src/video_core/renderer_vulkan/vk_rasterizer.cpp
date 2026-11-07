@@ -68,6 +68,7 @@
 #include "common/nx2_sample_profile.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
 
@@ -2000,7 +2001,11 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
 }
 
 bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
-    if ((True(which & VideoCommon::CacheType::BufferCache))) {
+    // The split's front asks this before each macro DMA read, and the back holds the buffer
+    // cache's lock through each draw: pages the GPU never wrote need no look under it.
+    if (True(which & VideoCommon::CacheType::BufferCache) &&
+        (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+         Tegra::Nx2MayBeGpuWritten(addr, size))) {
         std::scoped_lock lock{buffer_cache.mutex};
         if (buffer_cache.IsRegionGpuModified(addr, size)) {
             return true;
@@ -3018,9 +3023,10 @@ void RasterizerVulkan::UpdateDynamicStates(GraphicsPipeline* pipeline) {
     }
 
     if (device.IsExtVertexInputDynamicStateSupported()) {
-        GraphicsPipeline* const gp = skip_enabled && pipeline != nullptr
-                                         ? pipeline
-                                         : pipeline_cache.CurrentGraphicsPipeline();
+        // A draw passes the pipeline it looked up (#412: a second lookup was ~2.5% of the back
+        // thread); only a caller without one looks it up again.
+        GraphicsPipeline* const gp =
+            pipeline != nullptr ? pipeline : pipeline_cache.CurrentGraphicsPipeline();
         if (skip_enabled && pipeline != nullptr && VideoCommon::Nx2FastDraw::g_verify) {
             skip_stats.dynamic_pipeline_mismatches +=
                 pipeline != pipeline_cache.CurrentGraphicsPipeline() ? 1 : 0;
