@@ -1590,6 +1590,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
     pipeline_cache_filename =
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan", CACHE_VERSION);
+    static_assert(CACHE_VERSION == VideoCommon::VulkanPipelineCacheVersion);
+    LOG_INFO(Render_Vulkan, "Pipeline cache: {} ({})",
+             VideoCommon::VulkanPipelineCacheMarker.data(),
+             Common::FS::PathToUTF8String(pipeline_cache_filename));
     used_pipelines_filename =
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used", CACHE_VERSION);
     constexpr std::array<char, 8> shader_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
