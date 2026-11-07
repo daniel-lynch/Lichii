@@ -60,3 +60,10 @@ EDEN_NX2_FENCE_BATCH=1
 # single Ocarina compute shaders, each a freeze of the whole emulator at its first dispatch.
 # =0 builds the SPIR-V as emitted, as before.
 #EDEN_NX2_COMPUTE_NOINLINE=0
+# The same for graphics modules: functions a vertex, tessellation, geometry, task or mesh shader
+# calls from several places are built as calls, not inlined (a 3 s freeze followed a graphics
+# pipeline build in Ocarina's Hyrule Field). Fragment shaders keep the driver's inlining by
+# default: they run per pixel. =all adds fragment, =0 builds every graphics module as emitted;
+# letters pick stages (v vertex, c tess control, e tess eval, g geometry, t task, m mesh,
+# f fragment), e.g. =vtm. Applied when the module is built: the translation cache is unchanged.
+#EDEN_NX2_GRAPHICS_NOINLINE=0

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <span>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -22,11 +23,11 @@ struct Module {
     std::size_t small_control{};
 };
 
-Module Build(u32 calls_big, u32 calls_small, u32 big_body, u32 big_control = 0) {
+Module Build(u32 calls_big, u32 calls_small, u32 big_body, u32 big_control = 0, u32 model = 5) {
     Module m;
     auto& w = m.words;
     w = {0x07230203, 0x00010600, 0, 100, 0};
-    w.insert(w.end(), {Op(15, 4), 5, 1, 0x6e69616d}); // OpEntryPoint GLCompute %1 "main"
+    w.insert(w.end(), {Op(15, 4), model, 1, 0x6e69616d}); // OpEntryPoint <model> %1 "main"
     const auto function = [&](u32 id, u32 control) {
         w.insert(w.end(), {Op(54, 5), 10, id, control, 11});
         return w.size() - 2;
@@ -101,4 +102,108 @@ TEST_CASE("Malformed modules are left alone", "[spirv_inline_control]") {
     Module zero_count = Build(3, 0, 200);
     zero_count.words[5] = 0; // an instruction with a word count of 0
     REQUIRE(VideoCommon::MarkSharedFunctionsDontInline(zero_count.words) == 0);
+}
+
+namespace {
+using VideoCommon::SpirvStage;
+using VideoCommon::StageBit;
+// SPIR-V ExecutionModel values.
+constexpr u32 ModelVertex = 0;
+constexpr u32 ModelTessControl = 1;
+constexpr u32 ModelTessEval = 2;
+constexpr u32 ModelGeometry = 3;
+constexpr u32 ModelFragment = 4;
+constexpr u32 ModelCompute = 5;
+constexpr u32 ModelTaskEXT = 5364;
+constexpr u32 ModelMeshEXT = 5365;
+constexpr u32 ModelMeshNV = 5268;
+} // Anonymous namespace
+
+TEST_CASE("A module's stage comes from its entry points", "[spirv_inline_control]") {
+    REQUIRE(VideoCommon::ModuleStage(Build(3, 0, 200, 0, ModelVertex).words) == SpirvStage::Vertex);
+    REQUIRE(VideoCommon::ModuleStage(Build(3, 0, 200, 0, ModelTessControl).words) ==
+            SpirvStage::TessControl);
+    REQUIRE(VideoCommon::ModuleStage(Build(3, 0, 200, 0, ModelTessEval).words) ==
+            SpirvStage::TessEval);
+    REQUIRE(VideoCommon::ModuleStage(Build(3, 0, 200, 0, ModelGeometry).words) ==
+            SpirvStage::Geometry);
+    REQUIRE(VideoCommon::ModuleStage(Build(3, 0, 200, 0, ModelFragment).words) ==
+            SpirvStage::Fragment);
+    REQUIRE(VideoCommon::ModuleStage(Build(3, 0, 200, 0, ModelCompute).words) ==
+            SpirvStage::Compute);
+    REQUIRE(VideoCommon::ModuleStage(Build(3, 0, 200, 0, ModelTaskEXT).words) == SpirvStage::Task);
+    REQUIRE(VideoCommon::ModuleStage(Build(3, 0, 200, 0, ModelMeshEXT).words) == SpirvStage::Mesh);
+    REQUIRE(VideoCommon::ModuleStage(Build(3, 0, 200, 0, ModelMeshNV).words) == SpirvStage::Mesh);
+    REQUIRE(VideoCommon::ModuleStage(Build(3, 0, 200, 0, 99).words) == SpirvStage::Unknown);
+
+    std::vector<u32> empty;
+    REQUIRE(VideoCommon::ModuleStage(empty) == SpirvStage::Unknown);
+    Module two = Build(3, 0, 200, 0, ModelVertex);
+    // A second entry point of another stage, inserted after the first.
+    two.words.insert(two.words.begin() + 9, {Op(15, 4), ModelFragment, 2, 0x6e69616d});
+    REQUIRE(VideoCommon::ModuleStage(two.words) == SpirvStage::Unknown);
+}
+
+TEST_CASE("EDEN_NX2_GRAPHICS_NOINLINE values", "[spirv_inline_control]") {
+    using VideoCommon::AllGraphicsNoInlineStages;
+    using VideoCommon::DefaultGraphicsNoInlineStages;
+    using VideoCommon::ParseGraphicsNoInlineStages;
+    REQUIRE(ParseGraphicsNoInlineStages(nullptr) == DefaultGraphicsNoInlineStages);
+    REQUIRE(ParseGraphicsNoInlineStages("") == DefaultGraphicsNoInlineStages);
+    REQUIRE(ParseGraphicsNoInlineStages("1") == DefaultGraphicsNoInlineStages);
+    REQUIRE(ParseGraphicsNoInlineStages("0") == 0);
+    REQUIRE(ParseGraphicsNoInlineStages("none") == 0);
+    REQUIRE(ParseGraphicsNoInlineStages("all") == AllGraphicsNoInlineStages);
+    REQUIRE(ParseGraphicsNoInlineStages("vtm") == (StageBit(SpirvStage::Vertex) |
+                                                   StageBit(SpirvStage::Task) |
+                                                   StageBit(SpirvStage::Mesh)));
+    REQUIRE(ParseGraphicsNoInlineStages("f") == StageBit(SpirvStage::Fragment));
+    REQUIRE(ParseGraphicsNoInlineStages("vcegtmf") == AllGraphicsNoInlineStages);
+    REQUIRE(ParseGraphicsNoInlineStages("vx") == DefaultGraphicsNoInlineStages);
+    // The default leaves fragment shaders, and never names compute.
+    REQUIRE((DefaultGraphicsNoInlineStages & StageBit(SpirvStage::Fragment)) == 0);
+    REQUIRE((AllGraphicsNoInlineStages & StageBit(SpirvStage::Compute)) == 0);
+}
+
+TEST_CASE("Graphics modules are rebuilt only for the selected stages", "[spirv_inline_control]") {
+    const auto run = [](u32 model, u32 mask, bool expect_marked) {
+        const Module m = Build(3, 0, 200, 0, model);
+        std::vector<u32> storage;
+        std::size_t marked = 99;
+        const std::span<const u32> out =
+            VideoCommon::GraphicsModuleCode(m.words, mask, storage, marked);
+        if (expect_marked) {
+            REQUIRE(marked == 1);
+            REQUIRE(out.data() == storage.data());
+            REQUIRE(out[m.big_control] == 0x2);
+            REQUIRE(m.words[m.big_control] == 0); // the input is never written
+        } else {
+            REQUIRE(marked == 0);
+            REQUIRE(out.data() == m.words.data());
+            REQUIRE(out.size() == m.words.size());
+        }
+    };
+    const u32 def = VideoCommon::DefaultGraphicsNoInlineStages;
+    run(ModelVertex, def, true);
+    run(ModelTessControl, def, true);
+    run(ModelTessEval, def, true);
+    run(ModelGeometry, def, true);
+    run(ModelTaskEXT, def, true);
+    run(ModelMeshEXT, def, true);
+    run(ModelFragment, def, false);
+    run(ModelFragment, VideoCommon::AllGraphicsNoInlineStages, true);
+    run(ModelVertex, 0, false);
+    run(ModelVertex, StageBit(SpirvStage::Fragment), false);
+    // Compute has its own switch and is applied before BuildShader: never here, even if asked.
+    run(ModelCompute, def, false);
+    run(ModelCompute, ~0u, false);
+    run(99, ~0u, false);
+
+    // Nothing to mark: the input is returned.
+    const Module small = Build(1, 0, 200, 0, ModelVertex);
+    std::vector<u32> storage;
+    std::size_t marked = 99;
+    const auto out = VideoCommon::GraphicsModuleCode(small.words, def, storage, marked);
+    REQUIRE(marked == 0);
+    REQUIRE(out.data() == small.words.data());
 }
