@@ -262,6 +262,10 @@ public:
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
     /// of it was still queued.
     bool WaitForSync();
+    /// Waits until the back executed the compute and copy work sent before the last NoteSync:
+    /// the writers a command list fetched now is ordered after. Returns whether any of it was
+    /// still queued.
+    bool WaitForSyncedWriters();
     /// Deferred work that can write memory was just sent (puller semaphore releases, maps).
     void NoteMemoryWrite() {
         last_memory_write_position = write_position;
