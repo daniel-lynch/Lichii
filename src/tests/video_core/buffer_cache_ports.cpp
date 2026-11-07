@@ -497,7 +497,7 @@ TEST_CASE("Command page batch publishes only completed matching write generation
     const std::array<DAddr, 1> requested{0x20000};
     f.cache->Nx2FlushListPages(requested);
     REQUIRE(f.runtime.finishes == 1);
-    REQUIRE(f.runtime.downloads == (mapped ? 0 : 3));
+    REQUIRE(f.runtime.downloads == (mapped ? 0U : 3U));
     REQUIRE(f.cache->Nx2ReadListCopy(0x20000, out, true) == Read::Synced);
     REQUIRE(f.cache->Nx2ReadListCopy(0x21000, out, true) == Read::Synced);
     REQUIRE(f.cache->Nx2ReadListCopy(0x22000, out, true) == Read::Unknown);

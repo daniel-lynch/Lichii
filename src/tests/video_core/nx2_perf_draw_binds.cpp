@@ -20,7 +20,7 @@
 
 namespace {
 
-// UsageTracker::Track before the full-page run.
+// UsageTracker::Track before the full-page run, with the same per-page masks.
 class OldUsageTracker {
     static constexpr size_t BUFFER_BYTES_PER_BITSHIFT = 6;
     static constexpr size_t BUFFER_PAGE_SHIFT = 6 + BUFFER_BYTES_PER_BITSHIFT;
@@ -65,6 +65,9 @@ private:
     // range. #184's copy of the old mask shifted by 64 for an empty tail (undefined behaviour),
     // which marked a whole extra page after a page-aligned end.
     void TrackPage(u64 page, u64 offset, u64 size) noexcept {
+        if (size == 0) {
+            return;
+        }
         const size_t offset_in_page = offset % BUFFER_PAGE_BYTES;
         const size_t end_in_page = std::min<size_t>(
             offset_in_page + std::min<u64>(size, BUFFER_PAGE_BYTES), BUFFER_PAGE_BYTES);

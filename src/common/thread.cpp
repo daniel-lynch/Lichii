@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "common/adpf.h"
+#include "common/core_pinning.h"
 #include "common/error.h"
 #include "common/event_wait.h"
 #include "common/logging.h"
@@ -459,6 +460,7 @@ namespace {
 // (a soft affinity the power manager respects) and background workers on the slower ones.
 // EDEN_HYBRID_CORES=0 turns this off.
 struct WindowsCpuSets {
+    std::vector<Common::LogicalProcessor> processors;
     std::vector<ULONG> performance;
     std::vector<ULONG> efficiency;
     bool hybrid = false;
@@ -490,11 +492,6 @@ const WindowsCpuSets& CpuSets() {
                  GetCurrentProcess(), 0)) {
             return result;
         }
-        struct Entry {
-            ULONG id;
-            u8 efficiency_class;
-        };
-        std::vector<Entry> entries;
         u8 best = 0;
         for (ULONG offset = 0; offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= length;) {
             const auto* info =
@@ -503,14 +500,17 @@ const WindowsCpuSets& CpuSets() {
                 break;
             }
             if (info->Type == CpuSetInformation) {
-                entries.push_back({info->CpuSet.Id, info->CpuSet.EfficiencyClass});
+                const u32 core =
+                    (static_cast<u32>(info->CpuSet.Group) << 8) | info->CpuSet.CoreIndex;
+                result.processors.push_back({static_cast<u32>(info->CpuSet.Id), core,
+                                             static_cast<u8>(info->CpuSet.EfficiencyClass)});
                 best = (std::max)(best, static_cast<u8>(info->CpuSet.EfficiencyClass));
             }
             offset += info->Size;
         }
-        for (const Entry& entry : entries) {
-            (entry.efficiency_class == best ? result.performance : result.efficiency)
-                .push_back(entry.id);
+        for (const Common::LogicalProcessor& processor : result.processors) {
+            (processor.efficiency_class == best ? result.performance : result.efficiency)
+                .push_back(processor.id);
         }
         result.hybrid = !result.efficiency.empty() && result.performance.size() >= 2;
         if (result.hybrid) {
@@ -606,12 +606,15 @@ std::string_view GetCurrentThreadName() {
 void SetCurrentThreadName(const char* name) {
     current_thread_name = name;
     Nx2SampleProfile::OnThreadNamed(name);
-#ifdef _MSC_VER
-    // Sets the debugger-visible name of the current thread.
-    if (auto pf = (decltype(&SetThreadDescription))(void*)GetProcAddress(GetModuleHandle(TEXT("KernelBase.dll")), "SetThreadDescription"); pf)
-        pf(GetCurrentThread(), UTF8ToUTF16W(name).data()); // Windows 10+
-    else
-        ; // No-op
+#ifdef _WIN32
+    // Sets the debugger-visible name of the current thread (Windows 10+). Looked up at run time,
+    // which also covers MinGW, whose headers may not declare it.
+    using SetThreadDescriptionFn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+    static const auto set_description = reinterpret_cast<SetThreadDescriptionFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"KernelBase.dll"), "SetThreadDescription")));
+    if (set_description) {
+        set_description(GetCurrentThread(), UTF8ToUTF16W(name).c_str());
+    }
 #elif  defined(__APPLE__)
     pthread_setname_np(name);
 #elif defined(__HAIKU__)
@@ -631,11 +634,6 @@ void SetCurrentThreadName(const char* name) {
         buf[len] = '\0';
         pthread_setname_np(pthread_self(), buf);
     }
-#elif defined(_WIN32)
-    // MinGW with the POSIX threading model does not support pthread_setname_np
-    // See for reference
-    // https://gitlab.freedesktop.org/mesa/mesa/-/blame/main/src/util/u_thread.c?ref_type=heads#L75
-    (void)name;
 #else
     pthread_setname_np(pthread_self(), name);
 #endif
@@ -652,6 +650,44 @@ void SetCurrentThreadToPerformanceCores() {
     if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
         SelectCurrentThreadCpuSets(sets.performance);
     }
+#endif
+}
+
+void PinCurrentThread(PinnedRole role) {
+#ifdef _WIN32
+    struct PinnedCpuSets {
+        std::vector<ULONG> front;
+        std::vector<ULONG> back;
+        std::vector<ULONG> guest;
+    };
+    static const PinnedCpuSets pinned = [] {
+        const GpuThreadPinning plan = PlanGpuThreadPinning(CpuSets().processors);
+        if (plan.front.empty()) {
+            LOG_WARNING(Common,
+                        "GPU thread pinning skipped: {} physical performance cores, needs {}",
+                        plan.performance_cores, MinCoresForGpuThreadPinning);
+            return PinnedCpuSets{};
+        }
+        LOG_INFO(Common,
+                 "GPU thread pinning: front and back on a physical core each, guest cores on the "
+                 "other {} performance cores ({} logical processors)",
+                 plan.performance_cores - 2, plan.guest.size());
+        return PinnedCpuSets{{plan.front.begin(), plan.front.end()},
+                             {plan.back.begin(), plan.back.end()},
+                             {plan.guest.begin(), plan.guest.end()}};
+    }();
+    const std::vector<ULONG>& ids = role == PinnedRole::GpuFront  ? pinned.front
+                                    : role == PinnedRole::GpuBack ? pinned.back
+                                                                  : pinned.guest;
+    if (!ids.empty()) {
+        SelectCurrentThreadCpuSets(ids);
+    }
+#else
+    (void)role;
+    [[maybe_unused]] static const bool logged = [] {
+        LOG_INFO(Common, "GPU thread pinning is only supported on Windows");
+        return true;
+    }();
 #endif
 }
 

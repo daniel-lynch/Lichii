@@ -206,10 +206,13 @@ private:
     /// the GPU makes them now (BufferCache::Nx2CopyListPages).
     void SubmitNx2ListCopies();
 
-    /// EDEN_NX2_DYNAMIC_SKIP: pipeline is the draw's (null: look it up).
-    void UpdateDynamicStates(GraphicsPipeline* pipeline = nullptr);
+    /// Records the dynamic state of the draw being prepared with `pipeline` (null for
+    /// DrawTexture's blit, whose vertex input looks the pipeline up). EDEN_NX2_DYNAMIC_SKIP may
+    /// skip the fixed part when nothing it records changed.
+    void UpdateDynamicStates(const GraphicsPipeline* pipeline);
     void UpdateFixedDynamicStates(Tegra::Engines::Maxwell3D::Regs& regs,
-                                  Maxwell::PrimitiveTopology topology, bool topology_changed);
+                                  Maxwell::PrimitiveTopology topology, bool topology_changed,
+                                  const GraphicsPipeline* pipeline);
     /// The dirty flags that make UpdateFixedDynamicStates record anything on this device.
     Tegra::Engines::Maxwell3D::DirtyState::Flags DynamicStateFlags() const;
     /// EDEN_NX2_INLINE_INVALIDATE
@@ -246,7 +249,7 @@ private:
     void UpdateStencilOp(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateStencilTestEnable(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateLogicOp(Tegra::Engines::Maxwell3D::Regs& regs);
-    void UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs);
+    void UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs, const GraphicsPipeline* pipeline);
     void UpdateColorWriteEnable(Tegra::Engines::Maxwell3D::Regs& regs);
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
@@ -294,6 +297,8 @@ private:
     u32 render_trace_clears = 0;
     bool pending_native_work{};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+    /// Fragment output components the dynamic color write mask was last recorded with
+    u32 last_color_output_mask{};
 
     /// EDEN_NX2_FAST_DRAW: what the last fully resolved draw left bound (nx2_fast_draw.h).
     struct ReusableDraw {

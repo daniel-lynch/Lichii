@@ -84,7 +84,8 @@ consteval size_t CountFields() {
     POD(uses_is_helper_invocation) POD(uses_subgroup_invocation_id) POD(uses_subgroup_shuffles)   \
     POD(uses_quad_shuffles) POD(uses_patches) POD(interpolation) POD(loads) POD(stores)           \
     POD(passthrough) MAP(legacy_stores_mapping) POD(loads_indexed_attributes)                      \
-    POD(stores_frag_color) POD(stores_sample_mask) POD(stores_frag_depth)                          \
+    POD(stores_frag_color) POD(frag_color_components) POD(stores_sample_mask)                      \
+    POD(stores_frag_depth)                                                                         \
     POD(stores_tess_level_outer) POD(stores_tess_level_inner) POD(stores_indexed_attributes)      \
     POD(stores_global_memory) POD(uses_local_memory) POD(uses_fp16) POD(uses_fp64)                 \
     POD(uses_fp16_denorms_flush) POD(uses_fp16_denorms_preserve) POD(uses_fp32_denorms_flush)     \
@@ -108,7 +109,7 @@ consteval size_t CountFields() {
     VEC(storage_buffers_descriptors) VEC(texture_buffer_descriptors)                               \
     VEC(image_buffer_descriptors) VEC(texture_descriptors) VECVEC(handle_programs)                 \
     VEC(image_descriptors)
-constexpr size_t InfoFields = 88;
+constexpr size_t InfoFields = 89;
 
 #define TRANSLATION_CACHE_PROFILE_FIELDS(X) \
     X(supported_spirv) X(unified_descriptor_binding) X(support_descriptor_aliasing) \

@@ -1465,7 +1465,7 @@ void RasterizerVulkan::DrawTexture() {
     texture_cache.SynchronizeDescriptors(false);
     texture_cache.UpdateRenderTargets(false);
 
-    UpdateDynamicStates();
+    UpdateDynamicStates(nullptr);
 
     query_cache.NotifySegment(true);
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
@@ -2994,7 +2994,7 @@ bool AccelerateDMA::BufferToImage(const Tegra::DMA::ImageCopy& copy_info,
     return DmaBufferImageCopy<true>(copy_info, buffer_operand, image_operand);
 }
 
-void RasterizerVulkan::UpdateDynamicStates(GraphicsPipeline* pipeline) {
+void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
     auto& regs = maxwell3d->regs;
     auto& flags = maxwell3d->dirty.flags;
     const auto topology = maxwell3d->draw_manager.draw_state.topology;
@@ -3008,24 +3008,29 @@ void RasterizerVulkan::UpdateDynamicStates(GraphicsPipeline* pipeline) {
     if (skip_enabled) {
         ++skip_stats.dynamic_states;
     }
-    // The A2C refresh records its state on draws with no dirty flag set, so it can't be skipped.
-    if (skip_enabled && !topology_changed && !AlphaToCoverageRefresh() &&
+    // The A2C refresh records its state on draws with no dirty flag set, so it can't be skipped;
+    // neither can a change of the color components the pipeline writes (#353: UpdateBlending
+    // records the write mask again without a dirty flag).
+    const bool color_output_changed =
+        device.IsExtExtendedDynamicState3BlendingSupported() &&
+        (pipeline != nullptr ? pipeline->ColorOutputMask() : ~0U) != last_color_output_mask;
+    if (skip_enabled && !topology_changed && !AlphaToCoverageRefresh() && !color_output_changed &&
         (flags & dynamic_state_flags).none()) {
         ++skip_stats.dynamic_skipped;
         if (VideoCommon::Nx2FastDraw::g_verify) {
             // Nothing may be recorded: any flag the full update consumes was outside the mask.
             const auto before = flags;
-            UpdateFixedDynamicStates(regs, topology, topology_changed);
+            UpdateFixedDynamicStates(regs, topology, topology_changed, pipeline);
             skip_stats.dynamic_mismatches += before != flags ? 1 : 0;
         }
     } else {
-        UpdateFixedDynamicStates(regs, topology, topology_changed);
+        UpdateFixedDynamicStates(regs, topology, topology_changed, pipeline);
     }
 
     if (device.IsExtVertexInputDynamicStateSupported()) {
         // A draw passes the pipeline it looked up (#412: a second lookup was ~2.5% of the back
         // thread); only a caller without one looks it up again.
-        GraphicsPipeline* const gp =
+        const GraphicsPipeline* const gp =
             pipeline != nullptr ? pipeline : pipeline_cache.CurrentGraphicsPipeline();
         if (skip_enabled && pipeline != nullptr && VideoCommon::Nx2FastDraw::g_verify) {
             skip_stats.dynamic_pipeline_mismatches +=
@@ -3081,7 +3086,8 @@ Tegra::Engines::Maxwell3D::DirtyState::Flags RasterizerVulkan::DynamicStateFlags
 
 void RasterizerVulkan::UpdateFixedDynamicStates(Tegra::Engines::Maxwell3D::Regs& regs,
                                                 Maxwell::PrimitiveTopology topology,
-                                                bool topology_changed) {
+                                                bool topology_changed,
+                                                const GraphicsPipeline* pipeline) {
     UpdateViewportsState(regs);
     UpdateScissorsState(regs);
     UpdateDepthBias(regs);
@@ -3144,7 +3150,7 @@ void RasterizerVulkan::UpdateFixedDynamicStates(Tegra::Engines::Maxwell3D::Regs&
     }
 
     if (device.IsExtExtendedDynamicState3BlendingSupported()) {
-        UpdateBlending(regs);
+        UpdateBlending(regs, pipeline);
     } else if (device.IsExtColorWriteEnableSupported()) {
         UpdateColorWriteEnable(regs);
     }
@@ -3777,12 +3783,18 @@ void RasterizerVulkan::UpdateLogicOp(Tegra::Engines::Maxwell3D::Regs& regs) {
     scheduler.Record([op](vk::CommandBuffer cmdbuf) { cmdbuf.SetLogicOpEXT(op); });
 }
 
-void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs) {
-    if (!state_tracker.TouchBlending()) {
+void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs,
+                                      const GraphicsPipeline* pipeline) {
+    // The write mask also excludes components the fragment shader doesn't output, so it has to be
+    // recorded again whenever the bound pipeline outputs a different set of components.
+    const u32 color_output_mask = pipeline ? pipeline->ColorOutputMask() : ~0U;
+    const bool color_output_changed = color_output_mask != last_color_output_mask;
+    if (!state_tracker.TouchBlending() && !color_output_changed) {
         return;
     }
 
-    if (state_tracker.TouchColorMask()) {
+    if (state_tracker.TouchColorMask() || color_output_changed) {
+        last_color_output_mask = color_output_mask;
         std::array<VkColorComponentFlags, Maxwell::NumRenderTargets> setup_masks{};
         for (size_t index = 0; index < Maxwell::NumRenderTargets; index++) {
             const auto& mask = regs.color_mask[regs.color_mask_common ? 0 : index];
@@ -3799,6 +3811,7 @@ void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs) {
             if (mask.A) {
                 current |= VK_COLOR_COMPONENT_A_BIT;
             }
+            current &= (color_output_mask >> (index * 4)) & 0xF;
         }
         scheduler.Record([setup_masks](vk::CommandBuffer cmdbuf) {
             cmdbuf.SetColorWriteMaskEXT(0, setup_masks);
