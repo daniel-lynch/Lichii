@@ -104,6 +104,54 @@ if [ "${OOT_PRODUCT:-1}" = "1" ]; then
     done
   fi
 fi
+# OOT_PIPELINES: offline pipeline-key product ($OOT/offline-translate/pipeline-live/vulkan.fork-v53.bin
+# + its .sha256): pipeline-tools/pipeline_cache_merge.py appends the product's records whose key the
+# live pipeline cache lacks, before the emulator starts, so those pipelines are built at boot instead
+# of mid-play. The live cache's records stay a byte-identical prefix, with one exception: a record
+# cut short at its end (a crash mid-append) is dropped, because the emulator deletes the WHOLE cache
+# when it finds one; the backup (<live>.bak-*, 3 kept) keeps those bytes. Runs when the product's
+# sha differs from the one in <live>.merged, or the live cache was deleted and recreated since
+# (inode changed); otherwise only `repair` runs (about a second: it reads the cache), which drops a
+# cut-short tail a crashed session left -- with the same checks and a backup. Session lock: every
+# launch holds <live>.session.lock on fd 9, which the emulator inherits -- exclusive for the merge,
+# then shared while the game runs -- so a merge never runs under an emulator another launch
+# started (that launch skips it). The tool refuses rather than
+# risk the cache -- 3: an emulator, another session or another merge is using it; 2: live cache
+# unusable; 4: product failed validation -- and every refusal only skips the merge: the game
+# launches anyway. OOT_PIPELINES=0 skips the merge (the session lock is still taken).
+LIVE_PC="$HOME/.cache/eden/shader/0400486024dec000/vulkan.fork-v53.bin"
+if mkdir -p "${LIVE_PC%/*}" 2>/dev/null && exec 9>>"$LIVE_PC.session.lock"; then
+  if flock -n -x 9; then
+    PC_TOOL="$OOT/offline-translate/pipeline-tools/pipeline_cache_merge.py"
+    PC_PRODUCT="$OOT/offline-translate/pipeline-live/vulkan.fork-v53.bin"
+    rc=none
+    if [ "${OOT_PIPELINES:-1}" = "1" ] && [ -f "$PC_PRODUCT" ]; then
+      want=$(cut -c1-64 "$PC_PRODUCT.sha256" 2>/dev/null)
+      have=$(cut -c1-64 "$LIVE_PC.merged" 2>/dev/null)
+      ino=$(stat -c %i "$LIVE_PC" 2>/dev/null)
+      have_ino=$(sed -n 's/.* ino=//p' "$LIVE_PC.merged" 2>/dev/null)
+      if [ -z "$want" ] || [ "$want" != "$have" ] || [ "$ino" != "$have_ino" ]; then
+        timeout -s INT -k 10 300 python3 -I "$PC_TOOL" merge --live "$LIVE_PC" --product "$PC_PRODUCT" --session-lock
+        rc=$?
+        case $rc in
+          0) echo "$want ino=$(stat -c %i "$LIVE_PC" 2>/dev/null)" > "$LIVE_PC.merged.tmp" \
+               && mv -f "$LIVE_PC.merged.tmp" "$LIVE_PC.merged";;
+          3) echo "pipeline keys: emulator busy, skipped" >&2;;
+          *) echo "pipeline keys: not merged (exit $rc, reason above); launching anyway" >&2;;
+        esac
+      fi
+    fi
+    # No merge ran (or it refused the product / an unreadable live cache): still repair a
+    # cut-short tail a crashed session left, which the emulator would answer by deleting the cache.
+    if [ "${OOT_PIPELINES:-1}" = "1" ] && [ "$rc" != 0 ] && [ "$rc" != 3 ] && [ -s "$LIVE_PC" ]; then
+      timeout -s INT -k 10 120 python3 -I "$PC_TOOL" repair --live "$LIVE_PC" --session-lock \
+        | grep -v '^live .*records$\|^nothing to repair' >&2 9>&-  # 9>&-: the filter holds no session fd
+    fi
+  elif [ "${OOT_PIPELINES:-1}" = "1" ]; then
+    echo "pipeline keys: emulator busy, skipped (another session holds the cache)" >&2
+  fi
+  flock -s -w 60 9 || echo "pipeline keys: session lock not taken; launching anyway" >&2
+fi
 # MangoHud: overlay + CSV of fps/frametime, starts 5 s after launch, runs until exit.
 # MangoHud: OOT_MANGOHUD=0 disables the overlay and the frametime log entirely. The NVIDIA GPU
 # sampler (gpu_stats) aborts the process inside libMangoHud.so on this host since 2026-11-06
@@ -117,7 +165,7 @@ MH_CFG="fps,frametime,cpu_stats,output_folder=$OOT/logs,autostart_log=5,log_dura
 [ "${OOT_MANGOHUD_GPU_STATS:-0}" = "1" ] && MH_CFG="$MH_CFG,gpu_stats"
 export MANGOHUD_CONFIG="$MH_CFG"
 # PCIe + GPU load sampler (1 s) for the whole session, saved beside the logs.
-nvidia-smi dmon -s tu -d 1 > "$OOT/logs/pcie-$STAMP.txt" 2>/dev/null &
+nvidia-smi dmon -s tu -d 1 > "$OOT/logs/pcie-$STAMP.txt" 2>/dev/null 9>&- &  # 9>&-: only the game holds the session lock
 SAMPLER=$!
 # Field test in progress: every harness/build agent yields to this marker, so nothing else uses the
 # GPU or the emulator lock while the game is up. Removed when the game exits (trap covers signals).
