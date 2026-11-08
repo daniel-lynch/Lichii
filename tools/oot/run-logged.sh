@@ -266,6 +266,10 @@ fi
 # across sessions (the driver cache is where the 0.7-0.9 s runtime builds end up). OOT_GL_CACHE=0 leaves the driver defaults.
 if [ "${OOT_GL_CACHE:-1}" = "1" ]; then export __GL_SHADER_DISK_CACHE_SIZE=8589934592 __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1; fi
 export MANGOHUD="${OOT_MANGOHUD:-0}"  # default off since 2026-11-06: the in-process layer aborts lichii at GUI start on this host
+# Stereo for this game: the host advertises 6 channels, the game then renders 5.1 and dialogue
+# (centre channel) lands ~4.5 dB low in our downmix. Field-verified 2026-11-07: forcing stereo
+# brings the voice lines back. OOT_AUDIO_STEREO=0 restores the 5.1 path.
+if [ "${OOT_AUDIO_STEREO:-1}" = "1" ]; then export EDEN_NX2_AUDIO_STEREO=1; fi
 MH_CFG="fps,frametime,cpu_stats,output_folder=$OOT/logs,autostart_log=5,log_duration=0,log_interval=100"
 [ "${OOT_MANGOHUD_GPU_STATS:-0}" = "1" ] && MH_CFG="$MH_CFG,gpu_stats"
 export MANGOHUD_CONFIG="$MH_CFG"
