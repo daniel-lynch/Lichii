@@ -643,4 +643,9 @@ TEST_CASE("Chest trace sites preserve hints and report keys", "[oot_gamedata_tra
     }
     REQUIRE(Trace::Identify(Base, Base + 0x838964, 0xB94C5808) == Point::BitRead);
     REQUIRE(Trace::Identify(Base, Base + 0xF07134, 0xAA0003E8) == Point::BitSet);
+    // Co-op without tracing traps only the frame boundary, never the hot Bool64 accessors.
+    REQUIRE(Trace::CoopPoint(Point::Frame));
+    for (const auto point : {Point::BitRead, Point::BitSet, Point::StepSet, Point::StepApply,
+                             Point::PlayedEvent, Point::None})
+        REQUIRE_FALSE(Trace::CoopPoint(point));
 }

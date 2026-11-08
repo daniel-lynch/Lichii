@@ -85,8 +85,11 @@ inline constexpr std::array<Site, 10> Sites{{
     {Point::ActorFlagSet, 0xF07048, Pacibsp},
 }};
 
+/// Co-op alone hooks only the frame boundary: it binds GameData from the manager cell there, and
+/// its handler ignores every other point. The Bool64 accessors are hot (the actor reader copy at
+/// +0x838964 runs per actor per frame), so hooking them without tracing would cost a trap each.
 constexpr bool CoopPoint(Point point) {
-    return point == Point::Frame || point == Point::BitRead || point == Point::BitSet;
+    return point == Point::Frame;
 }
 
 /// The trace point at `address` whose original instruction is `instruction`, or None.
