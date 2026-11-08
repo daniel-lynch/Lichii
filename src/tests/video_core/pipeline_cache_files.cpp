@@ -519,6 +519,56 @@ TEST_CASE("Compute cache ordering prefers supersets over larger disjoint pointer
     CHECK(Markers(count_only[CullingKey.unique_hash]) == std::vector<u32>{'B', 'C', 'A'});
 }
 
+TEST_CASE("A chain of null-slot rebuild records loads the newest, strongest one first",
+          "[pipeline_cache_files][compute_null_slots]") {
+    // Daniel's live cache after the 2026-11-07 20:01 session holds three records of the far-tree
+    // culling compute 541ba22d44898196: the product's (c4[0xd0], c4[0x130] and c4[0x170] null),
+    // the first rebuild (c4[0xd0] and c4[0x170] bound) and the second (c4[0x130] too), appended
+    // in that order with no replacement mark. With retained pointers each rebuild binds every
+    // pointer the one before it binds, so the last is the superset with the most pointers: the
+    // loader tries it first whichever order the records sit in, and the stale slot that made a
+    // session rebuild is no longer null in what boot loads.
+    const PointerEnvironment stale{'S', {{4, 0x80, 0x1000, 0x22, true},
+                                         {4, 0xd0, 0, 0, false},
+                                         {4, 0x130, 0, 0, false},
+                                         {4, 0x170, 0, 0, false}}};
+    const PointerEnvironment first{'1', {{4, 0x80, 0x1000, 0x22, true},
+                                         {4, 0xd0, 0x2000, 0x22, true},
+                                         {4, 0x130, 0, 0, false},
+                                         {4, 0x170, 0x3000, 0x22, true}}};
+    const PointerEnvironment second{'2', {{4, 0x80, 0x1000, 0x22, true},
+                                          {4, 0xd0, 0x2000, 0x22, true},
+                                          {4, 0x130, 0x4000, 0x22, true},
+                                          {4, 0x170, 0x3000, 0x22, true}}};
+    TempDir temp;
+    // Live order (chronological) and a newest-first product holding every record.
+    const auto live = temp.path / "live.bin";
+    SerializeCompute(CullingKey, stale, live);
+    SerializeCompute(CullingKey, first, live);
+    SerializeCompute(CullingKey, second, live);
+    const auto newest_first = temp.path / "newest-first.bin";
+    SerializeCompute(CullingKey, second, newest_first);
+    SerializeCompute(CullingKey, first, newest_first);
+    SerializeCompute(CullingKey, stale, newest_first);
+    for (const auto& path : {live, newest_first}) {
+        CAPTURE(path.filename().string());
+        auto candidates = LoadCandidates(path, true);
+        auto& culling = candidates[CullingKey.unique_hash];
+        REQUIRE(culling.size() == 3);
+        CHECK(culling.front().ReadCbufValue(0, 0) == '2');
+        CHECK(culling.front().NullStoragePointerSlots().empty());
+        CHECK(culling.front().MappedStoragePointerKeys().size() == 4);
+    }
+    // A product deduplicated to the first rebuild alone (a union that keeps the first record of
+    // a key, fed the appended records oldest first) still leaves c4[0x130] null: boot loads it
+    // and the area that fills c4[0x130] rebuilds the pipeline again, cold.
+    const auto first_only = temp.path / "first-only.bin";
+    SerializeCompute(CullingKey, first, first_only);
+    auto candidates = LoadCandidates(first_only, true);
+    CHECK(candidates[CullingKey.unique_hash].front().NullStoragePointerSlots() ==
+          std::vector<std::pair<u32, u32>>{{4, 0x130}});
+}
+
 TEST_CASE("Compute rebuild keeps direct and table pointer classifications through serialization",
           "[pipeline_cache_files][compute_null_slots]") {
     TempDir temp;
