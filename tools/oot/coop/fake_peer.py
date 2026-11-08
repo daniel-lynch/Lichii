@@ -46,12 +46,13 @@ class FakePeer:
     """Relay + one scripted client in one event loop. `port=0` picks an ephemeral port."""
 
     def __init__(self, *, port=43390, room="default", team="default", policy="or-v2", seed="0",
-                 name="FakePeer", build_id=client_sim.BUILD_ID, record=None):
+                 name="FakePeer", build_id=client_sim.BUILD_ID, record=None, wallet=0):
         self.relay = relay_mod.Relay()
         self.port = port
         self.client = client_sim.ClientSim(room=room, team=team, name=name, build_id=build_id,
                                            seed_hash=seed, policy_id=policy)
         self.record = Path(record) if record else None
+        self.wallet = wallet  # the wallet key from the private profile (rupee_add)
         self.received = []
         self.seen = []
         self.waiters = []
@@ -107,7 +108,7 @@ class FakePeer:
                       "seq": self.client.seq, field: key, "value": True}
             if kind == "rupee_add":
                 packet = {"type": kind, "origin": self.client.hello["client_id"],
-                          "seq": self.client.seq, "hash": relay_mod.WALLET, "delta": key}
+                          "seq": self.client.seq, "hash": self.wallet, "delta": key}
             packets.append(packet)
             data += relay_mod.encode(packet)
         since = len(self.seen)
@@ -167,7 +168,8 @@ async def serve(args):
     commands, results = ctl / "cmd.txt", ctl / "out.jsonl"
     commands.touch()
     peer = FakePeer(port=args.port, room=args.room, team=args.team, policy=args.policy, seed=args.seed,
-                    name=args.name, build_id=args.build_id, record=ctl / "received.jsonl")
+                    name=args.name, build_id=args.build_id, record=ctl / "received.jsonl",
+                    wallet=args.wallet)
     port = await peer.start()
     print(f"fake peer ready on 127.0.0.1:{port} room={args.room} team={args.team}", flush=True)
     done = len(commands.read_text().splitlines())
@@ -204,6 +206,8 @@ def main():
     parser.add_argument("--seed", default="0")
     parser.add_argument("--name", default="FakePeer")
     parser.add_argument("--build-id", default=client_sim.BUILD_ID)
+    parser.add_argument("--wallet", type=lambda text: int(text, 0), default=0,
+                        help="wallet GameData key for rupee_add (from the private profile)")
     args = parser.parse_args()
     try:
         asyncio.run(serve(args))

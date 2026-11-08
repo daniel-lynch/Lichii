@@ -12,12 +12,10 @@ inline std::string_view ClassName(Kind kind) {
     return kind == Kind::Bit ? "bit" : kind == Kind::Rupee ? "rupee" : "bool";
 }
 
-// pouchMgr = *(main+PouchCell) (proven from four node loaders, C5). Wallet entry main+RupeeEntry
-// (x0=pouchMgr, w1=signed delta, w2=reason): ldadd into pouchMgr+0x3BD4, reason at +0x3BD8, then an
-// optional recorder tail call; the pouch update main+0x5EBE0 clamps it into CurrentRupee.
-inline constexpr u64 PouchCell = 0x4E78E28;
-inline constexpr u64 RupeeEntry = 0x33A6D70;
-inline constexpr u64 RupeeReason = 7; // OneshotIncreaseRupee's reason
+// The pouch manager is *(main + profile.pouch_cell). The wallet entry (profile.rupee_entry; x0 =
+// pouchMgr, w1 = signed delta, w2 = reason) adds into the pending field at pouchMgr+0x3BD4 (reason
+// at +0x3BD8); the game's own pouch update later clamps it into the wallet.
+inline constexpr u64 RupeeReason = 7; // the one-shot "increase rupee" caller's reason
 
 struct GuestBinding {
     u64 base{}, manager{}, data{}, queue{}, sentinel{}, stack{};
@@ -26,21 +24,6 @@ struct GuestBinding {
     u64 bool_data{}, bool_queue{}, bool_hashes{};
     u32 bool_count{}, bool_capacity{};
 };
-
-inline constexpr std::array<std::pair<u32, u32>, 206> ChestMembers{{
-#include "core/arm/dynarmic/oot_coop_chest_keys.inc"
-}};
-
-inline std::optional<u32> ChestBool(u32 member) {
-    const auto it = std::lower_bound(ChestMembers.begin(), ChestMembers.end(), member,
-                                    [](const auto& row, u32 hash) { return row.first < hash; });
-    return it != ChestMembers.end() && it->first == member ? std::optional{it->second} : std::nullopt;
-}
-
-inline bool IsChestBool(u64 key) {
-    return std::any_of(ChestMembers.begin(), ChestMembers.end(),
-                       [key](const auto& row) { return row.second == key; });
-}
 
 // Both flag classes use deferred guest setters, never direct byte stores:
 // the game's queue consumer owns notifications and dirty tracking (see HOOKS.md).
@@ -55,9 +38,10 @@ public:
         bool operator==(const Context&) const = default;
     };
 
-    GameDataBackend(Jit& jit_, Memory& memory_, GuestBinding& binding_, u64& tls_, u64& tls_ro_,
+    GameDataBackend(Jit& jit_, Memory& memory_, GuestBinding& binding_,
+                    const OotGameDataTrace::Profile& profile_, u64& tls_, u64& tls_ro_,
                     std::function<void()> clear_exclusive_)
-        : jit{jit_}, memory{memory_}, binding{binding_}, tls{tls_}, tls_ro{tls_ro_},
+        : jit{jit_}, memory{memory_}, binding{binding_}, profile{profile_}, tls{tls_}, tls_ro{tls_ro_},
           clear_exclusive{std::move(clear_exclusive_)} {}
 
     /// Did the manager cell or a bound table change since binding? Unreadable counts as moved.
@@ -65,7 +49,7 @@ public:
         using namespace OotGameDataTrace::Detail;
         if (!binding.manager) return false;
         const u64 m = binding.manager;
-        if (Read64(memory, binding.base + 0x4E842A8) != m) return true;
+        if (!profile.manager_cell || Read64(memory, binding.base + profile.manager_cell) != m) return true;
         if (binding.bool_data &&
             (Read32(memory, m + 0x10) != binding.bool_count ||
              Read64(memory, m + 0x18) != binding.bool_data ||
@@ -83,7 +67,9 @@ public:
     }
 
     bool BindFromCell() {
-        const auto manager = OotGameDataTrace::Detail::Read64(memory, binding.base + 0x4E842A8);
+        if (!profile.manager_cell) return false;
+        const auto manager =
+            OotGameDataTrace::Detail::Read64(memory, binding.base + profile.manager_cell);
         return BindManager(manager.value_or(0));
     }
 
@@ -134,7 +120,8 @@ public:
     }
 
     std::optional<bool> ReadFlag(const Change& change) {
-        if (!change.key || (change.kind == Kind::Bool && !IsChestBool(change.key)) ||
+        // Only keys from the reviewed policy reach here (ApplyPolicy and the frame poll).
+        if (!change.key || (change.kind == Kind::Bool && change.key > 0xFFFFFFFFULL) ||
             !Bind(binding.manager, change.kind)) return {};
         if (change.kind == Kind::Bool) {
             // Same modulo/linear probe as the guest. Bound corrupt/collision-heavy tables.
@@ -168,36 +155,25 @@ public:
     std::optional<ApplyTarget> Resolve(const Change& change) {
         using namespace OotGameDataTrace::Detail;
         if (change.kind == Kind::Rupee) {
-            if (change.key != WalletHash || !RupeeDelta(change.value) || !binding.manager ||
-                !binding.sentinel || binding.stack < 0x4000 ||
-                !Range(binding.stack - 0x4000, 0x4000) ||
-                Read32(memory, binding.sentinel) != OotGameDataTrace::Breakpoint) return {};
-            const u64 entry = binding.base + RupeeEntry;
-            constexpr std::array<u32, 4> words{0x52877A88, 0x8B080008, 0xB8210108, 0xB93BD802};
-            for (size_t i = 0; i < words.size(); ++i)
-                if (Read32(memory, entry + i * 4) != words[i]) return {};
-            const auto pouch = Read64(memory, binding.base + PouchCell);
-            if (!pouch || !*pouch || !Range(*pouch + 0x3BD4, 8)) return {};
-            return ApplyTarget{true, false, 0, 0, entry, binding.sentinel, binding.stack,
+            if (!profile.wallet_hash || change.key != profile.wallet_hash ||
+                !RupeeDelta(change.value) || !binding.manager || !Callable()) return {};
+            const auto entry = Verified(profile.rupee_entry);
+            const auto pouch = profile.pouch_cell ? Read64(memory, binding.base + profile.pouch_cell)
+                                                  : std::nullopt;
+            if (!entry || !pouch || !*pouch || !Range(*pouch + 0x3BD4, 8)) return {};
+            return ApplyTarget{true, false, 0, 0, *entry, binding.sentinel, binding.stack,
                                {*pouch, static_cast<u32>(static_cast<s32>(change.value)), RupeeReason}};
         }
-        if (!ReadFlag(change).has_value() || !binding.sentinel || binding.stack < 0x4000 ||
-            !Range(binding.stack - 0x4000, 0x4000) ||
-            Read32(memory, binding.sentinel) != OotGameDataTrace::Breakpoint) return {};
+        if (!ReadFlag(change).has_value() || !Callable()) return {};
         const bool flat = change.kind == Kind::Bool;
-        const u64 entry = binding.base + (flat ? 0x682B20 : 0x3761720);
-        if (flat) {
-            constexpr std::array<u32, 4> words{0xD503237F, 0xD100C3FF, 0xA9017BFD, 0xF90013F3};
-            for (size_t i = 0; i < words.size(); ++i)
-                if (Read32(memory, entry + i * 4) != words[i]) return {};
-        } else if (Read32(memory, entry) != 0xB40003C2 ||
-                   Read32(memory, entry + 4) != 0xAA0003E8) return {};
+        const auto entry = Verified(flat ? profile.bool_setter : profile.bit_setter);
+        if (!entry) return {};
         const auto capacity = Read32(memory, binding.manager + (flat ? 0x30 : 0xC68));
         const auto state = Read32(memory, binding.manager + (flat ? 0x40 : 0xC78));
         const u64 queue = flat ? binding.bool_queue : binding.queue;
         if (!capacity || !state || !*capacity || *capacity > 0xFFFFF ||
             (*state & 0xFFFFF) >= *capacity || !Range(queue, u64{*capacity} * 8)) return {};
-        return ApplyTarget{true, false, 0, 0, entry, binding.sentinel,
+        return ApplyTarget{true, false, 0, 0, *entry, binding.sentinel,
                            binding.stack, {binding.manager, 1, change.key}};
     }
 
@@ -236,6 +212,23 @@ public:
     }
 
 private:
+    /// The private stack and the sentinel breakpoint a synthetic call needs.
+    bool Callable() {
+        return binding.sentinel && binding.stack >= 0x4000 &&
+               Range(binding.stack - 0x4000, 0x4000) &&
+               OotGameDataTrace::Detail::Read32(memory, binding.sentinel) ==
+                   OotGameDataTrace::Breakpoint;
+    }
+    /// The entry's guest address when its first words are the profile's, else nothing.
+    std::optional<u64> Verified(const OotGameDataTrace::Entry& entry) {
+        if (!entry || entry.words.size() > 16) return std::nullopt;
+        const u64 address = binding.base + entry.offset;
+        for (size_t i = 0; i < entry.words.size(); ++i) {
+            if (OotGameDataTrace::Detail::Read32(memory, address + i * 4) != entry.words[i])
+                return std::nullopt;
+        }
+        return address;
+    }
     static bool Span(u64 address, u64 size) {
         return address && address <= std::numeric_limits<u64>::max() - size;
     }
@@ -250,6 +243,7 @@ private:
     Jit& jit;
     Memory& memory;
     GuestBinding& binding;
+    const OotGameDataTrace::Profile& profile;
     u64& tls;
     u64& tls_ro;
     std::function<void()> clear_exclusive;

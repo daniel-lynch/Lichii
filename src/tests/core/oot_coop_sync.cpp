@@ -10,6 +10,7 @@
 #include "core/arm/dynarmic/oot_coop_sync.h"
 #include "core/arm/dynarmic/oot_coop_apply.h"
 #include "core/arm/dynarmic/oot_coop_runtime.h"
+#include "tests/core/oot_test_profile.h"
 
 namespace {
 namespace Coop = Core::OotCoop;
@@ -17,6 +18,8 @@ namespace Trace = Core::OotGameDataTrace;
 using Coop::Change;
 using Coop::Kind;
 using Json = nlohmann::json;
+namespace P = OotTestProfile;
+constexpr u64 Wallet = P::Wallet;
 } // namespace
 
 TEST_CASE("OoT co-op change codecs preserve opaque hashes", "[core][oot_coop]") {
@@ -128,16 +131,16 @@ TEST_CASE("OoT co-op scalar state and runtime deny-list", "[core][oot_coop]") {
 }
 
 TEST_CASE("OoT co-op requires endpoint title build and matching handshake", "[core][oot_coop]") {
-    REQUIRE(Coop::Gate("1", Trace::ProgramId, Trace::BuildId));
-    REQUIRE(Coop::Gate("127.0.0.1:43390", Trace::ProgramId, Trace::BuildId));
-    REQUIRE(Coop::Gate("[::1]:43390", Trace::ProgramId, Trace::BuildId));
-    REQUIRE_FALSE(Coop::Gate("", Trace::ProgramId, Trace::BuildId));
-    REQUIRE_FALSE(Coop::Gate("0", Trace::ProgramId, Trace::BuildId));
-    REQUIRE_FALSE(Coop::Gate("host:0", Trace::ProgramId, Trace::BuildId));
-    REQUIRE_FALSE(Coop::Gate("host:65536", Trace::ProgramId, Trace::BuildId));
-    REQUIRE_FALSE(Coop::Gate("host:43390", 1, Trace::BuildId));
-    REQUIRE_FALSE(Coop::Gate("host:43390", Trace::ProgramId, "different"));
+    REQUIRE(Coop::Gate("1", Trace::ProgramId));
+    REQUIRE(Coop::Gate("127.0.0.1:43390", Trace::ProgramId));
+    REQUIRE(Coop::Gate("[::1]:43390", Trace::ProgramId));
+    REQUIRE_FALSE(Coop::Gate("", Trace::ProgramId));
+    REQUIRE_FALSE(Coop::Gate("0", Trace::ProgramId));
+    REQUIRE_FALSE(Coop::Gate("host:0", Trace::ProgramId));
+    REQUIRE_FALSE(Coop::Gate("host:65536", Trace::ProgramId));
+    REQUIRE_FALSE(Coop::Gate("host:43390", 1));
     Coop::Hello hello;
+    hello.build_id = P::BuildId;
     hello.client_id = "a";
     auto packet = Coop::EncodeHello(hello);
     REQUIRE_FALSE(Coop::MatchesHello(packet, hello));
@@ -148,7 +151,7 @@ TEST_CASE("OoT co-op requires endpoint title build and matching handshake", "[co
     packet["seed_hash"] = "0";
     packet["build_id"] = "different";
     REQUIRE_FALSE(Coop::MatchesHello(packet, hello));
-    packet["build_id"] = Trace::BuildId;
+    packet["build_id"] = P::BuildId;
     packet["version"] = 1;
     REQUIRE_FALSE(Coop::MatchesHello(packet, hello));
 }
@@ -550,42 +553,45 @@ TEST_CASE("OoT co-op frame observer quarantines rollback and incomplete baseline
 }
 
 TEST_CASE("OoT co-op typed key policies separate chest Bools and Bool64", "[core][oot_coop]") {
-    const Json chest{{"bool", Json::array({0xC8643846U})}};
+    constexpr u32 c1 = 0x5EED0001; // synthetic chest Bool
+    const Json chest{{"bool", Json::array({c1})}};
     const auto keys = Coop::DecodeKeyPolicy(chest);
     REQUIRE(keys);
-    REQUIRE(keys->contains({Kind::Bool, 0xC8643846}));
-    REQUIRE_FALSE(keys->contains({Kind::Bit, 0xC8643846}));
-    const auto legacy = Coop::DecodeKeyPolicy(Json::array({0xC8643846U}));
+    REQUIRE(keys->contains({Kind::Bool, c1}));
+    REQUIRE_FALSE(keys->contains({Kind::Bit, c1}));
+    const auto legacy = Coop::DecodeKeyPolicy(Json::array({c1}));
     REQUIRE(legacy);
-    REQUIRE(legacy->contains({Kind::Bit, 0xC8643846}));
-    REQUIRE(Coop::DecodeKeyPolicy(Json{{"bool", Json::array({0xC8643846U})},
-                                      {"bit", Json::array({0x3F38F9B9A399E19AULL})}})->size() == 2);
-    for (const auto& invalid : {Json{{"bool", Json::array({123})}},
-                               Json{{"bool", Json::array({0x3F38F9B9A399E19AULL})}},
-                               Json{{"bool,bool", Json::array({0xC8643846U})}},
+    REQUIRE(legacy->contains({Kind::Bit, c1}));
+    REQUIRE(Coop::DecodeKeyPolicy(Json{{"bool", Json::array({c1})},
+                                      {"bit", Json::array({0x1122334455667788ULL})}})->size() == 2);
+    // Bool keys are 32-bit; the user-supplied file is the reviewed list (no compiled-in catalog).
+    REQUIRE(Coop::DecodeKeyPolicy(Json{{"bool", Json::array({123})}}));
+    REQUIRE(Coop::DecodeKeyPolicy(Json{{"bool", Json::array({c1})}, {"offsets", Json::object()}}));
+    for (const auto& invalid : {Json{{"bool", Json::array({0x1122334455667788ULL})}},
+                               Json{{"bool,bool", Json::array({c1})}},
                                Json{{"quest", Json::array({123})}},
                                Json{{"bit", Json::array({0})}}}) {
         REQUIRE_FALSE(Coop::DecodeKeyPolicy(invalid));
     }
     Coop::FrameDrain<FakeGuest> disabled{{true, {}, *keys}};
-    REQUIRE_FALSE(disabled.Queue({Kind::Bool, "A", 1, 0xC8643846, 1}));
+    REQUIRE_FALSE(disabled.Queue({Kind::Bool, "A", 1, c1, 1}));
 }
 
 TEST_CASE("OoT co-op rupee deltas are wallet-only events, never state", "[core][oot_coop]") {
-    const Change five{Kind::Rupee, "B", 3, Coop::WalletHash, 5};
+    const Change five{Kind::Rupee, "B", 3, Wallet, 5};
     const auto packet = Coop::EncodeChange(five);
     REQUIRE(packet == Json{{"type", "rupee_add"}, {"origin", "B"}, {"seq", 3},
-                           {"hash", 0xA77921D7U}, {"delta", 5}});
+                           {"hash", P::Wallet}, {"delta", 5}});
     REQUIRE(Coop::DecodeChange(packet) == five);
     REQUIRE(Coop::WireKind(Kind::Rupee));
     auto with_rev = packet;
     with_rev["rev"] = 4;
     REQUIRE(Coop::DecodeChange(with_rev) == five);
     REQUIRE(Coop::DecodeChange({{"type", "rupee_add"}, {"origin", "B"}, {"seq", 3},
-                                {"hash", 0xA77921D7U}, {"delta", -999}})->value == -999);
+                                {"hash", P::Wallet}, {"delta", -999}})->value == -999);
     for (const auto& [field, value] : std::vector<std::pair<std::string, Json>>{
              {"delta", 0}, {"delta", 1000}, {"delta", -1000}, {"delta", true}, {"delta", 2.5},
-             {"delta", "5"}, {"hash", 101}, {"value", true}, {"extra", 1}}) {
+             {"delta", "5"}, {"hash", 0}, {"value", true}, {"extra", 1}}) {
         auto bad = packet;
         bad[field] = value;
         REQUIRE_FALSE(Coop::DecodeChange(bad));
@@ -595,34 +601,34 @@ TEST_CASE("OoT co-op rupee deltas are wallet-only events, never state", "[core][
     REQUIRE_FALSE(Coop::DecodeChange(bare));
     // A delta is never snapshot state, with or without an origin.
     REQUIRE_FALSE(Coop::DecodeChange(packet, true));
-    REQUIRE_FALSE(Coop::DecodeChange({{"type", "rupee_add"}, {"hash", 0xA77921D7U}, {"delta", 5}}, true));
+    REQUIRE_FALSE(Coop::DecodeChange({{"type", "rupee_add"}, {"hash", P::Wallet}, {"delta", 5}}, true));
     REQUIRE(Coop::DecodeAllowClasses("bool,rupee") == std::set{Kind::Bool, Kind::Rupee});
     REQUIRE(Coop::DecodeAllowClasses("rupee") == std::set{Kind::Rupee});
 
     Coop::State state;
     REQUIRE(state.Merge(five));
     REQUIRE_FALSE(state.Merge(five)); // same origin/sequence: a duplicate, not a second +5
-    REQUIRE(state.Merge({Kind::Rupee, "B", 4, Coop::WalletHash, 5}));
-    REQUIRE(state.Merge({Kind::Rupee, "C", 1, Coop::WalletHash, -3}));
-    REQUIRE_FALSE(state.Merge({Kind::Rupee, "C", 2, Coop::WalletHash, 0}));
-    REQUIRE_FALSE(state.Merge({Kind::Rupee, "C", 3, 101, 5}));
+    REQUIRE(state.Merge({Kind::Rupee, "B", 4, Wallet, 5}));
+    REQUIRE(state.Merge({Kind::Rupee, "C", 1, Wallet, -3}));
+    REQUIRE_FALSE(state.Merge({Kind::Rupee, "C", 2, Wallet, 0}));
+    REQUIRE_FALSE(state.Merge({Kind::Rupee, "C", 3, 0, 5}));
     REQUIRE(state.Snapshot().empty());
-    REQUIRE_FALSE(state.Find(Kind::Rupee, Coop::WalletHash));
+    REQUIRE_FALSE(state.Find(Kind::Rupee, Wallet));
     REQUIRE(Coop::ShouldApply(five, state));
 }
 
 TEST_CASE("OoT co-op rupee grants call once per delta and commit on return", "[core][oot_coop]") {
     FakeGuest guest;
     guest.target.arguments = {0x6000, 5, 7};
-    const Change five{Kind::Rupee, "B", 3, Coop::WalletHash, 5};
+    const Change five{Kind::Rupee, "B", 3, Wallet, 5};
     Coop::GrantApplier<FakeGuest> closed{Allowed()};
     REQUIRE_FALSE(closed.Queue(five)); // class not allowed
-    Coop::GrantApplier<FakeGuest> apply{{true, {Kind::Bool, Kind::Rupee}, {{Kind::Bool, 101}}}};
+    Coop::GrantApplier<FakeGuest> apply{{true, {Kind::Bool, Kind::Rupee}, {{Kind::Bool, 101}}, Wallet}};
     REQUIRE_FALSE(apply.Queue({Kind::Rupee, "B", 1, 101, 5, 0}));
-    REQUIRE_FALSE(apply.Queue({Kind::Rupee, "B", 1, Coop::WalletHash, 0, 0}));
-    REQUIRE_FALSE(apply.Queue({Kind::Rupee, "B", 1, Coop::WalletHash, 1000, 0}));
+    REQUIRE_FALSE(apply.Queue({Kind::Rupee, "B", 1, Wallet, 0, 0}));
+    REQUIRE_FALSE(apply.Queue({Kind::Rupee, "B", 1, Wallet, 1000, 0}));
     REQUIRE(apply.Queue(five));
-    REQUIRE(apply.Queue({Kind::Rupee, "B", 4, Coop::WalletHash, 5, 0}));
+    REQUIRE(apply.Queue({Kind::Rupee, "B", 4, Wallet, 5, 0}));
     REQUIRE_FALSE(apply.Suppress(five));
     guest.readable = false; // a delta never reads a flag
     for (u64 tick = 1; tick <= 2; ++tick) {
@@ -639,8 +645,55 @@ TEST_CASE("OoT co-op rupee grants call once per delta and commit on return", "[c
     REQUIRE(apply.Pending() == 0);
     REQUIRE(apply.Drain(guest, {7, 9, 10, true}) == Coop::ApplyEvent::None);
     guest.target.pure_flag = true; // a delta never takes the data-or path
-    REQUIRE(apply.Queue({Kind::Rupee, "B", 5, Coop::WalletHash, 5, 0}));
+    REQUIRE(apply.Queue({Kind::Rupee, "B", 5, Wallet, 5, 0}));
     REQUIRE(apply.Drain(guest, {7, 9, 11, true}) == Coop::ApplyEvent::Blocked);
     REQUIRE(guest.writes == 0);
     REQUIRE(apply.Pending() == 1);
+}
+
+TEST_CASE("OoT co-op loads game offsets only from the private profile", "[core][oot_coop]") {
+    using Trace::Point;
+    // Synthetic values: the real ones live only in the user-supplied file.
+    Json build{{"manager_cell", "0x200000"},
+               {"pouch_cell", 0x200100},
+               {"wallet_hash", "0x0BADCAFE"},
+               {"sites", {{"frame", Json::array({"0x103000"})}, {"bit_read", Json::array({"0x104004", 0x106004})}}},
+               {"entries", {{"bool_setter", {{"at", "0x110000"}, {"words", Json::array({"0xD503237F", 1})}}},
+                            {"rupee_entry", {{"at", 0x112000}, {"words", Json::array({2})}}}}}};
+    const Json document{{"bool", Json::array({101})}, {"offsets", {{P::BuildId, build}}}};
+    const auto profile = Coop::DecodeProfile(document, P::BuildId);
+    REQUIRE(profile);
+    REQUIRE(profile->build_id == P::BuildId);
+    REQUIRE(profile->manager_cell == 0x200000);
+    REQUIRE(profile->pouch_cell == 0x200100);
+    REQUIRE(profile->wallet_hash == 0x0BADCAFE);
+    REQUIRE(profile->sites.size() == 3);
+    REQUIRE(profile->SiteOffset(Point::Frame) == 0x103000);
+    for (const auto& site : profile->sites)
+        REQUIRE(site.instruction == Trace::ReplacedInstruction(site.point));
+    REQUIRE(profile->bool_setter.offset == 0x110000);
+    REQUIRE(profile->bool_setter.words == std::vector<u32>{0xD503237F, 1});
+    REQUIRE(profile->rupee_entry.words == std::vector<u32>{2});
+    REQUIRE_FALSE(profile->bit_setter);
+    // The key half of the same file still decodes.
+    REQUIRE(Coop::DecodeKeyPolicy(document)->contains({Kind::Bool, 101}));
+    // Another build, or no offsets at all: nothing.
+    REQUIRE_FALSE(Coop::DecodeProfile(document, "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"));
+    REQUIRE_FALSE(Coop::DecodeProfile(Json{{"bool", Json::array({101})}}, P::BuildId));
+    REQUIRE_FALSE(Coop::DecodeProfile(document, "short"));
+    const auto broken = [&](const char* field, Json value) {
+        auto copy = build;
+        copy[field] = std::move(value);
+        return Coop::DecodeProfile(Json{{"offsets", {{P::BuildId, copy}}}}, P::BuildId);
+    };
+    REQUIRE_FALSE(broken("unknown", 1));
+    REQUIRE_FALSE(broken("manager_cell", "0x200004"));   // a pointer cell is 8-aligned
+    REQUIRE_FALSE(broken("manager_cell", 0));
+    REQUIRE_FALSE(broken("manager_cell", "200000"));      // strings must be 0x hex
+    REQUIRE_FALSE(broken("wallet_hash", "0x100000000"));
+    REQUIRE_FALSE(broken("sites", Json{{"frame", Json::array({"0x103002"})}}));               // unaligned
+    REQUIRE_FALSE(broken("sites", Json{{"nowhere", Json::array({"0x103000"})}}));
+    REQUIRE_FALSE(broken("sites", Json{{"frame", Json::array({"0x103000"})}, {"step_set", Json::array({"0x103000"})}}));
+    REQUIRE_FALSE(broken("entries", Json{{"bool_setter", {{"at", "0x110000"}, {"words", Json::array()}}}}));
+    REQUIRE_FALSE(broken("entries", Json{{"mystery", {{"at", "0x110000"}, {"words", Json::array({1})}}}}));
 }

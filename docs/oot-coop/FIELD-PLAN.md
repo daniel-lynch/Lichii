@@ -74,7 +74,7 @@ not a successful two-instance launch. A missing B log still fails an enabled run
 With co-op unset, no co-op connection/application lines should appear; trace can run
 independently. With co-op enabled but `EDEN_NX2_OOT_COOP_ALLOW` empty, no grants may
 change guest state. `ALLOW` accepts exact comma-separated `bool`/`bit` tokens and is
-empty by default. `KEYS` also defaults empty. The `bool` adapter accepts only configured keys from the chest catalog; `bit` retains
+empty by default. `KEYS` also defaults empty. The `bool` adapter accepts only configured keys from the user-supplied key file; `bit` retains
 its separate configured Bool64 keys. `ALLOW_CLASSES` from C2 no longer enables a class.
 
 Confirm `gamedata trace on`, `gamedata frame`, and `gamedata actor-flag-set` /

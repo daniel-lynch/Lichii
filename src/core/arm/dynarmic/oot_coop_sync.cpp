@@ -166,7 +166,7 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
         }
         if (change.kind == Kind::Rupee) {
             const auto& delta = packet.at("delta");
-            if (change.key != WalletHash || !Signed32(delta) || !RupeeDelta(delta.get<s64>())) {
+            if (change.key == 0 || !Signed32(delta) || !RupeeDelta(delta.get<s64>())) {
                 return std::nullopt;
             }
             change.value = delta.get<s64>();
@@ -297,9 +297,127 @@ std::optional<Endpoint> ParseEndpoint(std::string_view text) {
     return Endpoint{std::string{host}, static_cast<u16>(port)};
 }
 
-bool Gate(std::string_view endpoint, u64 program_id, std::string_view build_id) {
-    return ParseEndpoint(endpoint).has_value() && program_id == OotGameDataTrace::ProgramId &&
-           build_id == OotGameDataTrace::BuildId;
+bool Gate(std::string_view endpoint, u64 program_id) {
+    return ParseEndpoint(endpoint).has_value() && program_id == OotGameDataTrace::ProgramId;
+}
+
+namespace {
+std::optional<u64> Number(const Json& value, u64 maximum) {
+    if (Unsigned(value, maximum)) return value.get<u64>();
+    if (!value.is_string()) return std::nullopt;
+    const auto& text = value.get_ref<const std::string&>();
+    if (text.size() < 3 || text.size() > 18 || text[0] != '0' || (text[1] != 'x' && text[1] != 'X'))
+        return std::nullopt;
+    u64 number = 0;
+    const auto [end, error] = std::from_chars(text.data() + 2, text.data() + text.size(), number, 16);
+    if (error != std::errc{} || end != text.data() + text.size() || number > maximum)
+        return std::nullopt;
+    return number;
+}
+
+constexpr u64 MaxModuleOffset = 0x10000000; // 256 MiB: larger than any main module
+} // namespace
+
+std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
+                                                       std::string_view build_id) {
+    using OotGameDataTrace::Point;
+    try {
+        if (build_id.size() != 40 || !document.is_object() || !document.contains("offsets"))
+            return std::nullopt;
+        const auto& all = document.at("offsets");
+        const auto found = all.find(std::string{build_id});
+        if (!all.is_object() || found == all.end() || !found->is_object()) return std::nullopt;
+        const Json& source = *found;
+        OotGameDataTrace::Profile profile;
+        profile.build_id = std::string{build_id};
+        const auto offset = [](const Json& value) -> std::optional<u64> {
+            const auto number = Number(value, MaxModuleOffset);
+            return number && *number && !(*number & 3) ? number : std::nullopt;
+        };
+        const auto entry = [&](const Json& value) -> std::optional<OotGameDataTrace::Entry> {
+            if (!value.is_object() || value.size() != 2 || !value.at("words").is_array() ||
+                value.at("words").empty() || value.at("words").size() > 16) return std::nullopt;
+            OotGameDataTrace::Entry result;
+            const auto at = offset(value.at("at"));
+            if (!at) return std::nullopt;
+            result.offset = *at;
+            for (const auto& word : value.at("words")) {
+                const auto number = Number(word, 0xFFFFFFFF);
+                if (!number) return std::nullopt;
+                result.words.push_back(static_cast<u32>(*number));
+            }
+            return result;
+        };
+        constexpr std::array<std::pair<std::string_view, Point>, 8> points{{
+            {"step_set", Point::StepSet}, {"step_apply", Point::StepApply},
+            {"played_event", Point::PlayedEvent}, {"frame", Point::Frame},
+            {"bit_read", Point::BitRead}, {"bit_set", Point::BitSet},
+            {"struct_bool_set", Point::StructBoolSet}, {"actor_flag_set", Point::ActorFlagSet}}};
+        for (const auto& [field, value] : source.items()) {
+            if (field == "manager_cell" || field == "pouch_cell") {
+                const auto cell = Number(value, MaxModuleOffset);
+                if (!cell || !*cell || (*cell & 7)) return std::nullopt;
+                (field == "manager_cell" ? profile.manager_cell : profile.pouch_cell) = *cell;
+            } else if (field == "wallet_hash") {
+                const auto hash = Number(value, 0xFFFFFFFF);
+                if (!hash || !*hash) return std::nullopt;
+                profile.wallet_hash = static_cast<u32>(*hash);
+            } else if (field == "sites") {
+                if (!value.is_object()) return std::nullopt;
+                for (const auto& [name, list] : value.items()) {
+                    const auto it = std::find_if(points.begin(), points.end(),
+                                                 [&](const auto& row) { return row.first == name; });
+                    if (it == points.end() || !list.is_array() || list.size() > 4) return std::nullopt;
+                    for (const auto& item : list) {
+                        const auto at = offset(item);
+                        if (!at) return std::nullopt;
+                        profile.sites.push_back(
+                            {it->second, *at, OotGameDataTrace::ReplacedInstruction(it->second)});
+                    }
+                }
+            } else if (field == "entries") {
+                if (!value.is_object()) return std::nullopt;
+                for (const auto& [name, item] : value.items()) {
+                    auto* target = name == "bool_setter"   ? &profile.bool_setter
+                                   : name == "bit_setter"  ? &profile.bit_setter
+                                   : name == "rupee_entry" ? &profile.rupee_entry
+                                                           : nullptr;
+                    const auto decoded = entry(item);
+                    if (!target || !decoded) return std::nullopt;
+                    *target = *decoded;
+                }
+            } else {
+                return std::nullopt;
+            }
+        }
+        // Two sites at one offset would make Identify ambiguous.
+        for (size_t i = 0; i < profile.sites.size(); ++i)
+            for (size_t j = i + 1; j < profile.sites.size(); ++j)
+                if (profile.sites[i].offset == profile.sites[j].offset) return std::nullopt;
+        return profile;
+    } catch (const Json::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::shared_ptr<const OotGameDataTrace::Profile> LoadProfile(std::string_view build_id,
+                                                             std::string* why) {
+    const auto fail = [&](std::string text) {
+        if (why) *why = std::move(text);
+        return nullptr;
+    };
+    const auto path = Env("EDEN_NX2_OOT_COOP_KEYS");
+    if (path.empty()) return fail("no private profile (EDEN_NX2_OOT_COOP_KEYS is unset)");
+    std::ifstream in{std::filesystem::path{path}};
+    if (!in) return fail("cannot read the private profile");
+    std::string text;
+    char c;
+    while (in.get(c) && text.size() <= MaxFrame) text.push_back(c);
+    const auto parsed = DecodeLine(text);
+    if (!parsed) return fail("the private profile is not a JSON object");
+    auto profile = DecodeProfile(*parsed, build_id);
+    if (!profile) return fail("the private profile has no valid offsets for this main build");
+    return std::make_shared<const OotGameDataTrace::Profile>(std::move(*profile));
 }
 
 bool Enabled() {
@@ -343,12 +461,13 @@ std::optional<std::set<std::pair<Kind, u64>>> DecodeKeyPolicy(const Json& packet
     std::set<std::pair<Kind, u64>> keys;
     size_t count = 0;
     for (const auto& [name, values] : document.items()) {
+        if (name == "offsets") continue; // the private profile's module offsets (DecodeProfile)
         if (name != "bool" && name != "bit") return std::nullopt;
         const auto list = DecodeDenyList(values);
         if (!list || list->contains(0) || (count += values.size()) > StateLimit) return std::nullopt;
         const Kind kind = name == "bool" ? Kind::Bool : Kind::Bit;
         for (const u64 key : *list) {
-            if (kind == Kind::Bool && !IsChestBool(key)) return std::nullopt;
+            if (kind == Kind::Bool && key > std::numeric_limits<u32>::max()) return std::nullopt;
             keys.emplace(kind, key);
         }
     }
@@ -365,7 +484,7 @@ bool State::Merge(const Change& change, bool deduplicate) {
     }
     if (denied.contains(change.key)) return false;
     // Deltas are deduplicated by origin/sequence above and never folded into state.
-    if (change.kind == Kind::Rupee) return change.key == WalletHash && RupeeDelta(change.value);
+    if (change.kind == Kind::Rupee) return change.key != 0 && RupeeDelta(change.value);
     const auto key = std::pair{StorageKind(change.kind), change.key};
     const auto it = values.find(key);
     if (it == values.end() && values.size() >= StateLimit) return false;
@@ -443,7 +562,7 @@ bool ShouldApply(const Change& change, const State& observed) {
     if (change.kind == Kind::Int || change.kind == Kind::Enum) {
         return !local || local->value != change.value;
     }
-    if (change.kind == Kind::Rupee) return change.key == WalletHash && RupeeDelta(change.value);
+    if (change.kind == Kind::Rupee) return change.key != 0 && RupeeDelta(change.value);
     // Pouch totals require a save baseline/application receipt, not a comparison to inventory.
     return change.kind == Kind::PouchAdd && change.value > 0;
 }
@@ -452,10 +571,10 @@ struct Session::Impl {
     using Backend = GameDataBackend<Dynarmic::A64::Jit, Memory::Memory>;
     struct Connection;
     Impl(Endpoint endpoint_, Hello hello_, std::set<u64> denied_, std::set<Kind> allowed_,
-         std::set<std::pair<Kind, u64>> keys)
+         std::set<std::pair<Kind, u64>> keys, u64 wallet)
         : endpoint{std::move(endpoint_)}, hello{std::move(hello_)}, denied{std::move(denied_)},
           local{denied}, remote{denied}, allowed_classes{std::move(allowed_)}, retry{io} {
-        ApplyPolicy policy{true, allowed_classes, {}};
+        ApplyPolicy policy{true, allowed_classes, {}, wallet};
         for (const auto& [kind, key] : keys) {
             if (!denied.contains(key)) policy.keys.emplace(kind, key);
         }
@@ -740,12 +859,14 @@ bool Session::Impl::Receive(const Json& packet) {
     return true;
 }
 
-Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_, Endpoint endpoint, Hello hello,
+Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_,
+                 std::shared_ptr<const OotGameDataTrace::Profile> profile_, Endpoint endpoint, Hello hello,
                  std::set<u64> denied, std::set<Kind> allowed_classes,
                  std::set<std::pair<Kind, u64>> allowed_keys)
-    : owner{owner_}, base{base_},
+    : owner{owner_}, base{base_}, profile{std::move(profile_)},
       impl{std::make_unique<Impl>(std::move(endpoint), std::move(hello), std::move(denied),
-                                   std::move(allowed_classes), std::move(allowed_keys))} {
+                                   std::move(allowed_classes), std::move(allowed_keys),
+                                   profile->wallet_hash)} {
     impl->binding.base = base;
     if (!impl->allowed_classes.empty()) {
         Kernel::KProcessAddress stack{}, sentinel{};
@@ -793,7 +914,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     std::scoped_lock guest_lock{impl->guest_mutex};
     auto& binding = impl->binding;
     auto& runtime = *impl->runtime;
-    Impl::Backend backend{jit, memory, binding, tls, tls_ro, std::move(clear_exclusive)};
+    Impl::Backend backend{jit, memory, binding, *profile, tls, tls_ro, std::move(clear_exclusive)};
     const auto log = [](std::string_view line) { LOG_INFO(Core_ARM, "{}", line); };
     const DrainContext site{thread, 1, impl->tick, true};
     if (binding.sentinel && pc == binding.sentinel) {
@@ -802,7 +923,9 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             runtime.LastGrant()->kind == Kind::Rupee) {
             using OotGameDataTrace::Detail::Read32;
             using OotGameDataTrace::Detail::Read64;
-            const u64 pouch = Read64(memory, binding.base + PouchCell).value_or(0);
+            const u64 pouch = profile->pouch_cell
+                                  ? Read64(memory, binding.base + profile->pouch_cell).value_or(0)
+                                  : 0;
             const auto pending = pouch ? Read32(memory, pouch + 0x3BD4) : std::nullopt;
             log(fmt::format("OoT co-op: rupee pending={} after the call (pouch {:#x})",
                             static_cast<s32>(pending.value_or(0)), pouch));
@@ -820,7 +943,8 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     ++impl->tick;
     if (!binding.invalid && backend.Moved()) {
         const u64 old = binding.manager;
-        const auto now = OotGameDataTrace::Detail::Read64(memory, binding.base + 0x4E842A8);
+        const auto now =
+            OotGameDataTrace::Detail::Read64(memory, binding.base + profile->manager_cell);
         if (runtime.Rebind(backend, log)) {
             impl->stable_frame = false;
             if (impl->rebinds < 16) {
@@ -889,8 +1013,14 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
     BeginSession();
     const auto endpoint_text = Env("EDEN_NX2_OOT_COOP") == "1"
         ? Env("EDEN_NX2_OOT_COOP_RELAY", "127.0.0.1:43390") : Env("EDEN_NX2_OOT_COOP");
-    if (!Gate(endpoint_text, program_id, build_id) || base == 0) {
-        if (!endpoint_text.empty()) LOG_INFO(Loader, "OoT co-op off: endpoint/title/build gate");
+    if (!Gate(endpoint_text, program_id) || base == 0) {
+        if (!endpoint_text.empty()) LOG_INFO(Loader, "OoT co-op off: endpoint/title gate");
+        return;
+    }
+    std::string why;
+    auto profile = LoadProfile(build_id, &why);
+    if (!profile) {
+        LOG_INFO(Loader, "OoT co-op off: {}", why);
         return;
     }
     try {
@@ -923,6 +1053,7 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
             keys = *list;
         }
         Hello hello;
+        hello.build_id = std::string{build_id};
         hello.seed_hash = Env("EDEN_NX2_OOT_COOP_SEED", "0");
         hello.policy_id = Env("EDEN_NX2_OOT_COOP_POLICY", "or-v2");
         hello.room = Env("EDEN_NX2_OOT_COOP_ROOM", "default");
@@ -930,7 +1061,8 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
         hello.name = Env("EDEN_NX2_OOT_COOP_NAME", "Player");
         std::random_device random;
         hello.client_id = fmt::format("{:08x}{:08x}{:08x}{:08x}", random(), random(), random(), random());
-        auto session = std::make_shared<Session>(kernel, owner, base, *ParseEndpoint(endpoint_text),
+        auto session = std::make_shared<Session>(kernel, owner, base, std::move(profile),
+            *ParseEndpoint(endpoint_text),
             std::move(hello), std::move(denied), *allowed, std::move(keys));
         std::scoped_lock lock{sessions_mutex};
         current_session = std::move(session);

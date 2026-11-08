@@ -343,10 +343,13 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     if (name == "main" && Core::OotGameDataTrace::Enabled() &&
         process.GetProgramId() == Core::OotGameDataTrace::ProgramId) {
         // EDEN_NX2_GAMEDATA_TRACE: the quest-step and HavePlayedEvent sites belong to one build.
+        // Their offsets come from the private profile (EDEN_NX2_OOT_COOP_KEYS), keyed by build.
         const std::string build_id = Common::HexToString(std::span{nso_header.build_id}.first(20));
-        const bool matching = build_id == Core::OotGameDataTrace::BuildId;
+        std::string why;
+        auto profile = Core::OotCoop::LoadProfile(build_id, &why);
+        const bool matching = profile != nullptr;
         const u64 base = load_base + module_start;
-        Core::OotGameDataTrace::sessions.Reset(&process, matching ? base : 0);
+        Core::OotGameDataTrace::sessions.Reset(&process, matching ? base : 0, std::move(profile));
         const size_t names =
             matching ? Common::Nx2EventTrace::LoadNamesFile(std::getenv("EDEN_NX2_GAMEDATA_NAMES"))
                      : 0;
@@ -354,8 +357,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
             Common::Nx2EventTrace::GameDataTarget(),
             matching ? fmt::format("gamedata trace on: main build {} at {:#x}, {} names loaded",
                                    build_id, base, names)
-                     : fmt::format("gamedata trace off: main build {} is not {}", build_id,
-                                   Core::OotGameDataTrace::BuildId));
+                     : fmt::format("gamedata trace off: main build {}: {}", build_id, why));
     }
     if (name == "main" && process.GetProgramId() == Service::Nx2OotTime::ProgramId) {
         // Write the delta only into the built-in's own stub: only when PatchNSO applied the

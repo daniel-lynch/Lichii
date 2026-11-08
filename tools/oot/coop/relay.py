@@ -24,7 +24,6 @@ MAX_REPLAY = 512
 MAX_OUTBOX = 256
 MAX_OUTBOX_BYTES = 2 * MAX_FRAME
 CHANGE_TYPES = {"bool_set", "bit_set", "rupee_add"}
-WALLET = 0xA77921D7  # PlayerStatus.CurrentRupee: the only rupee_add key
 RUPEE_LIMIT = 999
 
 
@@ -145,8 +144,9 @@ def validate_change(packet, origin):
     if kind == "bit_set":
         integer(packet["actor"], 0, (1 << 64) - 1)
     if kind == "rupee_add":
-        if packet["hash"] != WALLET:
-            raise ProtocolError("rupee_add is for the wallet only")
+        # The wallet key is game-derived: each receiver admits only its private profile's wallet.
+        if packet["hash"] == 0:
+            raise ProtocolError("rupee_add needs a wallet key")
         if integer(packet["delta"], -RUPEE_LIMIT, RUPEE_LIMIT) == 0:
             raise ProtocolError("zero rupee delta")
 

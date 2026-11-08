@@ -14,10 +14,11 @@ struct ApplyPolicy {
     bool enabled{};
     std::set<Kind> classes;
     std::set<std::pair<Kind, u64>> keys;
+    u64 wallet{}; // the profile's wallet key; 0 refuses every rupee delta
 
     bool Allows(const Change& change) const {
         if (change.kind == Kind::Rupee) {
-            return enabled && classes.contains(Kind::Rupee) && change.key == WalletHash &&
+            return enabled && classes.contains(Kind::Rupee) && wallet && change.key == wallet &&
                    RupeeDelta(change.value);
         }
         return enabled && WireKind(change.kind) && change.value == 1 &&

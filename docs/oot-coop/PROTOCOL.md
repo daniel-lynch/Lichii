@@ -117,7 +117,8 @@ Wallet deltas (class `rupee`, C6) are an additive event, not state:
 {"type":"rupee_add","origin":"session-a","seq":3,"hash":<hash>,"delta":5}
 ```
 
-`hash` must be the wallet key `PlayerStatus.CurrentRupee` (<hash>); `delta` is a non-zero
+`hash` is the wallet key `PlayerStatus.CurrentRupee` (non-zero; the receiver admits only the
+wallet key of its private profile, the relay any non-zero key); `delta` is a non-zero
 integer in [-999, 999]. The relay forwards and acks it like a grant and keeps it in the replay
 window (so revisions stay contiguous), but never folds it into team state; clients ignore
 `rupee_add` in a `team_state` snapshot or replay, so a reconnect never re-applies one (and a

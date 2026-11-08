@@ -86,11 +86,13 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
             m_gamedata_trace_looked_up = true;
         }
         if (m_gamedata_trace) {
-            return OotGameDataTrace::InstructionFor(m_gamedata_trace->base, vaddr, instruction);
+            return OotGameDataTrace::InstructionFor(*m_gamedata_trace->profile, m_gamedata_trace->base,
+                                                    vaddr, instruction);
         }
     }
     if (m_oot_coop) {
-        const auto point = OotGameDataTrace::Identify(m_oot_coop->base, vaddr, instruction);
+        const auto point =
+            OotGameDataTrace::Identify(*m_oot_coop->profile, m_oot_coop->base, vaddr, instruction);
         return OotGameDataTrace::CoopPoint(point) ? OotGameDataTrace::Breakpoint : instruction;
     }
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
@@ -178,8 +180,9 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
             return;
         }
         const u64 base = m_oot_coop ? m_oot_coop->base : m_gamedata_trace->base;
+        const auto& profile = m_oot_coop ? *m_oot_coop->profile : *m_gamedata_trace->profile;
         const auto original = OotGameDataTrace::Detail::Read32(m_memory, pc);
-        const auto point = original ? OotGameDataTrace::Identify(base, pc, *original)
+        const auto point = original ? OotGameDataTrace::Identify(profile, base, pc, *original)
                                     : OotGameDataTrace::Point::None;
         if (point != OotGameDataTrace::Point::None) {
             // Resume exactly once, whether tracing, co-op, or both registered the breakpoint.

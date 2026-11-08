@@ -11,6 +11,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+WALLET = 0x0BADCAFE  # synthetic wallet key (the real one is game-derived and private)
+
 sys.dont_write_bytecode = True
 
 
@@ -159,10 +161,10 @@ class ProtocolTests(unittest.TestCase):
 
     def test_rupee_deltas_are_events_not_state(self):
         def rupee(seq, delta=5, **extra):
-            return dict({"type": "rupee_add", "origin": "b", "seq": seq, "hash": relay.WALLET,
+            return dict({"type": "rupee_add", "origin": "b", "seq": seq, "hash": WALLET,
                          "delta": delta}, **extra)
         for bad in (rupee(1, 0), rupee(1, 1000), rupee(1, -1000), rupee(1, True), rupee(1, 2.5),
-                    rupee(1, hash=1), rupee(1, value=True)):
+                    rupee(1, hash=0), rupee(1, value=True)):
             with self.subTest(bad=bad), self.assertRaises(relay.ProtocolError):
                 relay.validate_change(bad, "b")
         team = relay.Team()
@@ -170,7 +172,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(team.accept(rupee(1), set())["rev"], 2)
         self.assertEqual(team.accept(rupee(2, -999), set())["rev"], 3)
         self.assertIsNone(team.accept(rupee(2), set()))  # duplicate sequence: no second +5
-        self.assertIsNone(team.accept(rupee(3), {relay.WALLET}))
+        self.assertIsNone(team.accept(rupee(3), {WALLET}))
         self.assertEqual(list(team.current), [("bool_set", 1)])
         snapshot = team.snapshot()
         self.assertEqual([p["delta"] for p in snapshot["replay"] if p["type"] == "rupee_add"], [5, -999])
@@ -476,7 +478,7 @@ class FakePeerTests(unittest.IsolatedAsyncioTestCase):
     """The single-emulator fake peer: in-process relay plus a scripted peer (TCP loopback)."""
 
     async def asyncSetUp(self):
-        self.peer = fake_peer.FakePeer(port=0, room="r", team="t", policy="p")
+        self.peer = fake_peer.FakePeer(port=0, room="r", team="t", policy="p", wallet=WALLET)
         self.port = await self.peer.start()
         self.emu = client_sim.ClientSim("emu", room="r", team="t", policy_id="p")
         await self.emu.connect("127.0.0.1", self.port)

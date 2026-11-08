@@ -33,8 +33,9 @@ inline constexpr size_t StateLimit = 4096;
 
 enum class Kind { Bool, Int, Enum, Quest, Bit, PouchAdd, PouchTotal, Rupee };
 
-// Wallet deltas (class "rupee"): an additive event, never state. Key = PlayerStatus.CurrentRupee.
-inline constexpr u32 WalletHash = 0xA77921D7;
+// Wallet deltas (class "rupee"): an additive event, never state. The key is the wallet's GameData
+// hash from the private profile; the wire accepts any non-zero 32-bit key and the receiver's
+// ApplyPolicy admits only its profile's wallet.
 inline constexpr s64 RupeeLimit = 999;
 [[nodiscard]] constexpr bool RupeeDelta(s64 delta) {
     return delta != 0 && delta >= -RupeeLimit && delta <= RupeeLimit;
@@ -64,11 +65,19 @@ struct Endpoint {
     u16 port{};
 };
 [[nodiscard]] std::optional<Endpoint> ParseEndpoint(std::string_view text);
-[[nodiscard]] bool Gate(std::string_view endpoint, u64 program_id, std::string_view build_id);
+[[nodiscard]] bool Gate(std::string_view endpoint, u64 program_id);
+
+/// The "offsets" object of a private profile document for `build_id` (40 hex digits), or nothing
+/// when that build is absent or any field is malformed. Numbers may be JSON integers or "0x" strings.
+[[nodiscard]] std::optional<OotGameDataTrace::Profile> DecodeProfile(const nlohmann::json& document,
+                                                                     std::string_view build_id);
+/// DecodeProfile of the EDEN_NX2_OOT_COOP_KEYS file; `why` says what failed.
+[[nodiscard]] std::shared_ptr<const OotGameDataTrace::Profile> LoadProfile(std::string_view build_id,
+                                                                           std::string* why = nullptr);
 [[nodiscard]] bool Enabled();
 
 struct Hello {
-    std::string build_id{OotGameDataTrace::BuildId};
+    std::string build_id; // the running main build; RegisterMain sets it
     std::string seed_hash{"0"};
     std::string policy_id{"or-v2"};
     std::string room{"default"};
@@ -104,7 +113,8 @@ private:
 
 class Session {
 public:
-    Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_, Endpoint endpoint, Hello hello,
+    Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_,
+            std::shared_ptr<const OotGameDataTrace::Profile> profile_, Endpoint endpoint, Hello hello,
             std::set<u64> denied, std::set<Kind> allowed_classes = {},
             std::set<std::pair<Kind, u64>> allowed_keys = {});
     ~Session();
@@ -116,6 +126,7 @@ public:
     bool IsSentinel(u64 pc) const;
     Kernel::KProcess* const owner;
     const u64 base;
+    const std::shared_ptr<const OotGameDataTrace::Profile> profile; ///< Never null
 
 private:
     struct Impl;

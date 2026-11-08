@@ -12,7 +12,8 @@ from pathlib import Path
 import sys
 import uuid
 
-BUILD_ID = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348"
+# A placeholder build id (40 hex digits); pass the real one with --build-id (it is game-derived).
+BUILD_ID = "0123456789ABCDEF0123456789ABCDEF01234567"
 # Explicit sibling loading keeps the documented python3 -I entry point isolated.
 _spec = importlib.util.spec_from_file_location("oot_coop_relay", Path(__file__).with_name("relay.py"))
 wire = importlib.util.module_from_spec(_spec)

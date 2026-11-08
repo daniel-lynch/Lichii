@@ -166,9 +166,8 @@ protects guest bookkeeping across host workers. The network thread never touches
 memory or registers. Other trace hooks do not drain.
 
 The chest class is `bool`: flat hash/index table + deferred setter at main+<offset>,
-x0=manager, w1=1, w2=backing Bool key. `oot_coop_chest_keys.inc` contains 206 member/hash
-pairs from GameDataList struct <hash>; `ChestBool` resolves a member hash and
-`IsChestBool` restricts the production adapter to that catalog. The runtime only polls
+x0=manager, w1=1, w2=backing Bool key. The reviewed chest Bools come from the user-supplied key
+file (below); nothing game-derived is compiled in. The runtime only polls
 configured keys, at most 206 chest flags per frame. Each lookup probes at most 64
 hash slots (modulo capacity, linear probing with wraparound); missing keys, invalid
 indices/bytes and exhausted probe budgets fail closed. No entire Bool table scan runs.
@@ -217,6 +216,34 @@ value. The `rupee` class (C6) is the only wallet path: a signed delta through th
 wallet entry above, applied by the game's own pouch update; it is grant-only (the local
 wallet is not observed). Neither int/enum/quest/item-pouch nor arbitrary struct-member writes are enabled.
 
+## Private profile (EDEN_NX2_OOT_COOP_KEYS "offsets")
+
+Every game-derived constant the emulator needs is read at main-module load from the same
+user-supplied file as the key policy, under `"offsets"` keyed by the main build id. Without an
+entry for the running build, co-op logs `OoT co-op off: ...` and the GameData trace logs
+`gamedata trace off: ...`; no instruction is substituted. (The trace reads the file too, so
+`EDEN_NX2_GAMEDATA_TRACE` now also needs `EDEN_NX2_OOT_COOP_KEYS`.) Numbers are JSON integers
+or `"0x..."` strings; unknown fields reject the file.
+
+```json
+{"bool": [<hash>, ...],
+ "offsets": {"<build-id>": {
+   "manager_cell": "<offset>", "pouch_cell": "<offset>", "wallet_hash": "<hash>",
+   "sites": {"frame": ["<offset>"], "step_set": [...], "step_apply": [...], "played_event": [...],
+             "bit_read": [...], "bit_set": [...], "struct_bool_set": [...], "actor_flag_set": [...]},
+   "entries": {"bool_setter": {"at": "<offset>", "words": ["<word>", ...]},
+               "bit_setter": {...}, "rupee_entry": {...}}}}}
+```
+
+- Cells are 8-aligned module offsets of a pointer; sites and entries are 4-aligned module
+  offsets below 256 MiB, at most four per site kind, never two at one offset.
+- A site's replaced instruction is fixed by its kind (`ReplacedInstruction`: `mov w8, #1` for
+  `step_set`, `ldr w8, [x0, #0xc58]` for `bit_read`, `mov x8, x0` for `bit_set`, `pacibsp`
+  otherwise), because `Resume` emulates exactly that word; any other word there means no hook.
+- An entry's `words` (1-16) must match guest memory before every synthetic call.
+- The wallet key gates `rupee_add` on the receiver (`ApplyPolicy::wallet`); the wire and the
+  relay accept any non-zero 32-bit key.
+
 ## Policy and logs
 
 - `EDEN_NX2_OOT_COOP=1`: enable loopback transport, default `127.0.0.1:43390`;
@@ -226,7 +253,7 @@ wallet is not observed). Neither int/enum/quest/item-pouch nor arbitrary struct-
   The old `ALLOW_CLASSES` variable is no longer consulted.
 - `EDEN_NX2_OOT_COOP_KEYS`: JSON policy with typed arrays, for example
   `{"bool":[<hash>],"bit":[123]}` (numeric hashes). At most 4096 keys in total;
-  `bool` keys must belong to the reviewed 206-key catalog. A legacy bare array still
+  `bool` keys are 32-bit; the file itself is the reviewed list. A legacy bare array still
   means `bit` only. Default is empty; class selection alone cannot grant anything.
   Deny-list keys are removed. Both peers must use the same reviewed key set/policy ID.
   The file is **user-supplied**: game-derived key lists are not part of this repository.

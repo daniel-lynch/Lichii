@@ -12,6 +12,7 @@
 #include "common/nx2_event_trace.h"
 #include "core/arm/dynarmic/oot_gamedata_trace.h"
 #include "core/arm/dynarmic/oot_coop_runtime.h"
+#include "tests/core/oot_test_profile.h"
 #include "dynarmic/interface/A64/a64.h"
 
 namespace {
@@ -19,6 +20,7 @@ namespace {
 namespace Trace = Core::OotGameDataTrace;
 using Trace::Point;
 using Common::Nx2EventTrace::Murmur3;
+namespace P = OotTestProfile;
 
 constexpr u64 Base = 0x10000000;
 constexpr u64 Stop = 0x08000000;
@@ -82,7 +84,7 @@ public:
         if (it == code.end()) {
             return std::nullopt;
         }
-        return enabled ? Trace::InstructionFor(Base, address, it->second) : it->second;
+        return enabled ? Trace::InstructionFor(P::Get(), Base, address, it->second) : it->second;
     }
     u64 MemoryRead(u64, size_t) override {
         FAIL("Unexpected memory read");
@@ -127,7 +129,7 @@ Dynarmic::A64::UserConfig Config(TraceEnvironment& env) {
 }
 
 u64 Site(Point point) {
-    for (const auto& site : Trace::Sites) {
+    for (const auto& site : P::Get().sites) {
         if (site.point == point) {
             return Base + site.offset;
         }
@@ -172,21 +174,26 @@ void RunAndCheck(TraceEnvironment& env, u64 entry, const std::array<u64, 6>& arg
 
 TEST_CASE("GameData trace sites need the traced build's base and original instructions",
           "[oot_gamedata_trace]") {
-    for (const auto& site : Trace::Sites) {
-        REQUIRE(Trace::Identify(Base, Base + site.offset, site.instruction) == site.point);
-        REQUIRE(Trace::InstructionFor(Base, Base + site.offset, site.instruction) ==
+    const auto& profile = P::Get();
+    for (const auto& site : profile.sites) {
+        REQUIRE(site.instruction == Trace::ReplacedInstruction(site.point));
+        REQUIRE(Trace::Identify(profile, Base, Base + site.offset, site.instruction) == site.point);
+        REQUIRE(Trace::InstructionFor(profile, Base, Base + site.offset, site.instruction) ==
                 Trace::Breakpoint);
         // No module registered (another build), or a different word there (a mod, a cheat, a
         // debugger breakpoint): the JIT gets the word unchanged.
-        REQUIRE(Trace::Identify(0, site.offset, site.instruction) == Point::None);
-        REQUIRE(Trace::InstructionFor(0, site.offset, site.instruction) == site.instruction);
-        REQUIRE(Trace::Identify(Base, Base + site.offset, Trace::Breakpoint) == Point::None);
-        REQUIRE(Trace::InstructionFor(Base, Base + site.offset, 0xD503201F) == 0xD503201F);
-        REQUIRE(Trace::Identify(Base, Base + site.offset + 4, site.instruction) == Point::None);
+        REQUIRE(Trace::Identify(profile, 0, site.offset, site.instruction) == Point::None);
+        REQUIRE(Trace::InstructionFor(profile, 0, site.offset, site.instruction) == site.instruction);
+        REQUIRE(Trace::Identify(profile, Base, Base + site.offset, Trace::Breakpoint) == Point::None);
+        REQUIRE(Trace::InstructionFor(profile, Base, Base + site.offset, P::Nop) == P::Nop);
+        REQUIRE(Trace::Identify(profile, Base, Base + site.offset + 4, site.instruction) ==
+                Point::None);
     }
-    REQUIRE(Trace::Identify(Base, Base - 4, Trace::Pacibsp) == Point::None);
-    REQUIRE(Trace::BuildId.size() == 40);
-    REQUIRE(Trace::BuildId.starts_with("E0F3CCFAF50065AE"));
+    REQUIRE(Trace::Identify(profile, Base, Base - 4, Trace::Pacibsp) == Point::None);
+    // No profile for this build: no sites at all.
+    const Trace::Profile empty;
+    for (const auto& site : profile.sites)
+        REQUIRE(Trace::Identify(empty, Base, Base + site.offset, site.instruction) == Point::None);
 }
 
 TEST_CASE("GameData trace: the step setter hook keeps its mov w8, #1",
@@ -198,7 +205,7 @@ TEST_CASE("GameData trace: the step setter hook keeps its mov w8, #1",
     for (const bool enabled : {false, true}) {
         TraceEnvironment env;
         env.enabled = enabled;
-        env.session.emplace(nullptr, Base, 1);
+        env.session.emplace(nullptr, Base, 1, P::Shared());
         env.Code(entry, MovzX9Seven);
         env.Code(entry + 4, Trace::MovW8One);
         env.Code(entry + 8, Ret);
@@ -238,7 +245,7 @@ TEST_CASE("GameData trace: the step apply hook reports the direction",
     for (const bool enabled : {false, true}) {
         TraceEnvironment env;
         env.enabled = enabled;
-        env.session.emplace(nullptr, Base, 1);
+        env.session.emplace(nullptr, Base, 1, P::Shared());
         env.Code(entry, Trace::Pacibsp);
         env.Code(entry + 4, MovzX9Seven);
         env.Code(entry + 8, Ret);
@@ -281,7 +288,7 @@ TEST_CASE("GameData trace: the HavePlayedEvent hook reads the event name",
     for (const bool enabled : {false, true}) {
         TraceEnvironment env;
         env.enabled = enabled;
-        env.session.emplace(nullptr, Base, 1);
+        env.session.emplace(nullptr, Base, 1, P::Shared());
         env.Code(entry, Trace::Pacibsp);
         env.Code(entry + 4, MovzX9Seven);
         env.Code(entry + 8, Ret);
@@ -312,7 +319,7 @@ TEST_CASE("GameData trace reads nothing it cannot and stops logging at the cap",
     const u64 entry = Site(Point::PlayedEvent);
     TraceEnvironment env;
     env.enabled = true;
-    env.session.emplace(nullptr, Base, 1);
+    env.session.emplace(nullptr, Base, 1, P::Shared());
     env.Code(entry, Trace::Pacibsp);
     env.Code(entry + 4, MovzX9Seven);
     env.Code(entry + 8, Ret);
@@ -323,7 +330,7 @@ TEST_CASE("GameData trace reads nothing it cannot and stops logging at the cap",
     REQUIRE(env.lines.size() == 1);
     REQUIRE(env.lines[0].starts_with("gamedata played-event name=? "));
 
-    Trace::Session session{nullptr, Base, 2};
+    Trace::Session session{nullptr, Base, 2, P::Shared()};
     bool last = false;
     for (u32 i = 0; i < Trace::Session::LineLimit; ++i) {
         REQUIRE(session.Take(Point::StepSet, last));
@@ -340,7 +347,9 @@ TEST_CASE("GameData trace sessions follow the loaded main module", "[oot_gamedat
     const auto* a = reinterpret_cast<const Kernel::KProcess*>(&process_a);
     const auto* b = reinterpret_cast<const Kernel::KProcess*>(&process_b);
     REQUIRE_FALSE(sessions.Find(a));
-    sessions.Reset(a, Base);
+    sessions.Reset(a, Base); // no profile for this build: no hooks
+    REQUIRE_FALSE(sessions.Find(a));
+    sessions.Reset(a, Base, P::Shared());
     const auto first = sessions.Find(a);
     REQUIRE(first);
     REQUIRE(first->base == Base);
@@ -353,7 +362,7 @@ TEST_CASE("GameData trace sessions follow the loaded main module", "[oot_gamedat
 TEST_CASE("GameData frame hook executes the replaced hint once", "[oot_gamedata_trace]") {
     TraceEnvironment env;
     env.enabled = true;
-    env.session.emplace(nullptr, Base, 1);
+    env.session.emplace(nullptr, Base, 1, P::Shared());
     const u64 entry = Site(Point::Frame);
     env.Code(entry, Trace::Pacibsp);
     env.Code(entry + 4, MovzX9Seven);
@@ -369,17 +378,17 @@ TEST_CASE("OoT frame redirects a real JIT and sentinel restores full context", "
     namespace Coop = Core::OotCoop;
     TraceEnvironment env;
     env.enabled = true;
-    env.session.emplace(nullptr, Base, 1);
+    env.session.emplace(nullptr, Base, 1, P::Shared());
     const u64 frame = Site(Point::Frame);
-    const u64 entry = Base + 0x3761720;
+    const u64 entry = Base + P::BitSetter;
     constexpr u64 sentinel = Stop + 0x100;
     constexpr u64 manager = Data;
     constexpr u64 data = Data + 0x2000;
     constexpr u64 queue = Data + 0x3000;
     env.Code(frame, Trace::Pacibsp);
     env.Code(frame + 4, Svc0);
-    env.Code(entry, 0xB40003C2); // cbz x2: nonzero reviewed key follows normal path
-    env.Code(entry + 4, 0xAA0003E8);
+    env.Code(entry, P::BitWords[0]);
+    env.Code(entry + 4, P::BitWords[1]);
     env.Code(entry + 8, Svc0); // Pause inside the synthetic setter to clobber its CPU context.
     env.Code(entry + 12, Ret);
     env.Code(sentinel, Trace::Breakpoint);
@@ -398,7 +407,7 @@ TEST_CASE("OoT frame redirects a real JIT and sentinel restores full context", "
     Coop::GuestBinding binding{Base, 0, 0, 0, sentinel, 0x20000000};
     for (u64 i = binding.stack - 0x4000; i < binding.stack; ++i) env.bytes[i] = 0;
     using Backend = Coop::GameDataBackend<Dynarmic::A64::Jit, TraceEnvironment>;
-    Backend backend{jit, env, binding, tls, tls_ro, [&] { ++exclusive_clears; }};
+    Backend backend{jit, env, binding, P::Get(), tls, tls_ro, [&] { ++exclusive_clears; }};
     REQUIRE(backend.Bind(manager));
     const Coop::Change grant{Coop::Kind::Bit, "A", 1, 101, 1};
     REQUIRE(backend.ReadFlag(grant) == false);
@@ -472,9 +481,9 @@ TEST_CASE("OoT frame redirects a real JIT and sentinel restores full context", "
 TEST_CASE("GameData Bool64 reader hook resumes its zero extending load", "[oot_gamedata_trace]") {
     TraceEnvironment env;
     env.enabled = true;
-    env.session.emplace(nullptr, Base, 1);
+    env.session.emplace(nullptr, Base, 1, P::Shared());
     const u64 entry = Site(Point::BitRead);
-    env.Code(entry, 0xB94C5808);
+    env.Code(entry, Trace::LdrW8C58);
     env.Code(entry + 4, MovzX9Seven);
     env.Code(entry + 8, Ret);
     env.Code(Stop, Svc0);
@@ -484,32 +493,16 @@ TEST_CASE("GameData Bool64 reader hook resumes its zero extending load", "[oot_g
     REQUIRE(env.lines.front().starts_with("gamedata bit-read mgr="));
 }
 
-TEST_CASE("OoT chest member hashes map to reviewed backing Bools", "[oot_coop]") {
-    namespace Coop = Core::OotCoop;
-    REQUIRE(Coop::ChestMembers.size() == 206);
-    REQUIRE(Murmur3("4555665598794293658") == 0xB3DEDFE4);
-    REQUIRE(Coop::ChestBool(0xB3DEDFE4) == 0xC8643846);
-    REQUIRE(Coop::ChestBool(0x5A95678A) == 0x467020FD);
-    REQUIRE_FALSE(Coop::ChestBool(0));
-    REQUIRE_FALSE(Coop::IsChestBool(0x3F38F9B9A399E19A));
-    std::set<u32> members, keys;
-    for (const auto& [member, key] : Coop::ChestMembers) {
-        REQUIRE(members.insert(member).second);
-        REQUIRE(keys.insert(key).second);
-        REQUIRE(Coop::ChestBool(member) == key);
-    }
-}
-
 TEST_CASE("OoT flat Bool polling and deferred chest grants", "[oot_coop]") {
     namespace Coop = Core::OotCoop;
-    constexpr u32 key = 0xC8643846;
+    constexpr u32 key = 0x5EED0006; // synthetic; key % 8 == 6
     constexpr u64 manager = Data, data = Data + 0x2000, hashes = Data + 0x3000;
     constexpr u64 queue = Data + 0x4000, sentinel = Stop + 0x100;
-    constexpr u64 entry = Base + 0x682B20;
+    constexpr u64 entry = Base + P::BoolSetter;
     TraceEnvironment env;
     for (u64 i = data; i < data + 0x30; ++i) env.bytes[i] = 0;
     for (u64 i = hashes; i < hashes + 8 * 8; ++i) env.bytes[i] = 0;
-    env.Write64(Base + 0x4E842A8, manager);
+    env.Write64(Base + P::ManagerCell, manager);
     env.Write32(manager + 0x10, 2);
     env.Write64(manager + 0x18, data);
     env.Write64(manager + 0x20, hashes);
@@ -523,10 +516,8 @@ TEST_CASE("OoT flat Bool polling and deferred chest grants", "[oot_coop]") {
     env.Write32(hashes + 7 * 8, 2);
     env.Write32(hashes, key);
     env.Write32(hashes + 4, 1);
-    env.Code(entry, 0xD503237F);
-    env.Code(entry + 4, 0xD100C3FF);
-    env.Code(entry + 8, 0xA9017BFD);
-    env.Code(entry + 12, 0xF90013F3);
+    env.Code(entry, P::BoolWords[0]);
+    env.Code(entry + 4, P::BoolWords[1]);
     env.Code(sentinel, Trace::Breakpoint);
     Coop::GuestBinding binding{Base, 0, 0, 0, sentinel, 0x20000000};
     for (u64 i = binding.stack - 0x4000; i < binding.stack; ++i) env.bytes[i] = 0;
@@ -534,7 +525,7 @@ TEST_CASE("OoT flat Bool polling and deferred chest grants", "[oot_coop]") {
     u64 tls = 123, tls_ro = 456;
     int clears = 0;
     using Backend = Coop::GameDataBackend<Dynarmic::A64::Jit, TraceEnvironment>;
-    Backend backend{jit, env, binding, tls, tls_ro, [&] { ++clears; }};
+    Backend backend{jit, env, binding, P::Get(), tls, tls_ro, [&] { ++clears; }};
     const Coop::Change grant{Coop::Kind::Bool, "A", 1, key, 1};
     REQUIRE(backend.BindFromCell()); // No Bool64 table or accessor call exists in this fixture.
     REQUIRE(backend.ReadFlag(grant) == false);
@@ -559,7 +550,7 @@ TEST_CASE("OoT flat Bool polling and deferred chest grants", "[oot_coop]") {
     SECTION("grant shape, full restoration, deferred commit and echo suppression") {
         for (size_t i = 0; i < 31; ++i) jit.SetRegister(i, 100 + i);
         for (size_t i = 0; i < 32; ++i) jit.SetVector(i, {200 + i, 300 + i});
-        jit.SetPC(Base + 0x11E7A54);
+        jit.SetPC(Site(Point::Frame) + 4);
         jit.SetSP(0x30000000);
         jit.SetPstate(0xA0000000);
         jit.SetFpcr(0x400000);
@@ -589,7 +580,7 @@ TEST_CASE("OoT flat Bool polling and deferred chest grants", "[oot_coop]") {
         REQUIRE_FALSE(drain.Queue(grant));
         for (const auto event : {"applied", "suppressed"}) {
             REQUIRE(std::count_if(logs.begin(), logs.end(), [&](const auto& line) {
-                return line.find(std::string{event} + " class=bool key=00000000c8643846") !=
+                return line.find(std::string{event} + " class=bool key=000000005eed0006") !=
                        std::string::npos;
             }) == 1);
         }
@@ -599,7 +590,7 @@ TEST_CASE("OoT flat Bool polling and deferred chest grants", "[oot_coop]") {
         REQUIRE_FALSE(backend.Resolve(grant));
     }
     SECTION("wrong setter word blocks") {
-        env.Code(entry + 12, 0);
+        env.Code(entry + 4, 0);
         REQUIRE_FALSE(backend.Resolve(grant));
     }
     SECTION("bad index blocks") {
@@ -616,7 +607,7 @@ TEST_CASE("OoT flat Bool polling and deferred chest grants", "[oot_coop]") {
         REQUIRE(binding.invalid);
     }
     SECTION("an unhandled manager cell change still quarantines the backend") {
-        env.Write64(Base + 0x4E842A8, 0);
+        env.Write64(Base + P::ManagerCell, 0);
         REQUIRE_FALSE(backend.BindFromCell());
         REQUIRE(binding.invalid);
     }
@@ -626,7 +617,7 @@ TEST_CASE("OoT flat Bool polling and deferred chest grants", "[oot_coop]") {
         drain.Frame(backend, {7, 9, 2, true}, send, log);
         REQUIRE(sent.size() == 1);
         // Back to the title screen: the cell is cleared.
-        env.Write64(Base + 0x4E842A8, 0);
+        env.Write64(Base + P::ManagerCell, 0);
         REQUIRE(backend.Moved());
         REQUIRE(drain.Rebind(backend, log));
         REQUIRE_FALSE(binding.invalid);
@@ -641,7 +632,7 @@ TEST_CASE("OoT flat Bool polling and deferred chest grants", "[oot_coop]") {
             if (env.bytes.contains(manager + i)) env.bytes[moved + i] = env.bytes.at(manager + i);
         for (u64 i = moved_data; i < moved_data + 0x30; ++i) env.bytes[i] = 0;
         env.Write64(moved + 0x18, moved_data);
-        env.Write64(Base + 0x4E842A8, moved);
+        env.Write64(Base + P::ManagerCell, moved);
         REQUIRE(backend.BindFromCell());
         REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) == Coop::ApplyEvent::None);
         REQUIRE(drain.BaselineReady());
@@ -663,10 +654,10 @@ TEST_CASE("OoT flat Bool polling and deferred chest grants", "[oot_coop]") {
         REQUIRE(drain.Frame(backend, {7, 9, 2, true}, send, log) == Coop::ApplyEvent::Started);
         REQUIRE(drain.Sentinel(backend, {7, 9, 2, true}, sentinel, log) ==
                 Coop::ApplyEvent::Returned);
-        env.Write64(Base + 0x4E842A8, 0);
+        env.Write64(Base + P::ManagerCell, 0);
         REQUIRE(backend.Moved());
         REQUIRE(drain.Rebind(backend, log));
-        env.Write64(Base + 0x4E842A8, manager);
+        env.Write64(Base + P::ManagerCell, manager);
         REQUIRE(backend.BindFromCell());
         env.bytes[data + 0x18 + 0x16] = 1; // The new epoch already holds it: no second call.
         REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) == Coop::ApplyEvent::Committed);
@@ -676,7 +667,7 @@ TEST_CASE("OoT flat Bool polling and deferred chest grants", "[oot_coop]") {
     SECTION("a move while a synthetic call is in flight quarantines") {
         REQUIRE(drain.Queue(grant));
         REQUIRE(drain.Frame(backend, {7, 9, 2, true}, send, log) == Coop::ApplyEvent::Started);
-        env.Write64(Base + 0x4E842A8, 0);
+        env.Write64(Base + P::ManagerCell, 0);
         REQUIRE(backend.Moved());
         REQUIRE_FALSE(drain.Rebind(backend, log));
         REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) ==
@@ -689,22 +680,22 @@ TEST_CASE("Chest trace sites preserve hints and report keys", "[oot_gamedata_tra
     Dynarmic::A64::Jit jit{Config(env)};
     jit.SetRegister(0, Data);
     jit.SetRegister(1, 1);
-    jit.SetRegister(3, 0xB3DEDFE4);
+    jit.SetRegister(3, 0x0A0B0C0D);
     jit.SetRegister(8, Data + 0x100);
-    env.Write32(Data + 0x108, 0xB3DEDFE4);
-    env.Write64(Data + 0x188, 0x3F38F9B9A399E19A);
+    env.Write32(Data + 0x108, 0x0A0B0C0D);
+    env.Write64(Data + 0x188, 0x1122334455667788);
     for (const auto point : {Point::StructBoolSet, Point::ActorFlagSet}) {
-        REQUIRE(Trace::Identify(Base, Site(point), Trace::Pacibsp) == point);
+        REQUIRE(Trace::Identify(P::Get(), Base, Site(point), Trace::Pacibsp) == point);
         REQUIRE_FALSE(Trace::CoopPoint(point));
         const auto before = jit.GetRegisters();
         Trace::Resume(point, jit, env);
         REQUIRE(jit.GetRegisters() == before);
         const auto line = Trace::Describe(point, Base, jit, env);
-        REQUIRE(line.find("b3dedfe4") != std::string::npos);
+        REQUIRE(line.find("0a0b0c0d") != std::string::npos);
         REQUIRE(line.find("value=1") != std::string::npos);
     }
-    REQUIRE(Trace::Identify(Base, Base + 0x838964, 0xB94C5808) == Point::BitRead);
-    REQUIRE(Trace::Identify(Base, Base + 0xF07134, 0xAA0003E8) == Point::BitSet);
+    REQUIRE(Trace::Identify(P::Get(), Base, Base + 0x106004, Trace::LdrW8C58) == Point::BitRead);
+    REQUIRE(Trace::Identify(P::Get(), Base, Base + 0x107004, Trace::MovX8X0) == Point::BitSet);
     // Co-op without tracing traps only the frame boundary, never the hot Bool64 accessors.
     REQUIRE(Trace::CoopPoint(Point::Frame));
     for (const auto point : {Point::BitRead, Point::BitSet, Point::StepSet, Point::StepApply,
@@ -716,11 +707,11 @@ TEST_CASE("OoT co-op rupee grant calls the wallet entry with the pouch manager",
     namespace Coop = Core::OotCoop;
     constexpr u64 manager = Data, data = Data + 0x2000, hashes = Data + 0x3000;
     constexpr u64 queue = Data + 0x4000, sentinel = Stop + 0x100, pouch = Data + 0x8000;
-    constexpr u64 entry = Base + Coop::RupeeEntry;
+    constexpr u64 entry = Base + P::RupeeEntry;
     TraceEnvironment env;
     for (u64 i = data; i < data + 0x30; ++i) env.bytes[i] = 0;
     for (u64 i = hashes; i < hashes + 8 * 8; ++i) env.bytes[i] = 0;
-    env.Write64(Base + 0x4E842A8, manager);
+    env.Write64(Base + P::ManagerCell, manager);
     env.Write32(manager + 0x10, 2);
     env.Write64(manager + 0x18, data);
     env.Write64(manager + 0x20, hashes);
@@ -729,12 +720,10 @@ TEST_CASE("OoT co-op rupee grant calls the wallet entry with the pouch manager",
     env.Write64(manager + 0x38, queue);
     env.Write32(manager + 0x40, 0);
     env.Write64(queue, 0);
-    env.Write64(Base + Coop::PouchCell, pouch);
+    env.Write64(Base + P::PouchCell, pouch);
     env.Write64(pouch + 0x3BD4, 0);
-    env.Code(entry, 0x52877A88);
-    env.Code(entry + 4, 0x8B080008);
-    env.Code(entry + 8, 0xB8210108);
-    env.Code(entry + 12, 0xB93BD802);
+    env.Code(entry, P::RupeeWords[0]);
+    env.Code(entry + 4, P::RupeeWords[1]);
     env.Code(sentinel, Trace::Breakpoint);
     Coop::GuestBinding binding{Base, 0, 0, 0, sentinel, 0x20000000};
     for (u64 i = binding.stack - 0x4000; i < binding.stack; ++i) env.bytes[i] = 0;
@@ -742,17 +731,17 @@ TEST_CASE("OoT co-op rupee grant calls the wallet entry with the pouch manager",
     u64 tls = 123, tls_ro = 456;
     int clears = 0;
     using Backend = Coop::GameDataBackend<Dynarmic::A64::Jit, TraceEnvironment>;
-    Backend backend{jit, env, binding, tls, tls_ro, [&] { ++clears; }};
+    Backend backend{jit, env, binding, P::Get(), tls, tls_ro, [&] { ++clears; }};
     REQUIRE(backend.BindFromCell());
-    const Coop::Change minus{Coop::Kind::Rupee, "B", 1, Coop::WalletHash, -5};
+    const Coop::Change minus{Coop::Kind::Rupee, "B", 1, P::Wallet, -5};
     SECTION("call shape, restoration and commit on return") {
-        Coop::FrameDrain<Backend> drain{{true, {Coop::Kind::Rupee}, {}}};
+        Coop::FrameDrain<Backend> drain{{true, {Coop::Kind::Rupee}, {}, P::Wallet}};
         std::vector<std::string> logs;
         const auto send = [](Coop::Change, bool) { FAIL("a delta is never observed"); };
         const auto log = [&](std::string_view line) { logs.emplace_back(line); };
         drain.Frame(backend, {7, 9, 1, true}, send, log);
         REQUIRE(drain.BaselineReady());
-        jit.SetPC(Base + 0x11E7A54);
+        jit.SetPC(Site(Point::Frame) + 4);
         jit.SetSP(0x30000000);
         const auto saved = *backend.Capture();
         REQUIRE(drain.Queue(minus));
@@ -767,21 +756,21 @@ TEST_CASE("OoT co-op rupee grant calls the wallet entry with the pouch manager",
         REQUIRE(*backend.Capture() == saved);
         REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) == Coop::ApplyEvent::Committed);
         REQUIRE(std::count_if(logs.begin(), logs.end(), [](const auto& line) {
-            return line.find("applied class=rupee key=00000000a77921d7 value=-5 path=call") !=
+            return line.find("applied class=rupee key=000000000badcafe value=-5 path=call") !=
                    std::string::npos;
         }) == 1);
-        REQUIRE(drain.Queue({Coop::Kind::Rupee, "B", 2, Coop::WalletHash, -5}));
+        REQUIRE(drain.Queue({Coop::Kind::Rupee, "B", 2, P::Wallet, -5}));
     }
     SECTION("a changed wallet entry word blocks") {
-        env.Code(entry + 8, 0);
+        env.Code(entry + 4, 0);
         REQUIRE_FALSE(backend.Resolve(minus));
     }
     SECTION("no pouch manager yet blocks") {
-        env.Write64(Base + Coop::PouchCell, 0);
+        env.Write64(Base + P::PouchCell, 0);
         REQUIRE_FALSE(backend.Resolve(minus));
     }
     SECTION("an unmapped pending field blocks") {
-        env.Write64(Base + Coop::PouchCell, pouch + 0x100000);
+        env.Write64(Base + P::PouchCell, pouch + 0x100000);
         REQUIRE_FALSE(backend.Resolve(minus));
     }
     SECTION("a missing sentinel breakpoint blocks") {

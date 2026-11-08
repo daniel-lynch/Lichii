@@ -69,8 +69,13 @@ relay service and no second emulator are needed.
 
 ```sh
 python3 -I tools/oot/coop/fake_peer.py --ctl /path/to/ctl --port 43391 \
-    --room R --team together --policy flags-... --seed 0
+    --room R --team together --policy flags-... --seed 0 \
+    --build-id "$MAIN_BUILD_ID" --wallet "$WALLET_KEY"
 ```
+
+`--build-id` (the running main build) and `--wallet` (for `rupee DELTA...`) come from your private
+profile; the defaults are placeholders, and the relay refuses an emulator whose build differs from
+the first client's.
 
 Start the emulator with `EDEN_NX2_OOT_COOP=1 EDEN_NX2_OOT_COOP_RELAY=127.0.0.1:43391` and the
 same room/team/policy/seed. Then append commands to `ctl/cmd.txt`; each gets one JSON line in
