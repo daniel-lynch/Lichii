@@ -16,9 +16,26 @@ struct GuestBinding {
     u64 base{}, manager{}, data{}, queue{}, sentinel{}, stack{};
     u32 count{};
     bool invalid{};
+    u64 bool_data{}, bool_queue{}, bool_hashes{};
+    u32 bool_count{}, bool_capacity{};
 };
 
-// Only Bool64 has a proven reader and callable ABI. Its byte is NOT a pure flag store:
+inline constexpr std::array<std::pair<u32, u32>, 206> ChestMembers{{
+#include "core/arm/dynarmic/oot_coop_chest_keys.inc"
+}};
+
+inline std::optional<u32> ChestBool(u32 member) {
+    const auto it = std::lower_bound(ChestMembers.begin(), ChestMembers.end(), member,
+                                    [](const auto& row, u32 hash) { return row.first < hash; });
+    return it != ChestMembers.end() && it->first == member ? std::optional{it->second} : std::nullopt;
+}
+
+inline bool IsChestBool(u64 key) {
+    return std::any_of(ChestMembers.begin(), ChestMembers.end(),
+                       [key](const auto& row) { return row.second == key; });
+}
+
+// Both flag classes use deferred guest setters, never direct byte stores:
 // the game's queue consumer owns notifications and dirty tracking (see HOOKS.md).
 template <typename Jit, typename Memory>
 class GameDataBackend {
@@ -36,42 +53,83 @@ public:
         : jit{jit_}, memory{memory_}, binding{binding_}, tls{tls_}, tls_ro{tls_ro_},
           clear_exclusive{std::move(clear_exclusive_)} {}
 
-    bool Bind(u64 manager) {
-        using namespace OotGameDataTrace::Detail;
-        if (binding.manager && manager != binding.manager) {
-            binding.invalid = true;
+    bool BindFromCell() {
+        const auto manager = OotGameDataTrace::Detail::Read64(memory, binding.base + 0x4E842A8);
+        return BindManager(manager.value_or(0));
+    }
+
+    bool BindManager(u64 manager) {
+        if (binding.manager && manager != binding.manager) binding.invalid = true;
+        if (binding.invalid || !manager || manager > std::numeric_limits<u64>::max() - 0xC80)
             return false;
-        }
-        if (!manager || manager > std::numeric_limits<u64>::max() - 0xC80) return false;
-        const auto count = Read32(memory, manager + 0xC58);
-        const auto data = Read64(memory, manager + 0xC60);
-        const auto queue = Read64(memory, manager + 0xC70);
-        if (!count || !data || !queue || !*count || *count > 1'000'000 || !*data ||
-            *data > std::numeric_limits<u64>::max() - u64{*count} * 0x10 ||
-            !memory.IsValidVirtualAddressRange(*data, u64{*count} * 0x10)) return false;
-        if (binding.manager && (binding.manager != manager || binding.count != *count ||
-                                binding.data != *data || binding.queue != *queue)) {
-            binding.invalid = true;
-            return false;
-        }
         binding.manager = manager;
-        binding.count = *count;
-        binding.data = *data;
-        binding.queue = *queue;
-        return !binding.invalid;
+        return true;
+    }
+
+    bool Bind(u64 manager, Kind kind = Kind::Bit) {
+        using namespace OotGameDataTrace::Detail;
+        if (!BindManager(manager)) return false;
+        const bool flat = kind == Kind::Bool;
+        if (!flat && kind != Kind::Bit) return false;
+        const auto count = Read32(memory, manager + (flat ? 0x10 : 0xC58));
+        const auto data = Read64(memory, manager + (flat ? 0x18 : 0xC60));
+        const auto queue = Read64(memory, manager + (flat ? 0x38 : 0xC70));
+        const u64 stride = flat ? 0x18 : 0x10;
+        if (!count || !data || !queue || !*count || *count > 1'000'000 ||
+            !Span(*data, u64{*count} * stride) ||
+            (!flat && !Range(*data, u64{*count} * stride))) return false;
+        auto& old_count = flat ? binding.bool_count : binding.count;
+        auto& old_data = flat ? binding.bool_data : binding.data;
+        auto& old_queue = flat ? binding.bool_queue : binding.queue;
+        if (old_data && (old_count != *count || old_data != *data || old_queue != *queue)) {
+            binding.invalid = true;
+            return false;
+        }
+        if (flat) {
+            const auto hashes = Read64(memory, manager + 0x20);
+            const auto capacity = Read32(memory, manager + 0x2C);
+            if (!hashes || !capacity || !*capacity || *capacity > 2'000'000 ||
+                !Span(*hashes, u64{*capacity} * 8)) return false;
+            if (binding.bool_hashes && (binding.bool_hashes != *hashes ||
+                                        binding.bool_capacity != *capacity)) {
+                binding.invalid = true;
+                return false;
+            }
+            binding.bool_hashes = *hashes;
+            binding.bool_capacity = *capacity;
+        }
+        old_count = *count;
+        old_data = *data;
+        old_queue = *queue;
+        return true;
     }
 
     std::optional<bool> ReadFlag(const Change& change) {
-        if (change.kind != Kind::Bit || !change.key || !Bind(binding.manager)) return {};
+        if (!change.key || (change.kind == Kind::Bool && !IsChestBool(change.key)) ||
+            !Bind(binding.manager, change.kind)) return {};
+        if (change.kind == Kind::Bool) {
+            // Same modulo/linear probe as the guest. Bound corrupt/collision-heavy tables.
+            u32 slot = static_cast<u32>(change.key % binding.bool_capacity);
+            for (u32 probe = 0; probe < std::min(binding.bool_capacity, 64U); ++probe) {
+                const u64 address = binding.bool_hashes + u64{slot} * 8;
+                if (!Range(address, 8)) return {};
+                const u32 key = memory.Read32(address);
+                if (!key) return {};
+                if (key == change.key) {
+                    const u32 index = memory.Read32(address + 4);
+                    if (index >= binding.bool_count) return {};
+                    return Value(binding.bool_data + u64{index} * 0x18 + 0x16);
+                }
+                slot = (slot + 1) % binding.bool_capacity;
+            }
+            return {};
+        }
         u32 low = 0, high = binding.count;
         while (low < high) {
             const u32 mid = low + (high - low) / 2;
             const u64 record = binding.data + u64{mid} * 0x10;
             const u64 key = memory.Read64(record);
-            if (key == change.key) {
-                const u8 value = memory.Read8(record + 0xC);
-                return value <= 1 ? std::optional<bool>{value != 0} : std::nullopt;
-            }
+            if (key == change.key) return Value(record + 0xC);
             if (key < change.key) low = mid + 1;
             else high = mid;
         }
@@ -81,16 +139,22 @@ public:
     std::optional<ApplyTarget> Resolve(const Change& change) {
         using namespace OotGameDataTrace::Detail;
         if (!ReadFlag(change).has_value() || !binding.sentinel || binding.stack < 0x4000 ||
-            !memory.IsValidVirtualAddressRange(binding.stack - 0x4000, 0x4000) ||
-            Read32(memory, binding.base + 0x3761720) != 0xB40003C2 ||
-            Read32(memory, binding.base + 0x3761724) != 0xAA0003E8 ||
+            !Range(binding.stack - 0x4000, 0x4000) ||
             Read32(memory, binding.sentinel) != OotGameDataTrace::Breakpoint) return {};
-        const auto capacity = Read32(memory, binding.manager + 0xC68);
-        const auto state = Read32(memory, binding.manager + 0xC78);
+        const bool flat = change.kind == Kind::Bool;
+        const u64 entry = binding.base + (flat ? 0x682B20 : 0x3761720);
+        if (flat) {
+            constexpr std::array<u32, 4> words{0xD503237F, 0xD100C3FF, 0xA9017BFD, 0xF90013F3};
+            for (size_t i = 0; i < words.size(); ++i)
+                if (Read32(memory, entry + i * 4) != words[i]) return {};
+        } else if (Read32(memory, entry) != 0xB40003C2 ||
+                   Read32(memory, entry + 4) != 0xAA0003E8) return {};
+        const auto capacity = Read32(memory, binding.manager + (flat ? 0x30 : 0xC68));
+        const auto state = Read32(memory, binding.manager + (flat ? 0x40 : 0xC78));
+        const u64 queue = flat ? binding.bool_queue : binding.queue;
         if (!capacity || !state || !*capacity || *capacity > 0xFFFFF ||
-            (*state & 0xFFFFF) >= *capacity || !binding.queue ||
-            !memory.IsValidVirtualAddressRange(binding.queue, u64{*capacity} * 8)) return {};
-        return ApplyTarget{true, false, 0, 0, binding.base + 0x3761720, binding.sentinel,
+            (*state & 0xFFFFF) >= *capacity || !Range(queue, u64{*capacity} * 8)) return {};
+        return ApplyTarget{true, false, 0, 0, entry, binding.sentinel,
                            binding.stack, {binding.manager, 1, change.key}};
     }
 
@@ -129,6 +193,17 @@ public:
     }
 
 private:
+    static bool Span(u64 address, u64 size) {
+        return address && address <= std::numeric_limits<u64>::max() - size;
+    }
+    bool Range(u64 address, u64 size) {
+        return Span(address, size) && memory.IsValidVirtualAddressRange(address, size);
+    }
+    std::optional<bool> Value(u64 address) {
+        if (!Range(address, 1)) return {};
+        const u8 value = memory.Read8(address);
+        return value <= 1 ? std::optional<bool>{value != 0} : std::nullopt;
+    }
     Jit& jit;
     Memory& memory;
     GuestBinding& binding;

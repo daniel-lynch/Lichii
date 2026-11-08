@@ -483,3 +483,164 @@ TEST_CASE("GameData Bool64 reader hook resumes its zero extending load", "[oot_g
     REQUIRE(env.breakpoints == 1);
     REQUIRE(env.lines.front().starts_with("gamedata bit-read mgr="));
 }
+
+TEST_CASE("OoT chest member hashes map to reviewed backing Bools", "[oot_coop]") {
+    namespace Coop = Core::OotCoop;
+    REQUIRE(Coop::ChestMembers.size() == 206);
+    REQUIRE(Murmur3("4555665598794293658") == 0xB3DEDFE4);
+    REQUIRE(Coop::ChestBool(0xB3DEDFE4) == 0xC8643846);
+    REQUIRE(Coop::ChestBool(0x5A95678A) == 0x467020FD);
+    REQUIRE_FALSE(Coop::ChestBool(0));
+    REQUIRE_FALSE(Coop::IsChestBool(0x3F38F9B9A399E19A));
+    std::set<u32> members, keys;
+    for (const auto& [member, key] : Coop::ChestMembers) {
+        REQUIRE(members.insert(member).second);
+        REQUIRE(keys.insert(key).second);
+        REQUIRE(Coop::ChestBool(member) == key);
+    }
+}
+
+TEST_CASE("OoT flat Bool polling and deferred chest grants", "[oot_coop]") {
+    namespace Coop = Core::OotCoop;
+    constexpr u32 key = 0xC8643846;
+    constexpr u64 manager = Data, data = Data + 0x2000, hashes = Data + 0x3000;
+    constexpr u64 queue = Data + 0x4000, sentinel = Stop + 0x100;
+    constexpr u64 entry = Base + 0x682B20;
+    TraceEnvironment env;
+    for (u64 i = data; i < data + 0x30; ++i) env.bytes[i] = 0;
+    for (u64 i = hashes; i < hashes + 8 * 8; ++i) env.bytes[i] = 0;
+    env.Write64(Base + 0x4E842A8, manager);
+    env.Write32(manager + 0x10, 2);
+    env.Write64(manager + 0x18, data);
+    env.Write64(manager + 0x20, hashes);
+    env.Write32(manager + 0x2C, 8);
+    env.Write32(manager + 0x30, 1);
+    env.Write64(manager + 0x38, queue);
+    env.Write32(manager + 0x40, 0);
+    env.Write64(queue, 0);
+    // Force collision and wraparound: key % 8 == 6, found at slot 0, record index 1.
+    env.Write32(hashes + 6 * 8, 1);
+    env.Write32(hashes + 7 * 8, 2);
+    env.Write32(hashes, key);
+    env.Write32(hashes + 4, 1);
+    env.Code(entry, 0xD503237F);
+    env.Code(entry + 4, 0xD100C3FF);
+    env.Code(entry + 8, 0xA9017BFD);
+    env.Code(entry + 12, 0xF90013F3);
+    env.Code(sentinel, Trace::Breakpoint);
+    Coop::GuestBinding binding{Base, 0, 0, 0, sentinel, 0x20000000};
+    for (u64 i = binding.stack - 0x4000; i < binding.stack; ++i) env.bytes[i] = 0;
+    Dynarmic::A64::Jit jit{Config(env)};
+    u64 tls = 123, tls_ro = 456;
+    int clears = 0;
+    using Backend = Coop::GameDataBackend<Dynarmic::A64::Jit, TraceEnvironment>;
+    Backend backend{jit, env, binding, tls, tls_ro, [&] { ++clears; }};
+    const Coop::Change grant{Coop::Kind::Bool, "A", 1, key, 1};
+    REQUIRE(backend.BindFromCell()); // No Bool64 table or accessor call exists in this fixture.
+    REQUIRE(backend.ReadFlag(grant) == false);
+    Coop::FrameDrain<Backend> drain{{true, {Coop::Kind::Bool}, {{Coop::Kind::Bool, key}}}};
+    std::vector<Coop::Change> sent;
+    std::vector<std::string> logs;
+    const auto send = [&](Coop::Change change, bool) { sent.push_back(change); };
+    const auto log = [&](std::string_view line) { logs.emplace_back(line); };
+    drain.Frame(backend, {7, 9, 1, true}, send, log);
+    REQUIRE(drain.BaselineReady());
+    REQUIRE(sent.empty());
+    SECTION("local flip observed exactly once and rollback quarantines") {
+        env.bytes[data + 0x18 + 0x16] = 1;
+        drain.Frame(backend, {7, 9, 2, true}, send, log);
+        drain.Frame(backend, {7, 9, 3, true}, send, log);
+        REQUIRE(sent.size() == 1);
+        REQUIRE(sent[0].kind == Coop::Kind::Bool);
+        REQUIRE(sent[0].key == key);
+        env.bytes[data + 0x18 + 0x16] = 0;
+        REQUIRE(drain.Frame(backend, {7, 9, 4, true}, send, log) == Coop::ApplyEvent::Quarantined);
+    }
+    SECTION("grant shape, full restoration, deferred commit and echo suppression") {
+        for (size_t i = 0; i < 31; ++i) jit.SetRegister(i, 100 + i);
+        for (size_t i = 0; i < 32; ++i) jit.SetVector(i, {200 + i, 300 + i});
+        jit.SetPC(Base + 0x11E7A54);
+        jit.SetSP(0x30000000);
+        jit.SetPstate(0xA0000000);
+        jit.SetFpcr(0x400000);
+        jit.SetFpsr(0x8000001);
+        const auto saved = *backend.Capture();
+        REQUIRE(drain.Queue(grant));
+        REQUIRE(drain.Frame(backend, {7, 9, 2, true}, send, log) == Coop::ApplyEvent::Started);
+        REQUIRE(jit.GetPC() == entry);
+        REQUIRE(jit.GetRegister(0) == manager);
+        REQUIRE(jit.GetRegister(1) == 1);
+        REQUIRE(jit.GetRegister(2) == key);
+        REQUIRE(jit.GetRegister(30) == sentinel);
+        REQUIRE(jit.GetSP() == binding.stack);
+        for (size_t i = 0; i < 31; ++i) jit.SetRegister(i, 0);
+        for (size_t i = 0; i < 32; ++i) jit.SetVector(i, {0, 0});
+        jit.SetPstate(0); jit.SetFpcr(0); jit.SetFpsr(0);
+        tls = tls_ro = 0;
+        REQUIRE(drain.Sentinel(backend, {7, 9, 2, true}, sentinel, log) == Coop::ApplyEvent::Returned);
+        REQUIRE(*backend.Capture() == saved);
+        REQUIRE(clears == 2);
+        REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) == Coop::ApplyEvent::Blocked);
+        env.bytes[data + 0x18 + 0x16] = 1;
+        REQUIRE(drain.Frame(backend, {7, 9, 4, true}, send, log) == Coop::ApplyEvent::Committed);
+        drain.Frame(backend, {7, 9, 5, true}, send, log);
+        REQUIRE(sent.empty());
+        REQUIRE(drain.Suppress(grant));
+        REQUIRE_FALSE(drain.Queue(grant));
+        for (const auto event : {"applied", "suppressed"}) {
+            REQUIRE(std::count_if(logs.begin(), logs.end(), [&](const auto& line) {
+                return line.find(std::string{event} + " class=bool key=00000000c8643846") !=
+                       std::string::npos;
+            }) == 1);
+        }
+    }
+    SECTION("full queue blocks") {
+        env.Write32(manager + 0x40, 1);
+        REQUIRE_FALSE(backend.Resolve(grant));
+    }
+    SECTION("wrong setter word blocks") {
+        env.Code(entry + 12, 0);
+        REQUIRE_FALSE(backend.Resolve(grant));
+    }
+    SECTION("bad index blocks") {
+        env.Write32(hashes + 4, 2);
+        REQUIRE_FALSE(backend.ReadFlag(grant));
+    }
+    SECTION("non-boolean byte blocks") {
+        env.bytes[data + 0x18 + 0x16] = 2;
+        REQUIRE_FALSE(backend.ReadFlag(grant));
+    }
+    SECTION("changed table quarantines") {
+        env.Write32(manager + 0x2C, 4);
+        REQUIRE_FALSE(backend.ReadFlag(grant));
+        REQUIRE(binding.invalid);
+    }
+    SECTION("changed manager cell quarantines") {
+        env.Write64(Base + 0x4E842A8, 0);
+        REQUIRE_FALSE(backend.BindFromCell());
+        REQUIRE(binding.invalid);
+    }
+}
+
+TEST_CASE("Chest trace sites preserve hints and report keys", "[oot_gamedata_trace]") {
+    TraceEnvironment env;
+    Dynarmic::A64::Jit jit{Config(env)};
+    jit.SetRegister(0, Data);
+    jit.SetRegister(1, 1);
+    jit.SetRegister(3, 0xB3DEDFE4);
+    jit.SetRegister(8, Data + 0x100);
+    env.Write32(Data + 0x108, 0xB3DEDFE4);
+    env.Write64(Data + 0x188, 0x3F38F9B9A399E19A);
+    for (const auto point : {Point::StructBoolSet, Point::ActorFlagSet}) {
+        REQUIRE(Trace::Identify(Base, Site(point), Trace::Pacibsp) == point);
+        REQUIRE_FALSE(Trace::CoopPoint(point));
+        const auto before = jit.GetRegisters();
+        Trace::Resume(point, jit, env);
+        REQUIRE(jit.GetRegisters() == before);
+        const auto line = Trace::Describe(point, Base, jit, env);
+        REQUIRE(line.find("b3dedfe4") != std::string::npos);
+        REQUIRE(line.find("value=1") != std::string::npos);
+    }
+    REQUIRE(Trace::Identify(Base, Base + 0x838964, 0xB94C5808) == Point::BitRead);
+    REQUIRE(Trace::Identify(Base, Base + 0xF07134, 0xAA0003E8) == Point::BitSet);
+}

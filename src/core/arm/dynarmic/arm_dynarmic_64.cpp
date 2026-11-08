@@ -90,7 +90,8 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
         }
     }
     if (m_oot_coop) {
-        return OotGameDataTrace::InstructionFor(m_oot_coop->base, vaddr, instruction);
+        const auto point = OotGameDataTrace::Identify(m_oot_coop->base, vaddr, instruction);
+        return OotGameDataTrace::CoopPoint(point) ? OotGameDataTrace::Breakpoint : instruction;
     }
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
         if (!m_window_trace) {

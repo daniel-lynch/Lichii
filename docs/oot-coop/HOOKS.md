@@ -17,7 +17,7 @@ For the previously unlisted small functions, this pass disassembled the read-onl
 `python3 -I .tmp/disasm-C2.py`. Function boundaries were cross-checked against
 `G/out11/functions.tsv`. Result listings are `.tmp/setters-disassembly-C2.txt`,
 `.tmp/bool64-disassembly-C2.txt`, `.tmp/write-queues-C2.txt` and
-`.tmp/struct-bool-C2.txt`. No native code or data tables are embedded here.
+`.tmp/struct-bool-C2.txt`. Only reviewed member/backing-Bool hashes are shipped; no game names or native code blobs are embedded.
 
 ## Hook and setter table
 
@@ -27,7 +27,7 @@ For the previously unlisted small functions, this pass disassembled the read-onl
 | Int setter `0x7100163B70` (exported bytes; stores at `0x7100163C5C`) | `x0=manager`, `w1=32-bit value`, `w2=nonzero key`. CAS reserves a 12-byte queue record through `manager+0x100`; value/key stored together. Array fallback calls `0x710376A590`. | **Proven** queued integer write; **inferred** signed/application meaning depends on the schema. Scalar grants excluded by protocol v2. |
 | Enum setter `0x71003E0980` (`G/out13/decomp/71003e0980.c`) | `x0=manager`, `w1=value`, `w2=nonzero key`; queued value/key pair, array fallback `0x710376ABE0`. | **Inferred:** value must belong to the enum. No numeric-max rule for arbitrary enum hashes. Not a pure write, not a quest-transition substitute. |
 | Bool64 reader `0x7103761680` (bytes `0x7103761684..0x7103761714`) | `x0=manager`, `x1=out byte*`, `x2=nonzero actor key`; sorted binary search; `w0=1` and writes the byte on match, else `w0=0`. | **Proven** layout below. **Inferred:** stable loaded table and concurrency guarantee still needed before an emulator reader uses it. |
-| Bool64 setter `0x7103761720` (bytes `0x7103761724..0x71037617A8`) | `x0=manager`, `w1=bool`, `x2=64-bit actor key`; finds record index in `w3`, changes `x0` to manager+`0xC58`, masks `w1` and tail-calls `0x7100F071C0`. Missing key returns without writing. | **Proven:** indexed deferred queue, not a direct OR. **Inferred:** first candidate guest call after field validation; leave runtime address gate closed until manager lifetime, frame site, queue and save behavior pass. |
+| Bool64 setter `0x7103761720` (bytes `0x7103761724..0x71037617A8`) | `x0=manager`, `w1=bool`, `x2=64-bit actor key`; finds record index in `w3`, changes `x0` to manager+`0xC58`, masks `w1` and tail-calls `0x7100F071C0`. Missing key returns without writing. | **Proven:** indexed deferred queue, not a direct OR. **Inferred:** first candidate guest call after field validation; leave runtime address gate closed until manager lifetime, frame site, queue and save behavior pass. **Field C3:** only static caller is `0x71028E6460`; actor flags use the copy `0x7100F07130`, and chests use struct `0xCE0C4DFE` (section below). |
 | Bool64 queue helper `0x7100F071C0` (bytes through `0x7100F07244`) | `x0=table`, `w1=bool`, `w3=resolved index`. CAS queue reservation; byte value at entry+0, index at +4. Capacity/generation mismatch branches to abort. | **Proven:** do not call with an unvalidated index; do not bypass by writing the record byte. Queue-consumer notifications/dirty tracking remain **unknown**. |
 | Quest setter `0x7102CF54A0`; observation `0x7102CF54A4` (`G/out17r/decomp/7102cf54a0.c`) | `x0=challenge manager`, `w1=challenge hash`, `w2=step hash`, `w3=UI choice`, `w4=mark current subentries`, `w5=force`. Three record sets; sets pending hash/flags; returns 1 for accepted/no-op, 0 for missing or protected state. | **Proven:** may move backwards, accepts an unresolved step hash as pending, and blocks terminal/not-ready states unless forced. A successful return does not prove a step applied. UI meaning inferred from caller. Do not force. |
 | Quest apply `0x7102CF1830` (`G/out17r/decomp/7102cf1830.c`) | Integer argument `x0=record+0x18`; `w1` controls old-step processing. Resolves pending hash, invokes `0x7102CF1160`, writes index, invokes `0x7102CF13A0`. | **Proven:** more than one field changes and callbacks run. Entry trace is before mutation. FP/vector argument needs in callees remain unverified; never inject this interior apply path. |
@@ -89,14 +89,69 @@ u32 boundary at file+8; values may instead point to strings/vectors. No complete
 schema, Bool64 serialization, inventory transaction or small-key counter ABI is
 established here. Never patch disposable or real saves using those assumptions alone.
 
-## C3 frame-drain application path
+## Chest-opened state: struct 0xCE0C4DFE, not Bool64 (C3 field follow-up)
+
+Source: `~/Downloads/OOT/field/coop-C3-20261108-0550/CHEST-STATE.md`. Static claims below
+come from the exported text bytes (`G/out10/dump/text_7100000000.bin`, disassembled with
+libcapstone). Save claims come from the C3 saves and the fieldb run saves.
+
+**Proven (save + schema): where a chest's opened flag is stored.** It is a member of GameData
+Struct `0xCE0C4DFE` (name unknown). The struct has 206 members. The member hash is
+`Murmur3_32("<decimal u64 instance id>")`, and the member value is the hash of an ordinary
+32-bit **Bool**. All 206 Bools are ResetTypeValue 24, SaveFileIndex 0. These members cover
+184 of the randomizer's 190 chest locations; the six left out are `Obj_TBox_A_04`. In the saves,
+six of six chest opens flipped exactly the backing Bool of the chest that was opened. C3's c1
+(`0x3F38F9B9A399E19A`) is member `0xB3DEDFE4`, which maps to Bool `0xC8643846`; it went 0→1 in
+slot_01. No save has a chest key in the Bool64 section, including real-play saves with 11 and
+39 chest Bools set. The Bool64 section (save type 32) holds sorted u64 true keys with a zero
+terminator; it contains pickups, breakables and enemies only.
+
+**Proven (static): run-time write path.** All addresses use the image base:
+
+| Site | Behavior |
+|---|---|
+| `0x7100F07040` (entry `ldr x8,[x0,#0x3d8]` = `F941EC08`; `pacibsp` at +8) | Actor GameData flag setter. `x0` = actor-side object, `w1` = value. `x8 = [x0+0x3D8]`; `ldset` on `[x8+0x98]`. If the value is set, flag bit 5 of `[x8+0x14]` is set, and `w19 = [x8+8]` (member hash) is nonzero, it calls handle `0x71009B3EB0(mgr,&h,0xCE0C4DFE)` and then `0x7100608A10(mgr,1,&h,w19)`. Then, if flag bit 3 is set and `[x8+0x88]` (instance u64) is nonzero, it calls the **second Bool64 setter** `0x7100F07130(mgr,1,id)`. `mgr = *(main+0x4E842A8)` through GOT `main+0x4C7E180`. Callers: `0x7100F06E80` (logic node, passes a bool input), `0x7102C251A0`, `0x7102DE6A60`, and the vtable thunk `0x71028663E0`. |
+| `0x71009B3EB0` | Struct handle lookup: hash table at mgr+0xC20 (capacity +0xC2C); record = mgr+0xC18 + idx*0x20, idx < count at mgr+0xC10. `h = {rec*, u32 0, u8 alt}`, with `alt=1` when rec+0x18 ≥ 2. |
+| `0x7100608A10` (`pacibsp`) | Struct-member Bool setter. `x0=mgr`, `w1=value`, `x2=&h`, `w3=member hash`. It reads the member table at `[rec+8]` (capacity `[rec+0x14]`, slots `{member u32, bool-key u32}`), finds the bool key in the flat bool table at mgr+0x20 (capacity +0x2C), and pushes an 8-byte record into the **ordinary bool queue**: capacity mgr+0x30, buffer +0x38, CAS +0x40; value byte +0, key +4. These are the same words that Bool setter `0x7100682B20` writes. When the queue is full it goes to `0x71034FC280`; when the key is missing it goes through mgr+0x68 (`0x7103744F00`). |
+| `0x7100DCD300` (`pacibsp`) | `bool IsChestOpened(u64 id)`: decimal → Murmur3 → struct 0xCE0C4DFE → getter `0x7100581170`. Called from the generic flag evaluator `0x7100206290` (other branches of that function read a named Bool and Bool64 reader `0x7103761680`). The map's TBox code at `0x7100B64E60` uses the same construction inline. |
+| `0x7100581170` | Struct-member Bool getter. The value is the flat bool record at mgr+0x18 + idx*0x18, byte +0x16 (count +0x10). |
+| `0x7100F07130` (`cbz x2` then `mov x8,x0` = `AA0003E8` at +4) | **Second copy** of the Bool64 setter, byte-identical to `0x7103761720`; tail-calls the same queue helper `0x7100F071C0`. |
+| `0x7100838960` (`ldr w8,[x0,#0xc58]` = `B94C5808` at +4) | Second copy of the Bool64 reader `0x7103761680`. |
+
+**Correction to the C3 hook choice.** The reviewed Bool64 setter `0x7103761720` has exactly one
+static caller, `0x71028E6460` (the InstanceGameParameter path). Actor dead/collected flags go
+through `0x7100F07130`. The reviewed reader has three callers. That explains why the C3 field
+run logged zero `bit-*` lines. A chest never reaches Bool64 at all. **Inferred:** a chest's
+placement flags have bit 3 clear (its ActorParam names `ActorGameDataSetting/AlwaysRespawn`),
+so its Bool64bitKey schema entry (189 TBox entries exist) is never written.
+
+**Consequences (inferred, needs field validation).**
+- A chest is a `bool`-class key, not a `bit` key. The 206 reviewed keys are the backing Bool
+  hashes, not actor hashes.
+- The manager comes from the cell `*(main+0x4E842A8)` on the frame hook. Do not wait for a
+  reader or setter call to learn it.
+- The read side for the baseline and the observer is the flat bool table (+0x20/+0x2C →
+  index; +0x10/+0x18 stride 0x18, byte +0x16).
+- A grant is a synthetic call to `0x7100682B20(mgr, 1, bool_key)`. It produces the same queued
+  record that `0x7100608A10` produces for a local open. It does **not** run
+  `0x7100F07040`'s actor-side `ldset [x8+0x98]`, it does not animate a chest that is already
+  loaded (spawn reads the state), and it grants **no item**. Items are separate
+  `IsGet.<actor>` Bools and `PouchData.<actor>.StockNum` Ints, and the pouch grant ABI is
+  still unknown.
+- `bit` stays the class for pickups and breakables. If it is kept, it must also observe the
+  copies at `0x7100838964` / `0x7100F07134`, which have the same original words as the
+  current hooks.
+
+## C4 frame-drain application path
 
 `oot_gamedata_trace.h` now substitutes the verified `pacibsp` at main+0x11E7A50.
-It also observes the Bool64 reader at +0x3761684 (`ldr w8, [x0, #0xC58]`) and
-setter at +0x3761724 (`mov x8, x0`) to learn the manager from actual guest arguments.
-Both original words were checked against the exported text bytes. Reader/setter entry
-observations are **not** receipts: the observer reads the authoritative reviewed keys
-at the next frame boundary and emits only false→true changes (or true baseline values).
+At that frame it binds the manager directly from `*(main+0x4E842A8)`, without waiting
+for any accessor call. The trace includes the Bool64 accessor copies at +0x838964 and
++0xF07134. Trace-only `pacibsp` sites +0x608A10 and +0xF07048 log struct member/value
+and actor member/instance key/value; they require `EDEN_NX2_GAMEDATA_TRACE` and are
+not installed merely by enabling co-op. Entry observations are **not** receipts:
+the observer polls committed values at the frame boundary and emits only false→true
+changes (or true baseline values).
 
 `arm_dynarmic_64.cpp` resumes each substituted instruction once, then invokes
 `Session::Hook`. At a frame, the resumed PC is frame+4. `Session` detaches at most 64
@@ -105,11 +160,18 @@ incoming entries under its transport lock, releases that lock, and feeds its per
 protects guest bookkeeping across host workers. The network thread never touches guest
 memory or registers. Other trace hooks do not drain.
 
-The first supported class is `bit`: Bool64 reader layout + deferred setter at
-main+0x3761720, x0=manager, w1=1, x2=reviewed actor key. The backend checks mappings,
-count/key lookup, manager/table/queue identity, setter instruction words and queue
-headroom. It requires two frame visits with a valid binding before application. A
-changed binding, unreadable baseline, or observed true→false rollback quarantines
+The chest class is `bool`: flat hash/index table + deferred setter at main+0x682B20,
+x0=manager, w1=1, w2=backing Bool key. `oot_coop_chest_keys.inc` contains 206 member/hash
+pairs from GameDataList struct 0xCE0C4DFE; `ChestBool` resolves a member hash and
+`IsChestBool` restricts the production adapter to that catalog. The runtime only polls
+configured keys, at most 206 chest flags per frame. Each lookup probes at most 64
+hash slots (modulo capacity, linear probing with wraparound); missing keys, invalid
+indices/bytes and exhausted probe budgets fail closed. No entire Bool table scan runs.
+The `bit` class remains the Bool64 adapter for pickups, breakables and enemies, with
+deferred setter main+0x3761720 and x2=reviewed actor key. Both adapters validate mapped
+ranges, stable table/queue identity, original setter instructions and queue headroom.
+Application requires two frame visits with a valid manager binding. A
+changed binding, unreadable post-baseline state, or observed true→false rollback quarantines
 injection for this process; receipts are never reset while the old guest can return.
 The process epoch is currently 1. This is conservative detection, **not a proven
 save-load/transition lifecycle hook**; same-address reloads and event scheduling still
@@ -134,8 +196,8 @@ The shared grant engine retains its atomic masked `data-or` branch and tests it 
 fake memory. **No production pure-write class is enabled.** Every GameData layout
 researched above either uses a deferred queue or has unknown dirty/notification
 obligations. Writing the Bool64 byte directly would contradict the evidence.
-Ordinary `bool` is recognized by the class parser/protocol but has no reviewed key
-adapter in C3; neither int/enum/quest/pouch nor struct-member writes are enabled.
+The `bool` adapter only marks chest locations checked. It grants no item or wallet
+value. Neither int/enum/quest/pouch nor arbitrary struct-member writes are enabled.
 
 ## Policy and logs
 
@@ -144,16 +206,33 @@ adapter in C3; neither int/enum/quest/pouch nor struct-member writes are enabled
 - `EDEN_NX2_OOT_COOP_ALLOW`: comma-separated `bool,bit` tokens, no spaces or empty
   tokens. Default is the **empty set**. Invalid tokens reject session creation.
   The old `ALLOW_CLASSES` variable is no longer consulted.
-- `EDEN_NX2_OOT_COOP_KEYS`: path to a private JSON array of up to 4096 nonzero u64
-  Bool64 keys. Default is empty; the class setting alone cannot grant anything.
+- `EDEN_NX2_OOT_COOP_KEYS`: JSON policy with typed arrays, for example
+  `{"bool":[3362011206],"bit":[123]}` (numeric hashes). At most 4096 keys in total;
+  `bool` keys must belong to the reviewed 206-key catalog. A legacy bare array still
+  means `bit` only. Default is empty; class selection alone cannot grant anything.
   Deny-list keys are removed. Both peers must use the same reviewed key set/policy ID.
+  `tools/oot/coop/chest-bools.json` configures all 206 chest Bools. No actor names or
+  instance IDs are included in that file or the member table.
+
+Regenerate both hash-only files from a local GameDataList JSON export (the lane's BYML
+reader must preserve integer hashes):
+
+```sh
+python3 -I tools/oot/coop/chest_keys.py "$GAMEDATA_JSON" \
+  --table src/core/arm/dynarmic/oot_coop_chest_keys.inc \
+  --keys tools/oot/coop/chest-bools.json
+```
+
+Source: `GameData__GameDataList.Product.110.byml`, `Data.Struct` entry `Hash=0xCE0C4DFE`,
+`DefaultValue[].{Hash,Value}`. The generator verifies distinct members/backing keys and
+that each backing key is in `Data.Bool` with ResetTypeValue 24 and SaveFileIndex 0.
 
 The observer consults the engine's class/key receipts before emitting any value.
 Receipts survive queueing, host worker changes, sentinel return, delayed commit,
 duplicate delivery and quarantine. Each application emits exactly one line:
 
 ```
-OoT co-op: applied class=bit key=<16-hex> value=1 path=setter echo=1-bit-<16-hex>
+OoT co-op: applied class=bool key=<16-hex> value=1 path=setter echo=1-bool-<16-hex>
 ```
 
 `started`, `returned` and `suppressed` carry the same key and echo ID. `already-true`
@@ -162,9 +241,9 @@ baseline/local mutations. A complete allowed-set read logs `baseline exported`;
 a FIFO state-request after its outgoing acknowledgements logs `baseline exchanged`
 on reply. That is a relay snapshot barrier, not proof of guest/save convergence.
 Until every reviewed key is readable, the first frame that cannot read one logs
-`baseline waiting: class=bit key=<16-hex> unreadable` once; no baseline is exported.
-The Bool64 reader/setter hooks run a full table Bind only when x0 differs from the
-learned manager; a different manager after one is learned quarantines the process.
+`baseline waiting: class=bool key=<16-hex> unreadable` once; no baseline is exported.
+The frame hook reads the manager cell every time; a changed or cleared learned manager
+quarantines the process. Per-class table identity is rechecked when reading flags.
 
 Unit tests exercise the real JIT's frame→synthetic setter→sentinel→continuation path
 and a fake two-peer observer/queue/application path. These do not validate this game's

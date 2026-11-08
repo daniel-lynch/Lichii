@@ -548,3 +548,25 @@ TEST_CASE("OoT co-op frame observer quarantines rollback and incomplete baseline
     REQUIRE_FALSE(drain.Queue(Grant));
     REQUIRE(guest.calls == 0);
 }
+
+TEST_CASE("OoT co-op typed key policies separate chest Bools and Bool64", "[core][oot_coop]") {
+    const Json chest{{"bool", Json::array({0xC8643846U})}};
+    const auto keys = Coop::DecodeKeyPolicy(chest);
+    REQUIRE(keys);
+    REQUIRE(keys->contains({Kind::Bool, 0xC8643846}));
+    REQUIRE_FALSE(keys->contains({Kind::Bit, 0xC8643846}));
+    const auto legacy = Coop::DecodeKeyPolicy(Json::array({0xC8643846U}));
+    REQUIRE(legacy);
+    REQUIRE(legacy->contains({Kind::Bit, 0xC8643846}));
+    REQUIRE(Coop::DecodeKeyPolicy(Json{{"bool", Json::array({0xC8643846U})},
+                                      {"bit", Json::array({0x3F38F9B9A399E19AULL})}})->size() == 2);
+    for (const auto& invalid : {Json{{"bool", Json::array({123})}},
+                               Json{{"bool", Json::array({0x3F38F9B9A399E19AULL})}},
+                               Json{{"bool,bool", Json::array({0xC8643846U})}},
+                               Json{{"quest", Json::array({123})}},
+                               Json{{"bit", Json::array({0})}}}) {
+        REQUIRE_FALSE(Coop::DecodeKeyPolicy(invalid));
+    }
+    Coop::FrameDrain<FakeGuest> disabled{{true, {}, *keys}};
+    REQUIRE_FALSE(disabled.Queue({Kind::Bool, "A", 1, 0xC8643846, 1}));
+}

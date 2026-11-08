@@ -66,6 +66,34 @@ class HarnessTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     harness.refuse_busy()
 
+    def test_empty_allow_control(self):
+        self.assertTrue(all(checker.check(READY, "", allow="").values()))
+        for event in ("started", "returned", "applied", "suppressed", "observed", "baseline"):
+            self.assertFalse(all(checker.check(READY, APPLIED.replace("applied", event), allow="").values()))
+
+    def test_bool_receipts(self):
+        self.assertTrue(all(checker.check((READY + OBSERVED).replace("bit", "bool"),
+                                         (READY + APPLIED + SUPPRESSED).replace("bit", "bool"),
+                                         allow="bool").values()))
+
+    def test_vram_profile(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd() / ".tmp") as directory:
+            root = Path(directory)
+            source = root / "source"
+            (source / "config/custom").mkdir(parents=True)
+            for file in ("qt-config.ini", "custom/game.ini"):
+                (source / "config" / file).write_text("[Renderer]\nresolution_setup=2\nvram_usage_mode=1\n[System]\nuse_docked_mode=1\n")
+            for name in ("A", "B"):
+                dest = root / name
+                harness.prepare_profile(source, dest, vram_profile=True)
+                for file in ("qt-config.ini", "custom/game.ini"):
+                    text = (dest / "config" / file).read_text()
+                    for key in ("resolution_setup", "vram_usage_mode", "use_docked_mode"):
+                        self.assertIn(key + "=0", text)
+                        self.assertIn(key + "\\default=false", text)
+                        self.assertIn(key + "\\use_global=false", text)
+            self.assertIn("resolution_setup=2", (source / "config/qt-config.ini").read_text())
+
     def test_profile_paths_are_private_copies(self):
         scratch = Path.cwd() / ".tmp"
         with tempfile.TemporaryDirectory(dir=scratch) as directory:

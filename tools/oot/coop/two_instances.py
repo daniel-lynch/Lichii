@@ -25,7 +25,7 @@ def refuse_busy(owned=()):
         raise RuntimeError("Refusing to start: .aot-priority exists or lichii is running")
 
 
-def prepare_profile(source, destination):
+def prepare_profile(source, destination, vram_profile=False):
     if any(path.is_symlink() for path in source.rglob("*")):
         raise ValueError("Profile must be a self-contained disposable copy without symlinks")
     shutil.copytree(source, destination)
@@ -36,7 +36,7 @@ def prepare_profile(source, destination):
         config.read(ini)
         if not config.has_section("Data%20Storage"):
             config.add_section("Data%20Storage")
-# Qt encodes spaces in group names; handle existing plain INI profiles too.
+        # Qt encodes spaces in group names; handle existing plain INI profiles too.
         for section in ("Data%20Storage", "Data Storage", "DataStorage"):
             if not config.has_section(section):
                 continue
@@ -49,6 +49,16 @@ def prepare_profile(source, destination):
             config.add_section("Miscellaneous")
         config["Miscellaneous"]["log_filter"] = "*:Info"
         config["Miscellaneous"]["log_filter\\default"] = "false"
+        if vram_profile:
+            for section, values in {
+                    "Renderer": {"resolution_setup": "0", "vram_usage_mode": "0"},
+                    "System": {"use_docked_mode": "0"}}.items():
+                if not config.has_section(section):
+                    config.add_section(section)
+                for key, value in values.items():
+                    config[section][key] = value
+                    config[section][key + "\\default"] = "false"
+                    config[section][key + "\\use_global"] = "false"
         with ini.open("w") as stream:
             config.write(stream, space_around_delimiters=False)
     log_dir = destination / "log"
@@ -62,9 +72,11 @@ def main():
     parser.add_argument("--game", type=Path, required=True)
     parser.add_argument("--profile", type=Path, required=True,
                         help="self-contained portable user/ template with disposable saves in nand/")
-    parser.add_argument("--keys", type=Path, required=True, help="reviewed numeric Bool64 JSON array")
+    parser.add_argument("--keys", type=Path, required=True, help="typed bool/bit JSON policy (legacy arrays are bit keys)")
     parser.add_argument("--run-dir", type=Path, required=True, help="new directory, never reused")
-    parser.add_argument("--allow", default="", choices=("", "bit"))
+    parser.add_argument("--allow", default="", choices=("", "bool", "bit", "bool,bit"))
+    parser.add_argument("--vram-profile", action="store_true",
+                        help="Res1_4X, conservative VRAM, handheld on both copied profiles")
     parser.add_argument("--seed", default="0")
     parser.add_argument("--port", type=int, default=43390)
     args = parser.parse_args()
@@ -81,19 +93,25 @@ def main():
     if run == profile or profile in run.parents:
         parser.error("Run directory must be outside the source profile")
     keys = json.loads(keys_path.read_text())
-    if not isinstance(keys, list) or not 1 <= len(keys) <= 4096 or any(
-            type(key) is not int or not 0 < key < (1 << 64) for key in keys):
-        parser.error("Keys must be 1..4096 nonzero u64 integers")
+    typed_keys = {"bit": keys} if isinstance(keys, list) else keys
+    if not isinstance(typed_keys, dict) or not typed_keys or any(
+            kind not in ("bool", "bit") or not isinstance(values, list) or
+            any(type(key) is not int or not 0 < key < (1 << (32 if kind == "bool" else 64))
+                for key in values) for kind, values in typed_keys.items()) or not (
+            1 <= sum(map(len, typed_keys.values())) <= 4096):
+        parser.error("Keys must be a typed bool/bit policy with 1..4096 nonzero integer hashes")
     if not 1 <= args.port <= 65535:
         parser.error("Invalid port")
-    policy = "bit-" + hashlib.sha256(json.dumps(sorted(set(keys))).encode()).hexdigest()[:32]
+    canonical = {kind: sorted(set(values)) for kind, values in sorted(typed_keys.items())}
+    policy = "flags-" + hashlib.sha256(json.dumps(canonical).encode()).hexdigest()[:32]
     run.mkdir(parents=True, exist_ok=False)
-    (run / "keys.json").write_text(json.dumps(keys) + "\n")
+    (run / "keys.json").write_text(json.dumps(typed_keys) + "\n")
     for name in ("A", "B"):
-        prepare_profile(profile, run / name / "user")
+        prepare_profile(profile, run / name / "user", args.vram_profile)
     (run / "settings.json").write_text(json.dumps({
         "emulator": str(emulator), "game": str(game), "seed": args.seed,
         "policy": policy, "allow": args.allow, "port": args.port,
+        "vram_profile": args.vram_profile,
         "profiles": [str(run / name / "user") for name in ("A", "B")],
     }, indent=2) + "\n")
     refuse_busy()  # Copying a profile can take time; never rely on the first check alone.
@@ -124,7 +142,7 @@ def main():
                         "EDEN_NX2_OOT_COOP_KEYS": str(run / "keys.json"),
                         "EDEN_NX2_OOT_COOP_POLICY": policy,
                         "EDEN_NX2_OOT_COOP_SEED": args.seed,
-                        "EDEN_NX2_OOT_COOP_ROOM": "field-C3-" + str(os.getpid()),
+                        "EDEN_NX2_OOT_COOP_ROOM": "field-C4-" + str(os.getpid()),
                         "EDEN_NX2_OOT_COOP_TEAM": "together",
                         "EDEN_NX2_OOT_COOP_NAME": name,
                         "EDEN_NX2_GAMEDATA_TRACE": "1",
@@ -147,7 +165,8 @@ def main():
             stream.close()
     return subprocess.call([sys.executable, "-I", str(Path(__file__).with_name("check_logs.py")),
                             str(run / "A/user/log/eden_log.txt"),
-                            str(run / "B/user/log/eden_log.txt")])
+                            str(run / "B/user/log/eden_log.txt"),
+                            "--allow", args.allow])
 
 
 if __name__ == "__main__":

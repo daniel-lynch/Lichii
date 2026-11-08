@@ -321,6 +321,25 @@ std::optional<std::set<u64>> DecodeDenyList(const Json& packet) {
     return denied;
 }
 
+std::optional<std::set<std::pair<Kind, u64>>> DecodeKeyPolicy(const Json& packet) {
+    // Legacy arrays remain Bool64 policies. Typed files keep namespaces separate.
+    const Json document = packet.is_array() ? Json{{"bit", packet}} : packet;
+    if (!document.is_object()) return std::nullopt;
+    std::set<std::pair<Kind, u64>> keys;
+    size_t count = 0;
+    for (const auto& [name, values] : document.items()) {
+        if (name != "bool" && name != "bit") return std::nullopt;
+        const auto list = DecodeDenyList(values);
+        if (!list || list->contains(0) || (count += values.size()) > StateLimit) return std::nullopt;
+        const Kind kind = name == "bool" ? Kind::Bool : Kind::Bit;
+        for (const u64 key : *list) {
+            if (kind == Kind::Bool && !IsChestBool(key)) return std::nullopt;
+            keys.emplace(kind, key);
+        }
+    }
+    return keys;
+}
+
 bool State::Merge(const Change& change, bool deduplicate) {
     if (deduplicate) {
         if (change.origin.empty() || change.seq == 0 || change.seq > MaxSequence) return false;
@@ -412,12 +431,13 @@ bool ShouldApply(const Change& change, const State& observed) {
 struct Session::Impl {
     using Backend = GameDataBackend<Dynarmic::A64::Jit, Memory::Memory>;
     struct Connection;
-    Impl(Endpoint endpoint_, Hello hello_, std::set<u64> denied_, std::set<Kind> allowed_, std::set<u64> keys)
+    Impl(Endpoint endpoint_, Hello hello_, std::set<u64> denied_, std::set<Kind> allowed_,
+         std::set<std::pair<Kind, u64>> keys)
         : endpoint{std::move(endpoint_)}, hello{std::move(hello_)}, denied{std::move(denied_)},
           local{denied}, remote{denied}, allowed_classes{std::move(allowed_)}, retry{io} {
         ApplyPolicy policy{true, allowed_classes, {}};
-        for (const u64 key : keys) {
-            if (!denied.contains(key)) policy.keys.emplace(Kind::Bit, key);
+        for (const auto& [kind, key] : keys) {
+            if (!denied.contains(key)) policy.keys.emplace(kind, key);
         }
         runtime = std::make_unique<FrameDrain<Backend>>(std::move(policy));
     }
@@ -700,12 +720,12 @@ bool Session::Impl::Receive(const Json& packet) {
 
 Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_, Endpoint endpoint, Hello hello,
                  std::set<u64> denied, std::set<Kind> allowed_classes,
-                 std::set<u64> allowed_keys)
+                 std::set<std::pair<Kind, u64>> allowed_keys)
     : owner{owner_}, base{base_},
       impl{std::make_unique<Impl>(std::move(endpoint), std::move(hello), std::move(denied),
                                    std::move(allowed_classes), std::move(allowed_keys))} {
     impl->binding.base = base;
-    if (impl->allowed_classes.contains(Kind::Bit)) {
+    if (!impl->allowed_classes.empty()) {
         Kernel::KProcessAddress stack{}, sentinel{};
         if (owner->AllocateDebugCallMemory(kernel, &stack, &sentinel).IsSuccess()) {
             impl->binding.stack = GetInteger(stack);
@@ -758,22 +778,17 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         return event == ApplyEvent::Returned;
     }
     if (impl->stopped) return false;
-    if (point == OotGameDataTrace::Point::BitRead || point == OotGameDataTrace::Point::BitSet) {
-        // Hot path (every Bool64 read): only a new or changed manager needs a full Bind. The
-        // table identity is re-validated by ReadFlag's Bind on every frame visit.
-        if (jit.GetRegister(0) != binding.manager) backend.Bind(jit.GetRegister(0));
-        return false;
-    }
     if (point != OotGameDataTrace::Point::Frame || !thread) return false;
     if (!impl->frame_thread) impl->frame_thread = thread;
     if (impl->frame_thread != thread) return false;
     ++impl->tick;
-    if (binding.invalid || (!backend.Bind(binding.manager) && impl->stable_frame)) {
+    const bool bound = backend.BindFromCell();
+    if (binding.invalid || (!bound && impl->stable_frame)) {
         runtime.Invalidate();
         runtime.Frame(backend, {thread, 1, impl->tick, true}, [](Change, bool) {}, log);
         return false;
     }
-    if (!binding.manager) return false;
+    if (!bound) return false;
     if (!std::exchange(impl->stable_frame, true)) return false;
 
     std::deque<std::variant<Change, HighWater>> batch;
@@ -846,7 +861,7 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
         }
         const auto allowed = DecodeAllowClasses(Env("EDEN_NX2_OOT_COOP_ALLOW"));
         if (!allowed) throw std::runtime_error{"invalid grant class allow-list"};
-        std::set<u64> keys;
+        std::set<std::pair<Kind, u64>> keys;
         const auto keys_path = Env("EDEN_NX2_OOT_COOP_KEYS");
         if (!keys_path.empty()) {
             std::ifstream in{std::filesystem::path{keys_path}};
@@ -855,8 +870,8 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
             char c;
             while (in.get(c) && text.size() <= MaxFrame) text.push_back(c);
             const auto parsed = DecodeLine("{\"keys\":" + text + "}");
-            const auto list = parsed ? DecodeDenyList(parsed->at("keys")) : std::nullopt;
-            if (!list || list->contains(0)) throw std::runtime_error{"invalid key allow-list"};
+            const auto list = parsed ? DecodeKeyPolicy(parsed->at("keys")) : std::nullopt;
+            if (!list) throw std::runtime_error{"invalid key allow-list"};
             keys = *list;
         }
         Hello hello;

@@ -2,7 +2,8 @@
 
 This document supersedes the wire and conflict sections of `docs/nx2/oot-coop.md`.
 The relay and simulator implement this protocol. Emulator guest application is still
-unverified and disabled by default; C3 has an opt-in reviewed Bool64 frame adapter.
+unverified and disabled by default; C4 has opt-in chest Bool and actor Bool64 frame
+adapters. Chest flags mark locations checked; they grant no items. Bool64 covers pickups, breakables and enemies.
 A transport acknowledgement never means that a save changed.
 
 ## Anchor source comparison
@@ -11,7 +12,8 @@ This is an independent protocol inspired by the locally inspected Anchor impleme
 not an Anchor-compatible client. Source references below use `Ship` for
 `~/dev/research/shipwright/soh/soh/Network/Anchor/` and `Relay` for
 `~/dev/research/anchor/`. The research summary is
-`~/Downloads/OOT/randomizer/RESEARCH.md`, section 2. No game tables or names are imported.
+`~/Downloads/OOT/randomizer/RESEARCH.md`, section 2. No Anchor game tables or names are
+imported. The C4 chest adapter ships only the reviewed member/backing-Bool hashes from this game's schema (see HOOKS.md).
 
 Anchor frames JSON with NUL (`Relay/server.go:328`, `Relay/client.go:42`), limits packets
 to 8 MiB, and retains 512 queued team events (`Relay/team.go:10`). It forwards requests
@@ -76,8 +78,8 @@ A duplicate connected client ID in a team is refused. A changed policy needs a n
 `policy_id` identifies the reviewed allow/deny configuration shared by testers; use a
 shared policy name or digest. Default `or-v2` is only the conservative prototype policy,
 not proof that two private configuration files match. The relay checks the supplied
-identity, not their content. The C3 one-host harness derives a digest of its reviewed Bool64 keys; manually
-configured clients must still supply a consistent policy identity.
+identity, not their content. The C4 one-host harness derives a digest of its typed
+bool/bit key policy; manually configured clients must still supply a consistent policy identity.
 
 Success yields `hello_ack` with `version`, `build_id`, `seed_hash`, `policy_id`, `client_id`,
 then `team_state`, then each connected peer's cached `client_state`. Failure yields
@@ -128,8 +130,8 @@ entire room. `heartbeat` and `heartbeat_ack` have only `type`.
 
 The desired baseline is the **union of verified permanent true flags**, never one
 player's whole save replacing another. The wire already represents this without a
-special baseline packet. C3 exports the explicitly reviewed Bool64 key set at the frame boundary and requests
-a FIFO snapshot after upload acknowledgements. The following still requires field
+special baseline packet. C4 exports the configured reviewed Bool/Bool64 key set at
+the frame boundary and requests a FIFO snapshot after upload acknowledgements. The following still requires field
 validation before claiming save synchronization:
 
 1. Use backed-up disposable saves, a new room name and identical build/seed/policy.

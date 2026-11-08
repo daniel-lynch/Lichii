@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check C3 emulator logs. Requires positive suppression evidence, not just silence."""
+"""Check co-op emulator logs. Requires positive suppression evidence, not just silence."""
 import argparse
 from pathlib import Path
 import re
@@ -13,7 +13,10 @@ FAILURES = ("quarantined", "pending queue full", "outgoing queue full", "handsha
             "relay rejected", "allocation failed", "sentinel refused")
 
 
-def check(a, b):
+def check(a, b, allow="bit"):
+    if not allow:
+        grant = re.compile(r"OoT co-op: (?:started|returned|applied|suppressed|observed|baseline) class=")
+        return {"no grants (empty allow control)": not any(grant.search(log) for log in (a, b))}
     results = {}
     results["relay connected"] = all("OoT co-op: relay connected" in log for log in (a, b))
     results["baseline exchanged"] = all("OoT co-op: baseline exported" in log and
@@ -49,8 +52,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("a", type=Path)
     parser.add_argument("b", type=Path)
+    parser.add_argument("--allow", default="bit", choices=("", "bool", "bit", "bool,bit"),
+                        help="pass an empty string for the no-grants control")
     args = parser.parse_args()
-    results = check(args.a.read_text(errors="replace"), args.b.read_text(errors="replace"))
+    def read(path):
+        if not args.allow and path == args.b and not path.exists():
+            print("SKIP: B log missing; control judges available logs only")
+            return ""
+        return path.read_text(errors="replace")
+    results = check(read(args.a), read(args.b), args.allow)
     for label, passed in results.items():
         print(f"{'PASS' if passed else 'FAIL'}: {label}")
     return 0 if all(results.values()) else 1

@@ -73,6 +73,9 @@ struct Hello {
 [[nodiscard]] bool MatchesHello(const nlohmann::json& packet, const Hello& hello);
 [[nodiscard]] std::optional<std::set<u64>> DecodeDenyList(const nlohmann::json& packet);
 
+[[nodiscard]] std::optional<std::set<std::pair<Kind, u64>>> DecodeKeyPolicy(
+    const nlohmann::json& packet);
+
 using HighWater = std::map<std::string, u64, std::less<>>;
 
 // Protocol state only. A successful Merge does NOT mean anything was applied to the guest.
@@ -96,7 +99,7 @@ class Session {
 public:
     Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_, Endpoint endpoint, Hello hello,
             std::set<u64> denied, std::set<Kind> allowed_classes = {},
-            std::set<u64> allowed_keys = {});
+            std::set<std::pair<Kind, u64>> allowed_keys = {});
     ~Session();
     void Stop();
     void Observe(Change change);
@@ -118,7 +121,7 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
                   std::string_view build_id);
 [[nodiscard]] std::shared_ptr<Session> FindSession(const Kernel::KProcess* owner);
 
-// Reuse only layouts already present in the read-only trace. No names or data tables are shipped.
+// Reuse the quest layout already present in the read-only trace.
 template <typename Memory>
 std::optional<u32> StepIndex(Memory& memory, u64 manager, u32 challenge, u32 step) {
     using namespace OotGameDataTrace::Detail;

@@ -57,8 +57,10 @@ enum class Point : u8 {
     Frame,
     BitRead,
     BitSet,
+    StructBoolSet,
+    ActorFlagSet,
 };
-inline constexpr size_t PointCount = 7;
+inline constexpr size_t PointCount = 9;
 
 struct Site {
     Point point;
@@ -70,14 +72,22 @@ inline constexpr u32 MovW8One = 0x52800028; // mov w8, #1
 inline constexpr u32 Pacibsp = 0xD503237F;  // pacibsp (a hint: dynarmic runs it as a no-op)
 inline constexpr u32 Breakpoint = 0xD4200000; // brk #0
 
-inline constexpr std::array<Site, 6> Sites{{
+inline constexpr std::array<Site, 10> Sites{{
     {Point::StepSet, 0x2CF54A4, MovW8One},
     {Point::StepApply, 0x2CF1830, Pacibsp},
     {Point::PlayedEvent, 0x2BDC4E0, Pacibsp},
     {Point::Frame, 0x11E7A50, Pacibsp},
     {Point::BitRead, 0x3761684, 0xB94C5808}, // ldr w8, [x0, #0xc58]
     {Point::BitSet, 0x3761724, 0xAA0003E8}, // mov x8, x0
+    {Point::BitRead, 0x838964, 0xB94C5808},
+    {Point::BitSet, 0xF07134, 0xAA0003E8},
+    {Point::StructBoolSet, 0x608A10, Pacibsp},
+    {Point::ActorFlagSet, 0xF07048, Pacibsp},
 }};
+
+constexpr bool CoopPoint(Point point) {
+    return point == Point::Frame || point == Point::BitRead || point == Point::BitSet;
+}
 
 /// The trace point at `address` whose original instruction is `instruction`, or None.
 constexpr Point Identify(u64 base, u64 address, u32 instruction) {
@@ -110,6 +120,8 @@ void Resume(Point point, Jit& jit, Memory& memory) {
     case Point::BitSet:
         jit.SetRegister(8, jit.GetRegister(0));
         break;
+    case Point::StructBoolSet:
+    case Point::ActorFlagSet:
     case Point::Frame:
     case Point::StepApply:
     case Point::PlayedEvent: // pacibsp: nothing
@@ -126,6 +138,8 @@ constexpr std::string_view Name(Point point) {
         return "step-apply";
     case Point::PlayedEvent:
         return "played-event";
+    case Point::StructBoolSet: return "struct-bool-set";
+    case Point::ActorFlagSet: return "actor-flag-set";
     case Point::Frame: return "frame";
     case Point::BitRead: return "bit-read";
     case Point::BitSet: return "bit-set";
@@ -310,6 +324,15 @@ std::string Describe(Point point, u64 base, Jit& jit, Memory& memory) {
         return fmt::format("gamedata played-event name={} hash={:#010x} lr={}", name,
                            Common::Nx2EventTrace::Murmur3(name), caller);
     }
+    case Point::StructBoolSet:
+        return fmt::format("gamedata struct-bool-set member={:08x} value={} mgr={:#x} lr={}",
+                           static_cast<u32>(jit.GetRegister(3)),
+                           static_cast<u32>(jit.GetRegister(1)), x0, caller);
+    case Point::ActorFlagSet:
+        return fmt::format("gamedata actor-flag-set member={} key={} value={} actor={:#x} lr={}",
+                           Hash(Read32(memory, jit.GetRegister(8) + 8)),
+                           fmt::format("{:016x}", Read64(memory, jit.GetRegister(8) + 0x88).value_or(0)),
+                           static_cast<u32>(jit.GetRegister(1)), x0, caller);
     case Point::Frame:
         return fmt::format("gamedata frame lr={}", caller);
     case Point::BitRead:
