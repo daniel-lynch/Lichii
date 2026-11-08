@@ -113,6 +113,10 @@ public:
     bool IsNativeProgram() const override;
     bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
     bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) override;
+    // Not translation queries: the pipeline cache reads them after translation to decide a
+    // compute rebuild, so they are forwarded without being recorded.
+    std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override;
+    std::vector<u64> MappedStoragePointerKeys() const override;
     u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
     Shader::TextureType ReadTextureType(u32 raw_handle) override;
     Shader::TexturePixelFormat ReadTexturePixelFormat(u32 raw_handle) override;
