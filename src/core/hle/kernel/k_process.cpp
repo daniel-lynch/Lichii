@@ -1291,16 +1291,19 @@ Result KProcess::AllocateDebugCallMemory(KernelCore& kernel, KProcessAddress* st
                                            TotalSize);
     R_UNLESS(reservation.Succeeded(), ResultLimitReached);
     KProcessAddress stack{}, code{};
+    bool code_mapped = false;
     R_TRY(m_page_table.MapPages(&stack, StackSize / PageSize, KMemoryState::Stack,
                                KMemoryPermission::UserReadWrite));
+    // One failure guard per scope (result.h): unmap whatever was mapped, newest first.
     ON_RESULT_FAILURE {
+        if (code_mapped) {
+            R_ASSERT(m_page_table.UnmapPages(code, 1, KMemoryState::AliasCode));
+        }
         R_ASSERT(m_page_table.UnmapPages(stack, StackSize / PageSize, KMemoryState::Stack));
     };
     R_TRY(m_page_table.MapPages(&code, 1, KMemoryState::AliasCode,
                                KMemoryPermission::UserReadWrite));
-    ON_RESULT_FAILURE {
-        R_ASSERT(m_page_table.UnmapPages(code, 1, KMemoryState::AliasCode));
-    };
+    code_mapped = true;
     this->GetMemory().Write32(GetInteger(code), 0xD4200000); // A64 brk #0 sentinel.
     R_TRY(m_page_table.SetProcessMemoryPermission(code, PageSize, Svc::MemoryPermission::ReadExecute));
     m_debug_call_memory_size = TotalSize;
