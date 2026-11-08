@@ -12,6 +12,7 @@
 #include <random>
 #include <sstream>
 #include <system_error>
+#include <tuple>
 #include <type_traits>
 
 #include <fmt/format.h>
@@ -356,7 +357,8 @@ bool RecipeHistogram::Load(std::istream& stream, u64 size, const TC::Digest& con
         Class entry{};
         u8 by_loads{};
         u32 recipes{};
-        if (!in.Get(entry.stage) || !in.Get(by_loads) || by_loads > 1 ||
+        if (!in.Get(entry.stage) || static_cast<u32>(entry.stage) > static_cast<u32>(Shader::Stage::Mesh) ||
+            !in.Get(by_loads) || by_loads > 1 ||
             (by_loads != 0 && !in.GetBits(entry.loads)) || !in.Get(recipes) ||
             recipes > MaxPerClass) {
             return refuse("truncated");
@@ -368,7 +370,7 @@ bool RecipeHistogram::Load(std::istream& stream, u64 size, const TC::Digest& con
                 !in.Get(recipe.binding_in)) {
                 return refuse("truncated");
             }
-            recipe.count = (recipe.count + 1) / 2;
+            recipe.count = recipe.count / 2 + recipe.count % 2;
             recipe.digest = RecipeDigest(recipe.runtime_info, recipe.binding_in);
             if (std::ranges::find(entry.recipes, recipe.digest, &Recipe::digest) !=
                 entry.recipes.end()) {
@@ -440,4 +442,33 @@ bool WriteFileAtomically(const std::filesystem::path& path, std::span<const u8> 
     return true;
 }
 
+TranslationCache::RecipeCatalog RecipeHistogram::ToCatalog(
+    const TranslationCache::Digest& config, u32 limit) const {
+    TranslationCache::RecipeCatalog catalog;
+    catalog.source_config = config;
+    std::vector<u64> keys;
+    for (const auto& [key, group] : classes) keys.push_back(key);
+    std::ranges::sort(keys);
+    for (const auto key : keys) {
+        const auto& group = classes.at(key);
+        Shader::Info info{};
+        info.loads.mask = group.loads;
+        auto& recipes = catalog.classes[TranslationCache::RecipeClass(
+            group.stage, group.by_loads ? &info : nullptr)];
+        for (const auto& recipe : group.recipes) {
+            recipes.push_back({{recipe.runtime_info, recipe.binding_in}, recipe.digest, recipe.count});
+        }
+        std::ranges::sort(recipes, [](const auto& a, const auto& b) {
+            if (a.count != b.count) return a.count > b.count;
+            return std::tie(a.key.lo, a.key.hi) < std::tie(b.key.lo, b.key.hi);
+        });
+        const auto keep = std::min<size_t>(recipes.size(), limit - catalog.entries);
+        catalog.truncated_entries += recipes.size() - keep;
+        recipes.resize(keep);
+        catalog.entries += keep;
+        if (recipes.empty()) catalog.classes.erase(TranslationCache::RecipeClass(
+            group.stage, group.by_loads ? &info : nullptr));
+    }
+    return catalog;
+}
 } // namespace VideoCommon

@@ -19,6 +19,7 @@
 #include "video_core/offline_recorded_producer.h"
 #include "video_core/offline_shader_producer.h"
 #include "video_core/shader_archive_environment.h"
+#include "video_core/shader_recipe_histogram.h"
 
 namespace VideoCommon::OfflineShaders {
 namespace {
@@ -254,12 +255,40 @@ Input ParseInput(std::string_view text, const std::filesystem::path& directory) 
     return result;
 }
 
+TranslationCache::RecipeCatalog ReadProducerRecipes(const std::filesystem::path& path,
+    const TranslationCache::Digest& config, u32 limit) {
+    if (std::filesystem::is_regular_file(path)) {
+        std::ifstream file(path, std::ios::binary);
+        std::array<char, 8> magic{};
+        file.read(magic.data(), magic.size());
+        if (magic == std::array<char, 8>{'L', 'X', 'R', 'E', 'C', 'I', 'P', '1'}) {
+            // Like LXTRANSC import, recipes may come from an older translator. No modules
+            // or metadata are reused: the destination always translates and emits afresh.
+            TranslationCache::Digest source_config{};
+            file.seekg(magic.size() + sizeof(u32));
+            if (!file.read(reinterpret_cast<char*>(&source_config), sizeof(source_config)))
+                throw std::runtime_error("Truncated LXRECIP1 configuration");
+            file.seekg(0);
+            RecipeHistogram histogram;
+            std::string why;
+            if (!histogram.Load(file, std::filesystem::file_size(path), source_config, why))
+                throw std::runtime_error("Invalid LXRECIP1 recipe histogram: " + why);
+            LOG_INFO(Render_Vulkan, "Offline LXRECIP1 recipes: {} classes, {} recipes; class-only import (no shader code or answers)",
+                     histogram.Classes(), histogram.Recipes());
+            auto catalog = histogram.ToCatalog(source_config, limit);
+            catalog.imported_bytes = std::filesystem::file_size(path);
+            return catalog;
+        }
+    }
+    return TranslationCache::Store::ReadRecipeCatalog(path, config, limit);
+}
+
 Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
             const std::filesystem::path& recipe_cache, const Shader::Profile& profile,
             const Shader::HostTranslateInfo& host, const TranslationCache::Digest& config,
             TranslationCache::Store& store, u32 recipe_count, u32 recipe_limit,
             const std::filesystem::path& report, TranslationCache::RecipeBaseline baseline,
-            u32 compute_shared_memory_limit) {
+            u32 compute_shared_memory_limit, RecordedOptions recorded_options) {
     namespace TC = TranslationCache;
     const auto begin = std::chrono::steady_clock::now();
     const auto index_size = std::filesystem::file_size(input);
@@ -279,8 +308,13 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
     if (!store.Enabled()) throw std::runtime_error("Translation cache must be enabled");
     if (recipe_count == 0 || recipe_count > 64)
         throw std::runtime_error("Recipe count must be between 1 and 64");
+    if (recorded_options.exact_pipeline_recipes) {
+        const char* sources = std::getenv("EDEN_NX2_OFFLINE_PIPELINE_SOURCES");
+        if (!sources || !*sources)
+            throw std::runtime_error("--shader-exact-pipeline-recipes requires EDEN_NX2_OFFLINE_PIPELINE_SOURCES");
+    }
     TC::RecipeCatalog recipes;
-    if (!recipe_cache.empty()) recipes = TC::Store::ReadRecipeCatalog(recipe_cache, config, recipe_limit);
+    if (!recipe_cache.empty()) recipes = ReadProducerRecipes(recipe_cache, config, recipe_limit);
     if (workers == 0) workers = std::max(1U, std::thread::hardware_concurrency() / 2);
     workers = std::min({workers, 64U, std::max(1U, static_cast<u32>(parsed.programs.size()))});
     Summary summary;
@@ -573,21 +607,8 @@ Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
     if (const char* sources = std::getenv("EDEN_NX2_OFFLINE_PIPELINE_SOURCES"); sources && *sources) {
         const auto recorded = ProduceRecorded(sources, profile, host, config, store,
                                               recipe_cache.empty() ? nullptr : &recipes,
-                                              compute_shared_memory_limit);
-        Json failures = Json::array();
-        for (const auto& failure : recorded.failures)
-            failures.push_back({{"source", failure.source.string()}, {"record", failure.record},
-                {"pipeline", fmt::format("{:016x}", failure.pipeline)}, {"slot", failure.slot},
-                {"shader", fmt::format("{:016x}", failure.shader)}, {"error", failure.error}});
-        summary.pipeline_validation = Json{{"files", recorded.files}, {"records", recorded.records},
-            {"failed_records", recorded.failed_records}, {"stages", recorded.stages},
-            {"entries", recorded.entries}, {"modules", recorded.modules},
-            {"module_bytes", recorded.module_bytes},
-            {"stages_by_type", recorded.stages_by_type},
-            {"uncovered_by_type", recorded.uncovered_by_type},
-            {"resumed", recorded.resumed}, {"replay_matched", recorded.replay.matched},
-            {"replay_mismatched", recorded.replay.mismatched},
-            {"replay_unavailable", recorded.replay.unavailable}, {"failures", failures}}.dump();
+                                              compute_shared_memory_limit, recorded_options);
+        summary.pipeline_validation = RecordedReport(recorded);
         summary.modules += recorded.modules;
         summary.module_bytes += recorded.module_bytes;
     }

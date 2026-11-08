@@ -320,6 +320,17 @@ public:
     void Close();
     [[nodiscard]] bool Persistent();
 
+    /// Offline producer checkpoint, after its workers have joined: flush and reload exactly
+    /// what a later boot can read. Callers must exclude concurrent Open/Close/Insert calls.
+    [[nodiscard]] bool ReloadForOfflineValidation() {
+        if (!Persistent()) return false;
+        const auto path = filename;
+        const auto config = config_digest;
+        Open(path, config);
+        return Persistent();
+    }
+
+
     [[nodiscard]] bool Enabled() const noexcept {
         return enabled;
     }

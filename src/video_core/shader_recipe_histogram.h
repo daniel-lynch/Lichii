@@ -65,6 +65,11 @@ public:
     /// Whether the class has a recipe.
     [[nodiscard]] bool HasRecipes(u64 class_key) const;
 
+    /// Class recipes only: no shader identities, code, or recorded query answers.
+    [[nodiscard]] TranslationCache::RecipeCatalog ToCatalog(
+        const TranslationCache::Digest& config,
+        u32 limit = TranslationCache::DefaultRecipeLimit) const;
+
     void Clear();
     [[nodiscard]] size_t Classes() const noexcept {
         return classes.size();

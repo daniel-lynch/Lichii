@@ -15,6 +15,11 @@ constexpr u64 MaxProgramBytes = 16 * 1024 * 1024;
 constexpr u64 MaxIndexBytes = 64 * 1024 * 1024;
 /// Largest bank-1 constant section the archive environment can read exactly.
 constexpr u32 MaxBank1Bytes = 256;
+struct RecordedOptions {
+    bool exact_pipeline_recipes{};
+    bool supports_transform_feedback{};
+    bool molten_vk{};
+};
 struct Origin {
     std::string source, member;
     u32 variation{};
@@ -88,6 +93,9 @@ struct Summary {
     const Shader::Info& info, std::span<const PartnerStage> partners,
     std::span<const TranslationCache::EmissionRecipe> layouts);
 [[nodiscard]] Shader::TextureType TextureTypeForProgram(const Program& program);
+[[nodiscard]] TranslationCache::RecipeCatalog ReadProducerRecipes(
+    const std::filesystem::path& path, const TranslationCache::Digest& config,
+    u32 limit = TranslationCache::DefaultRecipeLimit);
 void WriteReport(const std::filesystem::path& path, const Summary& summary);
 [[nodiscard]] Input ParseInput(std::string_view json, const std::filesystem::path& directory);
 [[nodiscard]] Summary Run(const std::filesystem::path& input, u64 title_id, u32 workers,
@@ -99,5 +107,6 @@ void WriteReport(const std::filesystem::path& path, const Summary& summary);
                           const std::filesystem::path& report = {},
                           TranslationCache::RecipeBaseline baseline =
                               TranslationCache::RecipeBaseline::Auto,
-                          u32 compute_shared_memory_limit = 0);
+                          u32 compute_shared_memory_limit = 0,
+                          RecordedOptions recorded_options = {});
 } // namespace VideoCommon::OfflineShaders

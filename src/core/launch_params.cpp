@@ -55,6 +55,7 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
         {"shader-archive-index", required_argument, 0, 0x109},
         {"shader-workers", required_argument, 0, 0x10a},
         {"shader-recipe-cache", required_argument, 0, 0x10b},
+        {"shader-exact-pipeline-recipes", no_argument, 0, 0x110},
         {"shader-recipe-count", required_argument, 0, 0x10c},
         {"shader-recipe-limit", required_argument, 0, 0x10d},
         {"shader-recipe-baseline", required_argument, 0, 0x10f},
@@ -132,6 +133,9 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                 }
                 break;
             }
+            case 0x110:
+                p.shader_exact_pipeline_recipes = true;
+                break;
             case 0x10b:
                 p.shader_recipe_cache = optarg;
                 break;
@@ -310,7 +314,8 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             " Rewrite default-language NUP metadata in place and exit\n"
             "--shader-archive-index FILE  Translate extracted archive index (eden-cli, Vulkan)\n"
             "--shader-workers N    Archive workers, 1..64 (default: hardware threads / 2)\n"
-            "--shader-recipe-cache FILE  Read recipes and answers from a translation cache or directory\n"
+            "--shader-recipe-cache FILE  Read LXTRANSC recipes/answers (or directory), or LXRECIP1 class recipes\n"
+            "--shader-exact-pipeline-recipes  Emit and validate exact graphics variants from EDEN_NX2_OFFLINE_PIPELINE_SOURCES\n"
             "--shader-recipe-limit N     Cap imported catalog entries (default 200000; 256 MiB import budget)\n"
             "--shader-recipe-baseline auto|always|never  Baseline policy (default auto: include canonical baseline)\n"
             "--shader-report FILE        Write per-run production statistics as JSON\n"

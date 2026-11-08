@@ -54,6 +54,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/offline_shader_producer.h"
+#include "video_core/offline_recorded_producer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -174,11 +175,13 @@ Shader::AttributeType AttributeType(const FixedPipelineState& state, size_t inde
     return Shader::AttributeType::Disabled;
 }
 
-Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> programs,
+} // namespace
+
+Shader::RuntimeInfo MakeGraphicsRuntimeInfo(std::span<const Shader::IR::Program> programs,
                                     const GraphicsPipelineCacheKey& key,
                                     const Shader::IR::Program& program,
                                     const Shader::IR::Program* previous_program,
-                                    const Vulkan::Device& device) {
+                                    bool supports_transform_feedback, bool molten_vk) {
     Shader::RuntimeInfo info;
     if (previous_program) {
         info.previous_stage_stores = previous_program->info.stores;
@@ -208,7 +211,7 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
                 info.fixed_state_point_size = point_size;
             }
             if (key.state.xfb_enabled) {
-                if (device.IsExtTransformFeedbackSupported()) {
+                if (supports_transform_feedback) {
                     auto [varyings, count] =
                         VideoCommon::MakeTransformFeedbackVaryings(key.state.xfb_state);
                     info.xfb_varyings = varyings;
@@ -268,7 +271,7 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
             info.fixed_state_point_size = point_size;
         }
         if (key.state.xfb_enabled != 0) {
-            if (device.IsExtTransformFeedbackSupported()) {
+            if (supports_transform_feedback) {
                 auto [varyings, count] =
                     VideoCommon::MakeTransformFeedbackVaryings(key.state.xfb_state);
                 info.xfb_varyings = varyings;
@@ -286,7 +289,7 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
 
         info.dual_source_blend = key.state.attachment0_dual_source_blend != 0;
 
-        if (device.IsMoltenVK()) {
+        if (molten_vk) {
             for (size_t i = 0; i < 8; ++i) {
                 const auto format = static_cast<Tegra::RenderTargetFormat>(key.state.color_formats[i]);
                 if (format == Tegra::RenderTargetFormat::NONE) {
@@ -342,6 +345,7 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     return info;
 }
 
+namespace {
 std::array<std::atomic<std::chrono::nanoseconds::rep>, 2> runtime_spirv_ns{};
 
 void AddRuntimeSpirvTime(size_t thread, std::chrono::steady_clock::time_point begin) {
@@ -842,7 +846,7 @@ bool PreloadAllPipelines() {
 bool PipelineCache::PrecompileArchiveShaders(const std::filesystem::path& input, u64 title_id,
                                              u32 workers, const std::filesystem::path& recipes,
                                              u32 recipe_count, u32 recipe_limit,
-                                             const std::filesystem::path& report, std::string_view baseline) {
+                                             const std::filesystem::path& report, std::string_view baseline, bool exact_pipeline_recipes) {
     try {
         if (pipeline_cache_filename.empty() || !translation_cache.Persistent()) {
             throw std::runtime_error("Disk shader cache must be enabled and initialized");
@@ -862,7 +866,10 @@ bool PipelineCache::PrecompileArchiveShaders(const std::filesystem::path& input,
                                                recipe_limit, report, policy,
                                                clamp_shared_memory
                                                    ? device.GetMaxComputeSharedMemorySize()
-                                                   : 0);
+                                                   : 0,
+                                               {exact_pipeline_recipes,
+                                                device.IsExtTransformFeedbackSupported(),
+                                                device.IsMoltenVK()});
         if (!translation_cache.Persistent()) throw std::runtime_error("Translation cache write failed");
         return true;
     } catch (const std::exception& error) {
@@ -2499,7 +2506,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         infos[stage_index] = &program.info;
 
         const auto stage_begin = Clock::now();
-        const auto full_runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        const auto full_runtime_info{MakeGraphicsRuntimeInfo(programs, key, program, previous_stage,
+            device.IsExtTransformFeedbackSupported(), device.IsMoltenVK())};
         const auto runtime_info = TC::CanonicalRuntimeInfo(full_runtime_info, program.info, program.stage);
         const TC::EmissionRecipe emission_recipe{runtime_info, binding};
         const bool compare_canonical = translation_cache_verify && !uses_vertex_a &&

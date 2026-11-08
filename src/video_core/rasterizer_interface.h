@@ -268,7 +268,7 @@ public:
 
     virtual bool PrecompileArchiveShaders(const std::filesystem::path&, u64, u32,
                                          const std::filesystem::path&, u32, u32,
-                                         const std::filesystem::path&, std::string_view) { return false; }
+                                         const std::filesystem::path&, std::string_view, bool) { return false; }
 
     virtual void InitializeChannel(Tegra::Control::ChannelState& channel) {}
 

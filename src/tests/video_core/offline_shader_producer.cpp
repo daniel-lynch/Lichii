@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include "video_core/offline_shader_producer.h"
+#include "video_core/shader_recipe_histogram.h"
 #include "core/launch_params.h"
 
 namespace {
@@ -237,6 +238,7 @@ TEST_CASE("Recipe policy defaults to two observations and attributes canonical d
           "[video_core][translation_cache]") {
     REQUIRE(Core::LaunchParams{}.shader_recipe_count == 2);
     REQUIRE(Core::LaunchParams{}.shader_recipe_baseline == "auto");
+    REQUIRE_FALSE(Core::LaunchParams{}.shader_exact_pipeline_recipes);
     REQUIRE(DefaultRecipeCount == 2);
     const auto stage = Shader::Stage::VertexB;
     const Digest key{17, 18};
@@ -416,5 +418,59 @@ TEST_CASE("Recipe import retains every runtime answer set without a recipe or to
     REQUIRE(catalog.recorded_answers.at(key).size() == 2);
     REQUIRE(catalog.exact.empty());
     REQUIRE_THROWS(Store::ReadRecipeCatalog(path, config, 1, 1));
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("LXRECIP1 imports ranked class recipes without shader identities or answers",
+          "[video_core][offline_shader_producer][translation_cache]") {
+    const auto path = std::filesystem::temp_directory_path() / "lichii_producer_histogram.bin";
+    const Digest config{0x1234, 0x5678};
+    VideoCommon::RecipeHistogram histogram;
+    Shader::Info info{};
+    info.loads.Set(Shader::IR::Attribute::Generic2X);
+    auto common = DefaultEmissionRecipe(Shader::Stage::Fragment);
+    common.bindings.unified = 7;
+    auto rare = common;
+    rare.bindings.unified = 3;
+    histogram.Record(Shader::Stage::Fragment, info.loads.mask, rare.runtime, rare.bindings);
+    for (int i = 0; i < 5; ++i)
+        histogram.Record(Shader::Stage::Fragment, info.loads.mask, common.runtime, common.bindings);
+    auto bytes = histogram.Serialize(config);
+    const auto write = [&] {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    };
+    write();
+    const auto catalog = ReadProducerRecipes(path, config);
+    CHECK(catalog.source_config == config);
+    CHECK(catalog.exact.empty());
+    CHECK(catalog.recorded_answers.empty());
+    CHECK(catalog.compute_pointers.empty());
+    CHECK(catalog.classes.size() == 2);
+    CHECK(catalog.entries == 4); // Recipe references, not shader programs.
+    const auto capped = ReadProducerRecipes(path, config, 1);
+    CHECK(capped.entries == 1);
+    CHECK(capped.truncated_entries == 3);
+    const auto selected = catalog.SelectWithSources({}, Shader::Stage::Fragment, info, 2,
+                                                    RecipeBaseline::Never);
+    REQUIRE(selected.size() == 2);
+    CHECK(selected[0].source == RecipeSource::Class);
+    CHECK(selected[0].recipe.bindings.unified == 7);
+    CHECK(selected[1].recipe.bindings.unified == 3);
+    Shader::Info another_class{};
+    CHECK(catalog.Select({}, Shader::Stage::Fragment, another_class, 1,
+                         RecipeBaseline::Never).front().bindings.unified == 7);
+    const auto migrated = ReadProducerRecipes(path, Digest{1, 2});
+    CHECK(migrated.source_config == config);
+    CHECK(migrated.classes.size() == 2);
+    VideoCommon::RecipeHistogram strict_reader;
+    std::string why;
+    CHECK_FALSE(strict_reader.Load(bytes, Digest{1, 2}, why));
+    SECTION("truncated") { bytes.pop_back(); }
+    SECTION("trailing bytes") { bytes.push_back(1); }
+    SECTION("format version") { bytes[8] = 2; }
+    SECTION("invalid stage") { bytes[32] = 0xff; }
+    write();
+    CHECK_THROWS(ReadProducerRecipes(path, config));
     std::filesystem::remove(path);
 }
