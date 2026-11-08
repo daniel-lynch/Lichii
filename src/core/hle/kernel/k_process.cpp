@@ -1291,21 +1291,21 @@ Result KProcess::AllocateDebugCallMemory(KernelCore& kernel, KProcessAddress* st
                                            TotalSize);
     R_UNLESS(reservation.Succeeded(), ResultLimitReached);
     KProcessAddress stack{}, code{};
-    bool code_mapped = false;
     R_TRY(m_page_table.MapPages(&stack, StackSize / PageSize, KMemoryState::Stack,
                                KMemoryPermission::UserReadWrite));
-    // One failure guard per scope (result.h): unmap whatever was mapped, newest first.
+    // One failure guard per scope (result.h); the sentinel mapping is the last fallible step.
     ON_RESULT_FAILURE {
-        if (code_mapped) {
-            R_ASSERT(m_page_table.UnmapPages(code, 1, KMemoryState::AliasCode));
-        }
         R_ASSERT(m_page_table.UnmapPages(stack, StackSize / PageSize, KMemoryState::Stack));
     };
-    R_TRY(m_page_table.MapPages(&code, 1, KMemoryState::AliasCode,
-                               KMemoryPermission::UserReadWrite));
-    code_mapped = true;
+    // The sentinel page is a separate Stack-region mapping, not AliasCode: in a 39-bit address
+    // space the AliasCode region is the whole Map39Bit range, which contains the heap and alias
+    // regions, so MapPages' CanContain check refuses it (ResultInvalidCurrentMemory, 0xd401: the
+    // C4 field launch). Code and AliasCode share that range; only a Code-flagged state may be
+    // reprotected to RX. The page therefore stays RW: Dynarmic fetches code through
+    // MemoryReadCode, which checks only that the address is mapped, and no guest pointer to
+    // this page exists.
+    R_TRY(m_page_table.MapPages(&code, 1, KMemoryState::Stack, KMemoryPermission::UserReadWrite));
     this->GetMemory().Write32(GetInteger(code), 0xD4200000); // A64 brk #0 sentinel.
-    R_TRY(m_page_table.SetProcessMemoryPermission(code, PageSize, Svc::MemoryPermission::ReadExecute));
     m_debug_call_memory_size = TotalSize;
     *stack_top = stack + StackSize;
     *sentinel = code;

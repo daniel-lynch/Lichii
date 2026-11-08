@@ -184,8 +184,12 @@ The process epoch is currently 1. This is conservative detection, **not a proven
 save-load/transition lifecycle hook**; same-address reloads and event scheduling still
 need the field checks below.
 
-The loader allocates an owned 16 KiB RW guest stack and separate RX sentinel page
+The loader allocates an owned 16 KiB RW guest stack and a separate one-page sentinel
 after loading main, before guest execution, through `KProcess::AllocateDebugCallMemory`.
+Both are Stack-region mappings. The sentinel page stays RW: in a 39-bit address space the
+AliasCode/Code region spans the heap and alias regions, so mapping it there fails
+(`ResultInvalidCurrentMemory`, 0xd401, first seen in the C4 field launch), and only Code
+states can be reprotected to RX. Dynarmic fetches code with a mapped-address check only.
 Both allocations are charged to the process resource limit and heap budget and released
 with its page table. No allocation/page-table locks are taken by the frame callback. It does not borrow a game's stack or executable padding.
 The backend captures all x0–x30, all 32 SIMD registers, PC, SP, PSTATE, FPCR, FPSR,
