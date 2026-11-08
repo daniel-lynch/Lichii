@@ -727,11 +727,15 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
     impl->binding.base = base;
     if (!impl->allowed_classes.empty()) {
         Kernel::KProcessAddress stack{}, sentinel{};
-        if (owner->AllocateDebugCallMemory(kernel, &stack, &sentinel).IsSuccess()) {
+        const auto result = owner->AllocateDebugCallMemory(kernel, &stack, &sentinel);
+        if (result.IsSuccess()) {
             impl->binding.stack = GetInteger(stack);
             impl->binding.sentinel = GetInteger(sentinel);
         } else {
-            LOG_WARNING(Core_ARM, "OoT co-op: private stack/sentinel allocation failed");
+            LOG_WARNING(Core_ARM,
+                        "OoT co-op: private stack/sentinel allocation failed (result {:#x}, "
+                        "module {}, description {})",
+                        result.raw, static_cast<u32>(result.GetModule()), result.GetDescription());
         }
     }
     impl->Start();
