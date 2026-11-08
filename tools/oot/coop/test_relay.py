@@ -24,6 +24,7 @@ def load_sibling(name):
 
 relay = load_sibling("relay")
 client_sim = load_sibling("client_sim")
+fake_peer = load_sibling("fake_peer")
 
 
 def framed(payload):
@@ -444,6 +445,46 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         for kind, key in (("bool_set", {"hash": 7}), ("bit_set", {"actor": 7})):
             await self.change(a, kind=kind, **key, value=True)
         self.assertEqual(materialize(await self.snapshot(a)), {})
+
+
+class FakePeerTests(unittest.IsolatedAsyncioTestCase):
+    """The single-emulator fake peer: in-process relay plus a scripted peer (TCP loopback)."""
+
+    async def asyncSetUp(self):
+        self.peer = fake_peer.FakePeer(port=0, room="r", team="t", policy="p")
+        self.port = await self.peer.start()
+        self.emu = client_sim.ClientSim("emu", room="r", team="t", policy_id="p")
+        await self.emu.connect("127.0.0.1", self.port)
+
+    async def asyncTearDown(self):
+        await self.emu.close()
+        await self.peer.close()
+
+    async def test_records_the_emulator_broadcast(self):
+        await self.emu.change("bool_set", hash=0xC1, value=True)
+        packet = (await self.peer.command("expect c1 2"))["packet"]
+        self.assertEqual((packet["hash"], packet["origin"], packet["rev"]), (0xC1, "emu", 1))
+        self.assertEqual((await self.peer.command("expect c2 0.05")), {"timeout": True})
+
+    async def test_burst_arrives_in_order_and_duplicates_add_nothing(self):
+        result = await self.peer.command("grant a1 a2 a3 a4")
+        self.assertEqual(result["sent"], [1, 2, 3, 4])
+        got = [(await self.emu.receive("bool_set"))["hash"] for _ in range(4)]
+        self.assertEqual(got, [0xA1, 0xA2, 0xA3, 0xA4])
+        await self.peer.command("grant a2")
+        with self.assertRaises(TimeoutError):
+            await self.emu.receive("bool_set", timeout=0.05)
+        state = (await self.peer.command("state"))["state"]
+        self.assertEqual(len(materialize(state)), 4)
+
+    async def test_snapshot_replays_grants_made_before_the_emulator_joined(self):
+        late = client_sim.ClientSim("late", room="r", team="t", policy_id="p")
+        await self.peer.command("grant b1 b2")
+        await late.connect("127.0.0.1", self.port)
+        try:
+            self.assertEqual({p["hash"] for p in late.snapshot["replay"]}, {0xB1, 0xB2})
+        finally:
+            await late.close()
 
 
 if __name__ == "__main__":

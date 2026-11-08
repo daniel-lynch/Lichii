@@ -60,3 +60,24 @@ C3 adds `two_instances.py` (owner-run Linux relay + two portable/disposable copi
 `test_harness.py`. See the field plan for the exact command and required environment.
 Do not run the harness during a playing session; it refuses `.aot-priority` and any
 existing `lichii` process. Class and key allow lists ship empty.
+
+## Single-emulator tests: `fake_peer.py`
+
+One real emulator is enough to exercise both directions: `fake_peer.py` runs the relay **in
+its own process** on a loopback port and joins it as a scripted second player. No separate
+relay service and no second emulator are needed.
+
+```sh
+python3 -I tools/oot/coop/fake_peer.py --ctl /path/to/ctl --port 43391 \
+    --room R --team together --policy flags-... --seed 0
+```
+
+Start the emulator with `EDEN_NX2_OOT_COOP=1 EDEN_NX2_OOT_COOP_RELAY=127.0.0.1:43391` and the
+same room/team/policy/seed. Then append commands to `ctl/cmd.txt`; each gets one JSON line in
+`ctl/out.jsonl`, and every packet the peer receives is logged to `ctl/received.jsonl`:
+
+- `grant HEX...` sends bool grants in one socket write (a batch);
+- `expect HEX SECS` waits for the emulator to broadcast that flag;
+- `received`, `state`, `mark TEXT`, `quit`.
+
+`FakePeerTests` in `test_relay.py` covers it over real loopback TCP.
