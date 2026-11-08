@@ -39,7 +39,7 @@ For the previously unlisted small functions, this pass disassembled the read-onl
 | Struct-bool helpers `<offset>`, `<offset>`, fallback `<offset>` (caller above and `.tmp/struct-bool-C2.txt`) | First two: `x0=manager+8` or `manager+0x68`, `w1=1`, `x2=local struct handle*`, `w3=member hash`, `w4=(manager+0xD0C == 0)`; low result bit controls fallback. Fallback adds `w4=0`, moves mode into `w5`. | **Proven** caller setup. Handle includes a resolved record and flags, not just an opaque hash. Member-key/type lookup must be reconstructed; no generic flat-bool adapter for these calls. |
 | Frame marker `<offset>` (`G/out4/decomp/<offset>.c`, `G/out12/ctx/<offset>.txt`, exported bytes) | Starts `pacibsp`; calls `nn::os::WaitEvent` at `<offset>`. Existing names identify `GameFramework::waitPresentDone`. | **Inferred** safe injection boundary, supported by prior debugger experiment in `findings-scene-tour.md`, not revalidated here. C3 installs this marker through the same instruction-substitution path as the other trace hooks; it drives the co-op drain on the first guest thread that reaches it. With co-op on and `EDEN_NX2_GAMEDATA_TRACE` off, this is the **only** substituted instruction: the Bool64 and chest trace sites are installed by the trace alone. |
 | Wallet entry `<offset>` (C5 static, C6 field) | `x0=pouchMgr` (`*(main+<offset>)`, GOT `main+<offset>`), `w1`=signed delta, `w2`=reason (7 in `OneshotIncreaseRupee`, 4 in another caller). Body: `ldadd w1` into `pouchMgr+0x3BD4`, `str w2` to `+0x3BD8`; then, if the global at `<offset>` is non-null, a tail call to the recorder `<offset>` (so it is not a pure leaf, as C5 said). The pouch update `main+<offset>` later clamps the pending delta into `PlayerStatus.CurrentRupee`. | **Proven** instruction bytes and callers; class `rupee` calls it from the frame drain (C6). |
-| Pouch item entry | `<offset>` push-to-pouch by actor name (C5 static; `x1=&{char* name,...}`, `w2` category, `w3` count, `x4` get type). `<offset>.c` is the remove path. | **Not field-tested.** Side effects (models, UI, autosave) and frame-thread safety unknown. |
+| Pouch item entry | `<offset>` give-to-pouch by actor name (C5/C7 static): `x0`=pouchMgr, `x1`=&cell with cell=`{const char* name}` (not a SafeString), `w2` PouchCategory, `w3` count, `x4` PouchGetType, `w5..w7` flags, a ninth argument byte at `[sp]`; returns `w0&1`. It writes IsGet/StockNum through GameData struct members (GameData is authoritative: no runtime inventory cache), the capacity struct and sub-items (it calls itself), and touches HUD and equipment objects. The remove path starts with the same four words, so the offset identifies the give. A chest's flow give returns to one call site (profile `item_callers`). | C7 `item` class: trapped at its `pacibsp` on the opener, replayed on the peer. Field status: RESULT C7. |
 
 ## Storage layout and what must be changed
 
@@ -232,8 +232,18 @@ or `"0x..."` strings; unknown fields reject the file.
    "sites": {"frame": ["<offset>"], "step_set": [...], "step_apply": [...], "played_event": [...],
              "bit_read": [...], "bit_set": [...], "struct_bool_set": [...], "actor_flag_set": [...]},
    "entries": {"bool_setter": {"at": "<offset>", "words": ["<word>", ...]},
-               "bit_setter": {...}, "rupee_entry": {...}}}}}
+               "bit_setter": {...}, "rupee_entry": {...}, "item_entry": {...}},
+   "item_callers": ["<offset>"], "event_got": "<offset>",
+   "item_guards": [["<cell>", "<field>"], ...]}}}
 ```
+
+- `item_give` is a site kind too (the give entry's `pacibsp`); co-op traps it whenever the profile
+  names it, logging each give (`item-give observed|seen|replayed ...`, at most 256 lines).
+- `event_got` is the GOT slot of the event manager's cell; a give waits while
+  `*(*(*(main+event_got)) + 0x68)` is non-zero (an event running). Each `item_guards` pair
+  `{cell, field}` must give a non-zero `*(*(main+cell)+field)`.
+- A replayed give runs on a frame 0x100 bytes below the top of the private stack (now 64 KiB):
+  the stack byte at `[sp]`, the name cell at `sp+0x20`, the name at `sp+0x30`.
 
 - Cells are 8-aligned module offsets of a pointer; sites and entries are 4-aligned module
   offsets below 256 MiB, at most four per site kind, never two at one offset.
@@ -248,7 +258,7 @@ or `"0x..."` strings; unknown fields reject the file.
 
 - `EDEN_NX2_OOT_COOP=1`: enable loopback transport, default `127.0.0.1:43390`;
   `EDEN_NX2_OOT_COOP_RELAY=host:port` overrides it. The older `COOP=host:port` form works.
-- `EDEN_NX2_OOT_COOP_ALLOW`: comma-separated `bool,bit` tokens, no spaces or empty
+- `EDEN_NX2_OOT_COOP_ALLOW`: comma-separated `bool`, `bit`, `rupee` and `item` tokens, no spaces or empty
   tokens. Default is the **empty set**. Invalid tokens reject session creation.
   The old `ALLOW_CLASSES` variable is no longer consulted.
 - `EDEN_NX2_OOT_COOP_KEYS`: JSON policy with typed arrays, for example

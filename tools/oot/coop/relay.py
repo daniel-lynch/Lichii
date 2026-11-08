@@ -23,8 +23,10 @@ MAX_TEAMS = 16
 MAX_REPLAY = 512
 MAX_OUTBOX = 256
 MAX_OUTBOX_BYTES = 2 * MAX_FRAME
-CHANGE_TYPES = {"bool_set", "bit_set", "rupee_add"}
+CHANGE_TYPES = {"bool_set", "bit_set", "rupee_add", "item_give"}
+EVENT_TYPES = {"rupee_add", "item_give"}  # additive events: replay window only, never team state
 RUPEE_LIMIT = 999
+ITEM_COUNT_LIMIT = 999
 
 
 class ProtocolError(ValueError):
@@ -130,7 +132,8 @@ def validate_change(packet, origin):
     common = ("type", "origin", "seq")
     if kind not in CHANGE_TYPES:
         raise ProtocolError("unsupported grant class")
-    extra = {"bool_set": ("hash", "value"), "bit_set": ("actor", "value"), "rupee_add": ("hash", "delta")}[kind]
+    extra = {"bool_set": ("hash", "value"), "bit_set": ("actor", "value"), "rupee_add": ("hash", "delta"),
+             "item_give": ("name", "category", "count", "get", "flags")}[kind]
     fields(packet, common + extra)
     if packet["origin"] != origin:
         raise ProtocolError("origin mismatch")
@@ -149,6 +152,18 @@ def validate_change(packet, origin):
             raise ProtocolError("rupee_add needs a wallet key")
         if integer(packet["delta"], -RUPEE_LIMIT, RUPEE_LIMIT) == 0:
             raise ProtocolError("zero rupee delta")
+    if kind == "item_give":
+        # The game's own give call, as the opener made it: an event, applied by each receiver.
+        if not isinstance(packet["name"], str) or not re.fullmatch(r"[A-Za-z0-9_]{1,63}", packet["name"]):
+            raise ProtocolError("invalid item name")
+        integer(packet["category"], 0, 15)
+        integer(packet["count"], 1, ITEM_COUNT_LIMIT)
+        integer(packet["get"], 0, 15)
+        flags = packet["flags"]
+        if type(flags) is not list or len(flags) != 4:
+            raise ProtocolError("item flags are four bytes")
+        for flag in flags:
+            integer(flag, 0, 255)
 
 
 
@@ -157,7 +172,7 @@ def state_key(packet):
 
 
 def fold(state, packet):
-    if packet["type"] == "rupee_add":
+    if packet["type"] in EVENT_TYPES:
         return  # a delta is an event in the replay window, never team state
     state[state_key(packet)] = {k: v for k, v in packet.items() if k not in ("origin", "seq", "rev")}
 
@@ -184,7 +199,7 @@ class Team:
         if kind in ("bool_set", "bit_set"):
             accepted &= packet["value"] and old is None
         if accepted:
-            if kind != "rupee_add" and old is None and len(self.current) >= MAX_KEYS:
+            if kind not in EVENT_TYPES and old is None and len(self.current) >= MAX_KEYS:
                 raise ProtocolError("team state capacity reached")
             if self.revision == MAX_SEQ:
                 raise ProtocolError("team revision exhausted")

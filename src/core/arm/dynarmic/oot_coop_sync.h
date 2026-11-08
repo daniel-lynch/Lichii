@@ -31,7 +31,7 @@ inline constexpr size_t MaxFrame = 1 << 20;
 inline constexpr size_t QueueLimit = 4096;
 inline constexpr size_t StateLimit = 4096;
 
-enum class Kind { Bool, Int, Enum, Quest, Bit, PouchAdd, PouchTotal, Rupee };
+enum class Kind { Bool, Int, Enum, Quest, Bit, PouchAdd, PouchTotal, Rupee, Item };
 
 // Wallet deltas (class "rupee"): an additive event, never state. The key is the wallet's GameData
 // hash from the private profile; the wire accepts any non-zero 32-bit key and the receiver's
@@ -41,6 +41,27 @@ inline constexpr s64 RupeeLimit = 999;
     return delta != 0 && delta >= -RupeeLimit && delta <= RupeeLimit;
 }
 
+// Item gives (class "item"): the game's own give-to-pouch call as the opener made it, replayed on
+// the peer. An event like a wallet delta: deduplicated by origin/sequence, never team state.
+// key packs the call's small arguments, value is the count, name the item's actor name.
+inline constexpr s64 ItemCountLimit = 999;
+inline constexpr size_t ItemNameLimit = 63;
+struct ItemArgs {
+    u32 category{}; // w2
+    u32 get{};      // x4, the get type
+    std::array<u8, 4> flags{}; // w5, w6, w7 and the stack byte
+};
+[[nodiscard]] constexpr u64 PackItem(const ItemArgs& args) {
+    return u64{args.category & 0xFF} | (u64{args.get & 0xFF} << 8) | (u64{args.flags[0]} << 16) |
+           (u64{args.flags[1]} << 24) | (u64{args.flags[2]} << 32) | (u64{args.flags[3]} << 40);
+}
+[[nodiscard]] constexpr ItemArgs UnpackItem(u64 key) {
+    return {static_cast<u32>(key & 0xFF), static_cast<u32>((key >> 8) & 0xFF),
+            {static_cast<u8>(key >> 16), static_cast<u8>(key >> 24), static_cast<u8>(key >> 32),
+             static_cast<u8>(key >> 40)}};
+}
+[[nodiscard]] bool ItemName(std::string_view name);
+
 struct Change {
     Kind kind{Kind::Bool};
     std::string origin;
@@ -48,6 +69,7 @@ struct Change {
     u64 key{}; // Hash, challenge hash, or 64-bit actor hash; never a guest address.
     s64 value{}; // Boolean, int/enum, step index, or pouch count.
     u32 step{};
+    std::string name; // Item only: the actor name passed to the give call
     bool operator==(const Change&) const = default;
 };
 
@@ -58,6 +80,10 @@ struct Change {
 [[nodiscard]] std::string EncodeFrame(const nlohmann::json& packet);
 [[nodiscard]] std::optional<u32> FrameLength(std::string_view header);
 [[nodiscard]] bool WireKind(Kind kind);
+/// An additive event (wallet delta, item give): applied once per origin/sequence, never state.
+[[nodiscard]] constexpr bool EventKind(Kind kind) { return kind == Kind::Rupee || kind == Kind::Item; }
+/// A well-formed item give: name, count 1..999, category and get type below 16, top bits clear.
+[[nodiscard]] bool ValidItem(const Change& change);
 [[nodiscard]] std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text);
 
 struct Endpoint {
@@ -129,6 +155,8 @@ public:
     const std::shared_ptr<const OotGameDataTrace::Profile> profile; ///< Never null
 
 private:
+    /// The give-to-pouch entry trapped on this (opener's) game: log it, forward chest gives.
+    void ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory);
     struct Impl;
     std::unique_ptr<Impl> impl;
 };

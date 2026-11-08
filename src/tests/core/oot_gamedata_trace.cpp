@@ -778,3 +778,169 @@ TEST_CASE("OoT co-op rupee grant calls the wallet entry with the pouch manager",
         REQUIRE_FALSE(backend.Resolve(minus));
     }
 }
+
+TEST_CASE("OoT co-op item give replays the give call with a private argument frame", "[oot_coop]") {
+    namespace Coop = Core::OotCoop;
+    constexpr u64 manager = Data, data = Data + 0x2000, hashes = Data + 0x3000;
+    constexpr u64 queue = Data + 0x4000, sentinel = Stop + 0x100, pouch = Data + 0x8000;
+    constexpr u64 events = Data + 0x9000, events_cell = Data + 0x9100, guard = Data + 0xA000;
+    constexpr u64 entry = Base + P::ItemEntry;
+    TraceEnvironment env;
+    for (u64 i = data; i < data + 0x30; ++i) env.bytes[i] = 0;
+    for (u64 i = hashes; i < hashes + 8 * 8; ++i) env.bytes[i] = 0;
+    env.Write64(Base + P::ManagerCell, manager);
+    env.Write32(manager + 0x10, 2);
+    env.Write64(manager + 0x18, data);
+    env.Write64(manager + 0x20, hashes);
+    env.Write32(manager + 0x2C, 8);
+    env.Write32(manager + 0x30, 1);
+    env.Write64(manager + 0x38, queue);
+    env.Write32(manager + 0x40, 0);
+    env.Write64(queue, 0);
+    env.Write64(Base + P::PouchCell, pouch);
+    env.Write64(pouch, 0);
+    env.Write64(pouch + 8, 0x1234);
+    env.Write64(Base + P::EventGot, events_cell); // GOT slot -> cell -> event manager
+    env.Write64(events_cell, events);
+    env.Write64(events + 0x68, 0); // no event running
+    env.Write64(Base + P::GuardCell, guard);
+    env.Write64(guard + P::GuardField, 0x5678);
+    env.Code(entry, P::ItemWords[0]);
+    env.Code(entry + 4, P::ItemWords[1]);
+    env.Code(sentinel, Trace::Breakpoint);
+    Coop::GuestBinding binding{Base, 0, 0, 0, sentinel, 0x20000000};
+    for (u64 i = binding.stack - Coop::ItemStackNeed; i < binding.stack; ++i) env.bytes[i] = 0xEE;
+    Dynarmic::A64::Jit jit{Config(env)};
+    u64 tls = 1, tls_ro = 2;
+    int clears = 0;
+    using Backend = Coop::GameDataBackend<Dynarmic::A64::Jit, TraceEnvironment>;
+    Backend backend{jit, env, binding, P::Get(), tls, tls_ro, [&] { ++clears; }};
+    REQUIRE(backend.BindFromCell());
+    Coop::Change give{Coop::Kind::Item, "B", 1, Coop::PackItem({6, 7, {0, 0, 1, 0}}), 1};
+    give.name = "Item_Test_Slingshot";
+    SECTION("call shape, argument frame, restoration and commit on return") {
+        Coop::FrameDrain<Backend> drain{{true, {Coop::Kind::Item}, {}}};
+        std::vector<std::string> logs;
+        const auto send = [](Coop::Change, bool) { FAIL("a replayed give is never observed here"); };
+        const auto log = [&](std::string_view line) { logs.emplace_back(line); };
+        drain.Frame(backend, {7, 9, 1, true}, send, log);
+        jit.SetPC(Site(Point::Frame) + 4);
+        jit.SetSP(0x30000000);
+        const auto saved = *backend.Capture();
+        REQUIRE(drain.Queue(give));
+        REQUIRE(drain.Frame(backend, {7, 9, 2, true}, send, log) == Coop::ApplyEvent::Started);
+        const u64 sp = binding.stack - Coop::ItemFrame;
+        REQUIRE(jit.GetPC() == entry);
+        REQUIRE(jit.GetSP() == sp);
+        REQUIRE(jit.GetRegister(0) == pouch);
+        REQUIRE(jit.GetRegister(1) == sp + 0x20);
+        REQUIRE(jit.GetRegister(2) == 6);
+        REQUIRE(jit.GetRegister(3) == 1);
+        REQUIRE(jit.GetRegister(4) == 7);
+        REQUIRE(jit.GetRegister(5) == 0);
+        REQUIRE(jit.GetRegister(6) == 0);
+        REQUIRE(jit.GetRegister(7) == 1);
+        REQUIRE(jit.GetRegister(30) == sentinel);
+        REQUIRE(env.Read64(sp) == 0); // the ninth argument byte and its padding
+        REQUIRE(env.Read64(sp + 8) == 0);
+        REQUIRE(env.Read64(sp + 0x20) == sp + 0x30); // cell = {const char* name}
+        std::string name;
+        for (u64 i = 0; env.Read8(sp + 0x30 + i) != 0; ++i) name.push_back(char(env.Read8(sp + 0x30 + i)));
+        REQUIRE(name == give.name);
+        REQUIRE(env.Read8(binding.stack - Coop::ItemFrame - 1) == 0xEE); // nothing below the frame
+        REQUIRE(drain.Sentinel(backend, {7, 9, 2, true}, sentinel, log) == Coop::ApplyEvent::Returned);
+        REQUIRE(*backend.Capture() == saved);
+        REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) == Coop::ApplyEvent::Committed);
+        REQUIRE(std::count_if(logs.begin(), logs.end(), [](const auto& line) {
+            return line.find("applied class=item") != std::string::npos;
+        }) == 1);
+        // A second give of the same item (a new origin/sequence) calls again: counts add.
+        Coop::Change again = give;
+        again.seq = 2;
+        REQUIRE(drain.Queue(again));
+        REQUIRE(drain.Frame(backend, {7, 9, 4, true}, send, log) == Coop::ApplyEvent::Started);
+    }
+    SECTION("a running event holds the give until it ends") {
+        Coop::FrameDrain<Backend> drain{{true, {Coop::Kind::Item}, {}}};
+        const auto send = [](Coop::Change, bool) {};
+        const auto log = [](std::string_view) {};
+        drain.Frame(backend, {7, 9, 1, true}, send, log);
+        env.Write64(events + 0x68, 0xABC);
+        REQUIRE(drain.Queue(give));
+        REQUIRE(drain.Frame(backend, {7, 9, 2, true}, send, log) == Coop::ApplyEvent::Blocked);
+        REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) == Coop::ApplyEvent::Blocked);
+        env.Write64(events + 0x68, 0);
+        REQUIRE(drain.Frame(backend, {7, 9, 4, true}, send, log) == Coop::ApplyEvent::Started);
+    }
+    SECTION("a dead guard pointer blocks") {
+        env.Write64(guard + P::GuardField, 0);
+        REQUIRE_FALSE(backend.Resolve(give));
+    }
+    SECTION("no pouch manager blocks") {
+        env.Write64(Base + P::PouchCell, 0);
+        REQUIRE_FALSE(backend.Resolve(give));
+    }
+    SECTION("a changed entry word blocks") {
+        env.Code(entry + 4, P::Nop);
+        REQUIRE_FALSE(backend.Resolve(give));
+    }
+    SECTION("an unmapped deep stack blocks") {
+        env.bytes.erase(binding.stack - Coop::ItemStackNeed);
+        REQUIRE_FALSE(backend.Resolve(give));
+    }
+    SECTION("a malformed give never resolves") {
+        give.name = "bad name";
+        REQUIRE_FALSE(backend.Resolve(give));
+    }
+}
+
+TEST_CASE("OoT co-op reads the opener's give call and forwards only reviewed callers", "[oot_coop]") {
+    namespace Coop = Core::OotCoop;
+    constexpr u64 cell = Data + 0x100, text = Data + 0x200, sp = Data + 0x400;
+    constexpr u64 sentinel = Stop + 0x100;
+    TraceEnvironment env;
+    const std::string name = "Item_Test_Bomb";
+    for (size_t i = 0; i <= name.size(); ++i) env.bytes[text + i] = i < name.size() ? u8(name[i]) : 0;
+    env.Write64(cell, text);
+    env.Write64(sp, 0);
+    Dynarmic::A64::Jit jit{Config(env)};
+    jit.SetRegister(1, cell);
+    jit.SetRegister(2, 6);
+    jit.SetRegister(3, 20);
+    jit.SetRegister(4, 7);
+    jit.SetRegister(5, 0);
+    jit.SetRegister(6, 0);
+    jit.SetRegister(7, 1);
+    jit.SetSP(sp);
+    jit.SetRegister(30, Base + P::ItemCaller);
+    auto call = Coop::ReadItemCall(jit, env, Base, P::Get(), sentinel, true);
+    REQUIRE(call.forward);
+    REQUIRE_FALSE(call.replay);
+    REQUIRE(call.change.name == name);
+    REQUIRE(call.change.value == 20);
+    REQUIRE(Coop::UnpackItem(call.change.key).category == 6);
+    REQUIRE(Coop::UnpackItem(call.change.key).get == 7);
+    REQUIRE(Coop::UnpackItem(call.change.key).flags == std::array<u8, 4>{0, 0, 1, 0});
+    REQUIRE(call.line.find("item-give observed name=Item_Test_Bomb") != std::string::npos);
+    // The item class off: logged, never forwarded.
+    REQUIRE_FALSE(Coop::ReadItemCall(jit, env, Base, P::Get(), sentinel, false).forward);
+    // Another caller (a pickup, a sub-item): seen only.
+    jit.SetRegister(30, Base + P::ItemCaller + 0x40);
+    call = Coop::ReadItemCall(jit, env, Base, P::Get(), sentinel, true);
+    REQUIRE_FALSE(call.forward);
+    REQUIRE(call.line.find("item-give seen") != std::string::npos);
+    // Our own replay returns to the sentinel: never forwarded again (no echo).
+    jit.SetRegister(30, sentinel);
+    call = Coop::ReadItemCall(jit, env, Base, P::Get(), sentinel, true);
+    REQUIRE(call.replay);
+    REQUIRE_FALSE(call.forward);
+    // Out-of-range small arguments are not forwarded.
+    jit.SetRegister(30, Base + P::ItemCaller);
+    jit.SetRegister(5, 0x100);
+    REQUIRE_FALSE(Coop::ReadItemCall(jit, env, Base, P::Get(), sentinel, true).forward);
+    jit.SetRegister(5, 0);
+    jit.SetRegister(3, 0);
+    REQUIRE_FALSE(Coop::ReadItemCall(jit, env, Base, P::Get(), sentinel, true).forward);
+    REQUIRE(Trace::CoopPoint(Point::ItemGive));
+    REQUIRE(Trace::Identify(P::Get(), Base, Base + P::ItemEntry, Trace::Pacibsp) == Point::ItemGive);
+}

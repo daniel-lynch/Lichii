@@ -20,17 +20,24 @@ inline constexpr u32 Wallet = 0x0BADCAFE;
 inline constexpr u64 BoolSetter = 0x110000;
 inline constexpr u64 BitSetter = 0x111000;
 inline constexpr u64 RupeeEntry = 0x112000;
+inline constexpr u64 ItemEntry = 0x113000;
+inline constexpr u64 ItemCaller = 0x120004;  // the "chest flow" return address
+inline constexpr u64 EventGot = 0x200200;    // GOT slot -> event manager cell
+inline constexpr u64 GuardCell = 0x200300;   // *(*(main+GuardCell)+GuardField) must be live
+inline constexpr u64 GuardField = 0x508;
 inline constexpr u32 Nop = 0xD503201F;
 /// Two arbitrary code words each entry must start with (any instructions the tests can run).
 inline constexpr std::array<u32, 2> BoolWords{Trace::Pacibsp, Nop};
 inline constexpr std::array<u32, 2> BitWords{Trace::MovX8X0, Nop};
 inline constexpr std::array<u32, 2> RupeeWords{Nop, Trace::MovX8X0};
+inline constexpr std::array<u32, 2> ItemWords{Trace::Pacibsp, Trace::MovX8X0};
 
 inline Trace::Profile Make() {
     using Trace::Point;
     Trace::Profile profile;
     profile.build_id = BuildId;
-    const std::array<std::pair<Point, u64>, 10> sites{{
+    const std::array<std::pair<Point, u64>, 11> sites{{
+        {Point::ItemGive, ItemEntry},
         {Point::StepSet, 0x100004}, {Point::StepApply, 0x101000},
         {Point::PlayedEvent, 0x102000}, {Point::Frame, 0x103000},
         {Point::BitRead, 0x104004}, {Point::BitSet, 0x105004},
@@ -44,6 +51,10 @@ inline Trace::Profile Make() {
     profile.bool_setter = {BoolSetter, {BoolWords.begin(), BoolWords.end()}};
     profile.bit_setter = {BitSetter, {BitWords.begin(), BitWords.end()}};
     profile.rupee_entry = {RupeeEntry, {RupeeWords.begin(), RupeeWords.end()}};
+    profile.item_entry = {ItemEntry, {ItemWords.begin(), ItemWords.end()}};
+    profile.item_callers = {ItemCaller};
+    profile.event_got = EventGot;
+    profile.item_guards = {{GuardCell, GuardField}};
     return profile;
 }
 

@@ -21,6 +21,9 @@ struct ApplyPolicy {
             return enabled && classes.contains(Kind::Rupee) && wallet && change.key == wallet &&
                    RupeeDelta(change.value);
         }
+        if (change.kind == Kind::Item) {
+            return enabled && classes.contains(Kind::Item) && ValidItem(change);
+        }
         return enabled && WireKind(change.kind) && change.value == 1 &&
                classes.contains(change.kind) && keys.contains({change.kind, change.key});
     }
@@ -42,6 +45,9 @@ struct ApplyTarget {
     u64 sentinel{};
     u64 stack{};
     std::array<u64, 8> arguments{};
+    /// 64-bit stores into the private stack region that Redirect makes before the call (an
+    /// argument block the callee reads); empty for the flag setters and the wallet entry.
+    std::vector<std::pair<u64, u64>> stores;
 };
 
 enum class ApplyPhase { Idle, Calling, AwaitingCommit, Quarantined };
@@ -62,7 +68,7 @@ public:
             return false;
         }
         // A delta repeats by design (each one is a new origin/sequence); flags commit once.
-        if (change.kind != Kind::Rupee) {
+        if (!EventKind(change.kind)) {
             if (receipts.size() >= StateLimit || receipts.contains(key)) return false;
             receipts.emplace(key, false);
         }
@@ -95,7 +101,8 @@ public:
         if (phase == ApplyPhase::AwaitingCommit) {
             // The wallet leaf adds to the pending field synchronously; the game's pouch update
             // applies and clamps it later. The return is the commit.
-            if (active->kind == Kind::Rupee) return Commit();
+            // An item give commits the same way: the game's call has run to completion.
+            if (EventKind(active->kind)) return Commit();
             if (backend.ReadFlag(*active) == true) return Commit();
             return site.tick >= deadline ? Quarantine() : ApplyEvent::Blocked;
         }
@@ -103,7 +110,7 @@ public:
         active = pending.front();
         last_grant = active;
         last_path = "already-true";
-        if (active->kind != Kind::Rupee) {
+        if (!EventKind(active->kind)) {
             const auto current = backend.ReadFlag(*active);
             if (!current) {
                 active.reset();
@@ -120,8 +127,8 @@ public:
         generation = site.generation;
         thread = site.thread;
         deadline = site.tick > MaxSequence - 120 ? MaxSequence : site.tick + 120;
-        last_path = target.pure_flag ? "data-or" : active->kind == Kind::Rupee ? "call" : "setter";
-        if (target.pure_flag && active->kind == Kind::Rupee) {
+        last_path = target.pure_flag ? "data-or" : EventKind(active->kind) ? "call" : "setter";
+        if (target.pure_flag && EventKind(active->kind)) {
             active.reset();
             return ApplyEvent::Blocked;
         }
@@ -206,7 +213,7 @@ private:
         return ApplyEvent::Quarantined;
     }
     ApplyEvent Commit() {
-        if (active->kind != Kind::Rupee) receipts.at({active->kind, active->key}) = true;
+        if (!EventKind(active->kind)) receipts.at({active->kind, active->key}) = true;
         pending.pop_front();
         active.reset();
         phase = ApplyPhase::Idle;

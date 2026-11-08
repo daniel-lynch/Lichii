@@ -83,16 +83,41 @@ std::string_view Type(Kind kind) {
     case Kind::PouchAdd: return "pouch_add";
     case Kind::PouchTotal: return "pouch_total";
     case Kind::Rupee: return "rupee_add";
+    case Kind::Item: return "item_give";
     }
     return {};
 }
 } // namespace
+
+bool ItemName(std::string_view name) {
+    return !name.empty() && name.size() <= ItemNameLimit &&
+           std::all_of(name.begin(), name.end(), [](unsigned char c) {
+               return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                      c == '_';
+           });
+}
+
+bool ValidItem(const Change& change) {
+    const auto args = UnpackItem(change.key);
+    return change.kind == Kind::Item && ItemName(change.name) && change.value >= 1 &&
+           change.value <= ItemCountLimit && args.category < 16 && args.get < 16 &&
+           PackItem(args) == change.key;
+}
 
 Json EncodeChange(const Change& change) {
     Json packet{{"type", Type(change.kind)}};
     if (!change.origin.empty()) {
         packet["origin"] = change.origin;
         packet["seq"] = change.seq;
+    }
+    if (change.kind == Kind::Item) {
+        const auto args = UnpackItem(change.key);
+        packet["name"] = change.name;
+        packet["category"] = args.category;
+        packet["count"] = change.value;
+        packet["get"] = args.get;
+        packet["flags"] = Json::array({args.flags[0], args.flags[1], args.flags[2], args.flags[3]});
+        return packet;
     }
     if (change.kind == Kind::Quest) {
         packet["challenge"] = change.key;
@@ -125,7 +150,7 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
         const auto type = packet.at("type").get<std::string>();
         bool found = false;
         for (const Kind kind : {Kind::Bool, Kind::Int, Kind::Enum, Kind::Quest, Kind::Bit,
-                                Kind::PouchAdd, Kind::PouchTotal, Kind::Rupee}) {
+                                Kind::PouchAdd, Kind::PouchTotal, Kind::Rupee, Kind::Item}) {
             if (type == Type(kind)) {
                 change.kind = kind;
                 found = true;
@@ -136,7 +161,7 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
             return std::nullopt;
         }
         // A delta is an event with an origin and sequence; it never appears as snapshot state.
-        if (snapshot && change.kind == Kind::Rupee) {
+        if (snapshot && EventKind(change.kind)) {
             return std::nullopt;
         }
         if (!snapshot || packet.contains("origin") || packet.contains("seq")) {
@@ -146,6 +171,28 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
             }
             change.origin = packet.at("origin").get<std::string>();
             change.seq = packet.at("seq").get<u64>();
+        }
+        if (change.kind == Kind::Item) {
+            for (const auto& [field, value] : packet.items()) {
+                if (field == "type" || field == "origin" || field == "seq" || field == "name" ||
+                    field == "category" || field == "count" || field == "get" || field == "flags")
+                    continue;
+                if (field == "rev" && Unsigned(value, MaxSequence) && value != 0) continue;
+                return std::nullopt;
+            }
+            const auto& flags = packet.at("flags");
+            if (!packet.at("name").is_string() || !Unsigned(packet.at("category"), 15) ||
+                !Unsigned(packet.at("get"), 15) || !Unsigned(packet.at("count"), ItemCountLimit) ||
+                !flags.is_array() || flags.size() != 4) return std::nullopt;
+            ItemArgs args{packet.at("category").get<u32>(), packet.at("get").get<u32>(), {}};
+            for (size_t i = 0; i < 4; ++i) {
+                if (!Unsigned(flags[i], 255)) return std::nullopt;
+                args.flags[i] = flags[i].get<u8>();
+            }
+            change.name = packet.at("name").get<std::string>();
+            change.key = PackItem(args);
+            change.value = packet.at("count").get<s64>();
+            return ValidItem(change) ? std::optional{change} : std::nullopt;
         }
         const char* key = change.kind == Kind::Quest ? "challenge"
                           : change.kind == Kind::Bit ? "actor" : "hash";
@@ -238,7 +285,7 @@ std::optional<Json> DecodeLine(std::string_view line) {
 }
 
 bool WireKind(Kind kind) {
-    return kind == Kind::Bool || kind == Kind::Bit || kind == Kind::Rupee;
+    return kind == Kind::Bool || kind == Kind::Bit || kind == Kind::Rupee || kind == Kind::Item;
 }
 
 std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text) {
@@ -249,6 +296,7 @@ std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text) {
         if (name == "bool") result.insert(Kind::Bool);
         else if (name == "bit") result.insert(Kind::Bit);
         else if (name == "rupee") result.insert(Kind::Rupee);
+        else if (name == "item") result.insert(Kind::Item);
         else return std::nullopt;
         if (comma == std::string_view::npos) break;
         text.remove_prefix(comma + 1);
@@ -348,7 +396,8 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
             }
             return result;
         };
-        constexpr std::array<std::pair<std::string_view, Point>, 8> points{{
+        constexpr std::array<std::pair<std::string_view, Point>, 9> points{{
+            {"item_give", Point::ItemGive},
             {"step_set", Point::StepSet}, {"step_apply", Point::StepApply},
             {"played_event", Point::PlayedEvent}, {"frame", Point::Frame},
             {"bit_read", Point::BitRead}, {"bit_set", Point::BitSet},
@@ -381,10 +430,31 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                     auto* target = name == "bool_setter"   ? &profile.bool_setter
                                    : name == "bit_setter"  ? &profile.bit_setter
                                    : name == "rupee_entry" ? &profile.rupee_entry
+                                   : name == "item_entry"  ? &profile.item_entry
                                                            : nullptr;
                     const auto decoded = entry(item);
                     if (!target || !decoded) return std::nullopt;
                     *target = *decoded;
+                }
+            } else if (field == "item_callers") {
+                if (!value.is_array() || value.size() > 16) return std::nullopt;
+                for (const auto& item : value) {
+                    const auto at = offset(item);
+                    if (!at) return std::nullopt;
+                    profile.item_callers.push_back(*at);
+                }
+            } else if (field == "event_got") {
+                const auto cell = Number(value, MaxModuleOffset);
+                if (!cell || !*cell || (*cell & 7)) return std::nullopt;
+                profile.event_got = *cell;
+            } else if (field == "item_guards") {
+                if (!value.is_array() || value.size() > 8) return std::nullopt;
+                for (const auto& pair : value) {
+                    if (!pair.is_array() || pair.size() != 2) return std::nullopt;
+                    const auto cell = Number(pair[0], MaxModuleOffset);
+                    const auto member = Number(pair[1], 0xFFFF);
+                    if (!cell || !*cell || (*cell & 7) || !member || (*member & 7)) return std::nullopt;
+                    profile.item_guards.emplace_back(*cell, *member);
                 }
             } else {
                 return std::nullopt;
@@ -482,8 +552,9 @@ bool State::Merge(const Change& change, bool deduplicate) {
         if (change.seq <= high) return false;
         high = change.seq;
     }
+    // Events are deduplicated by origin/sequence above and never folded into state.
+    if (change.kind == Kind::Item) return ValidItem(change);
     if (denied.contains(change.key)) return false;
-    // Deltas are deduplicated by origin/sequence above and never folded into state.
     if (change.kind == Kind::Rupee) return change.key != 0 && RupeeDelta(change.value);
     const auto key = std::pair{StorageKind(change.kind), change.key};
     const auto it = values.find(key);
@@ -515,6 +586,7 @@ bool State::Merge(const Change& change, bool deduplicate) {
         if (change.value <= old || change.value > static_cast<s64>(MaxSequence)) return false;
         break;
     case Kind::Rupee:
+    case Kind::Item:
         return false;
     }
     values[key] = std::move(next);
@@ -563,6 +635,7 @@ bool ShouldApply(const Change& change, const State& observed) {
         return !local || local->value != change.value;
     }
     if (change.kind == Kind::Rupee) return change.key != 0 && RupeeDelta(change.value);
+    if (change.kind == Kind::Item) return ValidItem(change);
     // Pouch totals require a save baseline/application receipt, not a comparison to inventory.
     return change.kind == Kind::PouchAdd && change.value > 0;
 }
@@ -599,7 +672,7 @@ struct Session::Impl {
     std::mutex guest_mutex;
     GuestBinding binding;
     std::unique_ptr<FrameDrain<Backend>> runtime;
-    u64 frame_thread{}, tick{}, rebinds{};
+    u64 frame_thread{}, tick{}, rebinds{}, item_lines{}, item_waiting_logged{};
     bool stable_frame{};
     bool baseline_ready{};
     bool logged_class{};
@@ -827,7 +900,8 @@ bool Session::Impl::Receive(const Json& packet) {
         }
         for (const auto& value : packet.at("changes")) {
             // A wallet delta is not state: a reconnect must never re-apply one.
-            if (value.is_object() && value.contains("type") && value.at("type") == "rupee_add") continue;
+            if (value.is_object() && value.contains("type") &&
+                (value.at("type") == "rupee_add" || value.at("type") == "item_give")) continue;
             const auto change = DecodeChange(value, true);
             if (!change || !WireKind(change->kind)) return false;
             checkpoint.Merge(*change, false);
@@ -837,7 +911,7 @@ bool Session::Impl::Receive(const Json& packet) {
             const auto change = DecodeChange(value);
             if (!change || !WireKind(change->kind) || !Unsigned(value.at("rev"), MaxSequence) ||
                 value.at("rev").get<u64>() != ++revision) return false;
-            if (change->kind != Kind::Rupee) checkpoint.Merge(*change);
+            if (!EventKind(change->kind)) checkpoint.Merge(*change);
         }
         changes = checkpoint.Snapshot();
     } else {
@@ -889,6 +963,7 @@ void Session::Stop() { impl->Stop(); }
 void Session::Observe(Change change) {
     // Wallet deltas are grant-only in this pass: the local wallet is not observed or re-sent.
     if (impl->stopped || !WireKind(change.kind) || change.kind == Kind::Rupee) return;
+    if (change.kind == Kind::Item && !ValidItem(change)) return;
     std::scoped_lock lock{impl->mutex};
     if (impl->outgoing.size() >= QueueLimit || impl->next_seq > MaxSequence) {
         if (!impl->logged_overflow) {
@@ -901,6 +976,17 @@ void Session::Observe(Change change) {
     change.origin = impl->hello.client_id;
     change.seq = impl->next_seq++;
     impl->outgoing.push_back(std::move(change));
+}
+
+void Session::ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory) {
+    const auto call = ReadItemCall(jit, memory, base, *profile, impl->binding.sentinel,
+                                   impl->allowed_classes.contains(Kind::Item));
+    // Every give is logged (bounded): the record of what the game passes, forwarded or not.
+    if (impl->item_lines < 256) {
+        ++impl->item_lines;
+        LOG_INFO(Core_ARM, "OoT co-op: {}", call.line);
+    }
+    if (call.forward) Observe(call.change);
 }
 
 bool Session::IsSentinel(u64 pc) const {
@@ -918,7 +1004,13 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     const auto log = [](std::string_view line) { LOG_INFO(Core_ARM, "{}", line); };
     const DrainContext site{thread, 1, impl->tick, true};
     if (binding.sentinel && pc == binding.sentinel) {
+        const u64 result = jit.GetRegister(0); // the call's return value, before the restore
         const auto event = runtime.Sentinel(backend, site, pc, log);
+        if (event == ApplyEvent::Returned && runtime.LastGrant() &&
+            runtime.LastGrant()->kind == Kind::Item) {
+            log(fmt::format("OoT co-op: item give returned w0={} name={}", result & 1,
+                            runtime.LastGrant()->name));
+        }
         if (event == ApplyEvent::Returned && runtime.LastGrant() &&
             runtime.LastGrant()->kind == Kind::Rupee) {
             using OotGameDataTrace::Detail::Read32;
@@ -937,6 +1029,10 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         return event == ApplyEvent::Returned;
     }
     if (impl->stopped) return false;
+    if (point == OotGameDataTrace::Point::ItemGive) {
+        ObserveItem(jit, memory);
+        return false;
+    }
     if (point != OotGameDataTrace::Point::Frame || !thread) return false;
     if (!impl->frame_thread) impl->frame_thread = thread;
     if (impl->frame_thread != thread) return false;
@@ -988,7 +1084,14 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         log(fmt::format("OoT co-op: {} class={} key={:016x} value=1 path=observer",
                         baseline ? "baseline" : "observed", ClassName(change.kind), change.key));
     };
-    runtime.Frame(backend, {thread, 1, impl->tick, true}, send, log);
+    const auto event = runtime.Frame(backend, {thread, 1, impl->tick, true}, send, log);
+    // A give waits while an event runs or a guard pointer is dead; say so now and then.
+    if (event == ApplyEvent::Blocked && runtime.Pending() && runtime.LastGrant() &&
+        runtime.LastGrant()->kind == Kind::Item && impl->tick - impl->item_waiting_logged >= 600) {
+        impl->item_waiting_logged = impl->tick;
+        log(fmt::format("OoT co-op: item give waiting name={} (event running, guard null or "
+                        "not callable)", runtime.LastGrant()->name));
+    }
     if (runtime.BaselineReady()) {
         std::scoped_lock lock{impl->mutex};
         if (!impl->baseline_ready) {

@@ -53,11 +53,11 @@ TEST_CASE("OoT co-op call memory maps a private stack and sentinel in a 39-bit p
     memory.SetCurrentPageTable(*process);
     REQUIRE(GetInteger(stack) % 16 == 0);
     REQUIRE(GetInteger(sentinel) % 0x1000 == 0);
-    REQUIRE(memory.IsValidVirtualAddressRange(GetInteger(stack) - 0x4000, 0x4000));
+    REQUIRE(memory.IsValidVirtualAddressRange(GetInteger(stack) - 0x10000, 0x10000));
     REQUIRE(memory.IsValidVirtualAddressRange(GetInteger(sentinel), 0x1000));
     REQUIRE(memory.Read32(GetInteger(sentinel)) == 0xD4200000); // brk #0
     // The sentinel is not inside the stack the setter runs on.
-    REQUIRE((GetInteger(sentinel) + 0x1000 <= GetInteger(stack) - 0x4000 ||
+    REQUIRE((GetInteger(sentinel) + 0x1000 <= GetInteger(stack) - 0x10000 ||
              GetInteger(sentinel) >= GetInteger(stack)));
     Kernel::KProcessAddress again_stack{}, again_sentinel{};
     REQUIRE(process->AllocateDebugCallMemory(kernel, &again_stack, &again_sentinel).IsError());

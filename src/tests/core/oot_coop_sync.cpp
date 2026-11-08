@@ -697,3 +697,45 @@ TEST_CASE("OoT co-op loads game offsets only from the private profile", "[core][
     REQUIRE_FALSE(broken("entries", Json{{"bool_setter", {{"at", "0x110000"}, {"words", Json::array()}}}}));
     REQUIRE_FALSE(broken("entries", Json{{"mystery", {{"at", "0x110000"}, {"words", Json::array({1})}}}}));
 }
+
+TEST_CASE("OoT co-op item gives are named events, never state", "[core][oot_coop]") {
+    Change give{Kind::Item, "B", 3, Coop::PackItem({6, 7, {0, 0, 1, 0}}), 20};
+    give.name = "Item_Test_Bomb";
+    const auto packet = Coop::EncodeChange(give);
+    REQUIRE(packet == Json{{"type", "item_give"}, {"origin", "B"}, {"seq", 3}, {"name", "Item_Test_Bomb"},
+                           {"category", 6}, {"count", 20}, {"get", 7},
+                           {"flags", Json::array({0, 0, 1, 0})}});
+    REQUIRE(Coop::DecodeChange(packet) == give);
+    auto with_rev = packet;
+    with_rev["rev"] = 9;
+    REQUIRE(Coop::DecodeChange(with_rev) == give);
+    for (const auto& [field, value] : std::vector<std::pair<std::string, Json>>{
+             {"name", ""}, {"name", "has space"}, {"name", std::string(64, 'a')}, {"name", 5},
+             {"count", 0}, {"count", 1000}, {"count", -1}, {"category", 16}, {"get", 16},
+             {"flags", Json::array({0, 0, 0})}, {"flags", Json::array({0, 0, 0, 256})},
+             {"hash", 1}, {"extra", 1}}) {
+        auto bad = packet;
+        bad[field] = value;
+        CAPTURE(field);
+        REQUIRE_FALSE(Coop::DecodeChange(bad));
+    }
+    REQUIRE_FALSE(Coop::DecodeChange(packet, true)); // never snapshot state
+    REQUIRE(Coop::DecodeAllowClasses("bool,item") == std::set{Kind::Bool, Kind::Item});
+    Coop::State state;
+    REQUIRE(state.Merge(give));
+    REQUIRE_FALSE(state.Merge(give)); // the same origin/sequence again: a duplicate, no second give
+    auto next = give;
+    next.seq = 4;
+    REQUIRE(state.Merge(next)); // a new give of the same item adds again
+    REQUIRE(state.Snapshot().empty());
+    REQUIRE(Coop::ShouldApply(give, state));
+    Coop::GrantApplier<FakeGuest> closed{Allowed()};
+    REQUIRE_FALSE(closed.Queue(give)); // the item class is off by default
+    Coop::GrantApplier<FakeGuest> open{{true, {Kind::Item}, {}}};
+    REQUIRE(open.Queue(give));
+    REQUIRE(open.Queue(next));
+    REQUIRE_FALSE(open.Suppress(give));
+    auto bad = give;
+    bad.value = 0;
+    REQUIRE_FALSE(open.Queue(bad));
+}

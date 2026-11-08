@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -36,6 +37,7 @@ class KProcess;
 /// - StepSet: the quest step setter, hooked at its `mov w8, #1` (x0-x5 are its arguments).
 /// - StepApply / PlayedEvent / Frame / StructBoolSet / ActorFlagSet: a `pacibsp` (a no-op).
 /// - BitRead: `ldr w8, [x0, #0xc58]`; BitSet: `mov x8, x0`.
+/// - ItemGive: the `pacibsp` at the entry of the game's give-to-pouch call (co-op item class).
 namespace Core::OotGameDataTrace {
 
 inline constexpr u64 ProgramId = 0x0400486024DEC000ULL;
@@ -54,8 +56,9 @@ enum class Point : u8 {
     BitSet,
     StructBoolSet,
     ActorFlagSet,
+    ItemGive,
 };
-inline constexpr size_t PointCount = 9;
+inline constexpr size_t PointCount = 10;
 
 struct Site {
     Point point;
@@ -95,6 +98,11 @@ struct Profile {
     u64 pouch_cell{};   ///< Module offset of the pouch manager pointer
     u32 wallet_hash{};  ///< GameData key of the wallet (rupee deltas)
     Entry bool_setter, bit_setter, rupee_entry;
+    Entry item_entry;               ///< The give-to-pouch call (the ItemGive site's function)
+    std::vector<u64> item_callers;  ///< Return addresses (module offsets) of gives to forward
+    u64 event_got{};                ///< Module offset of the GOT slot of the event manager's cell
+    /// {cell, field}: *(*(main + cell) + field) must be non-zero before a give is replayed.
+    std::vector<std::pair<u64, u64>> item_guards;
 
     u64 SiteOffset(Point point) const {
         for (const Site& site : sites) {
@@ -108,7 +116,7 @@ struct Profile {
 /// its handler ignores every other point. The Bool64 accessors are hot (the actor reader copy
 /// runs per actor per frame), so hooking them without tracing would cost a trap each.
 constexpr bool CoopPoint(Point point) {
-    return point == Point::Frame;
+    return point == Point::Frame || point == Point::ItemGive;
 }
 
 /// The trace point at `address` whose original instruction is `instruction`, or None.
@@ -144,6 +152,7 @@ void Resume(Point point, Jit& jit, Memory& memory) {
         break;
     case Point::StructBoolSet:
     case Point::ActorFlagSet:
+    case Point::ItemGive:
     case Point::Frame:
     case Point::StepApply:
     case Point::PlayedEvent: // pacibsp: nothing
@@ -162,6 +171,7 @@ constexpr std::string_view Name(Point point) {
         return "played-event";
     case Point::StructBoolSet: return "struct-bool-set";
     case Point::ActorFlagSet: return "actor-flag-set";
+    case Point::ItemGive: return "item-give";
     case Point::Frame: return "frame";
     case Point::BitRead: return "bit-read";
     case Point::BitSet: return "bit-set";
@@ -362,6 +372,10 @@ std::string Describe(Point point, u64 base, Jit& jit, Memory& memory) {
                            static_cast<u32>(jit.GetRegister(1)), x0, caller);
     case Point::Frame:
         return fmt::format("gamedata frame lr={}", caller);
+    case Point::ItemGive:
+        return fmt::format("gamedata item-give category={} count={} get={} lr={}",
+                           static_cast<u32>(jit.GetRegister(2)), static_cast<u32>(jit.GetRegister(3)),
+                           jit.GetRegister(4), caller);
     case Point::BitRead:
     case Point::BitSet:
         return fmt::format("gamedata {} mgr={:#x} key={:016x}", Name(point), x0,

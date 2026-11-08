@@ -2,20 +2,30 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <algorithm>
 #include <functional>
+#include <string>
 #include <limits>
 #include "core/arm/dynarmic/oot_coop_apply.h"
 
 namespace Core::OotCoop {
 
 inline std::string_view ClassName(Kind kind) {
-    return kind == Kind::Bit ? "bit" : kind == Kind::Rupee ? "rupee" : "bool";
+    return kind == Kind::Bit ? "bit" : kind == Kind::Rupee ? "rupee" : kind == Kind::Item ? "item" : "bool";
 }
 
 // The pouch manager is *(main + profile.pouch_cell). The wallet entry (profile.rupee_entry; x0 =
 // pouchMgr, w1 = signed delta, w2 = reason) adds into the pending field at pouchMgr+0x3BD4 (reason
 // at +0x3BD8); the game's own pouch update later clamps it into the wallet.
 inline constexpr u64 RupeeReason = 7; // the one-shot "increase rupee" caller's reason
+
+// An item give replays the game's give-to-pouch call (profile.item_entry): x0 = pouchMgr, x1 = &cell
+// where cell = {const char* name}, w2 = category, w3 = count, x4 = get type, w5..w7 = flags, and a
+// ninth argument byte at [sp]. The call gets a private frame ItemFrame bytes below the top of the
+// private stack: [sp, sp+16) the stack argument, cell at sp+0x20, the name at sp+0x30 (NUL-padded),
+// so the callee's own frames grow down from sp into the rest of the stack.
+inline constexpr u64 ItemFrame = 0x100;
+inline constexpr u64 ItemStackNeed = 0x10000; // mapped bytes below the top before a give is tried
 
 struct GuestBinding {
     u64 base{}, manager{}, data{}, queue{}, sentinel{}, stack{};
@@ -24,6 +34,57 @@ struct GuestBinding {
     u64 bool_data{}, bool_queue{}, bool_hashes{};
     u32 bool_count{}, bool_capacity{};
 };
+
+/// What the opener's game passed to its give-to-pouch call, read at the trapped entry.
+struct ItemCall {
+    Change change;
+    bool forward{}; ///< A give from a reviewed caller (a chest's event flow), well formed
+    bool replay{};  ///< Our own synthetic call (returns to the sentinel): never forwarded
+    std::string line;
+};
+
+template <typename Jit, typename Memory>
+ItemCall ReadItemCall(Jit& jit, Memory& memory, u64 base, const OotGameDataTrace::Profile& profile,
+                      u64 sentinel, bool item_class) {
+    using OotGameDataTrace::Detail::Read32;
+    using OotGameDataTrace::Detail::Read64;
+    ItemCall call;
+    const u64 lr = jit.GetRegister(30);
+    const u64 caller = lr >= base ? lr - base : 0;
+    std::string name; // x1 points at a cell holding a NUL-terminated char*
+    const auto text = Read64(memory, jit.GetRegister(1));
+    if (text && *text) {
+        for (u64 i = 0; i <= ItemNameLimit; ++i) {
+            if (!memory.IsValidVirtualAddressRange(*text + i, 1)) { name.clear(); break; }
+            const u8 c = memory.Read8(*text + i);
+            if (c == 0) break;
+            name.push_back(static_cast<char>(c));
+        }
+    }
+    const auto stack = Read32(memory, jit.GetSP());
+    const u32 w2 = static_cast<u32>(jit.GetRegister(2)), w5 = static_cast<u32>(jit.GetRegister(5));
+    const u32 w6 = static_cast<u32>(jit.GetRegister(6)), w7 = static_cast<u32>(jit.GetRegister(7));
+    const u64 x4 = jit.GetRegister(4);
+    const ItemArgs args{w2 & 0xFF, static_cast<u32>(x4 & 0xFF),
+                        {static_cast<u8>(w5), static_cast<u8>(w6), static_cast<u8>(w7),
+                         static_cast<u8>(stack.value_or(0) & 0xFF)}};
+    call.change = Change{Kind::Item, {}, 0, PackItem(args),
+                         static_cast<s64>(static_cast<s32>(jit.GetRegister(3)))};
+    call.change.name = name;
+    call.replay = sentinel && lr == sentinel;
+    const bool reviewed = std::find(profile.item_callers.begin(), profile.item_callers.end(), caller) !=
+                          profile.item_callers.end();
+    // Only calls whose small arguments survive the packing are forwarded.
+    const bool valid = ValidItem(call.change) && w2 < 16 && x4 < 16 && w5 <= 0xFF && w6 <= 0xFF &&
+                       w7 <= 0xFF && stack.has_value();
+    call.forward = item_class && !call.replay && reviewed && valid;
+    call.line = fmt::format("item-give {} name={} category={} count={} get={} flags={},{},{},{} lr={}",
+                            call.replay ? "replayed" : call.forward ? "observed" : "seen",
+                            name.empty() ? "?" : name, w2, static_cast<s32>(jit.GetRegister(3)), x4,
+                            w5, w6, w7, args.flags[3],
+                            call.replay ? std::string{"sentinel"} : fmt::format("main+{:#x}", caller));
+    return call;
+}
 
 // Both flag classes use deferred guest setters, never direct byte stores:
 // the game's queue consumer owns notifications and dirty tracking (see HOOKS.md).
@@ -164,6 +225,7 @@ public:
             return ApplyTarget{true, false, 0, 0, *entry, binding.sentinel, binding.stack,
                                {*pouch, static_cast<u32>(static_cast<s32>(change.value)), RupeeReason}};
         }
+        if (change.kind == Kind::Item) return ResolveItem(change);
         if (!ReadFlag(change).has_value() || !Callable()) return {};
         const bool flat = change.kind == Kind::Bool;
         const auto entry = Verified(flat ? profile.bool_setter : profile.bit_setter);
@@ -177,14 +239,62 @@ public:
                            binding.stack, {binding.manager, 1, change.key}};
     }
 
+    /// Is the game where a give may run: no event in progress and every guard pointer live?
+    bool ItemReady() {
+        using namespace OotGameDataTrace::Detail;
+        if (!profile.event_got) return false;
+        const auto cell = Read64(memory, binding.base + profile.event_got);
+        const auto events = cell ? Read64(memory, *cell) : std::nullopt;
+        const auto running = events && *events ? Read64(memory, *events + 0x68) : std::nullopt;
+        if (!running || *running) return false; // unreadable or an event is running
+        for (const auto& [guard_cell, member] : profile.item_guards) {
+            const auto object = Read64(memory, binding.base + guard_cell);
+            if (!object || !*object) return false;
+            const auto field = Read64(memory, *object + member);
+            if (!field || !*field) return false;
+        }
+        return true;
+    }
+
+    std::optional<ApplyTarget> ResolveItem(const Change& change) {
+        using namespace OotGameDataTrace::Detail;
+        if (!ValidItem(change) || !binding.manager || !Callable() || binding.stack < ItemStackNeed ||
+            !Range(binding.stack - ItemStackNeed, ItemStackNeed) || !ItemReady()) return {};
+        // The remove call starts with the same words: the offset is what identifies the give.
+        const auto entry = Verified(profile.item_entry);
+        const auto pouch = profile.pouch_cell ? Read64(memory, binding.base + profile.pouch_cell)
+                                              : std::nullopt;
+        if (!entry || !pouch || !*pouch || !Range(*pouch, 0x10)) return {};
+        const auto args = UnpackItem(change.key);
+        const u64 sp = binding.stack - ItemFrame;
+        ApplyTarget target{true, false, 0, 0, *entry, binding.sentinel, sp,
+                           {*pouch, sp + 0x20, args.category, static_cast<u64>(change.value), args.get,
+                            args.flags[0], args.flags[1], args.flags[2]}};
+        target.stores = {{sp, args.flags[3]}, {sp + 8, 0}, {sp + 0x20, sp + 0x30}, {sp + 0x28, 0}};
+        for (size_t i = 0; i < 8; ++i) { // 64 bytes: up to 63 characters and the NUL
+            u64 word = 0;
+            for (size_t j = 0; j < 8; ++j) {
+                const size_t k = i * 8 + j;
+                if (k < change.name.size()) word |= u64{static_cast<u8>(change.name[k])} << (8 * j);
+            }
+            target.stores.emplace_back(sp + 0x30 + i * 8, word);
+        }
+        return target;
+    }
+
     bool OrFlag(const ApplyTarget&) { return false; }
     std::optional<Context> Capture() {
         return Context{jit.GetRegisters(), jit.GetVectors(), jit.GetPC(), jit.GetSP(), tls, tls_ro,
                        jit.GetPstate(), jit.GetFpcr(), jit.GetFpsr()};
     }
     bool Redirect(const ApplyTarget& target) {
-        if (binding.invalid || target.stack != binding.stack || target.sentinel != binding.sentinel)
+        if (binding.invalid || target.sentinel != binding.sentinel || target.stack > binding.stack ||
+            binding.stack - target.stack > ItemFrame || (target.stack & 15))
             return false;
+        // The argument block lies in [target.stack, binding.stack): the private stack only.
+        for (const auto& [address, value] : target.stores)
+            if (address < target.stack || address + 8 > binding.stack || !Range(address, 8)) return false;
+        for (const auto& [address, value] : target.stores) memory.Write64(address, value);
         // Reservations are discarded, as on a scheduler context switch: STXR must retry.
         jit.ClearExclusiveState();
         clear_exclusive();
@@ -259,6 +369,7 @@ public:
     bool Queue(const Change& change) { return applier.Queue(change); }
     bool Suppress(const Change& change) const { return applier.Suppress(change); }
     bool Calling() const { return applier.Phase() == ApplyPhase::Calling; }
+    size_t Pending() const { return applier.Pending(); }
     const std::optional<Change>& LastGrant() const { return applier.LastGrant(); }
     bool BaselineReady() const { return baseline; }
     void Invalidate() { applier.Invalidate(); }

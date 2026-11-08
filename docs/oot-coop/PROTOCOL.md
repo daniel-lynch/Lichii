@@ -126,6 +126,24 @@ late joiner does not receive earlier deltas). A receiver with `rupee` in
 `EDEN_NX2_OOT_COOP_ALLOW` applies it by calling the game's wallet entry from the frame drain;
 the game's own pouch update clamps it. The local wallet is not observed or re-sent in this pass.
 
+Item gives (class `item`, C7) are an event too: the game's own give-to-pouch call, as the opener's
+game made it, replayed on the receiver:
+
+```json
+{"type":"item_give","origin":"session-a","seq":4,"name":"<actor name>","category":6,"count":1,"get":7,"flags":[0,0,1,0]}
+```
+
+`name` is the item's actor name (1-63 of `[A-Za-z0-9_]`), `category` and `get` the call's pouch
+category and get type (0-15), `count` 1-999, `flags` the call's three flag registers and its
+stack byte (0-255 each). The opener forwards a call only when its return address is one of the
+profile's `item_callers` (a chest's event-flow give); every other give is logged as `seen` and
+not sent, and the receiver's own replay (it returns to the co-op sentinel) is never re-sent. Like
+`rupee_add` it is deduplicated by origin/sequence, kept in the replay window and never folded into
+team state or applied from a snapshot, so a duplicate delivery never gives twice and two
+different gives of the same item both add. The chest's opened Bool travels separately as an
+ordinary `bool_set`. The receiver replays it from the frame drain only when no event is running and
+the profile's guard pointers are live; until then it waits at the head of the queue.
+
 `quest_step`, `int_set`, `enum_set`, `pouch_add`, `pouch_total` are **rejected in v2**.
 A quest index maximum is not an OR over flags and an observed setter request is not
 proof of successful progress. The existing trace can still observe it locally. Pouch

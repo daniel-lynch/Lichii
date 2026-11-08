@@ -12,6 +12,9 @@ Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CT
   grant HEX [HEX...]        bool_set value=true for each hash, all frames in ONE socket write
   bit HEX [HEX...]          bit_set (actor u64) the same way
   rupee DELTA [DELTA...]    rupee_add (wallet hash) with each signed delta, all in ONE socket write
+  item NAME CAT COUNT [GET [F0 F1 F2 F3]]  item_give: one give call (get type default 7, flags 0)
+  dup SEQ                   re-deliver this peer's accepted event SEQ to the other clients (a duplicate)
+  expect-item NAME SECS     wait for the emulator's item_give of NAME
   expect HEX SECS           wait for the emulator's bool_set of HEX (any rev); result has the packet
   received                  every change packet received so far (from other origins)
   state                     the relay's team checkpoint as the peer sees it (team_state_request)
@@ -141,6 +144,38 @@ class FakePeer:
             if not deltas:
                 raise ValueError("no deltas")
             return await self.burst("rupee_add", deltas)
+        if verb == "item":
+            # item NAME CATEGORY COUNT [GET [F0 F1 F2 F3]]: one give call, as an opener would send it
+            if len(words) < 4:
+                raise ValueError("item NAME CATEGORY COUNT [GET [F0 F1 F2 F3]]")
+            flags = [int(word, 0) for word in words[5:9]] or [0, 0, 0, 0]
+            self.client.seq += 1
+            packet = {"type": "item_give", "origin": self.client.hello["client_id"], "seq": self.client.seq,
+                      "name": words[1], "category": int(words[2], 0), "count": int(words[3], 0),
+                      "get": int(words[4], 0) if len(words) > 4 else 7, "flags": flags}
+            since = len(self.seen)
+            await self.client.send(packet)
+            await self.wait(lambda p: p.get("type") == "ack" and p.get("seq") == packet["seq"], 5, since)
+            return {"sent": packet["seq"], "item": packet}
+        if verb == "dup":
+            # dup SEQ: deliver this peer's accepted event SEQ (same origin/seq/rev) once more to every
+            # other client of the team, as a duplicate delivery would (the relay itself never repeats)
+            seq, me = int(words[1]), self.client.hello["client_id"]
+            for room in self.relay.rooms.values():
+                for team in room.teams.values():
+                    for event in team.replay:
+                        if event.get("origin") == me and event.get("seq") == seq:
+                            targets = [cid for cid, c in team.clients.items() if cid != me]
+                            for cid in targets:
+                                team.clients[cid].send(event)
+                            return {"duplicated": seq, "to": targets}
+            raise ValueError("no such accepted event")
+        if verb == "expect-item":
+            try:
+                return {"packet": await self.wait(lambda p: p.get("type") == "item_give" and
+                                                  p.get("name") == words[1], float(words[2]))}
+            except TimeoutError:
+                return {"timeout": True}
         if verb == "expect":
             try:
                 return {"packet": await self.expect(int(words[1], 16), float(words[2]))}

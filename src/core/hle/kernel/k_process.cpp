@@ -1281,7 +1281,7 @@ Result KProcess::LoadFromMetadata(KernelCore& kernel, const FileSys::ProgramMeta
 Result KProcess::AllocateDebugCallMemory(KernelCore& kernel, KProcessAddress* stack_top,
                                          KProcessAddress* sentinel) {
     // Loader-only allocation: never acquire page-table locks inside a running JIT callback.
-    constexpr size_t StackSize = 0x4000;
+    constexpr size_t StackSize = 0x10000; // 64 KiB: the game's give-to-pouch call is deep
     constexpr size_t TotalSize = StackSize + PageSize;
     R_UNLESS((m_state == State::Created || m_state == State::CreatedAttached) &&
                  m_debug_call_memory_size == 0, ResultInvalidState);
