@@ -29,6 +29,7 @@
 #include "video_core/post_processing/fx_chain.h"
 #endif
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
+#include "video_core/pipeline_diagnostics.h"
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -280,6 +281,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     const auto presenting = trace ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
     present_manager.Present(frame);
+    VideoCommon::PipelineDiagnostics::AdvancePresentCount();
     const auto presented = trace ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
 #ifdef HAS_LSFG

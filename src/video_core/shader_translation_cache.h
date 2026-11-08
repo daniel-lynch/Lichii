@@ -304,6 +304,8 @@ struct RecipeCatalog {
         RecipeBaseline baseline = RecipeBaseline::Auto) const;
 };
 
+enum class ModuleSource { LoadedProduct, BootTranslation, ThisSession };
+
 enum class OfflineOutcome { VariantHit, VariantMiss, MetaMismatch, FullHit };
 
 class Store {
@@ -386,6 +388,20 @@ public:
     void LogOfflineOutcome(Shader::Stage stage, u64 hash, OfflineOutcome outcome);
     void LogStatistics(std::string_view when);
 
+    void SetBootComplete() { boot_complete.store(true, std::memory_order_relaxed); }
+    [[nodiscard]] ModuleSource EmissionSource() const {
+        return boot_complete.load(std::memory_order_relaxed)
+                   ? ModuleSource::ThisSession : ModuleSource::BootTranslation;
+    }
+    [[nodiscard]] std::optional<ModuleSource> VariantSource(const Digest& variant_key);
+    void LogModuleProvenance(const Entry& entry, const Digest& variant_key, u64 pipeline_hash,
+                             u64 shader_hash, u32 slot, std::string_view reason,
+                             std::string_view forced_reason = "none");
+    void LogForcedTranslation(const Digest& stage_key, Shader::Stage stage, u64 pipeline_hash,
+                              u64 shader_hash, u32 slot, std::string_view reason);
+    void LogUncachedModule(Shader::Stage stage, u64 pipeline_hash, u64 shader_hash, u32 slot,
+                           std::string_view reason, std::string_view forced_reason = "none");
+
     /// With count_mismatches set (use_shader_aot_translation), FindEntry misses on a known
     /// stage key are counted by the kind of the first query answered differently, taken from the
     /// candidate whose replay got furthest.
@@ -409,6 +425,7 @@ private:
     };
     struct StoredVariant {
         Digest entry_id{};
+        ModuleSource module_source{ModuleSource::LoadedProduct};
         mutable bool resume_validated{}; // Guarded by mutex.
         bool fallback_recipe{};
         Shader::Backend::Bindings binding_out{};
@@ -458,6 +475,8 @@ private:
     std::mutex writer_mutex;
     std::mutex mutex;
     bool enabled{};
+    Digest config_digest{};
+    std::atomic<bool> boot_complete{};
     bool persistence_failed{};
     std::atomic<u64> generation{};
     std::unordered_map<Digest, std::vector<std::shared_ptr<const Entry>>, DigestHash> entries;

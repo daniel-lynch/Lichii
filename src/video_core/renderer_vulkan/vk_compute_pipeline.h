@@ -17,6 +17,7 @@
 #include "common/common_types.h"
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/pipeline_diagnostics.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
@@ -44,7 +45,10 @@ public:
                              Common::ThreadWorker* thread_worker,
                              PipelineStatistics* pipeline_statistics,
                              VideoCore::ShaderNotify* shader_notify, const Shader::Info& info,
-                             vk::ShaderModule spv_module, u64 shader_hash);
+                             vk::ShaderModule spv_module, u64 shader_hash,
+                             VideoCommon::PipelineDiagnostics::WaitCounter& dispatch_waits);
+
+    ~ComputePipeline();
 
     ComputePipeline& operator=(ComputePipeline&&) noexcept = delete;
     ComputePipeline(ComputePipeline&&) noexcept = delete;
@@ -90,6 +94,10 @@ public:
         return build_task_done.load(std::memory_order::acquire);
     }
 
+    void SetRebuildDiagnostic(std::string description) {
+        rebuild_description = std::move(description);
+    }
+
 private:
     /// Builds the pipeline once, on whichever thread gets here first.
     void RunBuild();
@@ -100,6 +108,9 @@ private:
     DescriptorBufferRing& descriptor_buffer_ring;
     Shader::Info info;
     u64 shader_hash{};
+    VideoCommon::PipelineDiagnostics::WaitCounter& dispatch_waits;
+    std::atomic<u64> driver_compile_ns{};
+    std::string rebuild_description;
     u32 num_descriptor_entries{};
     boost::container::small_vector<VideoCommon::ImageViewId, 8> written_images;
     std::vector<SampledImage> sampled_images;

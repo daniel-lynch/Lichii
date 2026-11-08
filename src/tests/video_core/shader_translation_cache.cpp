@@ -273,6 +273,38 @@ TEST_CASE("Translation cache runtime info digest covers emitted state",
     REQUIRE_FALSE(DigestRuntimeInfo(info) == base);
 }
 
+TEST_CASE("Translation module provenance follows emission phase, not entry provenance",
+          "[video_core][translation_cache]") {
+    Store store;
+    store.Open({}, Digest{1, 2});
+    ProgramMeta meta{};
+    meta.stage = Shader::Stage::Compute;
+    const auto entry = store.Insert(Digest{3, 4}, {}, meta, true);
+    REQUIRE(entry);
+    const Digest boot_key{5, 6};
+    const Digest session_key{7, 8};
+    const Variant variant{.spirv = {0x07230203, 1, 2}};
+    REQUIRE_FALSE(store.VariantSource(boot_key));
+    REQUIRE(store.EmissionSource() == ModuleSource::BootTranslation);
+    REQUIRE(store.InsertVariant(*entry, boot_key, variant));
+    REQUIRE(store.VariantSource(boot_key) == ModuleSource::BootTranslation);
+    store.SetBootComplete();
+    REQUIRE(store.EmissionSource() == ModuleSource::ThisSession);
+    REQUIRE(store.InsertVariant(*entry, session_key, variant));
+    REQUIRE(store.VariantSource(session_key) == ModuleSource::ThisSession);
+    REQUIRE(store.InsertVariant(*entry, boot_key, variant));
+    REQUIRE(store.VariantSource(boot_key) == ModuleSource::BootTranslation);
+    REQUIRE(store.EmissionSource() == ModuleSource::ThisSession);
+    store.DropEntry(*entry);
+    REQUIRE_FALSE(store.VariantSource(boot_key));
+    REQUIRE_FALSE(store.VariantSource(session_key));
+    store.Open({}, Digest{1, 2});
+    const auto next_entry = store.Insert(Digest{3, 4}, {}, meta);
+    REQUIRE(next_entry);
+    REQUIRE(store.InsertVariant(*next_entry, boot_key, variant));
+    REQUIRE(store.VariantSource(boot_key) == ModuleSource::BootTranslation);
+}
+
 TEST_CASE("Translation cache persists entries and variants", "[video_core][translation_cache]") {
     const auto path = TempPath("lichii_translation_cache_test.bin");
     std::filesystem::remove(path);
@@ -319,6 +351,7 @@ TEST_CASE("Translation cache persists entries and variants", "[video_core][trans
         REQUIRE(found->info.stores_frag_depth);
         REQUIRE(InfoEqual(found->info, variant.info));
         REQUIRE(store.HasVariant(variant_key));
+        REQUIRE(store.VariantSource(variant_key) == ModuleSource::LoadedProduct);
         REQUIRE_FALSE(store.FindVariant(MakeVariantKey(entry->id, runtime, {})));
 
         // The environment answers a query differently: no entry.
@@ -1876,6 +1909,27 @@ TEST_CASE("Translation cache evicts oldest resident variants only with a disk co
         REQUIRE(memory.ResidentBytes() == 0);
     }
     std::filesystem::remove(path);
+}
+
+TEST_CASE("Runtime entry replay mismatches and unavailable queries are accounted",
+          "[video_core][translation_cache]") {
+    Store store;
+    store.Open({}, Digest{1, 2});
+    store.count_mismatches = true;
+    FakeEnvironment env;
+    ProgramMeta meta{};
+    meta.stage = Shader::Stage::Fragment;
+    const Digest stage_key{3, 4};
+    const auto entry = store.Insert(stage_key, {{QueryKind::CbufValue, 1, 0, 7}}, meta);
+    REQUIRE(entry);
+    REQUIRE_FALSE(entry->offline);
+    REQUIRE_FALSE(store.FindEntry(stage_key, env));
+    REQUIRE(store.first_mismatch[static_cast<size_t>(QueryKind::CbufValue)] == 1);
+    REQUIRE(store.offline_replay_misses == 0);
+    env.fail_cbuf_reads = true;
+    REQUIRE_FALSE(store.FindEntry(stage_key, env));
+    REQUIRE(store.first_mismatch[static_cast<size_t>(QueryKind::CbufValue)] == 2);
+    REQUIRE(store.offline_replay_misses == 0);
 }
 
 TEST_CASE("Offline replay misses count failed lookups rather than rejected candidates",

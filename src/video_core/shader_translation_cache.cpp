@@ -17,6 +17,8 @@
 #include <type_traits>
 #include <utility>
 
+#include <boost/crc.hpp>
+
 #include "common/cityhash.h"
 #include "common/fs/fs.h"
 #include "common/logging.h"
@@ -26,6 +28,7 @@
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/nx2_switch.h"
 #include "shader_recompiler/translator_identity.h"
+#include "video_core/pipeline_diagnostics.h"
 #include "video_core/shader_translation_cache.h"
 
 #ifdef _WIN32
@@ -66,6 +69,20 @@ constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
 constexpr u8 RecordVariant = 1;
 constexpr u8 RecordDrop = 2;
+
+bool LogTranslationMisses() {
+    static const bool enabled = Shader::Nx2Switch("EDEN_NX2_TRANSLATION_MISS_LOG", false);
+    return enabled;
+}
+
+std::string_view ModuleSourceName(ModuleSource source) {
+    switch (source) {
+    case ModuleSource::LoadedProduct: return "loaded-product";
+    case ModuleSource::BootTranslation: return "boot-translation";
+    case ModuleSource::ThisSession: return "this-session";
+    }
+    return "unknown";
+}
 
 // The number of fields of an aggregate, to notice a structure gaining a field this file does not
 // serialize or digest yet.
@@ -457,6 +474,18 @@ bool ReadMeta(std::span<const u8>& in, ProgramMeta& meta,
              reader.Get(meta.mesh.max_primitives) && reader.Get(meta.mesh.topology) &&
              reader.GetVector(meta.mesh.vertex_lines, meta.mesh.vertex_lines.capacity()) &&
              reader.GetVector(meta.mesh.primitive_lines, meta.mesh.primitive_lines.capacity())));
+}
+
+Digest QueryIdentity(std::span<const Query> queries) {
+    Hasher hasher;
+    for (const Query& query : queries) {
+        hasher.Add(query.kind);
+        hasher.Add(query.a);
+        hasher.Add(query.b);
+        hasher.Add(query.answer);
+        hasher.Add(query.c);
+    }
+    return hasher.Finish();
 }
 
 Digest EntryId(const Digest& stage_key, std::span<const Query> queries, bool offline) {
@@ -1546,6 +1575,7 @@ void Store::Close() {
     entries_with_modules.clear();
     offline_entry_only_rejected = 0;
     enabled = false;
+    boot_complete.store(false, std::memory_order_relaxed);
     persistence_failed = false;
     file.clear();
     append_offset = FileMagic.size() + sizeof(u32) + sizeof(Digest);
@@ -1560,6 +1590,7 @@ void Store::Open(const std::filesystem::path& path, const Digest& config) {
     std::scoped_lock writer_lock{writer_mutex};
     std::scoped_lock lock{mutex};
     enabled = true;
+    config_digest = config;
     if (path.empty()) {
         return;
     }
@@ -1950,6 +1981,33 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
                  "Translation cache: written by another build or configuration, starting over");
         return false;
     }
+    if (LogTranslationMisses() && !collect_recipe_entries) {
+        Hasher header_hasher;
+        header_hasher.AddBytes(header.data(), header.size());
+        const Digest header_digest = header_hasher.Finish();
+        // CRC-64/ECMA-182 of the entire accepted input, including a possible truncated tail.
+        boost::crc_optimal<64, 0x42F0E1EBA9EA3693ULL, 0, 0, false, false> checksum;
+        std::array<char, 64 * 1024> bytes{};
+        in.seekg(0);
+        size_t read = 0;
+        while (in.read(bytes.data(), bytes.size()) || in.gcount()) {
+            checksum.process_bytes(bytes.data(), static_cast<size_t>(in.gcount()));
+            read += static_cast<size_t>(in.gcount());
+        }
+        if (read == size) {
+            LOG_INFO(Render_Vulkan,
+                     "Translation product accepted: path={} version={} config={:016x}{:016x} "
+                     "header_digest={:016x}{:016x} checksum_crc64_ecma={:016x} bytes={} "
+                     "module_source=loaded-product (accepted snapshot; historical origin unknown)",
+                     Common::FS::PathToUTF8String(path), version, file_config.hi, file_config.lo,
+                     header_digest.hi, header_digest.lo, checksum.checksum(), size);
+        } else {
+            LOG_WARNING(Render_Vulkan, "Translation product checksum failed: path={} read={} bytes={}",
+                        Common::FS::PathToUTF8String(path), read, size);
+        }
+        in.clear();
+        in.seekg(HeaderSize);
+    }
     info_layout = InfoLayout::Current;
     if (version < FormatVersion) {
         info_layout = DetectInfoLayout(in, size);
@@ -2095,17 +2153,25 @@ std::shared_ptr<const Entry> Store::InsertLocked(Entry entry) {
 std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::Environment& env,
                                               LiveAnswers* live, u64 pipeline_hash,
                                               u64 shader_hash, u32 slot) {
-    static const bool log_misses = [] {
-        const char* value = std::getenv("EDEN_NX2_TRANSLATION_MISS_LOG");
-        return value && std::string_view{value} == "1";
-    }();
+    const bool log_misses = LogTranslationMisses();
+    const Entry* mismatch_entry = nullptr;
     const auto log_miss = [&](std::string_view reason, std::string_view difference) {
         if (log_misses) {
+            const Digest query_id = mismatch_entry ? QueryIdentity(mismatch_entry->queries) : Digest{};
             LOG_INFO(Render_Vulkan,
-                     "Translation cache miss: pipeline={:016x} slot={} shader={:016x} "
-                     "stage={} stage_key={:016x}{:016x} reason={} first_query={}",
-                     pipeline_hash, slot, shader_hash, static_cast<u32>(env.ShaderStage()),
-                     stage_key.hi, stage_key.lo, reason, difference);
+                     "Translation cache miss: pipeline={:016x} present={} slot={} shader={:016x} "
+                     "stage={} config={:016x}{:016x} stage_key={:016x}{:016x} "
+                     "candidate_entry={:016x}{:016x} entry_offline={} query_id={:016x}{:016x} "
+                     "queries={} variant_key=unresolved "
+                     "module_source=none reason={} forced=none first_query={}",
+                     pipeline_hash, PipelineDiagnostics::PresentCount(), slot, shader_hash,
+                     static_cast<u32>(env.ShaderStage()),
+                     config_digest.hi, config_digest.lo, stage_key.hi, stage_key.lo,
+                     mismatch_entry ? mismatch_entry->id.hi : 0,
+                     mismatch_entry ? mismatch_entry->id.lo : 0,
+                     mismatch_entry ? (mismatch_entry->offline ? "true" : "false") : "unresolved",
+                     query_id.hi, query_id.lo,
+                     mismatch_entry ? mismatch_entry->queries.size() : 0, reason, difference);
         }
     };
     std::vector<std::shared_ptr<const Entry>> candidates;
@@ -2126,6 +2192,7 @@ std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::E
     size_t furthest = 0;
     std::optional<QueryKind> furthest_kind;
     std::string difference;
+    bool replay_exception = false;
     bool offline_failed = false;
     for (const auto& candidate : candidates) {
         ReplayMismatch mismatch;
@@ -2143,6 +2210,8 @@ std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::E
         if (candidate->offline) offline_failed = true;
         if (mismatch.index < candidate->queries.size() &&
             (!furthest_kind || mismatch.index > furthest)) {
+            mismatch_entry = candidate.get();
+            replay_exception = !failure.empty();
             furthest = mismatch.index;
             const Query& query = candidate->queries[furthest];
             furthest_kind = query.kind;
@@ -2166,7 +2235,8 @@ std::shared_ptr<const Entry> Store::FindEntry(const Digest& stage_key, Shader::E
     if (count_mismatches && furthest_kind) {
         ++first_mismatch[static_cast<size_t>(*furthest_kind) % first_mismatch.size()];
     }
-    log_miss(candidates.empty() ? "dropped" : "replay", difference.empty() ? "none" : difference);
+    log_miss(candidates.empty() ? "dropped" : replay_exception ? "replay-exception" : "replay",
+             difference.empty() ? "none" : difference);
     return nullptr;
 }
 
@@ -2334,6 +2404,7 @@ bool Store::InsertVariant(const Entry& entry, const Digest& variant_key, const V
     }
     auto stored = std::make_shared<StoredVariant>();
     stored->entry_id = entry.id;
+    stored->module_source = EmissionSource();
     stored->fallback_recipe = variant.fallback_recipe;
     stored->binding_out = variant.binding_out;
     auto resident = std::make_shared<ResidentVariant>();
@@ -2461,9 +2532,71 @@ void Store::LogOfflineOutcome(Shader::Stage stage, u64 hash, OfflineOutcome outc
     }
 }
 
+std::optional<ModuleSource> Store::VariantSource(const Digest& variant_key) {
+    std::scoped_lock lock{mutex};
+    const auto found = variants.find(variant_key);
+    if (found == variants.end() || dropped_entries.contains(found->second->entry_id)) {
+        return std::nullopt;
+    }
+    return found->second->module_source;
+}
+
+void Store::LogModuleProvenance(const Entry& entry, const Digest& variant_key, u64 pipeline_hash,
+                                u64 shader_hash, u32 slot, std::string_view reason,
+                                std::string_view forced_reason) {
+    if (!LogTranslationMisses()) return;
+    const auto cache_source = VariantSource(variant_key);
+    // Another emitter may already have stored this key; the code just emitted still belongs
+    // to this phase, independently of the copy retained by InsertVariant.
+    const auto source = reason == "emitted" || reason == "worker-emitted"
+                            ? std::optional{EmissionSource()} : cache_source;
+    const Digest query_id = QueryIdentity(entry.queries);
+    LOG_INFO(Render_Vulkan,
+             "Translation module: pipeline={:016x} present={} slot={} shader={:016x} stage={} "
+             "config={:016x}{:016x} stage_key={:016x}{:016x} entry={:016x}{:016x} "
+             "query_id={:016x}{:016x} queries={} variant_key={:016x}{:016x} "
+             "entry_offline={} module_source={} cache_source={} reason={} forced={}",
+             pipeline_hash, PipelineDiagnostics::PresentCount(), slot, shader_hash,
+             static_cast<u32>(entry.meta.stage), config_digest.hi, config_digest.lo,
+             entry.stage_key.hi, entry.stage_key.lo, entry.id.hi, entry.id.lo,
+             query_id.hi, query_id.lo, entry.queries.size(), variant_key.hi, variant_key.lo,
+             entry.offline, source ? ModuleSourceName(*source) : "none",
+             cache_source ? ModuleSourceName(*cache_source) : "none", reason, forced_reason);
+}
+
+void Store::LogUncachedModule(Shader::Stage stage, u64 pipeline_hash, u64 shader_hash, u32 slot,
+                              std::string_view reason, std::string_view forced_reason) {
+    if (!LogTranslationMisses()) return;
+    LOG_INFO(Render_Vulkan,
+             "Translation module: pipeline={:016x} present={} slot={} shader={:016x} stage={} "
+             "config={} stage_key=unavailable entry=unavailable query_id=unavailable "
+             "variant_key=unavailable entry_offline=unavailable module_source={} "
+             "cache_source=none reason={} forced={}",
+             pipeline_hash, PipelineDiagnostics::PresentCount(), slot, shader_hash,
+             static_cast<u32>(stage),
+             enabled ? fmt::format("{:016x}{:016x}", config_digest.hi, config_digest.lo)
+                     : "unavailable",
+             ModuleSourceName(EmissionSource()), reason, forced_reason);
+}
+
+void Store::LogForcedTranslation(const Digest& stage_key, Shader::Stage stage, u64 pipeline_hash,
+                                 u64 shader_hash, u32 slot, std::string_view reason) {
+    if (!LogTranslationMisses()) return;
+    LOG_INFO(Render_Vulkan,
+             "Translation cache miss: pipeline={:016x} present={} slot={} shader={:016x} "
+             "stage={} config={:016x}{:016x} stage_key={:016x}{:016x} "
+             "entry=unresolved entry_offline=unresolved query_id=unresolved variant_key=unresolved "
+             "module_source=none "
+             "reason=forced-translation forced={}",
+             pipeline_hash, PipelineDiagnostics::PresentCount(), slot, shader_hash,
+             static_cast<u32>(stage), config_digest.hi, config_digest.lo,
+             stage_key.hi, stage_key.lo, reason);
+}
+
 void Store::LogStatistics(std::string_view when) {
-    LOG_INFO(Render_Vulkan, "Translation cache misses ({}): stage_key={} offline_query_replay={} offline_dropped={}",
-             when, entry_key_misses.load(), offline_replay_misses.load(), offline_dropped_misses.load());
+    LOG_INFO(Render_Vulkan, "Translation cache misses ({}): present={} stage_key={} offline_query_replay={} offline_dropped={}",
+             when, PipelineDiagnostics::PresentCount(), entry_key_misses.load(),
+             offline_replay_misses.load(), offline_dropped_misses.load());
     LOG_INFO(Render_Vulkan, "Translation cache ({}): offline entry-only records rejected={}",
              when, offline_entry_only_rejected.load());
     for (size_t stage = 0; stage < offline_outcomes.size(); ++stage) {

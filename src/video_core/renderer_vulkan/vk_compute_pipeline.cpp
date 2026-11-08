@@ -256,11 +256,12 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                                  Common::ThreadWorker* thread_worker,
                                  PipelineStatistics* pipeline_statistics,
                                  VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
-                                 vk::ShaderModule spv_module_, u64 shader_hash_)
+                                 vk::ShaderModule spv_module_, u64 shader_hash_,
+                                 VideoCommon::PipelineDiagnostics::WaitCounter& dispatch_waits_)
     : device{device_},
       pipeline_cache(pipeline_cache_), guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_},
-      shader_hash{shader_hash_}, spv_module(std::move(spv_module_)) {
+      shader_hash{shader_hash_}, dispatch_waits{dispatch_waits_}, spv_module(std::move(spv_module_)) {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -347,11 +348,18 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             TracePipelineBuild("BEGIN", "compute", shader_hash, traced, unoptimized);
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
             const auto build_end = std::chrono::steady_clock::now();
+            driver_compile_ns.store(static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(build_end - build_begin).count()),
+                std::memory_order_relaxed);
             ReportDriverBuild(shader_hash, build_end - build_begin, cpu_begin);
             TracePipelineBuild("END", "compute", shader_hash, traced, unoptimized,
                                std::chrono::duration<double, std::milli>(build_end - trace_begin)
                                    .count());
         } catch (const vk::Exception& exception) {
+            driver_compile_ns.store(static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - build_begin).count()),
+                std::memory_order_relaxed);
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());
             std::scoped_lock lock{build_mutex};
@@ -393,6 +401,17 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         });
     } else {
         RunBuild();
+    }
+}
+
+ComputePipeline::~ComputePipeline() {
+    // The scheduler and pipeline workers are drained before cached pipelines are destroyed.
+    if (!rebuild_description.empty()) {
+        LOG_INFO(Render_Vulkan,
+                 "Compute null-slot rebuild: {} driver_compile_ms={:.3f} dispatch_wait_ms=0 "
+                 "present={} dispatch=not-reached driver_result={}",
+                 rebuild_description, driver_compile_ns.load(std::memory_order_relaxed) / 1e6,
+                 VideoCommon::PipelineDiagnostics::PresentCount(), pipeline ? "ready" : "failed");
     }
 }
 
@@ -666,15 +685,30 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         return false;
     }
 
-    if (!is_built.load(std::memory_order::relaxed)) {
-        // Wait for the pipeline to be built
-        scheduler.Record([this](vk::CommandBuffer) {
-            const auto begin = std::chrono::steady_clock::now();
-            const bool claimed = !build_claimed.load(std::memory_order::relaxed);
-            RunBuild();
-            std::unique_lock lock{build_mutex};
-            build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
-            ReportDispatchWait(shader_hash, std::chrono::steady_clock::now() - begin, claimed);
+    if (!is_built.load(std::memory_order::acquire) || !rebuild_description.empty()) {
+        // Only pipeline waiting belongs here; descriptor preparation and queue latency do not.
+        scheduler.Record([this, rebuild = std::exchange(rebuild_description, {})](vk::CommandBuffer) {
+            double wait_ms{};
+            if (!is_built.load(std::memory_order::acquire)) {
+                const auto begin = std::chrono::steady_clock::now();
+                const u64 wait = dispatch_waits.Begin(begin);
+                const bool claimed = !build_claimed.load(std::memory_order_relaxed);
+                RunBuild();
+                std::unique_lock lock{build_mutex};
+                build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::acquire); });
+                const auto end = std::chrono::steady_clock::now();
+                dispatch_waits.End(wait);
+                wait_ms = Milliseconds(end - begin);
+                ReportDispatchWait(shader_hash, end - begin, claimed);
+            }
+            if (!rebuild.empty()) {
+                LOG_INFO(Render_Vulkan,
+                         "Compute null-slot rebuild: {} driver_compile_ms={:.3f} "
+                         "dispatch_wait_ms={:.3f} present={} driver_result={}",
+                         rebuild, driver_compile_ns.load(std::memory_order_relaxed) / 1e6,
+                         wait_ms, VideoCommon::PipelineDiagnostics::PresentCount(),
+                         pipeline ? "ready" : "failed");
+            }
         });
     }
 

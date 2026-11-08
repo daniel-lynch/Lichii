@@ -766,6 +766,12 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         device.SupportsProvokingVertexLastMode();
     dynamic_features.has_provoking_vertex_tf_preserve =
         device.SupportsTransformFeedbackProvokingVertexPreservation();
+    VideoCommon::PipelineDiagnostics::ResetPresentCount();
+    (void)GraphicsPipeline::TakeHoldTime();
+    for (auto& counter : runtime_spirv_ns) {
+        counter.store(0, std::memory_order_relaxed);
+    }
+    StartDiagnosticReports();
 }
 
 namespace {
@@ -1428,12 +1434,15 @@ void PipelineCache::LogStageOutcomes(std::string_view when) {
              "Shader AOT ({}): run-time pipelines / ms of draws held, all modules from the cache "
              "{} / {:.1f}, a seeded stage's module made on a worker {} / {:.1f}, a known "
              "program's module made on a worker {} / {:.1f}, a stage translated at the draw {} / "
-             "{:.1f}; other pipelines (boot, background) held {:.1f} ms",
+             "{:.1f}; other pipelines (boot, background) held {:.1f} ms; "
+             "compute dispatch-wait {:.1f} ms (including active), present={}",
              when, pipelines_by_class[0].load(), GraphicsPipeline::HoldNsOfClass(0) / 1e6,
              pipelines_by_class[1].load(), GraphicsPipeline::HoldNsOfClass(1) / 1e6,
              pipelines_by_class[2].load(), GraphicsPipeline::HoldNsOfClass(2) / 1e6,
              pipelines_by_class[3].load(), GraphicsPipeline::HoldNsOfClass(3) / 1e6,
-             GraphicsPipeline::HoldNsOfClass(4) / 1e6);
+             GraphicsPipeline::HoldNsOfClass(4) / 1e6,
+             std::chrono::duration<double, std::milli>(compute_dispatch_waits.Read().total).count(),
+             VideoCommon::PipelineDiagnostics::PresentCount());
     {
         std::scoped_lock lock{recipe_mutex};
         LOG_INFO(Render_Vulkan,
@@ -1479,8 +1488,11 @@ PipelineCache::~PipelineCache() {
     }
     serialization_thread.WaitForRequests();
     SaveRecipes();
+    diagnostic_reports.request_stop();
+    diagnostic_reports.join();
     translation_cache.LogStatistics("run time");
     LogStageOutcomes("run time");
+    LogRuntimePipelines(true);
     if (translation_cache_verify) {
         LOG_INFO(Render_Vulkan,
                  "Translation cache: {} cached stages compared with a fresh translation, {} differed",
@@ -1667,10 +1679,6 @@ bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry)
         const GPUVAddr address{gpu_memory->Read<u64>(slot)};
         if (address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
             gpu_memory->IsFullyMappedRange(address, 1)) {
-            LOG_INFO(Render_Vulkan,
-                     "Rebuilding compute program {:#x}: c{}[{:#x}] was null at translation and "
-                     "now points to {:#x}",
-                     kepler_compute->regs.code_loc.Address() + qmd.program_start, index, offset, address);
             return true;
         }
     }
@@ -1700,7 +1708,31 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
         // binds, null now or not: a null pointer binds nothing.
         auto rebuilt{CreateComputePipeline(
             key, shader, ComputeKeepPointers() ? std::span<const u64>{entry.mapped_pointers}
-                                               : std::span<const u64>{})};
+                                               : std::span<const u64>{}, true)};
+        static const bool log_rebuilds = Shader::Nx2Switch("EDEN_NX2_COMPUTE_REBUILD_LOG", false);
+        if (log_rebuilds) {
+            const auto answers = [](const ComputePipelineCacheEntry& value) {
+                std::string text;
+                for (const auto& query : value.pointer_answers) {
+                    text += fmt::format(" kind{}:c{}+{:x}+{:x}={}",
+                                        static_cast<u32>(query.kind), query.a, query.b,
+                                        query.c, query.answer);
+                }
+                return text.empty() ? std::string{value.pipeline ? "none" : "unavailable"} : text;
+            };
+            const auto description = fmt::format(
+                "key={:016x} shader={:016x} rebuild={} old_answers=[{}] new_answers=[{}] "
+                "noinline={}", key.Hash(), key.unique_hash, entry.rebuilds + 1,
+                answers(entry), answers(rebuilt), Shader::Nx2Switch("EDEN_NX2_COMPUTE_NOINLINE", true));
+            if (rebuilt.pipeline) {
+                rebuilt.pipeline->SetRebuildDiagnostic(description);
+            } else {
+                LOG_INFO(Render_Vulkan,
+                         "Compute null-slot rebuild: {} driver_compile_ms=unavailable "
+                         "dispatch_wait_ms=0 present={} result=translation-failed reason={}",
+                         description, VideoCommon::PipelineDiagnostics::PresentCount(), rebuilt.failure);
+            }
+        }
         if (rebuilt.pipeline) {
             if (entry.pipeline) {
                 retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
@@ -1969,6 +2001,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     workers.WaitForRequests(stop_loading);
 
+    translation_cache.SetBootComplete();
     translation_cache.LogStatistics("boot");
     if (aot_translation) {
         LOG_INFO(Render_Vulkan, "Boot preload: {} task/mesh pipelines queued, {} pipelines failed",
@@ -2046,7 +2079,7 @@ namespace {
 // log which parts of the fixed state differ from that one (finds state that splits the same
 // draws into many pipelines, each translated on the GPU thread).
 void ReportNewPipelineKey(const GraphicsPipelineCacheKey& key) {
-    static const bool enabled = std::getenv("EDEN_NX2_PIPELINE_DIFF") != nullptr;
+    static const bool enabled = Shader::Nx2Switch("EDEN_NX2_PIPELINE_DIFF", false);
     if (!enabled) {
         return;
     }
@@ -2242,6 +2275,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     namespace TC = VideoCommon::TranslationCache;
     using Clock = std::chrono::steady_clock;
     const bool use_translation_cache = translation_cache.Enabled() && !uses_vertex_a;
+    const std::string_view uncached_reason =
+        !translation_cache.Enabled() ? "cache-disabled"
+        : uses_vertex_a ? "vertex-a-cache-disabled" : "uncacheable-or-entry-not-retained";
     std::array<std::shared_ptr<const TC::Entry>, Maxwell::MaxShaderProgram> cached_entries{};
     /// AOT translation: the live answers of each matched entry (class-level replay).
     std::array<TC::LiveAnswers, Maxwell::MaxShaderProgram> live_answers{};
@@ -2489,7 +2525,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 !program.info.stores.Legacy() && !TC::InfoEqual(variant->info, program.info)) {
                 ++aot_variant_meta_differs;
                 variant.reset();
+                translation_cache.LogModuleProvenance(*entry, variant_key, hash,
+                    key.unique_hashes[index], static_cast<u32>(index), "variant-metadata-mismatch");
             }
+            translation_cache.LogModuleProvenance(*entry, variant_key, hash,
+                key.unique_hashes[index], static_cast<u32>(index),
+                variant ? "variant-hit" : "variant-miss");
         }
         if (entry && entry->offline && (variant || !emit_pools || translation_cache_verify)) {
             translation_cache.LogOfflineOutcome(program.stage, key.unique_hashes[index],
@@ -2622,6 +2663,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 } else if (entry) {
                     translation_cache.InsertVariant(*entry, variant_key,
                                                     TC::Variant{binding, program.info, code}, &emission_recipe);
+                } else {
+                    translation_cache.LogUncachedModule(program.stage, hash, key.unique_hashes[index],
+                        static_cast<u32>(index), is_emulated_stage ? "emulated-stage"
+                        : layer_source_program ? "layer-emulation" : uncached_reason);
+                }
+                if (entry) {
+                    translation_cache.LogModuleProvenance(*entry, variant_key, hash,
+                        key.unique_hashes[index], static_cast<u32>(index), "emitted",
+                        translation_cache_verify ? "verification" : "none");
                 }
             }
         } else {
@@ -2682,7 +2732,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 infos[stage] = &job->programs[stage + 1].info;
             }
         }
-        emit_stages = [this, job = std::move(job), hashes = key.unique_hashes]() mutable {
+        emit_stages = [this, job = std::move(job), hashes = key.unique_hashes, hash,
+                       uncached_reason = layer_source_program ? std::string_view{"layer-emulation"}
+                                                             : uncached_reason]() mutable {
             const auto begin = std::chrono::steady_clock::now();
             std::array<vk::ShaderModule, Maxwell::MaxShaderStage> stage_modules =
                 std::move(job->modules);
@@ -2702,6 +2754,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                         stage_entry->id, TC::DigestRuntimeInfo(stage_runtime_info), stage_binding);
                     if (auto cached = translation_cache.FindVariant(lookup_key)) {
                         if (TC::InfoEqual(cached->info, stage_program.info)) {
+                            translation_cache.LogModuleProvenance(*stage_entry, lookup_key, hash,
+                                hashes[stage + 1], static_cast<u32>(stage + 1), "worker-variant-hit");
                             ++worker_variant_hits;
                             if (stage_entry->offline) {
                                 translation_cache.LogOfflineOutcome(
@@ -2723,7 +2777,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                             continue;
                         }
                         ++worker_variant_info_differs;
+                        translation_cache.LogModuleProvenance(*stage_entry, lookup_key, hash,
+                            hashes[stage + 1], static_cast<u32>(stage + 1),
+                            "worker-variant-metadata-mismatch");
                     }
+                    translation_cache.LogModuleProvenance(*stage_entry, lookup_key, hash,
+                        hashes[stage + 1], static_cast<u32>(stage + 1), "worker-variant-miss");
                 }
                 if (job->seeded[stage]) {
                     ++aot_emitted_at_draw;
@@ -2779,7 +2838,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                                            : std::nullopt;
                 if (variant && !TC::InfoEqual(variant->info, stage_program.info)) {
                     // Pipeline layout construction already consumed the live program's info.
+                    translation_cache.LogModuleProvenance(*stage_entry, stage_variant_key, hash,
+                        hashes[stage + 1], static_cast<u32>(stage + 1),
+                        "worker-late-variant-metadata-mismatch");
                     variant.reset();
+                }
+                if (stage_entry) {
+                    translation_cache.LogModuleProvenance(*stage_entry, stage_variant_key, hash,
+                        hashes[stage + 1], static_cast<u32>(stage + 1),
+                        variant ? "worker-late-variant-hit" : "worker-late-variant-miss");
                 }
                 if (stage_entry && stage_entry->offline) {
                     translation_cache.LogOfflineOutcome(stage_program.stage, hashes[stage + 1],
@@ -2799,6 +2866,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     translation_cache.InsertVariant(
                         *stage_entry, stage_variant_key,
                         TC::Variant{stage_binding, stage_program.info, stage_code}, &emission_recipe);
+                }
+                if (stage_entry) {
+                    translation_cache.LogModuleProvenance(*stage_entry, stage_variant_key, hash,
+                        hashes[stage + 1], static_cast<u32>(stage + 1),
+                        variant ? "worker-variant-hit" : "worker-emitted");
+                } else {
+                    translation_cache.LogUncachedModule(stage_program.stage, hash, hashes[stage + 1],
+                        static_cast<u32>(stage + 1), hashes[stage + 1] == 0 ? "emulated-stage"
+                                                                         : uncached_reason);
                 }
                 stage_modules[stage] =
                     BuildStageModule(device, stage_code, hashes[stage + 1], stage);
@@ -2880,43 +2956,87 @@ std::array<std::atomic<u64>, 4> runtime_compute_builds{};
 
 void LogRuntimeComputeBuilds(std::string_view when) {
     LOG_INFO(Render_Vulkan,
-             "Runtime compute pipelines ({}): offline={} cached={} translated={} uncached={}",
-             when, runtime_compute_builds[1].load(), runtime_compute_builds[2].load(),
+             "Runtime compute pipelines ({}): present={} offline={} cached={} translated={} uncached={}",
+             when, VideoCommon::PipelineDiagnostics::PresentCount(), runtime_compute_builds[1].load(), runtime_compute_builds[2].load(),
              runtime_compute_builds[3].load(), runtime_compute_builds[0].load());
 }
 
-// Pipelines built on the GPU thread at run time (shader translation, and the SPIR-V unless a worker
-// emits it). Preparation is logged for every hash so it can be joined with executor,
-// translation/emission, driver and held-wait timings.
-// Totals are reported every 10 s.
-void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_point begin,
-                           const std::string& shaders) {
-    static std::chrono::steady_clock::duration total{};
-    static u32 count{};
-    static auto window = std::chrono::steady_clock::now();
-    const auto now = std::chrono::steady_clock::now();
-    const auto elapsed = now - begin;
-    total += elapsed;
-    ++count;
-    const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
-    LOG_INFO(Render_Vulkan, "{} pipeline built on the GPU thread in {:.1f} ms: {}", kind,
-             ms(elapsed), shaders);
-    if (now - window > std::chrono::seconds{10}) {
-        const auto take = [](auto& counter) {
-            return std::chrono::nanoseconds{counter.exchange(0, std::memory_order::relaxed)};
-        };
-        LOG_INFO(Render_Vulkan,
-                 "Runtime pipelines in the last 10 s: {} built, {:.1f} ms on the GPU thread "
-                 "({:.1f} ms of it graphics SPIR-V), {:.1f} ms graphics SPIR-V on workers, "
-                 "{:.1f} ms of draws held for unbuilt pipelines",
-                 count, ms(total), ms(take(runtime_spirv_ns[0])), ms(take(runtime_spirv_ns[1])),
-                 ms(GraphicsPipeline::TakeHoldTime()));
-        total = {};
-        count = 0;
-        window = now;
-    }
-}
 } // Anonymous namespace
+
+void PipelineCache::ReportRuntimePipeline(const char* kind,
+                                         std::chrono::steady_clock::time_point begin,
+                                         const std::string& shaders) {
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    runtime_pipeline_ns.fetch_add(static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+        std::memory_order_relaxed);
+    runtime_pipeline_count.fetch_add(1, std::memory_order_relaxed);
+    LOG_INFO(Render_Vulkan, "{} pipeline built on the GPU thread in {:.1f} ms: {}", kind,
+             std::chrono::duration<double, std::milli>(elapsed).count(), shaders);
+}
+
+void PipelineCache::LogRuntimePipelines(bool shutdown) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto wait = compute_dispatch_waits.Read();
+    const u64 count = runtime_pipeline_count.load(std::memory_order_relaxed);
+    const u64 ns = runtime_pipeline_ns.load(std::memory_order_relaxed);
+    const auto graphics_hold = GraphicsPipeline::TakeHoldTime();
+    graphics_hold_total += graphics_hold;
+    const auto ms = [](auto duration) {
+        return std::chrono::duration<double, std::milli>(duration).count();
+    };
+    const auto take = [](auto& counter) {
+        return std::chrono::nanoseconds{counter.exchange(0, std::memory_order_relaxed)};
+    };
+    LOG_INFO(Render_Vulkan,
+             "Runtime pipelines in the last 10 s: present={} {} built, {:.1f} ms on the GPU thread "
+             "({:.1f} ms of it graphics SPIR-V), {:.1f} ms graphics SPIR-V on workers, "
+             "{:.1f} ms of draws held for unbuilt pipelines, {:.1f} ms compute dispatch-wait "
+             "(active={}, total_ms={:.1f}); window_ms={:.1f} reason={}",
+             VideoCommon::PipelineDiagnostics::PresentCount(), count - reported_pipeline_count,
+             static_cast<double>(ns - reported_pipeline_ns) / 1e6,
+             ms(take(runtime_spirv_ns[0])), ms(take(runtime_spirv_ns[1])), ms(graphics_hold),
+             ms(wait.total - reported_compute_wait), wait.active, ms(wait.total),
+             ms(now - runtime_report_time), shutdown ? "shutdown-tail" : "periodic");
+    if (shutdown) {
+        LOG_INFO(Render_Vulkan,
+                 "Runtime pipelines (shutdown): present={} {} built, {:.1f} ms on the GPU thread, "
+                 "{:.1f} ms of draws held for unbuilt pipelines, {:.1f} ms compute dispatch-wait "
+                 "(active={})",
+                 VideoCommon::PipelineDiagnostics::PresentCount(), count, ns / 1e6,
+                 ms(graphics_hold_total), ms(wait.total), wait.active);
+    }
+    reported_pipeline_count = count;
+    reported_pipeline_ns = ns;
+    reported_compute_wait = wait.total;
+    runtime_report_time = now;
+}
+
+void PipelineCache::StartDiagnosticReports() {
+    runtime_report_time = std::chrono::steady_clock::now();
+    const char* mark_file = std::getenv("EDEN_NX2_OOT_MARK_FILE");
+    const auto path = VideoCommon::PipelineDiagnostics::MarkFilePath(mark_file);
+    // This heartbeat must keep running while the scheduler is blocked in a driver build.
+    diagnostic_reports = std::jthread([this, path](std::stop_token stop) {
+        VideoCommon::PipelineDiagnostics::SceneMarker marker{path};
+        std::mutex mutex;
+        std::condition_variable_any wake;
+        std::unique_lock lock{mutex};
+        const auto interval = path.empty() ? std::chrono::seconds{10} : std::chrono::seconds{1};
+        while (!wake.wait_for(lock, stop, interval, [] { return false; })) {
+            if (stop.stop_requested()) {
+                break;
+            }
+            if (const auto mark = marker.Poll()) {
+                LOG_INFO(Render_Vulkan, "[mark] {} present={}", *mark,
+                         VideoCommon::PipelineDiagnostics::PresentCount());
+            }
+            if (std::chrono::steady_clock::now() - runtime_report_time >= std::chrono::seconds{10}) {
+                LogRuntimePipelines();
+            }
+        }
+    });
+}
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     const auto begin = std::chrono::steady_clock::now();
@@ -2991,7 +3111,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
 
 ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     const ComputePipelineCacheKey& key, const ShaderInfo* shader,
-    std::span<const u64> keep_pointers) {
+    std::span<const u64> keep_pointers, bool null_slot_rebuild) {
     const auto begin = std::chrono::steady_clock::now();
     compute_source = ComputeSource::None;
     SCOPE_EXIT {
@@ -3017,7 +3137,9 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     env.KeepStoragePointers(keep_pointers);
 
     main_pools.ReleaseContents();
-    auto entry{CreateComputePipeline(main_pools, key, env, nullptr, true, !keep_pointers.empty())};
+    auto entry{CreateComputePipeline(
+        main_pools, key, env, nullptr, true,
+        null_slot_rebuild && !keep_pointers.empty() ? "null-slot-rebuild" : "none")};
     if (const char* directory = std::getenv("EDEN_NX2_SHADER_DUMP");
         directory && !entry.pipeline && env.CanBeSerialized()) {
         const auto path = std::filesystem::path{directory} /
@@ -3060,10 +3182,7 @@ void DumpComputeSpirv(u64 shader_hash, std::span<const u32> code) {
 // site, which made NVIDIA spend 2-13 s on single Ocarina compute shaders, every one a freeze at
 // its first dispatch (video_core/spirv_inline_control.h).
 bool ComputeNoInline() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_COMPUTE_NOINLINE");
-        return !(value != nullptr && value[0] == '0');
-    }();
+    static const bool enabled = Shader::Nx2Switch("EDEN_NX2_COMPUTE_NOINLINE", true);
     return enabled;
 }
 
@@ -3088,7 +3207,7 @@ std::vector<u32> ComputeModuleCode(std::span<const u32> code, u64 shader_hash) {
 
 ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     ShaderPools& pools, const ComputePipelineCacheKey& key, Shader::Environment& env,
-    PipelineStatistics* statistics, bool build_in_parallel, bool force_translation) try {
+    PipelineStatistics* statistics, bool build_in_parallel, std::string_view forced_reason) try {
     auto hash = key.Hash();
     if (device.HasBrokenCompute()) {
         LOG_ERROR(Render_Vulkan, "Skipping {:#016x}", hash);
@@ -3098,13 +3217,21 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
 
     namespace TC = VideoCommon::TranslationCache;
+    static const bool log_rebuilds = Shader::Nx2Switch("EDEN_NX2_COMPUTE_REBUILD_LOG", false);
+    std::vector<TC::Query> recorded_queries;
     const auto stage_begin = std::chrono::steady_clock::now();
     const bool cacheable = translation_cache.Enabled() && IsTranslationCacheable(env);
+    const std::string_view translation_reason = forced_reason != "none" ? forced_reason
+        : translation_cache_verify ? "verification" : "none";
     TC::Digest stage_key{};
     std::shared_ptr<const TC::Entry> entry;
     if (cacheable) {
         stage_key = TC::MakeStageKey(env, key.unique_hash, 5, translation_config);
-        if (!force_translation) {
+        if (translation_reason != "none") {
+            translation_cache.LogForcedTranslation(stage_key, Shader::Stage::Compute, hash,
+                                                   key.unique_hash, 5, translation_reason);
+        }
+        if (forced_reason == "none") {
             entry = translation_cache.FindEntry(stage_key, env, nullptr, hash, key.unique_hash, 5);
         }
     }
@@ -3114,6 +3241,9 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     std::optional<TC::Variant> variant;
     if (entry && !translation_cache_verify) {
         variant = translation_cache.FindVariant(variant_key);
+        translation_cache.LogModuleProvenance(*entry, variant_key, hash, key.unique_hash, 5,
+                                              variant ? "variant-hit" : "variant-miss",
+                                              translation_reason);
     }
     // The null pointer slots the translation depends on: CurrentComputePipeline rebuilds the
     // pipeline once one of them holds a mapped pointer. A translation served from the translation
@@ -3132,6 +3262,18 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         }
         return entry ? MappedPointersAskedBy(env.MappedStoragePointerKeys(), entry->queries)
                      : env.MappedStoragePointerKeys();
+    };
+    const auto pointer_answers = [&] {
+        std::vector<TC::Query> answers;
+        if (log_rebuilds) {
+            for (const auto& query : entry ? entry->queries : recorded_queries) {
+                if (query.kind == TC::QueryKind::CbufStorageBufferPointer ||
+                    query.kind == TC::QueryKind::CbufIndirectStorageBufferPointer) {
+                    answers.push_back(query);
+                }
+            }
+        }
+        return answers;
     };
     if (entry && entry->offline && !translation_cache_verify) {
         translation_cache.LogOfflineOutcome(Shader::Stage::Compute, key.unique_hash,
@@ -3155,12 +3297,14 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         return {.pipeline = std::make_unique<ComputePipeline>(
                     device, scheduler, vulkan_pipeline_cache, descriptor_pool,
                     guest_descriptor_queue, descriptor_buffer_ring, cached_worker, statistics,
-                    &shader_notify, variant->info, std::move(cached_module), key.unique_hash),
+                    &shader_notify, variant->info, std::move(cached_module), key.unique_hash,
+                    compute_dispatch_waits),
                 .null_pointer_slots = null_pointer_slots(),
-                .mapped_pointers = mapped_pointers()};
+                .mapped_pointers = mapped_pointers(),
+                .pointer_answers = pointer_answers()};
     }
     std::optional<TC::RecordingEnvironment> recording;
-    if (cacheable && !entry) {
+    if ((cacheable || log_rebuilds) && !entry) {
         recording.emplace(env);
     }
     Shader::Environment& translate_env =
@@ -3175,8 +3319,11 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
 
     auto program{TranslateProgram(pools.inst, pools.block, translate_env, cfg, host_info)};
     compute_source = cacheable ? ComputeSource::Translated : ComputeSource::None;
-    if (recording && IsTranslationCacheable(env)) {
-        entry = translation_cache.Insert(stage_key, recording->TakeQueries(),
+    if (recording) {
+        recorded_queries = recording->TakeQueries();
+    }
+    if (cacheable && recording && IsTranslationCacheable(env)) {
+        entry = translation_cache.Insert(stage_key, recorded_queries,
                                          TC::ProgramMeta::From(program));
     }
     LogUntrackedGlobal(key.unique_hash, Shader::Stage::Compute, program.info);
@@ -3214,6 +3361,13 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         }
         translation_cache.InsertVariant(*entry, compute_variant_key,
                                         TC::Variant{{}, program.info, code});
+        translation_cache.LogModuleProvenance(*entry, compute_variant_key, hash, key.unique_hash,
+                                              5, "emitted", translation_reason);
+    } else {
+        translation_cache.LogUncachedModule(
+            Shader::Stage::Compute, hash, key.unique_hash, 5,
+            !translation_cache.Enabled() ? "cache-disabled" : "uncacheable-or-entry-not-retained",
+            translation_reason);
     }
     if (cacheable) {
         ++translation_cache.stage_misses;
@@ -3249,9 +3403,10 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     return {.pipeline = std::make_unique<ComputePipeline>(
                 device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
                 descriptor_buffer_ring, thread_worker, statistics, &shader_notify, program.info,
-                std::move(spv_module), key.unique_hash),
+                std::move(spv_module), key.unique_hash, compute_dispatch_waits),
             .null_pointer_slots = null_pointer_slots(),
-            .mapped_pointers = mapped_pointers()};
+            .mapped_pointers = mapped_pointers(),
+                .pointer_answers = pointer_answers()};
 
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "Compute pipeline compilation failed shader={:#016x} pipeline={:#016x}: {}",

@@ -21,6 +21,7 @@
 #include <span>
 #include <utility>
 #include <type_traits>
+#include <thread>
 #include "common/container/unordered_map.h"
 #include <vector>
 
@@ -126,6 +127,7 @@ struct ComputePipelineCacheEntry {
     std::vector<std::pair<u32, u32>> null_pointer_slots;
     /// Constant buffer slots bound as storage buffer pointers (see MappedStoragePointerKeys)
     std::vector<u64> mapped_pointers;
+    std::vector<VideoCommon::TranslationCache::Query> pointer_answers;
     u32 rebuilds{};
 
     [[nodiscard]] ComputePipeline* Get(bool native, GPUVAddr address,
@@ -187,13 +189,14 @@ private:
     /// their slots hold now (see GenericEnvironment::KeepStoragePointers)
     ComputePipelineCacheEntry CreateComputePipeline(const ComputePipelineCacheKey& key,
                                                     const ShaderInfo* shader,
-                                                    std::span<const u64> keep_pointers = {});
+                                                    std::span<const u64> keep_pointers = {},
+                                                    bool null_slot_rebuild = false);
 
     ComputePipelineCacheEntry CreateComputePipeline(ShaderPools& pools,
                                                      const ComputePipelineCacheKey& key,
                                                      Shader::Environment& env,
                                                      PipelineStatistics* statistics,
-                                                     bool build_in_parallel, bool force_translation = false);
+                                                     bool build_in_parallel, std::string_view forced_reason = "none");
 
     void SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                       const vk::PipelineCache& pipeline_cache, u32 cache_version);
@@ -226,6 +229,7 @@ private:
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
 
+    VideoCommon::PipelineDiagnostics::WaitCounter compute_dispatch_waits;
     ::Common::unordered_map<ComputePipelineCacheKey, ComputePipelineCacheEntry> compute_cache;
     /// Replaced compute pipelines, destroyed once the GPU and their queued build are done with
     /// them (tick, pipeline)
@@ -277,6 +281,16 @@ private:
     std::atomic<u64> boot_mesh_pipelines{};
     void CountStageOutcome(StageOutcome outcome, Shader::Stage stage, u64 ns);
     void LogStageOutcomes(std::string_view when);
+    void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_point begin,
+                               const std::string& shaders);
+    void LogRuntimePipelines(bool shutdown = false);
+    void StartDiagnosticReports();
+    std::atomic<u64> runtime_pipeline_count{}, runtime_pipeline_ns{};
+    u64 reported_pipeline_count{}, reported_pipeline_ns{};
+    std::chrono::nanoseconds reported_compute_wait{};
+    std::chrono::nanoseconds graphics_hold_total{};
+    std::chrono::steady_clock::time_point runtime_report_time{};
+    std::jthread diagnostic_reports;
 
     /// Ahead-of-time translation of recognised pool programs (ShaderCache::seed_stage): the
     /// GPU thread builds the environment and an owned copy of it; a worker translates the copy,

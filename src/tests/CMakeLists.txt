@@ -74,6 +74,7 @@ add_executable(tests
     video_core/async_draw_policy.cpp
     video_core/query_wait.cpp
     video_core/async_shader_emission.cpp
+    video_core/pipeline_diagnostics.cpp
     video_core/pipeline_build.cpp
     video_core/pipeline_optimization.cpp
     video_core/spirv_atomic_retry.cpp
