@@ -46,6 +46,13 @@ class HarnessTests(unittest.TestCase):
         self.assertFalse(checker.check(READY + OBSERVED,
                                       READY + APPLIED + SUPPRESSED + "OoT co-op: quarantined")["no runtime failures"])
 
+    def test_policy_refusal_is_not_a_runtime_failure(self):
+        refusal = "OoT co-op: not applied: class/key policy disabled or queue full\n"
+        self.assertTrue(checker.check(READY + OBSERVED, READY + refusal)["no runtime failures"])
+        for line in ("OoT co-op: pending queue full; reconnect for a fresh snapshot\n",
+                     "OoT co-op: outgoing queue full; observation skipped\n"):
+            self.assertFalse(checker.check(READY + OBSERVED, READY + line)["no runtime failures"])
+
     def test_suppression_epoch_must_match(self):
         self.assertFalse(checker.check(READY + OBSERVED,
                                       READY + APPLIED + SUPPRESSED.replace("echo=1", "echo=2"))["no echo"])

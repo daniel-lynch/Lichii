@@ -6,8 +6,11 @@ import re
 
 GRANT = re.compile(r"OoT co-op: (observed|applied|suppressed) class=(bool|bit) "
                    r"key=([0-9a-f]{16}) value=1 path=([a-z-]+)(?: echo=(\S+))?")
-FAILURES = ("quarantined", "queue full", "handshake refused", "relay rejected", "allocation failed",
-            "sentinel refused")
+# Exact failure phrases. "not applied: class/key policy disabled or queue full" is not listed:
+# it is the expected policy refusal of an empty-allow control run, and a real queue overflow
+# logs its own "pending/outgoing queue full" line.
+FAILURES = ("quarantined", "pending queue full", "outgoing queue full", "handshake refused",
+            "relay rejected", "allocation failed", "sentinel refused")
 
 
 def check(a, b):
