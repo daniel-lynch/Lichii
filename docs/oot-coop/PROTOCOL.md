@@ -66,7 +66,7 @@ JavaScript `Number` is unsuitable. Sequence and revision numbers are limited to 
 The first payload must be:
 
 ```json
-{"type":"hello","version":2,"build_id":"E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348","seed_hash":"0","room":"field-round-1","team":"together","client_id":"session-a","name":"Daniel","policy_id":"or-v2"}
+{"type":"hello","version":2,"build_id":"<build-id>","seed_hash":"0","room":"field-round-1","team":"together","client_id":"session-a","name":"Daniel","policy_id":"or-v2"}
 ```
 
 `build_id` is 40 uppercase hex characters. `seed_hash` is 1..128 hex characters,
@@ -114,10 +114,10 @@ must not bypass the local class/key allow list or build/lifecycle guards.
 Wallet deltas (class `rupee`, C6) are an additive event, not state:
 
 ```json
-{"type":"rupee_add","origin":"session-a","seq":3,"hash":2809733591,"delta":5}
+{"type":"rupee_add","origin":"session-a","seq":3,"hash":<hash>,"delta":5}
 ```
 
-`hash` must be the wallet key `PlayerStatus.CurrentRupee` (0xA77921D7); `delta` is a non-zero
+`hash` must be the wallet key `PlayerStatus.CurrentRupee` (<hash>); `delta` is a non-zero
 integer in [-999, 999]. The relay forwards and acks it like a grant and keeps it in the replay
 window (so revisions stay contiguous), but never folds it into team state; clients ignore
 `rupee_add` in a `team_state` snapshot or replay, so a reconnect never re-applies one (and a

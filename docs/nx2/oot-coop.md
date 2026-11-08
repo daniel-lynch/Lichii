@@ -10,8 +10,8 @@ receive snapshots and drain a pending queue, but **cannot apply a network change
 guest**. All new setter sites are zero and `GuestWritesVerified` is a compile-time false.
 There is no switch that enables guest writes.
 
-Scope: title `0400486024DEC000`, main build
-`E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348`. The constants come from
+Scope: title `<title-id>`, main build
+`<build-id>`. The constants come from
 [`OotGameDataTrace`](../../src/core/arm/dynarmic/oot_gamedata_trace.h).
 Other titles/builds never create a co-op session. All hashes below are opaque integers;
 there are no shipped name lists, actor tables, seeds, extracted binaries or game assets.
@@ -49,7 +49,7 @@ Anchor. Protocol version 1 rejects incompatible versions instead of guessing.
 First packet:
 
 ```json
-{"type":"hello","version":1,"build_id":"E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348","seed_hash":"0","room":"demo","team":"together","client_id":"session-a","name":"Sam"}
+{"type":"hello","version":1,"build_id":"<build-id>","seed_hash":"0","room":"demo","team":"together","client_id":"session-a","name":"Sam"}
 ```
 
 The first client fixes the room's build ID and seed hash. All clients in that room,
@@ -231,9 +231,9 @@ The existing original-instruction-checked BRK substitutions remain the only hook
 
 | Existing site | Current draft use |
 |---|---|
-| StepSet, `main+0x2CF54A4` | Read challenge/step hashes from x1/x2; find requested/current indices through the same bounded manager/challenge layouts already used by the trace. Enqueue only an identifiable forward request. |
-| StepApply, `main+0x2CF1830` | Preserve tracing; opportunity to drain pending network observations. |
-| PlayedEvent, `main+0x2BDC4E0` | With `_PLAYED_EVENTS=1`, read the full bounded, NUL-terminated event string and hash `HavePlayedEvent.` plus the name into a true boolean observation. |
+| StepSet, `main+<offset>` | Read challenge/step hashes from x1/x2; find requested/current indices through the same bounded manager/challenge layouts already used by the trace. Enqueue only an identifiable forward request. |
+| StepApply, `main+<offset>` | Preserve tracing; opportunity to drain pending network observations. |
+| PlayedEvent, `main+<offset>` | With `_PLAYED_EVENTS=1`, read the full bounded, NUL-terminated event string and hash `HavePlayedEvent.` plus the name into a true boolean observation. |
 
 Co-op and trace can run separately or together. At a breakpoint, co-op observes and
 drains, trace logs if enabled, and the original instruction is emulated **exactly once**.

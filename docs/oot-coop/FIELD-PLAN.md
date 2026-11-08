@@ -5,9 +5,9 @@ class/key-gated deferred setter injection. Bool64 remains for pickups, breakable
 by default. The tests validate control flow and protocol behavior, not game/save
 correctness. The harness must be run by the external lane when the game is idle.
 
-Both instances must use title `0400486024DEC000`, main build
-`E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348`. Preserve backups and use disposable saves.
-Record emulator commit, game build, seed/mods and the reviewed key policy. Use c1 backing Bool `0xC8643846`, false on both copies, with the 206-key chest policy.
+Both instances must use title `<title-id>`, main build
+`<build-id>`. Preserve backups and use disposable saves.
+Record emulator commit, game build, seed/mods and the reviewed key policy. Use c1 backing Bool `<hash>`, false on both copies, with the 206-key chest policy.
 There are no scalar or pouch grants. The C3 failure and its resolution are recorded in
 `~/Downloads/OOT/field/coop-C3-20261108-0550/{RESULT,CHEST-STATE}.md`.
 
@@ -34,15 +34,15 @@ launches. It never stops a game; close both game windows normally to finish.
 
 From the worktree root, set these three variables to the lane's actual local files:
 `OOT_EMULATOR` (native Linux lichii executable), `OOT_GAME` (game file/directory),
-`OOT_PROFILE` (portable user template). Use `tools/oot/coop/chest-bools.json` as the
-reviewed typed key policy. Then run this exact command:
+`OOT_PROFILE` (portable user template). Use your own user-supplied key file (`$OOT_KEYS`; not part of this
+repository) as the reviewed typed key policy. Then run this exact command:
 
 ```sh
 python3 -I tools/oot/coop/two_instances.py \
   --emulator "${OOT_EMULATOR:?set native lichii path}" \
   --game "${OOT_GAME:?set game path}" \
   --profile "${OOT_PROFILE:?set disposable portable user template}" \
-  --keys tools/oot/coop/chest-bools.json \
+  --keys "${OOT_KEYS:?set the user-supplied key file}" \
   --allow bool --vram-profile \
   --run-dir "$HOME/Downloads/OOT/harness-runs/coop-C4-$(date +%Y%m%d-%H%M%S)"
 ```
@@ -82,7 +82,7 @@ Confirm `gamedata trace on`, `gamedata frame`, and `gamedata actor-flag-set` /
 correct. The manager is bound from the cell at each frame; the observer reads committed
 flat Bool bytes at frame boundaries. A setter request by itself must never emit a grant.
 
-The owner must establish that main+0x11E7A50 is a safe loaded-save boundary on the
+The owner must establish that main+<offset> is a safe loaded-save boundary on the
 selected guest thread and that the manager/table/queue remain valid. Validate absence
 of a transition or active event at injection. C4 detects changed object/table identity,
 unreadable state and observed flag rollbacks; this is not a complete save lifecycle
@@ -95,8 +95,8 @@ Wait until **both** logs show `relay connected`, `baseline exported` and
 `baseline exchanged`. Confirm the chosen key is false on B. Open c1 normally on A.
 The logs must show, for the same class/key:
 
-1. A: `observed class=bool key=00000000c8643846 value=1 path=observer` exactly once.
-2. B: `started ... path=setter echo=1-bool-00000000c8643846` and then `returned` with that ID.
+1. A: `observed class=bool key=<key> value=1 path=observer` exactly once.
+2. B: `started ... path=setter echo=1-bool-<key>` and then `returned` with that ID.
 3. B: `applied ... path=setter` only after the authoritative byte becomes true.
 4. B: `suppressed ... path=observer` with the same ID, and no `observed` for that key.
    Suppression can precede the applied line during the same drain.
@@ -110,7 +110,7 @@ wrong-thread return or return-stack failure. A setter that stalls before another
 cannot trip the frame-clock watchdog; use the live debugger to diagnose it, never
 rewind arbitrary code that may hold locks.
 
-Check B's flat Bool `0xC8643846` becomes 1. Change B's scene and return to inspect c1;
+Check B's flat Bool `<hash>` becomes 1. Change B's scene and return to inspect c1;
 a loaded chest may need a scene reload since the grant skips actor-side notifications.
 **No item is granted. B's wallet must remain unchanged.** Items are separate `IsGet.*`
 Bools and `PouchData.*.StockNum` Ints; the pouch grant entry is unknown.
