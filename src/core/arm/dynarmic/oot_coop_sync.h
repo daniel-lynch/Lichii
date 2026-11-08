@@ -31,7 +31,14 @@ inline constexpr size_t MaxFrame = 1 << 20;
 inline constexpr size_t QueueLimit = 4096;
 inline constexpr size_t StateLimit = 4096;
 
-enum class Kind { Bool, Int, Enum, Quest, Bit, PouchAdd, PouchTotal };
+enum class Kind { Bool, Int, Enum, Quest, Bit, PouchAdd, PouchTotal, Rupee };
+
+// Wallet deltas (class "rupee"): an additive event, never state. Key = PlayerStatus.CurrentRupee.
+inline constexpr u32 WalletHash = 0xA77921D7;
+inline constexpr s64 RupeeLimit = 999;
+[[nodiscard]] constexpr bool RupeeDelta(s64 delta) {
+    return delta != 0 && delta >= -RupeeLimit && delta <= RupeeLimit;
+}
 
 struct Change {
     Kind kind{Kind::Bool};

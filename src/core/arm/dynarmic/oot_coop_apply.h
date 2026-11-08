@@ -16,6 +16,10 @@ struct ApplyPolicy {
     std::set<std::pair<Kind, u64>> keys;
 
     bool Allows(const Change& change) const {
+        if (change.kind == Kind::Rupee) {
+            return enabled && classes.contains(Kind::Rupee) && change.key == WalletHash &&
+                   RupeeDelta(change.value);
+        }
         return enabled && WireKind(change.kind) && change.value == 1 &&
                classes.contains(change.kind) && keys.contains({change.kind, change.key});
     }
@@ -53,10 +57,14 @@ public:
     bool Queue(const Change& change) {
         const auto key = std::pair{change.kind, change.key};
         if (phase == ApplyPhase::Quarantined || !policy.Allows(change) ||
-            pending.size() >= QueueLimit || receipts.size() >= StateLimit || receipts.contains(key)) {
+            pending.size() >= QueueLimit) {
             return false;
         }
-        receipts.emplace(key, false);
+        // A delta repeats by design (each one is a new origin/sequence); flags commit once.
+        if (change.kind != Kind::Rupee) {
+            if (receipts.size() >= StateLimit || receipts.contains(key)) return false;
+            receipts.emplace(key, false);
+        }
         pending.push_back(change);
         return true;
     }
@@ -84,6 +92,9 @@ public:
             thread = site.thread;
         }
         if (phase == ApplyPhase::AwaitingCommit) {
+            // The wallet leaf adds to the pending field synchronously; the game's pouch update
+            // applies and clamps it later. The return is the commit.
+            if (active->kind == Kind::Rupee) return Commit();
             if (backend.ReadFlag(*active) == true) return Commit();
             return site.tick >= deadline ? Quarantine() : ApplyEvent::Blocked;
         }
@@ -91,12 +102,14 @@ public:
         active = pending.front();
         last_grant = active;
         last_path = "already-true";
-        const auto current = backend.ReadFlag(*active);
-        if (!current) {
-            active.reset();
-            return ApplyEvent::Blocked;
+        if (active->kind != Kind::Rupee) {
+            const auto current = backend.ReadFlag(*active);
+            if (!current) {
+                active.reset();
+                return ApplyEvent::Blocked;
+            }
+            if (*current) return Commit();
         }
-        if (*current) return Commit();
         const auto candidate = backend.Resolve(*active);
         if (!candidate || !candidate->verified) {
             active.reset();
@@ -106,7 +119,11 @@ public:
         generation = site.generation;
         thread = site.thread;
         deadline = site.tick > MaxSequence - 120 ? MaxSequence : site.tick + 120;
-        last_path = target.pure_flag ? "data-or" : "setter";
+        last_path = target.pure_flag ? "data-or" : active->kind == Kind::Rupee ? "call" : "setter";
+        if (target.pure_flag && active->kind == Kind::Rupee) {
+            active.reset();
+            return ApplyEvent::Blocked;
+        }
         if (target.pure_flag) {
             // The adapter must prove this is the authoritative word with no notifications,
             // queue, dirty bits or concurrent writer; OrFlag is an atomic masked update.
@@ -188,7 +205,7 @@ private:
         return ApplyEvent::Quarantined;
     }
     ApplyEvent Commit() {
-        receipts.at({active->kind, active->key}) = true;
+        if (active->kind != Kind::Rupee) receipts.at({active->kind, active->key}) = true;
         pending.pop_front();
         active.reset();
         phase = ApplyPhase::Idle;

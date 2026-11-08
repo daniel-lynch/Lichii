@@ -9,8 +9,15 @@
 namespace Core::OotCoop {
 
 inline std::string_view ClassName(Kind kind) {
-    return kind == Kind::Bit ? "bit" : "bool";
+    return kind == Kind::Bit ? "bit" : kind == Kind::Rupee ? "rupee" : "bool";
 }
+
+// pouchMgr = *(main+PouchCell) (proven from four node loaders, C5). Wallet entry main+RupeeEntry
+// (x0=pouchMgr, w1=signed delta, w2=reason): ldadd into pouchMgr+0x3BD4, reason at +0x3BD8, then an
+// optional recorder tail call; the pouch update main+0x5EBE0 clamps it into CurrentRupee.
+inline constexpr u64 PouchCell = 0x4E78E28;
+inline constexpr u64 RupeeEntry = 0x33A6D70;
+inline constexpr u64 RupeeReason = 7; // OneshotIncreaseRupee's reason
 
 struct GuestBinding {
     u64 base{}, manager{}, data{}, queue{}, sentinel{}, stack{};
@@ -160,6 +167,20 @@ public:
 
     std::optional<ApplyTarget> Resolve(const Change& change) {
         using namespace OotGameDataTrace::Detail;
+        if (change.kind == Kind::Rupee) {
+            if (change.key != WalletHash || !RupeeDelta(change.value) || !binding.manager ||
+                !binding.sentinel || binding.stack < 0x4000 ||
+                !Range(binding.stack - 0x4000, 0x4000) ||
+                Read32(memory, binding.sentinel) != OotGameDataTrace::Breakpoint) return {};
+            const u64 entry = binding.base + RupeeEntry;
+            constexpr std::array<u32, 4> words{0x52877A88, 0x8B080008, 0xB8210108, 0xB93BD802};
+            for (size_t i = 0; i < words.size(); ++i)
+                if (Read32(memory, entry + i * 4) != words[i]) return {};
+            const auto pouch = Read64(memory, binding.base + PouchCell);
+            if (!pouch || !*pouch || !Range(*pouch + 0x3BD4, 8)) return {};
+            return ApplyTarget{true, false, 0, 0, entry, binding.sentinel, binding.stack,
+                               {*pouch, static_cast<u32>(static_cast<s32>(change.value)), RupeeReason}};
+        }
         if (!ReadFlag(change).has_value() || !binding.sentinel || binding.stack < 0x4000 ||
             !Range(binding.stack - 0x4000, 0x4000) ||
             Read32(memory, binding.sentinel) != OotGameDataTrace::Breakpoint) return {};
@@ -244,6 +265,7 @@ public:
     bool Queue(const Change& change) { return applier.Queue(change); }
     bool Suppress(const Change& change) const { return applier.Suppress(change); }
     bool Calling() const { return applier.Phase() == ApplyPhase::Calling; }
+    const std::optional<Change>& LastGrant() const { return applier.LastGrant(); }
     bool BaselineReady() const { return baseline; }
     void Invalidate() { applier.Invalidate(); }
 

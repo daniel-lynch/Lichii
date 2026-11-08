@@ -111,6 +111,20 @@ its actual save before applying, keeps an application receipt/echo guard across 
 guest execution, and records success only after verified completion. Protocol retries
 must not bypass the local class/key allow list or build/lifecycle guards.
 
+Wallet deltas (class `rupee`, C6) are an additive event, not state:
+
+```json
+{"type":"rupee_add","origin":"session-a","seq":3,"hash":2809733591,"delta":5}
+```
+
+`hash` must be the wallet key `PlayerStatus.CurrentRupee` (0xA77921D7); `delta` is a non-zero
+integer in [-999, 999]. The relay forwards and acks it like a grant and keeps it in the replay
+window (so revisions stay contiguous), but never folds it into team state; clients ignore
+`rupee_add` in a `team_state` snapshot or replay, so a reconnect never re-applies one (and a
+late joiner does not receive earlier deltas). A receiver with `rupee` in
+`EDEN_NX2_OOT_COOP_ALLOW` applies it by calling the game's wallet entry from the frame drain;
+the game's own pouch update clamps it. The local wallet is not observed or re-sent in this pass.
+
 `quest_step`, `int_set`, `enum_set`, `pouch_add`, `pouch_total` are **rejected in v2**.
 A quest index maximum is not an OR over flags and an observed setter request is not
 proof of successful progress. The existing trace can still observe it locally. Pouch

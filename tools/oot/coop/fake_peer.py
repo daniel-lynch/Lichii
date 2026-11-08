@@ -11,6 +11,7 @@ emulator broadcasts. Never launches a game; binds 127.0.0.1 only.
 Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CTL/out.jsonl:
   grant HEX [HEX...]        bool_set value=true for each hash, all frames in ONE socket write
   bit HEX [HEX...]          bit_set (actor u64) the same way
+  rupee DELTA [DELTA...]    rupee_add (wallet hash) with each signed delta, all in ONE socket write
   expect HEX SECS           wait for the emulator's bool_set of HEX (any rev); result has the packet
   received                  every change packet received so far (from other origins)
   state                     the relay's team checkpoint as the peer sees it (team_state_request)
@@ -95,7 +96,8 @@ class FakePeer:
             self.waiters.remove(waiter)
 
     async def burst(self, kind, keys):
-        """All changes in one write, so the relay forwards them back to back."""
+        """All changes in one write, so the relay forwards them back to back. For rupee_add the
+        'keys' are the signed deltas."""
         field = "hash" if kind == "bool_set" else "actor"
         data = b""
         packets = []
@@ -103,6 +105,9 @@ class FakePeer:
             self.client.seq += 1
             packet = {"type": kind, "origin": self.client.hello["client_id"],
                       "seq": self.client.seq, field: key, "value": True}
+            if kind == "rupee_add":
+                packet = {"type": kind, "origin": self.client.hello["client_id"],
+                          "seq": self.client.seq, "hash": relay_mod.WALLET, "delta": key}
             packets.append(packet)
             data += relay_mod.encode(packet)
         since = len(self.seen)
@@ -130,6 +135,11 @@ class FakePeer:
             if not keys:
                 raise ValueError("no keys")
             return await self.burst("bool_set" if verb == "grant" else "bit_set", keys)
+        if verb == "rupee":
+            deltas = [int(word) for word in words[1:]]
+            if not deltas:
+                raise ValueError("no deltas")
+            return await self.burst("rupee_add", deltas)
         if verb == "expect":
             try:
                 return {"packet": await self.expect(int(words[1], 16), float(words[2]))}

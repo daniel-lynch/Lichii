@@ -141,7 +141,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_bool_bit_or_and_duplicate_check_across_players(self):
         team = relay.Team()
-        for kind in relay.CHANGE_TYPES:
+        for kind in ("bool_set", "bit_set"):
             self.assertIsNone(team.accept(grant(1, origin=kind, kind=kind, value=False), set()))
             self.assertIsNotNone(team.accept(grant(2, origin=kind, kind=kind), set()))
             self.assertIsNone(team.accept(grant(3, origin=kind, kind=kind, value=False), set()))
@@ -156,6 +156,31 @@ class ProtocolTests(unittest.TestCase):
                 team.accept(dict(grant(), type=kind), set())
         self.assertEqual(team.current, {})
         self.assertEqual(team.seen, {})
+
+    def test_rupee_deltas_are_events_not_state(self):
+        def rupee(seq, delta=5, **extra):
+            return dict({"type": "rupee_add", "origin": "b", "seq": seq, "hash": relay.WALLET,
+                         "delta": delta}, **extra)
+        for bad in (rupee(1, 0), rupee(1, 1000), rupee(1, -1000), rupee(1, True), rupee(1, 2.5),
+                    rupee(1, hash=1), rupee(1, value=True)):
+            with self.subTest(bad=bad), self.assertRaises(relay.ProtocolError):
+                relay.validate_change(bad, "b")
+        team = relay.Team()
+        team.accept(grant(1), set())
+        self.assertEqual(team.accept(rupee(1), set())["rev"], 2)
+        self.assertEqual(team.accept(rupee(2, -999), set())["rev"], 3)
+        self.assertIsNone(team.accept(rupee(2), set()))  # duplicate sequence: no second +5
+        self.assertIsNone(team.accept(rupee(3), {relay.WALLET}))
+        self.assertEqual(list(team.current), [("bool_set", 1)])
+        snapshot = team.snapshot()
+        self.assertEqual([p["delta"] for p in snapshot["replay"] if p["type"] == "rupee_add"], [5, -999])
+        self.assertEqual(materialize(snapshot), team.current)
+        for seq in range(4, 604):
+            team.accept(rupee(seq), set())
+        snapshot = team.snapshot()
+        self.assertEqual(snapshot["changes"], [{"type": "bool_set", "hash": 1, "value": True}])
+        self.assertEqual(len(snapshot["replay"]), 512)
+        self.assertEqual(materialize(snapshot), team.current)
 
     def test_noop_highwater_and_deny(self):
         team = relay.Team()
@@ -476,6 +501,17 @@ class FakePeerTests(unittest.IsolatedAsyncioTestCase):
             await self.emu.receive("bool_set", timeout=0.05)
         state = (await self.peer.command("state"))["state"]
         self.assertEqual(len(materialize(state)), 4)
+
+    async def test_rupee_burst_reaches_the_emulator_and_never_becomes_state(self):
+        result = await self.peer.command("rupee 5 -2")
+        self.assertEqual(result["sent"], [1, 2])
+        got = [(await self.emu.receive("rupee_add"))["delta"] for _ in range(2)]
+        self.assertEqual(got, [5, -2])
+        state = (await self.peer.command("state"))["state"]
+        self.assertEqual(state["changes"], [])
+        self.assertEqual(materialize(state), {})
+        with self.assertRaises(ValueError):
+            await self.peer.command("rupee")
 
     async def test_snapshot_replays_grants_made_before_the_emulator_joined(self):
         late = client_sim.ClientSim("late", room="r", team="t", policy_id="p")

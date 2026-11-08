@@ -82,6 +82,7 @@ std::string_view Type(Kind kind) {
     case Kind::Bit: return "bit_set";
     case Kind::PouchAdd: return "pouch_add";
     case Kind::PouchTotal: return "pouch_total";
+    case Kind::Rupee: return "rupee_add";
     }
     return {};
 }
@@ -102,7 +103,9 @@ Json EncodeChange(const Change& change) {
         packet["value"] = change.value != 0;
     } else {
         packet["hash"] = change.key;
-        if (change.kind == Kind::Bool) {
+        if (change.kind == Kind::Rupee) {
+            packet["delta"] = change.value;
+        } else if (change.kind == Kind::Bool) {
             packet["value"] = change.value != 0;
         } else {
             packet[change.kind == Kind::PouchAdd || change.kind == Kind::PouchTotal ? "count"
@@ -122,7 +125,7 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
         const auto type = packet.at("type").get<std::string>();
         bool found = false;
         for (const Kind kind : {Kind::Bool, Kind::Int, Kind::Enum, Kind::Quest, Kind::Bit,
-                                Kind::PouchAdd, Kind::PouchTotal}) {
+                                Kind::PouchAdd, Kind::PouchTotal, Kind::Rupee}) {
             if (type == Type(kind)) {
                 change.kind = kind;
                 found = true;
@@ -130,6 +133,10 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
             }
         }
         if (!found || (!snapshot && change.kind == Kind::PouchTotal)) {
+            return std::nullopt;
+        }
+        // A delta is an event with an origin and sequence; it never appears as snapshot state.
+        if (snapshot && change.kind == Kind::Rupee) {
             return std::nullopt;
         }
         if (!snapshot || packet.contains("origin") || packet.contains("seq")) {
@@ -148,15 +155,22 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
             return std::nullopt;
         }
         change.key = packet.at(key).get<u64>();
+        const char* value_field = change.kind == Kind::Rupee ? "delta" : "value";
         if (WireKind(change.kind)) {
             for (const auto& [field, value] : packet.items()) {
-                if (field == "type" || field == key || field == "value") continue;
+                if (field == "type" || field == key || field == value_field) continue;
                 if (!snapshot && (field == "origin" || field == "seq")) continue;
                 if (!snapshot && field == "rev" && Unsigned(value, MaxSequence) && value != 0) continue;
                 return std::nullopt;
             }
         }
-        if (change.kind == Kind::Bool || change.kind == Kind::Bit) {
+        if (change.kind == Kind::Rupee) {
+            const auto& delta = packet.at("delta");
+            if (change.key != WalletHash || !Signed32(delta) || !RupeeDelta(delta.get<s64>())) {
+                return std::nullopt;
+            }
+            change.value = delta.get<s64>();
+        } else if (change.kind == Kind::Bool || change.kind == Kind::Bit) {
             if (!packet.at("value").is_boolean()) {
                 return std::nullopt;
             }
@@ -224,7 +238,7 @@ std::optional<Json> DecodeLine(std::string_view line) {
 }
 
 bool WireKind(Kind kind) {
-    return kind == Kind::Bool || kind == Kind::Bit;
+    return kind == Kind::Bool || kind == Kind::Bit || kind == Kind::Rupee;
 }
 
 std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text) {
@@ -234,6 +248,7 @@ std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text) {
         const auto name = text.substr(0, comma);
         if (name == "bool") result.insert(Kind::Bool);
         else if (name == "bit") result.insert(Kind::Bit);
+        else if (name == "rupee") result.insert(Kind::Rupee);
         else return std::nullopt;
         if (comma == std::string_view::npos) break;
         text.remove_prefix(comma + 1);
@@ -349,6 +364,8 @@ bool State::Merge(const Change& change, bool deduplicate) {
         high = change.seq;
     }
     if (denied.contains(change.key)) return false;
+    // Deltas are deduplicated by origin/sequence above and never folded into state.
+    if (change.kind == Kind::Rupee) return change.key == WalletHash && RupeeDelta(change.value);
     const auto key = std::pair{StorageKind(change.kind), change.key};
     const auto it = values.find(key);
     if (it == values.end() && values.size() >= StateLimit) return false;
@@ -378,6 +395,8 @@ bool State::Merge(const Change& change, bool deduplicate) {
     case Kind::PouchTotal:
         if (change.value <= old || change.value > static_cast<s64>(MaxSequence)) return false;
         break;
+    case Kind::Rupee:
+        return false;
     }
     values[key] = std::move(next);
     return true;
@@ -424,6 +443,7 @@ bool ShouldApply(const Change& change, const State& observed) {
     if (change.kind == Kind::Int || change.kind == Kind::Enum) {
         return !local || local->value != change.value;
     }
+    if (change.kind == Kind::Rupee) return change.key == WalletHash && RupeeDelta(change.value);
     // Pouch totals require a save baseline/application receipt, not a comparison to inventory.
     return change.kind == Kind::PouchAdd && change.value > 0;
 }
@@ -687,6 +707,8 @@ bool Session::Impl::Receive(const Json& packet) {
             snapshot_seen.emplace(origin, value.get<u64>());
         }
         for (const auto& value : packet.at("changes")) {
+            // A wallet delta is not state: a reconnect must never re-apply one.
+            if (value.is_object() && value.contains("type") && value.at("type") == "rupee_add") continue;
             const auto change = DecodeChange(value, true);
             if (!change || !WireKind(change->kind)) return false;
             checkpoint.Merge(*change, false);
@@ -696,7 +718,7 @@ bool Session::Impl::Receive(const Json& packet) {
             const auto change = DecodeChange(value);
             if (!change || !WireKind(change->kind) || !Unsigned(value.at("rev"), MaxSequence) ||
                 value.at("rev").get<u64>() != ++revision) return false;
-            checkpoint.Merge(*change);
+            if (change->kind != Kind::Rupee) checkpoint.Merge(*change);
         }
         changes = checkpoint.Snapshot();
     } else {
@@ -744,7 +766,8 @@ Session::~Session() = default;
 void Session::Stop() { impl->Stop(); }
 
 void Session::Observe(Change change) {
-    if (impl->stopped || !WireKind(change.kind)) return;
+    // Wallet deltas are grant-only in this pass: the local wallet is not observed or re-sent.
+    if (impl->stopped || !WireKind(change.kind) || change.kind == Kind::Rupee) return;
     std::scoped_lock lock{impl->mutex};
     if (impl->outgoing.size() >= QueueLimit || impl->next_seq > MaxSequence) {
         if (!impl->logged_overflow) {
@@ -775,6 +798,15 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     const DrainContext site{thread, 1, impl->tick, true};
     if (binding.sentinel && pc == binding.sentinel) {
         const auto event = runtime.Sentinel(backend, site, pc, log);
+        if (event == ApplyEvent::Returned && runtime.LastGrant() &&
+            runtime.LastGrant()->kind == Kind::Rupee) {
+            using OotGameDataTrace::Detail::Read32;
+            using OotGameDataTrace::Detail::Read64;
+            const u64 pouch = Read64(memory, binding.base + PouchCell).value_or(0);
+            const auto pending = pouch ? Read32(memory, pouch + 0x3BD4) : std::nullopt;
+            log(fmt::format("OoT co-op: rupee pending={} after the call (pouch {:#x})",
+                            static_cast<s32>(pending.value_or(0)), pouch));
+        }
         // An unowned/invalid sentinel must reach the normal breakpoint fault, never resume.
         if (event != ApplyEvent::Returned) {
             log(fmt::format("OoT co-op: sentinel refused thread={} pc={:#x}", thread, pc));

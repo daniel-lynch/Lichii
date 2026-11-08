@@ -34,7 +34,8 @@ For the previously unlisted small functions, this pass disassembled the read-onl
 | Played event `0x7102BDC4E0` (`G/out17/decomp/7102bdc4e0.c`) | `x0=task wrapper`; task at +0x10, name pointer at task+8, length including NUL at task+0x10. Finds `HavePlayedEvent` struct then hashes the member name. | **Proven:** this is a struct/member operation, not `Murmur3("HavePlayedEvent." + name)` as the skeleton assumed. Trigger timing/creator and success are **inferred/unknown**. No v2 grant emitted from this hook. |
 | Struct-bool helpers `0x7103745A10`, `0x7103745CD0`, fallback `0x7103745B70` (caller above and `.tmp/struct-bool-C2.txt`) | First two: `x0=manager+8` or `manager+0x68`, `w1=1`, `x2=local struct handle*`, `w3=member hash`, `w4=(manager+0xD0C == 0)`; low result bit controls fallback. Fallback adds `w4=0`, moves mode into `w5`. | **Proven** caller setup. Handle includes a resolved record and flags, not just an opaque hash. Member-key/type lookup must be reconstructed; no generic flat-bool adapter for these calls. |
 | Frame marker `0x71011E7A50` (`G/out4/decomp/71011e7a50.c`, `G/out12/ctx/71011e7a50.txt`, exported bytes) | Starts `pacibsp`; calls `nn::os::WaitEvent` at `0x71011E7A68`. Existing names identify `GameFramework::waitPresentDone`. | **Inferred** safe injection boundary, supported by prior debugger experiment in `findings-scene-tour.md`, not revalidated here. C3 installs this marker through the same instruction-substitution path as the other trace hooks; it drives the co-op drain on the first guest thread that reaches it. With co-op on and `EDEN_NX2_GAMEDATA_TRACE` off, this is the **only** substituted instruction: the Bool64 and chest trace sites are installed by the trace alone. |
-| Pouch grant entry | **Unknown.** Notification references are not a grant API; e.g. `G/out13/decomp/710110d570.c` and `71033a4fa0.c` reference pouch-content changes. | Need successful item-receive caller, exact manager/actor/count ABI, source check identity, ownership/equipment/ammo/notification/autosave effects. No address is guessed. |
+| Wallet entry `0x71033A6D70` (C5 static, C6 field) | `x0=pouchMgr` (`*(main+0x4E78E28)`, GOT `main+0x4C7E0D0`), `w1`=signed delta, `w2`=reason (7 in `OneshotIncreaseRupee`, 4 in another caller). Body: `ldadd w1` into `pouchMgr+0x3BD4`, `str w2` to `+0x3BD8`; then, if the global at `0x7104E6B718` is non-null, a tail call to the recorder `0x7100E46AB0` (so it is not a pure leaf, as C5 said). The pouch update `main+0x5EBE0` later clamps the pending delta into `PlayerStatus.CurrentRupee`. | **Proven** instruction bytes and callers; class `rupee` calls it from the frame drain (C6). |
+| Pouch item entry | `0x710110D570` push-to-pouch by actor name (C5 static; `x1=&{char* name,...}`, `w2` category, `w3` count, `x4` get type). `71033a4fa0.c` is the remove path. | **Not field-tested.** Side effects (models, UI, autosave) and frame-thread safety unknown. |
 
 ## Storage layout and what must be changed
 
@@ -208,7 +209,9 @@ fake memory. **No production pure-write class is enabled.** Every GameData layou
 researched above either uses a deferred queue or has unknown dirty/notification
 obligations. Writing the Bool64 byte directly would contradict the evidence.
 The `bool` adapter only marks chest locations checked. It grants no item or wallet
-value. Neither int/enum/quest/pouch nor arbitrary struct-member writes are enabled.
+value. The `rupee` class (C6) is the only wallet path: a signed delta through the game's
+wallet entry above, applied by the game's own pouch update; it is grant-only (the local
+wallet is not observed). Neither int/enum/quest/item-pouch nor arbitrary struct-member writes are enabled.
 
 ## Policy and logs
 

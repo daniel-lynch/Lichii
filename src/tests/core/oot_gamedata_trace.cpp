@@ -711,3 +711,81 @@ TEST_CASE("Chest trace sites preserve hints and report keys", "[oot_gamedata_tra
                              Point::PlayedEvent, Point::None})
         REQUIRE_FALSE(Trace::CoopPoint(point));
 }
+
+TEST_CASE("OoT co-op rupee grant calls the wallet entry with the pouch manager", "[oot_coop]") {
+    namespace Coop = Core::OotCoop;
+    constexpr u64 manager = Data, data = Data + 0x2000, hashes = Data + 0x3000;
+    constexpr u64 queue = Data + 0x4000, sentinel = Stop + 0x100, pouch = Data + 0x8000;
+    constexpr u64 entry = Base + Coop::RupeeEntry;
+    TraceEnvironment env;
+    for (u64 i = data; i < data + 0x30; ++i) env.bytes[i] = 0;
+    for (u64 i = hashes; i < hashes + 8 * 8; ++i) env.bytes[i] = 0;
+    env.Write64(Base + 0x4E842A8, manager);
+    env.Write32(manager + 0x10, 2);
+    env.Write64(manager + 0x18, data);
+    env.Write64(manager + 0x20, hashes);
+    env.Write32(manager + 0x2C, 8);
+    env.Write32(manager + 0x30, 1);
+    env.Write64(manager + 0x38, queue);
+    env.Write32(manager + 0x40, 0);
+    env.Write64(queue, 0);
+    env.Write64(Base + Coop::PouchCell, pouch);
+    env.Write64(pouch + 0x3BD4, 0);
+    env.Code(entry, 0x52877A88);
+    env.Code(entry + 4, 0x8B080008);
+    env.Code(entry + 8, 0xB8210108);
+    env.Code(entry + 12, 0xB93BD802);
+    env.Code(sentinel, Trace::Breakpoint);
+    Coop::GuestBinding binding{Base, 0, 0, 0, sentinel, 0x20000000};
+    for (u64 i = binding.stack - 0x4000; i < binding.stack; ++i) env.bytes[i] = 0;
+    Dynarmic::A64::Jit jit{Config(env)};
+    u64 tls = 123, tls_ro = 456;
+    int clears = 0;
+    using Backend = Coop::GameDataBackend<Dynarmic::A64::Jit, TraceEnvironment>;
+    Backend backend{jit, env, binding, tls, tls_ro, [&] { ++clears; }};
+    REQUIRE(backend.BindFromCell());
+    const Coop::Change minus{Coop::Kind::Rupee, "B", 1, Coop::WalletHash, -5};
+    SECTION("call shape, restoration and commit on return") {
+        Coop::FrameDrain<Backend> drain{{true, {Coop::Kind::Rupee}, {}}};
+        std::vector<std::string> logs;
+        const auto send = [](Coop::Change, bool) { FAIL("a delta is never observed"); };
+        const auto log = [&](std::string_view line) { logs.emplace_back(line); };
+        drain.Frame(backend, {7, 9, 1, true}, send, log);
+        REQUIRE(drain.BaselineReady());
+        jit.SetPC(Base + 0x11E7A54);
+        jit.SetSP(0x30000000);
+        const auto saved = *backend.Capture();
+        REQUIRE(drain.Queue(minus));
+        REQUIRE(drain.Frame(backend, {7, 9, 2, true}, send, log) == Coop::ApplyEvent::Started);
+        REQUIRE(jit.GetPC() == entry);
+        REQUIRE(jit.GetRegister(0) == pouch);
+        REQUIRE(jit.GetRegister(1) == 0xFFFFFFFBU); // w1 = -5
+        REQUIRE(jit.GetRegister(2) == Coop::RupeeReason);
+        REQUIRE(jit.GetRegister(30) == sentinel);
+        REQUIRE(jit.GetSP() == binding.stack);
+        REQUIRE(drain.Sentinel(backend, {7, 9, 2, true}, sentinel, log) == Coop::ApplyEvent::Returned);
+        REQUIRE(*backend.Capture() == saved);
+        REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) == Coop::ApplyEvent::Committed);
+        REQUIRE(std::count_if(logs.begin(), logs.end(), [](const auto& line) {
+            return line.find("applied class=rupee key=00000000a77921d7 value=-5 path=call") !=
+                   std::string::npos;
+        }) == 1);
+        REQUIRE(drain.Queue({Coop::Kind::Rupee, "B", 2, Coop::WalletHash, -5}));
+    }
+    SECTION("a changed wallet entry word blocks") {
+        env.Code(entry + 8, 0);
+        REQUIRE_FALSE(backend.Resolve(minus));
+    }
+    SECTION("no pouch manager yet blocks") {
+        env.Write64(Base + Coop::PouchCell, 0);
+        REQUIRE_FALSE(backend.Resolve(minus));
+    }
+    SECTION("an unmapped pending field blocks") {
+        env.Write64(Base + Coop::PouchCell, pouch + 0x100000);
+        REQUIRE_FALSE(backend.Resolve(minus));
+    }
+    SECTION("a missing sentinel breakpoint blocks") {
+        env.Code(sentinel, 0);
+        REQUIRE_FALSE(backend.Resolve(minus));
+    }
+}

@@ -23,7 +23,9 @@ MAX_TEAMS = 16
 MAX_REPLAY = 512
 MAX_OUTBOX = 256
 MAX_OUTBOX_BYTES = 2 * MAX_FRAME
-CHANGE_TYPES = {"bool_set", "bit_set"}
+CHANGE_TYPES = {"bool_set", "bit_set", "rupee_add"}
+WALLET = 0xA77921D7  # PlayerStatus.CurrentRupee: the only rupee_add key
+RUPEE_LIMIT = 999
 
 
 class ProtocolError(ValueError):
@@ -129,7 +131,7 @@ def validate_change(packet, origin):
     common = ("type", "origin", "seq")
     if kind not in CHANGE_TYPES:
         raise ProtocolError("unsupported grant class")
-    extra = {"bool_set": ("hash", "value"), "bit_set": ("actor", "value")}[kind]
+    extra = {"bool_set": ("hash", "value"), "bit_set": ("actor", "value"), "rupee_add": ("hash", "delta")}[kind]
     fields(packet, common + extra)
     if packet["origin"] != origin:
         raise ProtocolError("origin mismatch")
@@ -142,6 +144,11 @@ def validate_change(packet, origin):
             raise ProtocolError("expected boolean")
     if kind == "bit_set":
         integer(packet["actor"], 0, (1 << 64) - 1)
+    if kind == "rupee_add":
+        if packet["hash"] != WALLET:
+            raise ProtocolError("rupee_add is for the wallet only")
+        if integer(packet["delta"], -RUPEE_LIMIT, RUPEE_LIMIT) == 0:
+            raise ProtocolError("zero rupee delta")
 
 
 
@@ -150,6 +157,8 @@ def state_key(packet):
 
 
 def fold(state, packet):
+    if packet["type"] == "rupee_add":
+        return  # a delta is an event in the replay window, never team state
     state[state_key(packet)] = {k: v for k, v in packet.items() if k not in ("origin", "seq", "rev")}
 
 
@@ -175,7 +184,7 @@ class Team:
         if kind in ("bool_set", "bit_set"):
             accepted &= packet["value"] and old is None
         if accepted:
-            if old is None and len(self.current) >= MAX_KEYS:
+            if kind != "rupee_add" and old is None and len(self.current) >= MAX_KEYS:
                 raise ProtocolError("team state capacity reached")
             if self.revision == MAX_SEQ:
                 raise ProtocolError("team revision exhausted")

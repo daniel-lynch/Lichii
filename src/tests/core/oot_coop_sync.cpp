@@ -570,3 +570,77 @@ TEST_CASE("OoT co-op typed key policies separate chest Bools and Bool64", "[core
     Coop::FrameDrain<FakeGuest> disabled{{true, {}, *keys}};
     REQUIRE_FALSE(disabled.Queue({Kind::Bool, "A", 1, 0xC8643846, 1}));
 }
+
+TEST_CASE("OoT co-op rupee deltas are wallet-only events, never state", "[core][oot_coop]") {
+    const Change five{Kind::Rupee, "B", 3, Coop::WalletHash, 5};
+    const auto packet = Coop::EncodeChange(five);
+    REQUIRE(packet == Json{{"type", "rupee_add"}, {"origin", "B"}, {"seq", 3},
+                           {"hash", 0xA77921D7U}, {"delta", 5}});
+    REQUIRE(Coop::DecodeChange(packet) == five);
+    REQUIRE(Coop::WireKind(Kind::Rupee));
+    auto with_rev = packet;
+    with_rev["rev"] = 4;
+    REQUIRE(Coop::DecodeChange(with_rev) == five);
+    REQUIRE(Coop::DecodeChange({{"type", "rupee_add"}, {"origin", "B"}, {"seq", 3},
+                                {"hash", 0xA77921D7U}, {"delta", -999}})->value == -999);
+    for (const auto& [field, value] : std::vector<std::pair<std::string, Json>>{
+             {"delta", 0}, {"delta", 1000}, {"delta", -1000}, {"delta", true}, {"delta", 2.5},
+             {"delta", "5"}, {"hash", 101}, {"value", true}, {"extra", 1}}) {
+        auto bad = packet;
+        bad[field] = value;
+        REQUIRE_FALSE(Coop::DecodeChange(bad));
+    }
+    auto bare = packet;
+    bare.erase("delta");
+    REQUIRE_FALSE(Coop::DecodeChange(bare));
+    // A delta is never snapshot state, with or without an origin.
+    REQUIRE_FALSE(Coop::DecodeChange(packet, true));
+    REQUIRE_FALSE(Coop::DecodeChange({{"type", "rupee_add"}, {"hash", 0xA77921D7U}, {"delta", 5}}, true));
+    REQUIRE(Coop::DecodeAllowClasses("bool,rupee") == std::set{Kind::Bool, Kind::Rupee});
+    REQUIRE(Coop::DecodeAllowClasses("rupee") == std::set{Kind::Rupee});
+
+    Coop::State state;
+    REQUIRE(state.Merge(five));
+    REQUIRE_FALSE(state.Merge(five)); // same origin/sequence: a duplicate, not a second +5
+    REQUIRE(state.Merge({Kind::Rupee, "B", 4, Coop::WalletHash, 5}));
+    REQUIRE(state.Merge({Kind::Rupee, "C", 1, Coop::WalletHash, -3}));
+    REQUIRE_FALSE(state.Merge({Kind::Rupee, "C", 2, Coop::WalletHash, 0}));
+    REQUIRE_FALSE(state.Merge({Kind::Rupee, "C", 3, 101, 5}));
+    REQUIRE(state.Snapshot().empty());
+    REQUIRE_FALSE(state.Find(Kind::Rupee, Coop::WalletHash));
+    REQUIRE(Coop::ShouldApply(five, state));
+}
+
+TEST_CASE("OoT co-op rupee grants call once per delta and commit on return", "[core][oot_coop]") {
+    FakeGuest guest;
+    guest.target.arguments = {0x6000, 5, 7};
+    const Change five{Kind::Rupee, "B", 3, Coop::WalletHash, 5};
+    Coop::GrantApplier<FakeGuest> closed{Allowed()};
+    REQUIRE_FALSE(closed.Queue(five)); // class not allowed
+    Coop::GrantApplier<FakeGuest> apply{{true, {Kind::Bool, Kind::Rupee}, {{Kind::Bool, 101}}}};
+    REQUIRE_FALSE(apply.Queue({Kind::Rupee, "B", 1, 101, 5, 0}));
+    REQUIRE_FALSE(apply.Queue({Kind::Rupee, "B", 1, Coop::WalletHash, 0, 0}));
+    REQUIRE_FALSE(apply.Queue({Kind::Rupee, "B", 1, Coop::WalletHash, 1000, 0}));
+    REQUIRE(apply.Queue(five));
+    REQUIRE(apply.Queue({Kind::Rupee, "B", 4, Coop::WalletHash, 5, 0}));
+    REQUIRE_FALSE(apply.Suppress(five));
+    guest.readable = false; // a delta never reads a flag
+    for (u64 tick = 1; tick <= 2; ++tick) {
+        REQUIRE(apply.Drain(guest, {7, 9, tick * 3, true}) == Coop::ApplyEvent::Started);
+        REQUIRE(apply.LastPath() == "call");
+        REQUIRE(guest.cpu.x[1] == 5);
+        REQUIRE(guest.cpu.x[2] == 7);
+        REQUIRE(apply.Sentinel(guest, {7, 9, tick * 3 + 1, true}, 0x800) ==
+                Coop::ApplyEvent::Returned);
+        REQUIRE(apply.Drain(guest, {7, 9, tick * 3 + 2, true}) == Coop::ApplyEvent::Committed);
+    }
+    REQUIRE(guest.calls == 2);
+    REQUIRE(guest.restores == 2);
+    REQUIRE(apply.Pending() == 0);
+    REQUIRE(apply.Drain(guest, {7, 9, 10, true}) == Coop::ApplyEvent::None);
+    guest.target.pure_flag = true; // a delta never takes the data-or path
+    REQUIRE(apply.Queue({Kind::Rupee, "B", 5, Coop::WalletHash, 5, 0}));
+    REQUIRE(apply.Drain(guest, {7, 9, 11, true}) == Coop::ApplyEvent::Blocked);
+    REQUIRE(guest.writes == 0);
+    REQUIRE(apply.Pending() == 1);
+}
