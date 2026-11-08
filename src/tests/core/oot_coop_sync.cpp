@@ -3,11 +3,13 @@
 
 #include <limits>
 #include <string>
+#include <thread>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "core/arm/dynarmic/oot_coop_sync.h"
 #include "core/arm/dynarmic/oot_coop_apply.h"
+#include "core/arm/dynarmic/oot_coop_runtime.h"
 
 namespace {
 namespace Coop = Core::OotCoop;
@@ -125,24 +127,8 @@ TEST_CASE("OoT co-op scalar state and runtime deny-list", "[core][oot_coop]") {
     REQUIRE(state.Snapshot()[0].origin.empty());
 }
 
-TEST_CASE("OoT co-op suppresses nested incoming sends and restores after exceptions",
-          "[core][oot_coop]") {
-    REQUIRE_FALSE(Coop::IncomingScope::SuppressSend());
-    try {
-        Coop::IncomingScope outer;
-        REQUIRE(Coop::IncomingScope::SuppressSend());
-        {
-            Coop::IncomingScope inner;
-            REQUIRE(Coop::IncomingScope::SuppressSend());
-        }
-        REQUIRE(Coop::IncomingScope::SuppressSend());
-        throw 1;
-    } catch (int) {
-    }
-    REQUIRE_FALSE(Coop::IncomingScope::SuppressSend());
-}
-
 TEST_CASE("OoT co-op requires endpoint title build and matching handshake", "[core][oot_coop]") {
+    REQUIRE(Coop::Gate("1", Trace::ProgramId, Trace::BuildId));
     REQUIRE(Coop::Gate("127.0.0.1:43390", Trace::ProgramId, Trace::BuildId));
     REQUIRE(Coop::Gate("[::1]:43390", Trace::ProgramId, Trace::BuildId));
     REQUIRE_FALSE(Coop::Gate("", Trace::ProgramId, Trace::BuildId));
@@ -165,20 +151,6 @@ TEST_CASE("OoT co-op requires endpoint title build and matching handshake", "[co
     packet["build_id"] = Trace::BuildId;
     packet["version"] = 1;
     REQUIRE_FALSE(Coop::MatchesHello(packet, hello));
-}
-
-TEST_CASE("OoT co-op has no enabled guest write path", "[core][oot_coop]") {
-    REQUIRE_FALSE(Coop::GuestWritesVerified);
-    for (const auto& site : Coop::Sites) {
-        REQUIRE(site.offset == 0);
-        const Change change{site.kind, "a", 1, 101, 1, 0};
-        REQUIRE(Coop::GuestWriter{Coop::Strategy::GuestCall}.Apply(change) ==
-                Coop::ApplyStatus::NotAppliedNoSite);
-        REQUIRE(Coop::GuestWriter{Coop::Strategy::DirectWrite}.Apply(change) ==
-                Coop::ApplyStatus::NotAppliedNoSite);
-    }
-    REQUIRE(Coop::GuestWriter{}.Apply({Kind::PouchTotal, {}, 0, 101, 5, 0}) ==
-            Coop::ApplyStatus::NotAppliedNoSite);
 }
 
 TEST_CASE("OoT co-op apply decision respects observed local progress", "[core][oot_coop]") {
@@ -491,4 +463,88 @@ TEST_CASE("OoT co-op v2 grant fields cannot carry unchecked extensions", "[core]
     REQUIRE_FALSE(Coop::DecodeChange(packet, true));
     packet = {{"type", "bool_set"}, {"hash", 101}, {"value", true}};
     REQUIRE(Coop::DecodeChange(packet, true));
+}
+
+TEST_CASE("OoT co-op frame drain drives two peers without an echo", "[core][oot_coop]") {
+    FakeGuest a, b;
+    bool pure = false;
+    SECTION("deferred setter") {}
+    SECTION("proven pure flag") { pure = true; }
+    b.target.pure_flag = pure;
+    b.target.address = 0x9000;
+    b.target.mask = 1;
+    Coop::FrameDrain<FakeGuest> peer_a{Allowed()}, peer_b{Allowed()};
+    std::vector<Change> from_a, from_b;
+    std::vector<std::string> logs;
+    const auto log = [&](std::string_view line) { logs.emplace_back(line); };
+    const auto send_a = [&](Change c, bool) { from_a.push_back(c); };
+    const auto send_b = [&](Change c, bool) { from_b.push_back(c); };
+    peer_a.Frame(a, Safe, send_a, log);
+    peer_b.Frame(b, Safe, send_b, log);
+    REQUIRE(peer_a.BaselineReady());
+    REQUIRE(peer_b.BaselineReady());
+    REQUIRE(from_a.empty());
+    REQUIRE(from_b.empty());
+    a.memory.at(0x9000) |= 1; // The game commits a local check on A.
+    peer_a.Frame(a, {7, 9, 2, true}, send_a, log);
+    REQUIRE(from_a.size() == 1);
+    auto wire = from_a.front();
+    wire.origin = "A";
+    wire.seq = 1;
+    REQUIRE(peer_b.Queue(*Coop::DecodeChange(Coop::EncodeChange(wire))));
+    REQUIRE(peer_b.Frame(b, {7, 9, 3, false}, send_b, log) == Coop::ApplyEvent::Blocked);
+    REQUIRE(b.calls == 0);
+    REQUIRE(b.writes == 0);
+    peer_b.Frame(b, {7, 9, 4, true}, send_b, log);
+    if (!pure) {
+        REQUIRE(peer_b.Calling());
+        Coop::ApplyEvent returned{};
+        std::thread worker{[&] {
+            returned = peer_b.Sentinel(b, {7, 9, 4, true}, b.target.sentinel, log);
+        }};
+        worker.join();
+        REQUIRE(returned == Coop::ApplyEvent::Returned);
+        peer_b.Frame(b, {7, 9, 5, true}, send_b, log);
+        REQUIRE(from_b.empty());
+        // Deferred queue consumer runs after the C++ callback and sentinel return.
+        b.memory.at(0x9000) |= 1;
+    }
+    peer_b.Frame(b, {7, 9, 6, true}, send_b, log);
+    peer_b.Frame(b, {7, 9, 7, true}, send_b, log);
+    REQUIRE(from_b.empty());
+    REQUIRE(b.calls == (pure ? 0 : 1));
+    REQUIRE(b.writes == (pure ? 1 : 0));
+    REQUIRE(peer_b.Suppress(wire));
+    REQUIRE_FALSE(peer_b.Queue(wire));
+    REQUIRE(std::count_if(logs.begin(), logs.end(), [](const auto& line) {
+        return line.find("applied class=bool key=0000000000000065 value=1 path=") !=
+               std::string::npos;
+    }) == 1);
+    REQUIRE(std::count_if(logs.begin(), logs.end(), [](const auto& line) {
+        return line.find("suppressed class=bool") != std::string::npos &&
+               line.find("echo=9-bool-0000000000000065") != std::string::npos;
+    }) == 1);
+}
+
+TEST_CASE("OoT co-op frame observer quarantines rollback and incomplete baselines",
+          "[core][oot_coop]") {
+    FakeGuest guest;
+    Coop::FrameDrain<FakeGuest> drain{Allowed()};
+    std::vector<Change> sent;
+    const auto send = [&](Change change, bool) { sent.push_back(change); };
+    const auto log = [](std::string_view) {};
+    guest.readable = false;
+    REQUIRE(drain.Frame(guest, Safe, send, log) == Coop::ApplyEvent::Blocked);
+    REQUIRE_FALSE(drain.BaselineReady());
+    REQUIRE(sent.empty());
+    guest.readable = true;
+    guest.memory.at(0x9000) |= 1;
+    drain.Frame(guest, Safe, send, log);
+    REQUIRE(sent.size() == 1);
+    REQUIRE(drain.Frame(guest, {8, 9, 2, true}, send, log) == Coop::ApplyEvent::Blocked);
+    SECTION("rollback") { guest.memory.at(0x9000) &= ~u64{1}; }
+    SECTION("unmapped save") { guest.readable = false; }
+    REQUIRE(drain.Frame(guest, {7, 9, 3, true}, send, log) == Coop::ApplyEvent::Quarantined);
+    REQUIRE_FALSE(drain.Queue(Grant));
+    REQUIRE(guest.calls == 0);
 }

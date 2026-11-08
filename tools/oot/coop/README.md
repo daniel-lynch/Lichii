@@ -50,6 +50,13 @@ the relay does not calculate a digest of each emulator's local configuration.
 
 A relay ack is not a guest-write receipt. Before real synchronization, both disposable
 saves must export their verified allowlisted true flags and finish baseline reconciliation.
-That guest exporter is not implemented. Relay restart loses memory; reconnecting cannot
+C3 exports the explicitly reviewed Bool64 key set at the frame hook; its game/save
+semantics remain unverified in the field. Relay restart loses memory; reconnecting cannot
 recover flags never observed or exported. See the protocol's baseline and duplicate-check
 sections before testing pre-existing saves or adding inventory support.
+
+C3 adds `two_instances.py` (owner-run Linux relay + two portable/disposable copies),
+`check_logs.py` (positive applied/suppressed receipt checking) and socket-free
+`test_harness.py`. See the field plan for the exact command and required environment.
+Do not run the harness during a playing session; it refuses `.aot-priority` and any
+existing `lichii` process. Class and key allow lists ship empty.

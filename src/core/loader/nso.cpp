@@ -340,10 +340,6 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         }
     }
     LOG_INFO(Loader, "Module {} loaded at {:#x} (size {:#x})", nso_file.GetName(), load_base, image_size);
-    if (name == "main") {
-        Core::OotCoop::RegisterMain(&process, process.GetProgramId(), load_base + module_start,
-                                  Common::HexToString(std::span{nso_header.build_id}.first(20)));
-    }
     if (name == "main" && Core::OotGameDataTrace::Enabled() &&
         process.GetProgramId() == Core::OotGameDataTrace::ProgramId) {
         // EDEN_NX2_GAMEDATA_TRACE: the quest-step and HavePlayedEvent sites belong to one build.
@@ -380,6 +376,10 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         process.SetOotDeltaAddress(hooked ? load_base + module_start + OotTime::DeltaOffset : 0);
     }
     process.LoadModule(system.Kernel(), std::move(codeset), load_base);
+    if (name == "main") {
+        Core::OotCoop::RegisterMain(system.Kernel(), &process, process.GetProgramId(), load_base + module_start,
+                                  Common::HexToString(std::span{nso_header.build_id}.first(20)));
+    }
     Core::ExecCoverage::OnModuleLoaded(process, nso_file.GetName(), load_base, image_size);
     if (name == "main" && process.GetProgramId() == Settings::MarioKartWorldProgramId) {
         process.SetMkwDynamicFpsPatchApplied(mkw_dynamic_fps_patch_applied);

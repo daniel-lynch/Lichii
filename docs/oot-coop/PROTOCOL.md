@@ -2,7 +2,8 @@
 
 This document supersedes the wire and conflict sections of `docs/nx2/oot-coop.md`.
 The relay and simulator implement this protocol. Emulator guest application is still
-unverified and disabled. A transport acknowledgement never means that a save changed.
+unverified and disabled by default; C3 has an opt-in reviewed Bool64 frame adapter.
+A transport acknowledgement never means that a save changed.
 
 ## Anchor source comparison
 
@@ -75,7 +76,8 @@ A duplicate connected client ID in a team is refused. A changed policy needs a n
 `policy_id` identifies the reviewed allow/deny configuration shared by testers; use a
 shared policy name or digest. Default `or-v2` is only the conservative prototype policy,
 not proof that two private configuration files match. The relay checks the supplied
-identity, not their content. Automatically deriving a policy digest remains future work.
+identity, not their content. The C3 one-host harness derives a digest of its reviewed Bool64 keys; manually
+configured clients must still supply a consistent policy identity.
 
 Success yields `hello_ack` with `version`, `build_id`, `seed_hash`, `policy_id`, `client_id`,
 then `team_state`, then each connected peer's cached `client_state`. Failure yields
@@ -126,8 +128,9 @@ entire room. `heartbeat` and `heartbeat_ack` have only `type`.
 
 The desired baseline is the **union of verified permanent true flags**, never one
 player's whole save replacing another. The wire already represents this without a
-special baseline packet. A baseline exporter is not implemented in the emulator; the
-following is a required field-tested workflow before claiming save synchronization:
+special baseline packet. C3 exports the explicitly reviewed Bool64 key set at the frame boundary and requests
+a FIFO snapshot after upload acknowledgements. The following still requires field
+validation before claiming save synchronization:
 
 1. Use backed-up disposable saves, a new room name and identical build/seed/policy.
    Pause progression while each client enumerates the reviewed keys from its loaded save.

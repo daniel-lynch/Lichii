@@ -23,7 +23,7 @@ class KProcess;
 
 /// EDEN_NX2_GAMEDATA_TRACE: Ocarina of Time's quest-step changes and HavePlayedEvent writes, for
 /// randomizer research. A pure observer that never writes guest memory: the JIT is handed a
-/// `brk #0` in place of the original instruction at three sites (DynarmicCallbacks64::
+/// `brk #0` in place of the original instruction at verified sites (DynarmicCallbacks64::
 /// MemoryReadCode, the same way as Core::WindowTrace), and the breakpoint's handler logs the
 /// arguments and then does exactly what the replaced instruction does (Resume) before execution
 /// continues at the next instruction. Guest data reads of the code still see the original words.
@@ -54,8 +54,11 @@ enum class Point : u8 {
     StepSet,
     StepApply,
     PlayedEvent,
+    Frame,
+    BitRead,
+    BitSet,
 };
-inline constexpr size_t PointCount = 4;
+inline constexpr size_t PointCount = 7;
 
 struct Site {
     Point point;
@@ -67,10 +70,13 @@ inline constexpr u32 MovW8One = 0x52800028; // mov w8, #1
 inline constexpr u32 Pacibsp = 0xD503237F;  // pacibsp (a hint: dynarmic runs it as a no-op)
 inline constexpr u32 Breakpoint = 0xD4200000; // brk #0
 
-inline constexpr std::array<Site, 3> Sites{{
+inline constexpr std::array<Site, 6> Sites{{
     {Point::StepSet, 0x2CF54A4, MovW8One},
     {Point::StepApply, 0x2CF1830, Pacibsp},
     {Point::PlayedEvent, 0x2BDC4E0, Pacibsp},
+    {Point::Frame, 0x11E7A50, Pacibsp},
+    {Point::BitRead, 0x3761684, 0xB94C5808}, // ldr w8, [x0, #0xc58]
+    {Point::BitSet, 0x3761724, 0xAA0003E8}, // mov x8, x0
 }};
 
 /// The trace point at `address` whose original instruction is `instruction`, or None.
@@ -92,12 +98,19 @@ constexpr u32 InstructionFor(u64 base, u64 address, u32 instruction) {
 }
 
 /// Does what the replaced instruction would have: the JIT has already moved the PC past it.
-template <typename Jit>
-void Resume(Point point, Jit& jit) {
+template <typename Jit, typename Memory>
+void Resume(Point point, Jit& jit, Memory& memory) {
     switch (point) {
     case Point::StepSet:
         jit.SetRegister(8, 1); // mov w8, #1 (a W write clears the upper half)
         break;
+    case Point::BitRead:
+        jit.SetRegister(8, memory.Read32(jit.GetRegister(0) + 0xC58));
+        break;
+    case Point::BitSet:
+        jit.SetRegister(8, jit.GetRegister(0));
+        break;
+    case Point::Frame:
     case Point::StepApply:
     case Point::PlayedEvent: // pacibsp: nothing
     case Point::None:
@@ -113,6 +126,9 @@ constexpr std::string_view Name(Point point) {
         return "step-apply";
     case Point::PlayedEvent:
         return "played-event";
+    case Point::Frame: return "frame";
+    case Point::BitRead: return "bit-read";
+    case Point::BitSet: return "bit-set";
     case Point::None:
         break;
     }
@@ -294,6 +310,12 @@ std::string Describe(Point point, u64 base, Jit& jit, Memory& memory) {
         return fmt::format("gamedata played-event name={} hash={:#010x} lr={}", name,
                            Common::Nx2EventTrace::Murmur3(name), caller);
     }
+    case Point::Frame:
+        return fmt::format("gamedata frame lr={}", caller);
+    case Point::BitRead:
+    case Point::BitSet:
+        return fmt::format("gamedata {} mgr={:#x} key={:016x}", Name(point), x0,
+                           jit.GetRegister(2));
     case Point::None:
         break;
     }
@@ -321,7 +343,7 @@ bool Handle(Session& session, u64 pc, Jit& jit, Memory& memory, std::string* out
             Common::Nx2EventTrace::Write(Common::Nx2EventTrace::GameDataTarget(), line);
         }
     }
-    Resume(point, jit);
+    Resume(point, jit, memory);
     return true;
 }
 

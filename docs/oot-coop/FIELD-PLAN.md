@@ -1,175 +1,132 @@
-# OoT co-op field plan
+# OoT co-op C3 field plan
 
-This revision is **transport + diagnostics + an offline application state machine**.
-It cannot synchronize live saves. Steps 1–3 below can test this revision; steps 4–7
-require the explicitly listed runtime adapter work. A successful connection is not
-playable co-op and an `ack` is not a saved grant.
+C3 wires frame draining, Bool64 observation/baseline export and class/key-gated setter
+injection. It is an **unverified field candidate**, with production grant policy empty
+by default. The tests validate control flow and protocol behavior, not game/save
+correctness. The harness must be run by the external lane when the game is idle.
 
-Use title `0400486024DEC000`, main build
-`E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348` on both instances. Preserve untouched backups,
-make two separate disposable copies of the same starting save, and use isolated emulator
-user directories. Do not share an actively written user/save directory. Record emulator
-commit, game build, mods/seed, policy identity and save generation for every run. Owner
-launches/stops games; never automate a restart of their playing session.
+Both instances must use title `0400486024DEC000`, main build
+`E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348`. Preserve backups and use disposable saves.
+Record emulator commit, game build, seed/mods and the reviewed key policy. Use one
+permanent Bool64 key initially, false on both copies, and no scalar or pouch grants.
 
-The relay deployment is another lane's job. It needs reachable **TCP 43390**, protocol
-v2 (4-byte big-endian length + UTF-8 JSON, payload at most 1 MiB), from both clients and
-return traffic. No UDP, discovery or inbound game-client ports are needed. Use loopback
-for two instances on one host, then Daniel and Anthony's site-to-site VPN with an
-explicit private relay address. No public exposure, credentials or NAT traversal are
-required by this prototype.
+## 1. External transport gate
 
-## 1. External lane transport gate
-
-Outside the socket-restricted development sandbox, run:
+Outside this socket-restricted lane:
 
 ```sh
 python3 -I tools/oot/coop/test_relay.py
 ```
 
-Expected: **34 tests pass** (21 socket-free, 13 TCP). The suite exercises split and
-coalesced frames, malformed framing, title/seed/policy refusal, team isolation,
-reconnect snapshots, OR deduplication, presence and cleanup. Do not substitute the
-21 pure cases for this gate. Two `client_sim.py` processes can then exchange synthetic
-flags using the README's commands; never inject a guessed synthetic hash into a game.
-Pass: one accepted key per team, correct snapshot/replay, no duplicate event on resend.
-Fail: unexpected re-broadcast, unsupported scalar accepted, peer mismatch accepted,
-or a framing/timeout exception.
+All 34 cases must pass (21 pure and 13 TCP). Local unit tests are not a substitute for
+this gate. TCP 43390 loopback is sufficient for the one-host test.
 
-## 2. Two instances on one host: off and observation controls
+## 2. One-host harness
 
-For the off control, leave all `EDEN_NX2_OOT_COOP*` variables unset. Trace independently:
+Prepare a self-contained portable `user/` template containing `config/`, keys/firmware
+and `nand/` with the disposable starting save. Absolute paths to saves outside that
+NAND are not imported. The harness copies this entire template twice (no hardlinks or
+symlinks), rewrites storage paths in the copied INIs and captures both emulator logs.
+It refuses an existing run directory, a running `lichii` process, or
+`~/Downloads/OOT/harness-runs/.aot-priority`. It checks again after copying and before
+launches. It never stops a game; close both game windows normally to finish.
 
-```sh
-EDEN_NX2_GAMEDATA_TRACE=1
-EDEN_NX2_ROMFS_TRACE=1
-```
-
-Set environment variables in the owner's existing launch method; these snippets are
-settings, not instructions for this lane to launch the game. Use `Core_ARM:Info` and
-`Loader:Info` logging (or `*:Info`). For instance A then B:
+From the worktree root, set these four variables to the lane's actual local files:
+`OOT_EMULATOR` (native Linux lichii executable), `OOT_GAME` (game file/directory),
+`OOT_PROFILE` (portable user template), and `OOT_KEYS` (private reviewed JSON array of
+nonzero numeric u64 keys). Then run this exact command:
 
 ```sh
-EDEN_NX2_OOT_COOP=127.0.0.1:43390
-EDEN_NX2_OOT_COOP_ROOM=field-C2-local-1
-EDEN_NX2_OOT_COOP_TEAM=together
-EDEN_NX2_OOT_COOP_SEED=0
-EDEN_NX2_OOT_COOP_POLICY=or-v2
-EDEN_NX2_OOT_COOP_NAME=Daniel
-EDEN_NX2_OOT_COOP_ALLOW_CLASSES=
-EDEN_NX2_GAMEDATA_TRACE=1
-EDEN_NX2_ROMFS_TRACE=1
+python3 -I tools/oot/coop/two_instances.py \
+  --emulator "${OOT_EMULATOR:?set native lichii path}" \
+  --game "${OOT_GAME:?set game path}" \
+  --profile "${OOT_PROFILE:?set disposable portable user template}" \
+  --keys "${OOT_KEYS:?set reviewed key JSON path}" \
+  --allow bit \
+  --run-dir "$HOME/Downloads/OOT/harness-runs/coop-C3-$(date +%Y%m%d-%H%M%S)"
 ```
 
-On B change only `EDEN_NX2_OOT_COOP_NAME=Anthony`. Use the same private deny-list
-file contents if `EDEN_NX2_OOT_COOP_DENY_LIST` is set. There is no automatic seed or
-policy digest; vanilla is seed `0`. `EDEN_NX2_OOT_COOP_PLAYED_EVENTS` no longer enables
-grants. No environment variable enables the production guest writer in this revision.
+The harness starts the loopback relay and two separate portable instances, sets
+`EDEN_NX2_OOT_COOP=1`, `...ALLOW=bit`, `...KEYS=<copied file>`, matching room/team/seed
+and a digest of the reviewed keys as policy ID. It enables both GameData and ROMFS
+traces. Omit `--allow bit` for the empty-class control. `--seed` defaults to `0`.
+The harness was not run in the development lane.
 
-Expected current log substrings:
+Logs: `relay.log`, `A.console.log`, `B.console.log`, and each
+`A/user/log/eden_log.txt`, `B/user/log/eden_log.txt`. `settings.json` records inputs.
+Re-run the checker on closed-session logs if needed:
 
-- `OoT co-op: connected; guest application disabled` after handshake + initial state.
-- `OoT co-op: observation only; setter request is not a grant receipt` once a shared
-  trace hook executes. No grants are emitted by these hooks.
-- `OoT co-op: not applied: grant class disabled` on a received candidate with empty
-  allow list. For a deliberate transport-only test using `...ALLOW_CLASSES=bit`,
-  the same candidate instead reaches `OoT co-op: not applied: no site (guest writes disabled)`.
-- `OoT co-op: handshake refused or mismatched` for deliberate seed/policy mismatch;
-  a mismatching title/build is rejected earlier with `OoT co-op off: endpoint/title/build gate`.
-- Queue failure diagnostics: `OoT co-op: pending queue full; reconnect for a fresh snapshot`,
-  `OoT co-op: outgoing queue full; observation skipped`, or `OoT co-op: relay rejected a packet`.
-  Any such line fails a normal smoke test.
+```sh
+python3 -I tools/oot/coop/check_logs.py \
+  "$RUN/A/user/log/eden_log.txt" "$RUN/B/user/log/eden_log.txt"
+```
 
-Pass: co-op off is silent, trace still works, both matching clients connect, deliberate
-mismatch is refused, no guest save state changes due to incoming traffic. Fail: an
-incoming grant claims applied, or a mere setter request is sent as a successful grant.
+## 3. Off/trace controls and the frame site
 
-## 3. Validate read-only trace evidence
+With co-op unset, no co-op connection/application lines should appear; trace can run
+independently. With co-op enabled but `EDEN_NX2_OOT_COOP_ALLOW` empty, no grants may
+change guest state. `ALLOW` accepts exact comma-separated `bool`/`bit` tokens and is
+empty by default. `KEYS` also defaults empty. Only reviewed `bit` keys have a C3
+production adapter. `ALLOW_CLASSES` from C2 no longer enables a class.
 
-Perform one ordinary forward quest transition and one event on disposable save A;
-observe B without repeating the action. With `EDEN_NX2_GAMEDATA_TRACE=1`, expect
-`gamedata trace on: main build ...`, `gamedata step-set ...`,
-`gamedata step-apply ... forwards` (or `same`/`backwards` if that is what the game requests),
-and `gamedata played-event name=... hash=...`. StepApply is an entry trace, so independently
-read the record after the update and confirm the actual resulting index/hash. For a
-natural rollback, verify the trace reports `backwards`; never force rollback to test it.
-`EDEN_NX2_ROMFS_TRACE=1` reports `romfs gamedata`, `romfs banc` and relevant
-`romfs evfl`/`romfs timeline` loads; caching means a file need not log every action.
-Trace logs are bounded per session; absence after the cap is not evidence of no mutation.
+Confirm `gamedata trace on`, `gamedata frame`, and `gamedata bit-read`/`bit-set` on the
+exact build. Existing step-set, step-apply and played-event diagnostics must remain
+correct. The new reader/setter hooks only learn the manager; the observer reads
+committed bytes at frame boundaries. A setter request by itself must never emit a grant.
 
-Pass: exact-build original instruction checks and observed registers match HOOKS.md,
-trace-only and trace+co-op produce the same natural progression. Fail: missing valid
-fields, unexplained `?`, wrong manager/record, or trace Resume executes twice.
-There is no trace-installed frame callback in this base. Do not treat StepSet,
-StepApply or PlayedEvent as a safe once-per-frame drain.
+The owner must establish that main+0x11E7A50 is a safe loaded-save boundary on the
+selected guest thread and that the manager/table/queue remain valid. Validate absence
+of a transition or active event at injection. C3 detects changed object/table identity,
+unreadable state and observed flag rollbacks; this is not a complete save lifecycle
+oracle, particularly for same-address reloads. Do not enable a real-save policy based
+only on the unit tests or on two unchanged pointers.
 
-## 4. Runtime adapter acceptance gate — future field build
+## 4. First field pass
 
-Implement the production adapter described in HOOKS.md before attempting this step.
-Keep key policy empty until a reviewed permanent check is chosen from the private data.
-Set `EDEN_NX2_OOT_COOP_ALLOW_CLASSES=bit`, a shared policy identity for the reviewed
-key list, and retain both traces. A class setting alone must still fail closed until
-all code verification gates and the private key allow list are satisfied.
+Wait until **both** logs show `relay connected`, `baseline exported` and
+`baseline exchanged`. Confirm the chosen key is false on B. Collect it normally on A.
+The logs must show, for the same class/key:
 
-The owner should use the live debugger to validate `main+0x11E7A50` on the main guest
-thread after save load. Establish that no save transition/event is active, manager
-and Bool64 table remain valid, the key exists and is false, queues have headroom, and
-private stack/sentinel memory belong to this process. First exercise a no-mutation
-sentinel round trip: every GPR, SIMD register, SP/PC/flags/FP state/TLS and exclusive
-monitor policy must agree after restore; the original instruction executes once.
+1. A: `observed class=bit key=<key> value=1 path=observer` exactly once.
+2. B: `started ... path=setter echo=1-bit-<key>` and then `returned` with that ID.
+3. B: `applied ... path=setter` only after the authoritative byte becomes true.
+4. B: `suppressed ... path=observer` with the same ID, and no `observed` for that key.
+   Suppression can precede the applied line during the same drain.
 
-The adapter must add logs for start, sentinel return, authoritative commit, timeout,
-quarantine and reset with opaque key, guest thread, generation and sequence identifiers.
-**Those application logs do not exist in this revision**; the offline engine returns
-`ApplyEvent::{Started,Returned,Committed,Recovered,Quarantined}` for that future wiring.
-Do not report those event names as observed runtime log lines today.
+The checker requires a necessary setter/data write, one applied receipt, positive
+suppression evidence and no echo or runtime failure diagnostics. An `already-true`
+receipt, relay ack, setter return, or silent log does not count as this field pass.
+No queue overflow, quarantine, allocation failure, mismatch or rejected-packet line is
+acceptable. Verify full context continuation and no repeated frame instruction,
+wrong-thread return or return-stack failure. A setter that stalls before another frame
+cannot trip the frame-clock watchdog; use the live debugger to diagnose it, never
+rewind arbitrary code that may hold locks.
 
-Pass: complete restoration and continued gameplay, no borrowed-stack corruption and no
-writes during a scene transition. Fail: wrong-thread sentinel, generation change,
-unmatched SP, callback reentry, or a restore that only covers callee-saved registers.
-On timeout do not rewind arbitrary running code or replay the grant. Quarantine; let
-owner recover the disposable session. A setter could still hold a lock or have queued
-its write before failing.
+Finally save/reload B and independently verify the intended key persisted and unrelated
+flags stayed unchanged. The checker cannot prove persistence, event safety or actor
+notification behavior. If an actor needs reload to reflect the flag, record that as a
+separate notification limitation. Repeat B→A with another reviewed key.
 
-## 5. One allowlisted check, local instances — future field build
+## 5. Baselines, duplicate delivery and resets
 
-A collects the chosen permanent check. After the successful local mutation, A emits
-one `bit_set`. B must re-read its value, invoke `main+0x3761720` only if false, restore
-on its sentinel, then wait for the authoritative byte to become true. Persist/reload
-B's disposable save and verify it remains true. Repeat B→A with another reviewed key.
+Repeat with different pre-existing reviewed true flags on A/B and confirm both readers
+converge to their union after both uploads and snapshot barriers. Duplicate and
+simultaneous flags must cause at most one necessary write. Test a short disconnect
+without restarting the relay, then a separate round with a fresh relay and restarted
+emulators so their baselines are exported again. Mid-session relay-state loss is not
+a supported recovery claim: a new process must re-export its actual save baseline.
 
-Pass: one accepted grant, at most one necessary call, true only for the intended key,
-no echo from B even if the setter's delayed consumer runs after sentinel return, no
-unrelated flags changed. Existing actors may need scene reload; a stale chest/wall
-requires actor-notification research, not blind rewrites. GameData trace should continue
-logging natural transitions/events, but its three hooks **do not log generic Bool64
-writes**, so absence of a trace line is expected and cannot validate this step alone.
+Exercise a scene transition and disposable save rollback. A changed binding/read
+failure/observed true→false must stop injection and retain receipts. Same-address save
+reloads need explicit investigation. Do not clear receipts while a setter can still
+return. No automatic retry of a timed-out call/commit is allowed.
 
-## 6. Reconciliation and failures — future field build
+## 6. Two machines
 
-Start with A and B having different pre-existing permanent checks, export both complete
-allowlisted baselines, then use the protocol's FIFO state-request barriers. Pass only
-after both save readers confirm the union. Restart/reconnect and deliberately resend
-the same event. Collect the same physical check simultaneously on both machines: one
-OR key survives; no extra item/count may be created. Additive items and small keys are
-unsupported and must be rejected, not counted as successful tests.
+Only after the local field and persistence gates pass, repeat over the private VPN with
+an explicit relay endpoint, matching game/build/seed/policy and independent disposable
+profiles. No public relay, real-time actors, movement/combat synchronization, teleport,
+quest progression, additive rewards or inventory synchronization is claimed.
 
-Disconnect B, collect on A, reconnect; then repeat past 512 events using simulator-only
-synthetic keys. Restart the memory-only relay only as a separate disposable round;
-baselines must rebuild its state. Save rollback/new save/scene transition while a grant
-is pending must invalidate the active generation and stop injection. An injected fault
-or missing sentinel must quarantine without automatic retry. The current prototype has
-no baseline extractor or durable receipts; these gates cannot pass on this revision.
-
-## 7. Daniel + Anthony over VPN
-
-Repeat steps 2–6 with the two separate machines. Change only the relay endpoint to the
-private VPN-reachable address and use a fresh room (e.g. `field-C2-vpn-1`). Keep build,
-seed, reviewed key policy, disposable save lineage and settings identical. Exercise
-latency and a short disconnect, compare both logs and post-reload save differences.
-Pass: the same convergence, echo and recovery criteria as localhost; no real-time player
-movement, dummy actors, combat, sounds or teleportation is expected. Report those as
-outside this protocol, not as missing successful flag synchronization.
-
-Keep save dumps and game-derived traces private. Hand back build/settings, relevant
-log lines and the specific permitted before/after flag evidence; do not post upstream.
+Keep save dumps and game-derived traces private. Hand back settings/build IDs, the
+relevant log lines and permitted before/after flag evidence.

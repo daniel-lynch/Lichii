@@ -9,8 +9,7 @@
 
 namespace Core::OotCoop {
 
-// This engine has no production memory/JIT adapter. A verified adapter must capture all CPU
-// state, own a private stack and executable sentinel, and validate the current save generation.
+// Backends capture full CPU state and own the private stack and executable sentinel.
 struct ApplyPolicy {
     bool enabled{};
     std::set<Kind> classes;
@@ -68,6 +67,9 @@ public:
 
     ApplyPhase Phase() const { return phase; }
     size_t Pending() const { return pending.size(); }
+    const std::optional<Change>& LastGrant() const { return last_grant; }
+    std::string_view LastPath() const { return last_path; }
+    void Invalidate() { Quarantine(); }
 
     ApplyEvent Drain(Backend& backend, const DrainContext& site) {
         if (phase == ApplyPhase::Quarantined) return ApplyEvent::Quarantined;
@@ -87,6 +89,8 @@ public:
         }
         if (pending.empty()) return ApplyEvent::None;
         active = pending.front();
+        last_grant = active;
+        last_path = "already-true";
         const auto current = backend.ReadFlag(*active);
         if (!current) {
             active.reset();
@@ -102,6 +106,7 @@ public:
         generation = site.generation;
         thread = site.thread;
         deadline = site.tick > MaxSequence - 120 ? MaxSequence : site.tick + 120;
+        last_path = target.pure_flag ? "data-or" : "setter";
         if (target.pure_flag) {
             // The adapter must prove this is the authoritative word with no notifications,
             // queue, dirty bits or concurrent writer; OrFlag is an atomic masked update.
@@ -182,6 +187,8 @@ private:
     std::deque<Change> pending;
     std::map<std::pair<Kind, u64>, bool> receipts;
     std::optional<Change> active;
+    std::optional<Change> last_grant;
+    std::string_view last_path;
     std::optional<typename Backend::Context> saved;
     ApplyTarget target;
     ApplyPhase phase{ApplyPhase::Idle};

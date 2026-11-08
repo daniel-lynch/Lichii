@@ -11,6 +11,7 @@
 
 #include "common/nx2_event_trace.h"
 #include "core/arm/dynarmic/oot_gamedata_trace.h"
+#include "core/arm/dynarmic/oot_coop_runtime.h"
 #include "dynarmic/interface/A64/a64.h"
 
 namespace {
@@ -37,6 +38,7 @@ public:
     std::map<u64, u8> bytes;
     std::vector<std::string> lines;
     u32 breakpoints{};
+    std::function<void(u64)> on_breakpoint;
 
     void Code(u64 address, u32 word) {
         code[address] = word;
@@ -101,6 +103,7 @@ public:
     }
     void ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) override {
         REQUIRE(exception == Dynarmic::A64::Exception::Breakpoint);
+        if (on_breakpoint) { on_breakpoint(pc); return; }
         REQUIRE(session.has_value());
         ++breakpoints;
         std::string line;
@@ -345,4 +348,138 @@ TEST_CASE("GameData trace sessions follow the loaded main module", "[oot_gamedat
     sessions.Reset(b, 0); // another build: no hooks
     REQUIRE_FALSE(sessions.Find(a));
     REQUIRE_FALSE(sessions.Find(b));
+}
+
+TEST_CASE("GameData frame hook executes the replaced hint once", "[oot_gamedata_trace]") {
+    TraceEnvironment env;
+    env.enabled = true;
+    env.session.emplace(nullptr, Base, 1);
+    const u64 entry = Site(Point::Frame);
+    env.Code(entry, Trace::Pacibsp);
+    env.Code(entry + 4, MovzX9Seven);
+    env.Code(entry + 8, Ret);
+    env.Code(Stop, Svc0);
+    RunAndCheck(env, entry, {}, ~u64{0}, 7);
+    REQUIRE(env.breakpoints == 1);
+    REQUIRE(env.lines.size() == 1);
+    REQUIRE(env.lines[0].starts_with("gamedata frame"));
+}
+
+TEST_CASE("OoT frame redirects a real JIT and sentinel restores full context", "[oot_coop][oot_gamedata_trace]") {
+    namespace Coop = Core::OotCoop;
+    TraceEnvironment env;
+    env.enabled = true;
+    env.session.emplace(nullptr, Base, 1);
+    const u64 frame = Site(Point::Frame);
+    const u64 entry = Base + 0x3761720;
+    constexpr u64 sentinel = Stop + 0x100;
+    constexpr u64 manager = Data;
+    constexpr u64 data = Data + 0x2000;
+    constexpr u64 queue = Data + 0x3000;
+    env.Code(frame, Trace::Pacibsp);
+    env.Code(frame + 4, Svc0);
+    env.Code(entry, 0xB40003C2); // cbz x2: nonzero reviewed key follows normal path
+    env.Code(entry + 4, 0xAA0003E8);
+    env.Code(entry + 8, Svc0); // Pause inside the synthetic setter to clobber its CPU context.
+    env.Code(entry + 12, Ret);
+    env.Code(sentinel, Trace::Breakpoint);
+    env.Write32(manager + 0xC58, 1);
+    env.Write64(manager + 0xC60, data);
+    env.Write32(manager + 0xC68, 1);
+    env.Write64(manager + 0xC70, queue);
+    env.Write32(manager + 0xC78, 0);
+    env.Write64(data, 101);
+    env.Write64(data + 8, 0);
+    env.Write64(queue, 0);
+    Dynarmic::A64::Jit jit{Config(env)};
+    env.jit = &jit;
+    u64 tls = 0x1234, tls_ro = 0x5678;
+    int exclusive_clears = 0;
+    Coop::GuestBinding binding{Base, 0, 0, 0, sentinel, 0x20000000};
+    for (u64 i = binding.stack - 0x4000; i < binding.stack; ++i) env.bytes[i] = 0;
+    using Backend = Coop::GameDataBackend<Dynarmic::A64::Jit, TraceEnvironment>;
+    Backend backend{jit, env, binding, tls, tls_ro, [&] { ++exclusive_clears; }};
+    REQUIRE(backend.Bind(manager));
+    const Coop::Change grant{Coop::Kind::Bit, "A", 1, 101, 1};
+    REQUIRE(backend.ReadFlag(grant) == false);
+    SECTION("queue full fails closed") {
+        env.Write32(manager + 0xC78, 1);
+        REQUIRE_FALSE(backend.Resolve(grant));
+        REQUIRE(exclusive_clears == 0);
+        return;
+    }
+    SECTION("changed table quarantines binding") {
+        env.Write64(manager + 0xC70, queue + 8);
+        REQUIRE_FALSE(backend.Bind(manager));
+        REQUIRE(binding.invalid);
+        REQUIRE_FALSE(backend.Resolve(grant));
+        return;
+    }
+    SECTION("sentinel round trip") {}
+    Coop::FrameDrain<Backend> drain{{true, {Coop::Kind::Bit}, {{Coop::Kind::Bit, 101}}}};
+    REQUIRE(drain.Queue(grant));
+    std::vector<std::string> logs;
+    const auto log = [&](std::string_view line) { logs.emplace_back(line); };
+    const auto send = [](Coop::Change, bool) { FAIL("Injected grant echoed"); };
+    int frames = 0, returns = 0;
+    env.on_breakpoint = [&](u64 pc) {
+        if (pc == sentinel) {
+            REQUIRE(drain.Sentinel(backend, {7, 9, 1, true}, pc, log) == Coop::ApplyEvent::Returned);
+            ++returns;
+        } else {
+            std::string line;
+            REQUIRE(Trace::Handle(*env.session, pc, jit, env, &line));
+            if (pc == frame) {
+                ++frames;
+                REQUIRE(drain.Frame(backend, {7, 9, 1, true}, send, log) == Coop::ApplyEvent::Started);
+            }
+        }
+    };
+    for (size_t i = 0; i < 31; ++i) jit.SetRegister(i, 0x12340000 + i);
+    for (size_t i = 0; i < 32; ++i) jit.SetVector(i, {0x45670000 + i, 0x78900000 + i});
+    jit.SetSP(0x30000000);
+    jit.SetPC(frame + 4);
+    jit.SetPstate(0xA0000000);
+    jit.SetFpcr(0x400000);
+    jit.SetFpsr(0x8000001);
+    auto expected = *backend.Capture();
+    jit.SetPC(frame);
+    jit.Run();
+    REQUIRE(jit.GetPC() == entry + 12);
+    REQUIRE(jit.GetRegister(0) == manager);
+    REQUIRE(jit.GetRegister(1) == 1);
+    REQUIRE(jit.GetRegister(2) == 101);
+    REQUIRE(jit.GetRegister(30) == sentinel);
+    REQUIRE(jit.GetSP() == binding.stack);
+    for (size_t i = 0; i < 30; ++i) jit.SetRegister(i, i);
+    for (size_t i = 0; i < 32; ++i) jit.SetVector(i, {i, i});
+    jit.SetPstate(0);
+    jit.SetFpcr(0);
+    jit.SetFpsr(0);
+    tls = tls_ro = 0;
+    jit.Run();
+    expected.pc = frame + 8; // Original continuation executed exactly one SVC.
+    REQUIRE(*backend.Capture() == expected);
+    REQUIRE(exclusive_clears == 2);
+    REQUIRE(frames == 1);
+    REQUIRE(returns == 1);
+    REQUIRE(backend.ReadFlag(grant) == false); // Return alone is not a commit.
+    env.bytes[data + 0xC] = 1;
+    REQUIRE(drain.Frame(backend, {7, 9, 2, true}, send, log) == Coop::ApplyEvent::Committed);
+    REQUIRE(drain.Suppress(grant));
+}
+
+TEST_CASE("GameData Bool64 reader hook resumes its zero extending load", "[oot_gamedata_trace]") {
+    TraceEnvironment env;
+    env.enabled = true;
+    env.session.emplace(nullptr, Base, 1);
+    const u64 entry = Site(Point::BitRead);
+    env.Code(entry, 0xB94C5808);
+    env.Code(entry + 4, MovzX9Seven);
+    env.Code(entry + 8, Ret);
+    env.Code(Stop, Svc0);
+    env.Write32(Data + 0xC58, 0x80000001);
+    RunAndCheck(env, entry, {Data, 0, 101, 0, 0, 0}, 0x80000001, 7);
+    REQUIRE(env.breakpoints == 1);
+    REQUIRE(env.lines.front().starts_with("gamedata bit-read mgr="));
 }

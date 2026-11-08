@@ -3,7 +3,7 @@
 Target: title `0400486024DEC000`, main build
 `E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348`. All addresses below use the
 Ghidra image base `0x7100000000`; relocate by subtracting that base and adding
-this process's verified main base. These are evidence, **not enabled write sites**.
+this process's verified main base. Writes require the explicit class/key policy described below; all field claims remain unverified.
 
 `G` below means `~/Downloads/OOT/ghidra`. **Proven** means an operation is visible
 in a supplied listing or the exported instruction bytes at the cited address.
@@ -33,7 +33,7 @@ For the previously unlisted small functions, this pass disassembled the read-onl
 | Quest apply `0x7102CF1830` (`G/out17r/decomp/7102cf1830.c`) | Integer argument `x0=record+0x18`; `w1` controls old-step processing. Resolves pending hash, invokes `0x7102CF1160`, writes index, invokes `0x7102CF13A0`. | **Proven:** more than one field changes and callbacks run. Entry trace is before mutation. FP/vector argument needs in callees remain unverified; never inject this interior apply path. |
 | Played event `0x7102BDC4E0` (`G/out17/decomp/7102bdc4e0.c`) | `x0=task wrapper`; task at +0x10, name pointer at task+8, length including NUL at task+0x10. Finds `HavePlayedEvent` struct then hashes the member name. | **Proven:** this is a struct/member operation, not `Murmur3("HavePlayedEvent." + name)` as the skeleton assumed. Trigger timing/creator and success are **inferred/unknown**. No v2 grant emitted from this hook. |
 | Struct-bool helpers `0x7103745A10`, `0x7103745CD0`, fallback `0x7103745B70` (caller above and `.tmp/struct-bool-C2.txt`) | First two: `x0=manager+8` or `manager+0x68`, `w1=1`, `x2=local struct handle*`, `w3=member hash`, `w4=(manager+0xD0C == 0)`; low result bit controls fallback. Fallback adds `w4=0`, moves mode into `w5`. | **Proven** caller setup. Handle includes a resolved record and flags, not just an opaque hash. Member-key/type lookup must be reconstructed; no generic flat-bool adapter for these calls. |
-| Frame marker `0x71011E7A50` (`G/out4/decomp/71011e7a50.c`, `G/out12/ctx/71011e7a50.txt`, exported bytes) | Starts `pacibsp`; calls `nn::os::WaitEvent` at `0x71011E7A68`. Existing names identify `GameFramework::waitPresentDone`. | **Inferred** safe injection boundary, supported by prior debugger experiment in `findings-scene-tour.md`, not revalidated here. Critically, this marker is **not hooked by the trace code in this tree**. No frame drain is claimed to exist. |
+| Frame marker `0x71011E7A50` (`G/out4/decomp/71011e7a50.c`, `G/out12/ctx/71011e7a50.txt`, exported bytes) | Starts `pacibsp`; calls `nn::os::WaitEvent` at `0x71011E7A68`. Existing names identify `GameFramework::waitPresentDone`. | **Inferred** safe injection boundary, supported by prior debugger experiment in `findings-scene-tour.md`, not revalidated here. C3 installs this marker through the same instruction-substitution path as the other trace hooks; it drives the co-op drain on the first guest thread that reaches it. |
 | Pouch grant entry | **Unknown.** Notification references are not a grant API; e.g. `G/out13/decomp/710110d570.c` and `71033a4fa0.c` reference pouch-content changes. | Need successful item-receive caller, exact manager/actor/count ABI, source check identity, ownership/equipment/ammo/notification/autosave effects. No address is guessed. |
 
 ## Storage layout and what must be changed
@@ -89,55 +89,80 @@ u32 boundary at file+8; values may instead point to strings/vectors. No complete
 schema, Bool64 serialization, inventory transaction or small-key counter ABI is
 established here. Never patch disposable or real saves using those assumptions alone.
 
-## One application path
+## C3 frame-drain application path
 
-The selected first field candidate is an allowlisted Bool64 setter call, using
-`x0=verified live GameData manager`, `w1=1`, `x2=actor key`, entry main+0x3761720.
-A matching setter return restores the interrupted context, then waits for the reader
-above to report true at a later safe drain. There is no success boolean to trust.
-No production adapter is installed by this change.
+`oot_gamedata_trace.h` now substitutes the verified `pacibsp` at main+0x11E7A50.
+It also observes the Bool64 reader at +0x3761684 (`ldr w8, [x0, #0xC58]`) and
+setter at +0x3761724 (`mov x8, x0`) to learn the manager from actual guest arguments.
+Both original words were checked against the exported text bytes. Reader/setter entry
+observations are **not** receipts: the observer reads the authoritative reviewed keys
+at the next frame boundary and emits only false→true changes (or true baseline values).
 
-1. Decode/validate network input off-thread. Queue only true grants allowed by both
-   class and key policy; match title/build/seed/policy. At a verified frame boundary,
-   detach a bounded batch from the queue lock and validate guest thread/save generation.
-2. Read authoritative state. Already true means satisfied without a write. Validate
-   object lifetime, key lookup, instruction bytes, queue capacity, save-loaded state,
-   absence of a transition/event and sufficient private guest stack before starting.
-3. Prefer an atomic masked data write **only if** the specific class has proved no
-   queue, notifications, cache or dirty-state obligations. None of the researched
-   setters qualifies. The fake backend exercises this branch for future proven flags.
-4. Otherwise capture full CPU state, redirect PC to the callable entry, set x0..x7,
-   align a separate guest stack to 16 bytes and set LR to a dedicated executable
-   sentinel. The sentinel cannot be the original frame marker: distinguish thread,
-   generation and return SP. Preserve GPR/SIMD/PC/SP/PSTATE/FPCR/FPSR/TLS and explicitly
-   handle exclusive-monitor state. Never restore only callee-saved registers.
-5. At the owned sentinel restore the full interrupted context and resume the original
-   instruction exactly once. A caller must not also execute the trace's normal Resume
-   after redirecting execution. Await authoritative commit; do not retry on timeout.
-6. Echo receipts survive host-thread changes, sentinel return and delayed application;
-   they are keyed by grant class/key within one save generation. During an uncertain
-   failure retain suppression and quarantine further grants. Never unwind from an
-   arbitrary PC that may hold locks. Restore only when the adapter proves a recoverable
-   boundary; otherwise stop injection and let the owner diagnose/restart the disposable
-   session. Reset receipts only once the old guest cannot execute any further.
+`arm_dynarmic_64.cpp` resumes each substituted instruction once, then invokes
+`Session::Hook`. At a frame, the resumed PC is frame+4. `Session` detaches at most 64
+incoming entries under its transport lock, releases that lock, and feeds its persistent
+`FrameDrain<GameDataBackend>` on the owning guest thread. A separate session mutex
+protects guest bookkeeping across host workers. The network thread never touches guest
+memory or registers. Other trace hooks do not drain.
 
-`oot_coop_apply.h` implements this state machine against a backend contract; tests use
-fake memory/registers. It is **not wired to Session or Dynarmic**, so it cannot alter
-guest execution. Its receipts persist in memory through the full operation, not on disk.
-Process restart requires baseline reread; durable receipts would need atomic binding to
-the save and a protocol epoch before any additive rewards could be considered.
-`EDEN_NX2_OOT_COOP_ALLOW_CLASSES` controls the current disabled writer's class gate;
-the backend additionally requires an explicit key set. Default class/key sets are empty.
+The first supported class is `bit`: Bool64 reader layout + deferred setter at
+main+0x3761720, x0=manager, w1=1, x2=reviewed actor key. The backend checks mappings,
+count/key lookup, manager/table/queue identity, setter instruction words and queue
+headroom. It requires two frame visits with a valid binding before application. A
+changed binding, unreadable baseline, or observed true→false rollback quarantines
+injection for this process; receipts are never reset while the old guest can return.
+The process epoch is currently 1. This is conservative detection, **not a proven
+save-load/transition lifecycle hook**; same-address reloads and event scheduling still
+need the field checks below.
 
-## Trace integration correction
+The loader allocates an owned 16 KiB RW guest stack and separate RX sentinel page
+after loading main, before guest execution, through `KProcess::AllocateDebugCallMemory`.
+Both allocations are charged to the process resource limit and heap budget and released
+with its page table. No allocation/page-table locks are taken by the frame callback. It does not borrow a game's stack or executable padding.
+The backend captures all x0–x30, all 32 SIMD registers, PC, SP, PSTATE, FPCR, FPSR,
+TPIDR_EL0 and TPIDRRO_EL0. It clears both Dynarmic's local and the core's global
+exclusive reservations on redirect/restore (STXR retries, as after a context switch).
+It redirects to the setter with a private SP and sentinel LR. Only the matching
+thread, epoch, sentinel and return SP restore that context. Invalid sentinel hits
+halt through the normal instruction-breakpoint path. No normal Resume follows a
+sentinel restore. Setter return means enqueueing; `applied` is logged only when a
+later frame reads true. A 120-frame commit timeout quarantines without replay.
+A setter that never reaches another hook/frame cannot be timed out by this frame
+clock; it must be diagnosed by the owner. No arbitrary-PC recovery is implemented.
 
-`oot_gamedata_trace.h` substitutes three original instructions only: StepSet+4,
-StepApply entry, PlayedEvent entry. `arm_dynarmic_64.cpp` invokes co-op alongside the
-read-only trace, then resumes once. `nso.cpp` checks the main build ID. ROMFS tracing
-locates relevant files and timing; it neither identifies a loaded save manager nor
-provides a frame callback. The co-op hook now emits only a diagnostic marker and drains
-the disabled writer. Neither StepSet nor PlayedEvent fabricates a protocol grant.
+The shared grant engine retains its atomic masked `data-or` branch and tests it with
+fake memory. **No production pure-write class is enabled.** Every GameData layout
+researched above either uses a deferred queue or has unknown dirty/notification
+obligations. Writing the Bool64 byte directly would contradict the evidence.
+Ordinary `bool` is recognized by the class parser/protocol but has no reviewed key
+adapter in C3; neither int/enum/quest/pouch nor struct-member writes are enabled.
 
-The field adapter must install and test the frame marker separately. Exact original
-instruction `pacibsp` is known from exported bytes, but safe scheduling and guest-stack
-ownership are not. Do not turn `GuestWritesVerified` on to bypass that missing work.
+## Policy and logs
+
+- `EDEN_NX2_OOT_COOP=1`: enable loopback transport, default `127.0.0.1:43390`;
+  `EDEN_NX2_OOT_COOP_RELAY=host:port` overrides it. The older `COOP=host:port` form works.
+- `EDEN_NX2_OOT_COOP_ALLOW`: comma-separated `bool,bit` tokens, no spaces or empty
+  tokens. Default is the **empty set**. Invalid tokens reject session creation.
+  The old `ALLOW_CLASSES` variable is no longer consulted.
+- `EDEN_NX2_OOT_COOP_KEYS`: path to a private JSON array of up to 4096 nonzero u64
+  Bool64 keys. Default is empty; the class setting alone cannot grant anything.
+  Deny-list keys are removed. Both peers must use the same reviewed key set/policy ID.
+
+The observer consults the engine's class/key receipts before emitting any value.
+Receipts survive queueing, host worker changes, sentinel return, delayed commit,
+duplicate delivery and quarantine. Each application emits exactly one line:
+
+```
+OoT co-op: applied class=bit key=<16-hex> value=1 path=setter echo=1-bit-<16-hex>
+```
+
+`started`, `returned` and `suppressed` carry the same key and echo ID. `already-true`
+is a satisfied receipt without a write. `baseline` and `observed` identify outbound
+baseline/local mutations. A complete allowed-set read logs `baseline exported`;
+a FIFO state-request after its outgoing acknowledgements logs `baseline exchanged`
+on reply. That is a relay snapshot barrier, not proof of guest/save convergence.
+
+Unit tests exercise the real JIT's frame→synthetic setter→sentinel→continuation path
+and a fake two-peer observer/queue/application path. These do not validate this game's
+manager lifetime, event exclusion, queue-consumer effects or save durability. Follow
+FIELD-PLAN.md on disposable saves before claiming the field candidate works.

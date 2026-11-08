@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <map>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <set>
@@ -17,6 +18,10 @@
 #include <nlohmann/json.hpp>
 
 #include "core/arm/dynarmic/oot_gamedata_trace.h"
+
+namespace Kernel { class KernelCore; }
+namespace Dynarmic::A64 { class Jit; }
+namespace Core::Memory { class Memory; }
 
 namespace Core::OotCoop {
 
@@ -87,60 +92,20 @@ private:
 
 [[nodiscard]] bool ShouldApply(const Change& change, const State& observed);
 
-// The scope covers synchronous setters. An injected call must keep this token alive until its
-// sentinel returns; TODO bind that lifetime to the guest thread, not the host worker thread.
-class IncomingScope {
-public:
-    IncomingScope();
-    ~IncomingScope();
-    IncomingScope(const IncomingScope&) = delete;
-    IncomingScope& operator=(const IncomingScope&) = delete;
-    [[nodiscard]] static bool SuppressSend();
-
-private:
-    static thread_local u32 depth;
-};
-
-enum class Strategy { GuestCall, DirectWrite };
-enum class ApplyStatus { NotAppliedNoSite, NotAppliedUnverified, Applied };
-struct Site {
-    Kind kind;
-    u64 offset;
-    u32 instruction;
-};
-inline constexpr std::array<Site, 6> Sites{{
-    {Kind::Bool, 0, 0},     // TODO locate and verify GameData bool setter and ABI.
-    {Kind::Int, 0, 0},      // TODO locate and verify GameData int setter and ABI.
-    {Kind::Enum, 0, 0},     // TODO locate and verify GameData enum setter and ABI.
-    {Kind::Quest, 0, 0},    // TODO verify callable entry/ABI; StepSet is an observation at +4.
-    {Kind::Bit, 0, 0},      // TODO locate and verify Bool64bitKey setter and ABI.
-    {Kind::PouchAdd, 0, 0}, // TODO locate and verify pouch add entry and result semantics.
-}};
-inline constexpr bool GuestWritesVerified = false;
-
-class GuestWriter {
-public:
-    explicit GuestWriter(Strategy strategy_ = Strategy::GuestCall) : strategy{strategy_} {}
-    [[nodiscard]] ApplyStatus Apply(const Change& change) const;
-
-private:
-    [[nodiscard]] ApplyStatus InjectCall(const Change& change) const;
-    [[nodiscard]] ApplyStatus WriteStorage(const Change& change) const;
-    Strategy strategy;
-};
-
 class Session {
 public:
-    Session(const Kernel::KProcess* owner_, u64 base_, Endpoint endpoint, Hello hello,
-            std::set<u64> denied, bool played_events_, std::set<Kind> allowed_classes = {});
+    Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_, Endpoint endpoint, Hello hello,
+            std::set<u64> denied, std::set<Kind> allowed_classes = {},
+            std::set<u64> allowed_keys = {});
     ~Session();
     void Stop();
     void Observe(Change change);
-    void Drain();
-    void ObserveDiagnostic();
-    const Kernel::KProcess* const owner;
+    bool Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& jit,
+              Memory::Memory& memory, u64 thread, u64& tls, u64& tls_ro,
+              std::function<void()> clear_exclusive);
+    bool IsSentinel(u64 pc) const;
+    Kernel::KProcess* const owner;
     const u64 base;
-    const bool played_events;
 
 private:
     struct Impl;
@@ -149,7 +114,7 @@ private:
 
 // Reset stops the previous transport even when a JIT still owns its shared session.
 void BeginSession();
-void RegisterMain(const Kernel::KProcess* owner, u64 program_id, u64 base,
+void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 program_id, u64 base,
                   std::string_view build_id);
 [[nodiscard]] std::shared_ptr<Session> FindSession(const Kernel::KProcess* owner);
 
@@ -184,14 +149,6 @@ std::optional<u32> StepIndex(Memory& memory, u64 manager, u32 challenge, u32 ste
         }
     }
     return std::nullopt;
-}
-
-template <typename Jit, typename Memory>
-void OnHook(Session& session, OotGameDataTrace::Point point, Jit& jit, Memory& memory) {
-    // Requests are not receipts. PlayedEvent is a struct member, not a dotted-name hash.
-    // Until successful mutation hooks exist, the shared breakpoints are diagnostic only.
-    session.ObserveDiagnostic();
-    session.Drain();
 }
 
 } // namespace Core::OotCoop

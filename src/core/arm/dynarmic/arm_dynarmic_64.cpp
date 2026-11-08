@@ -23,6 +23,7 @@
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_thread.h"
 #include "dynarmic/interface/A64/config.h"
 #include "core/arm/exec_coverage.h"
 
@@ -163,20 +164,31 @@ void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::Instruc
 
 void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) {
     if (exception == Dynarmic::A64::Exception::Breakpoint && (m_oot_coop || m_gamedata_trace)) {
+        const auto coop_hook = [&](OotGameDataTrace::Point point) {
+            return m_oot_coop->Hook(point, pc, *m_parent.m_jit, m_memory,
+                Kernel::GetCurrentThread(m_parent.m_system.Kernel()).GetThreadId(),
+                m_tpidr_el0, m_tpidrro_el0, [&] {
+                    m_parent.m_exclusive_monitor.ClearExclusive(m_parent.m_core_index);
+                });
+        };
+        if (m_oot_coop && m_oot_coop->IsSentinel(pc)) {
+            if (coop_hook(OotGameDataTrace::Point::None)) return;
+            ReturnException(pc, InstructionBreakpoint);
+            return;
+        }
         const u64 base = m_oot_coop ? m_oot_coop->base : m_gamedata_trace->base;
         const auto original = OotGameDataTrace::Detail::Read32(m_memory, pc);
         const auto point = original ? OotGameDataTrace::Identify(base, pc, *original)
                                     : OotGameDataTrace::Point::None;
         if (point != OotGameDataTrace::Point::None) {
-            if (m_oot_coop) {
-                OotCoop::OnHook(*m_oot_coop, point, *m_parent.m_jit, m_memory);
-            }
             // Resume exactly once, whether tracing, co-op, or both registered the breakpoint.
             if (m_gamedata_trace) {
                 OotGameDataTrace::Handle(*m_gamedata_trace, pc, *m_parent.m_jit, m_memory);
             } else {
-                OotGameDataTrace::Resume(point, *m_parent.m_jit);
+                OotGameDataTrace::Resume(point, *m_parent.m_jit, m_memory);
             }
+            // Resume the original instruction before capturing context or redirecting PC.
+            if (m_oot_coop) coop_hook(point);
             return;
         }
     }

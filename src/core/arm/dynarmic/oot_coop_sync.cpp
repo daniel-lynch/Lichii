@@ -21,6 +21,10 @@
 #include "common/logging.h"
 #include "common/thread.h"
 #include "core/arm/dynarmic/oot_coop_sync.h"
+#include "core/arm/dynarmic/oot_coop_runtime.h"
+#include "core/hle/kernel/k_process.h"
+#include "core/memory.h"
+#include "dynarmic/interface/A64/a64.h"
 
 namespace Core::OotCoop {
 namespace {
@@ -257,6 +261,7 @@ std::string EncodeFrame(const Json& packet) {
 }
 
 std::optional<Endpoint> ParseEndpoint(std::string_view text) {
+    if (text == "1") return Endpoint{"127.0.0.1", 43390};
     const auto colon = text.rfind(':');
     if (colon == std::string_view::npos || colon == 0) return std::nullopt;
     auto host = text.substr(0, colon);
@@ -404,37 +409,18 @@ bool ShouldApply(const Change& change, const State& observed) {
     return change.kind == Kind::PouchAdd && change.value > 0;
 }
 
-thread_local u32 IncomingScope::depth{};
-IncomingScope::IncomingScope() { ++depth; }
-IncomingScope::~IncomingScope() { --depth; }
-bool IncomingScope::SuppressSend() { return depth != 0; }
-
-ApplyStatus GuestWriter::Apply(const Change& change) const {
-    const auto it = std::find_if(Sites.begin(), Sites.end(), [&](const Site& site) {
-        return site.kind == change.kind;
-    });
-    if (it == Sites.end() || it->offset == 0) return ApplyStatus::NotAppliedNoSite;
-    if constexpr (!GuestWritesVerified) {
-        return ApplyStatus::NotAppliedUnverified;
-    }
-    return strategy == Strategy::GuestCall ? InjectCall(change) : WriteStorage(change);
-}
-
-ApplyStatus GuestWriter::InjectCall(const Change&) const {
-    // TODO full CPU context + guest thread ownership, setter ABI, x0..x7, sentinel LR, restore.
-    return ApplyStatus::NotAppliedNoSite;
-}
-
-ApplyStatus GuestWriter::WriteStorage(const Change&) const {
-    // TODO storage layout, manager lifetime, synchronization, notifications and save dirty bits.
-    return ApplyStatus::NotAppliedNoSite;
-}
-
 struct Session::Impl {
+    using Backend = GameDataBackend<Dynarmic::A64::Jit, Memory::Memory>;
     struct Connection;
-    Impl(Endpoint endpoint_, Hello hello_, std::set<u64> denied_, std::set<Kind> allowed_)
+    Impl(Endpoint endpoint_, Hello hello_, std::set<u64> denied_, std::set<Kind> allowed_, std::set<u64> keys)
         : endpoint{std::move(endpoint_)}, hello{std::move(hello_)}, denied{std::move(denied_)},
-          local{denied}, remote{denied}, allowed_classes{std::move(allowed_)}, retry{io} {}
+          local{denied}, remote{denied}, allowed_classes{std::move(allowed_)}, retry{io} {
+        ApplyPolicy policy{true, allowed_classes, {}};
+        for (const u64 key : keys) {
+            if (!denied.contains(key)) policy.keys.emplace(Kind::Bit, key);
+        }
+        runtime = std::make_unique<FrameDrain<Backend>>(std::move(policy));
+    }
     ~Impl() { Stop(); }
     void Start();
     void Stop();
@@ -451,8 +437,12 @@ struct Session::Impl {
     std::deque<Change> outgoing;
     std::deque<std::variant<Change, HighWater>> pending;
     u64 next_seq{1};
-    bool logged_no_site{};
-    bool logged_diagnostic{};
+    std::mutex guest_mutex;
+    GuestBinding binding;
+    std::unique_ptr<FrameDrain<Backend>> runtime;
+    u64 frame_thread{}, tick{};
+    bool stable_frame{};
+    bool baseline_ready{};
     bool logged_class{};
     bool logged_overflow{};
     std::atomic<bool> stopped{};
@@ -513,6 +503,16 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                 for (const auto& change : changes) {
                     self->Send(EncodeChange(change));
                     self->sent_seq = change.seq;
+                }
+                bool request_baseline = false;
+                {
+                    std::scoped_lock lock{self->owner.mutex};
+                    request_baseline = self->owner.baseline_ready &&
+                                       self->owner.outgoing.empty() && !self->baseline_requested;
+                }
+                if (request_baseline) {
+                    self->baseline_requested = true;
+                    self->Send({{"type", "team_state_request"}});
                 }
                 if (now - self->last_heartbeat >= 30s) {
                     self->Send({{"type", "heartbeat"}});
@@ -579,11 +579,14 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                     } else {
                         if (!self->ready && type != "team_state") return self->Fail();
                         if (!self->owner.Receive(*packet)) return self->Fail();
+                        if (self->baseline_requested && type == "team_state") {
+                            LOG_INFO(Core_ARM, "OoT co-op: baseline exchanged");
+                        }
                         if (!self->ready) {
                             self->ready = true;
                             self->Send({{"type", "client_state"},
-                                        {"state", {{"apply_enabled", false}}}});
-                            LOG_INFO(Core_ARM, "OoT co-op: connected; guest application disabled");
+                                        {"state", {{"apply_enabled", !self->owner.allowed_classes.empty()}}}});
+                            LOG_INFO(Core_ARM, "OoT co-op: relay connected; frame drain class-gated");
                         }
                     }
                 } catch (const std::exception&) {
@@ -601,6 +604,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
     Clock::time_point last_heartbeat{Clock::now()};
     bool failed{};
     bool handshaken{};
+    bool baseline_requested{};
     bool ready{};
     u64 sent_seq{};
     std::array<char, 4> header{};
@@ -694,18 +698,29 @@ bool Session::Impl::Receive(const Json& packet) {
     return true;
 }
 
-Session::Session(const Kernel::KProcess* owner_, u64 base_, Endpoint endpoint, Hello hello,
-                 std::set<u64> denied, bool played_events_, std::set<Kind> allowed_classes)
-    : owner{owner_}, base{base_}, played_events{played_events_},
+Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_, Endpoint endpoint, Hello hello,
+                 std::set<u64> denied, std::set<Kind> allowed_classes,
+                 std::set<u64> allowed_keys)
+    : owner{owner_}, base{base_},
       impl{std::make_unique<Impl>(std::move(endpoint), std::move(hello), std::move(denied),
-                                   std::move(allowed_classes))} {
+                                   std::move(allowed_classes), std::move(allowed_keys))} {
+    impl->binding.base = base;
+    if (impl->allowed_classes.contains(Kind::Bit)) {
+        Kernel::KProcessAddress stack{}, sentinel{};
+        if (owner->AllocateDebugCallMemory(kernel, &stack, &sentinel).IsSuccess()) {
+            impl->binding.stack = GetInteger(stack);
+            impl->binding.sentinel = GetInteger(sentinel);
+        } else {
+            LOG_WARNING(Core_ARM, "OoT co-op: private stack/sentinel allocation failed");
+        }
+    }
     impl->Start();
 }
 Session::~Session() = default;
 void Session::Stop() { impl->Stop(); }
 
 void Session::Observe(Change change) {
-    if (impl->stopped || IncomingScope::SuppressSend() || !WireKind(change.kind)) return;
+    if (impl->stopped || !WireKind(change.kind)) return;
     std::scoped_lock lock{impl->mutex};
     if (impl->outgoing.size() >= QueueLimit || impl->next_seq > MaxSequence) {
         if (!impl->logged_overflow) {
@@ -720,49 +735,79 @@ void Session::Observe(Change change) {
     impl->outgoing.push_back(std::move(change));
 }
 
-void Session::ObserveDiagnostic() {
-    std::scoped_lock lock{impl->mutex};
-    if (!impl->logged_diagnostic) {
-        LOG_INFO(Core_ARM, "OoT co-op: observation only; setter request is not a grant receipt");
-        impl->logged_diagnostic = true;
-    }
+bool Session::IsSentinel(u64 pc) const {
+    std::scoped_lock lock{impl->guest_mutex};
+    return impl->binding.sentinel && pc == impl->binding.sentinel;
 }
 
-void Session::Drain() {
-    if (impl->stopped || IncomingScope::SuppressSend()) return;
-    // Only called from the guest breakpoint callback; the I/O thread never accesses guest state.
-    std::scoped_lock lock{impl->mutex};
-    const GuestWriter writer;
-    for (size_t count = 0; count < 64 && !impl->pending.empty(); ++count) {
-        auto entry = std::move(impl->pending.front());
-        impl->pending.pop_front();
-        if (const auto* seen = std::get_if<HighWater>(&entry)) {
-            if (!impl->remote.AdoptSeen(*seen)) {
-                LOG_WARNING(Core_ARM, "OoT co-op stopped: snapshot sender capacity exceeded");
-                impl->stopped = true;
-                impl->io.stop();
-            }
-            continue;
+bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& jit,
+                   Memory::Memory& memory, u64 thread, u64& tls, u64& tls_ro,
+                   std::function<void()> clear_exclusive) {
+    std::scoped_lock guest_lock{impl->guest_mutex};
+    auto& binding = impl->binding;
+    auto& runtime = *impl->runtime;
+    Impl::Backend backend{jit, memory, binding, tls, tls_ro, std::move(clear_exclusive)};
+    const auto log = [](std::string_view line) { LOG_INFO(Core_ARM, "{}", line); };
+    const DrainContext site{thread, 1, impl->tick, true};
+    if (binding.sentinel && pc == binding.sentinel) {
+        const auto event = runtime.Sentinel(backend, site, pc, log);
+        // An unowned/invalid sentinel must reach the normal breakpoint fault, never resume.
+        if (event != ApplyEvent::Returned) {
+            log(fmt::format("OoT co-op: sentinel refused thread={} pc={:#x}", thread, pc));
         }
-        const auto& change = std::get<Change>(entry);
-        if (!impl->remote.Merge(change, !change.origin.empty())) continue;
-        // TODO read authoritative guest values here before enabling either writer. Observations
-        // alone cannot account for pre-session saves, local resets or rejected setter requests.
-        if (change.kind != Kind::PouchTotal && !ShouldApply(change, impl->local)) continue;
-        if (!impl->allowed_classes.contains(change.kind)) {
-            if (!impl->logged_class) {
-                LOG_INFO(Core_ARM, "OoT co-op: not applied: grant class disabled");
-                impl->logged_class = true;
-            }
-            continue;
-        }
-        IncomingScope incoming;
-        const auto status = writer.Apply(change);
-        if (status != ApplyStatus::Applied && !impl->logged_no_site) {
-            LOG_INFO(Core_ARM, "OoT co-op: not applied: no site (guest writes disabled)");
-            impl->logged_no_site = true;
+        return event == ApplyEvent::Returned;
+    }
+    if (impl->stopped) return false;
+    if (point == OotGameDataTrace::Point::BitRead || point == OotGameDataTrace::Point::BitSet) {
+        backend.Bind(jit.GetRegister(0));
+        return false;
+    }
+    if (point != OotGameDataTrace::Point::Frame || !thread) return false;
+    if (!impl->frame_thread) impl->frame_thread = thread;
+    if (impl->frame_thread != thread) return false;
+    ++impl->tick;
+    if (binding.invalid || (!backend.Bind(binding.manager) && impl->stable_frame)) {
+        runtime.Invalidate();
+        runtime.Frame(backend, {thread, 1, impl->tick, true}, [](Change, bool) {}, log);
+        return false;
+    }
+    if (!binding.manager) return false;
+    if (!std::exchange(impl->stable_frame, true)) return false;
+
+    std::deque<std::variant<Change, HighWater>> batch;
+    {
+        std::scoped_lock lock{impl->mutex};
+        for (size_t count = 0; count < 64 && !impl->pending.empty(); ++count) {
+            batch.push_back(std::move(impl->pending.front()));
+            impl->pending.pop_front();
         }
     }
+    for (const auto& entry : batch) {
+        if (const auto* seen = std::get_if<HighWater>(&entry)) {
+            if (!impl->remote.AdoptSeen(*seen)) runtime.Invalidate();
+        } else {
+            const auto& change = std::get<Change>(entry);
+            if (impl->remote.Merge(change, !change.origin.empty()) && !runtime.Queue(change) &&
+                !runtime.Suppress(change) && !impl->logged_class) {
+                log("OoT co-op: not applied: class/key policy disabled or queue full");
+                impl->logged_class = true;
+            }
+        }
+    }
+    const auto send = [&](Change change, bool baseline) {
+        Observe(change);
+        log(fmt::format("OoT co-op: {} class={} key={:016x} value=1 path=observer",
+                        baseline ? "baseline" : "observed", ClassName(change.kind), change.key));
+    };
+    runtime.Frame(backend, {thread, 1, impl->tick, true}, send, log);
+    if (runtime.BaselineReady()) {
+        std::scoped_lock lock{impl->mutex};
+        if (!impl->baseline_ready) {
+            impl->baseline_ready = true;
+            log("OoT co-op: baseline exported");
+        }
+    }
+    return runtime.Calling();
 }
 
 void BeginSession() {
@@ -774,10 +819,11 @@ void BeginSession() {
     if (old) old->Stop();
 }
 
-void RegisterMain(const Kernel::KProcess* owner, u64 program_id, u64 base,
+void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 program_id, u64 base,
                   std::string_view build_id) {
     BeginSession();
-    const auto endpoint_text = Env("EDEN_NX2_OOT_COOP");
+    const auto endpoint_text = Env("EDEN_NX2_OOT_COOP") == "1"
+        ? Env("EDEN_NX2_OOT_COOP_RELAY", "127.0.0.1:43390") : Env("EDEN_NX2_OOT_COOP");
     if (!Gate(endpoint_text, program_id, build_id) || base == 0) {
         if (!endpoint_text.empty()) LOG_INFO(Loader, "OoT co-op off: endpoint/title/build gate");
         return;
@@ -796,8 +842,21 @@ void RegisterMain(const Kernel::KProcess* owner, u64 program_id, u64 base,
             if (!list) throw std::runtime_error{"invalid deny-list"};
             denied = *list;
         }
-        const auto allowed = DecodeAllowClasses(Env("EDEN_NX2_OOT_COOP_ALLOW_CLASSES"));
+        const auto allowed = DecodeAllowClasses(Env("EDEN_NX2_OOT_COOP_ALLOW"));
         if (!allowed) throw std::runtime_error{"invalid grant class allow-list"};
+        std::set<u64> keys;
+        const auto keys_path = Env("EDEN_NX2_OOT_COOP_KEYS");
+        if (!keys_path.empty()) {
+            std::ifstream in{std::filesystem::path{keys_path}};
+            if (!in) throw std::runtime_error{"cannot read key allow-list"};
+            std::string text;
+            char c;
+            while (in.get(c) && text.size() <= MaxFrame) text.push_back(c);
+            const auto parsed = DecodeLine("{\"keys\":" + text + "}");
+            const auto list = parsed ? DecodeDenyList(parsed->at("keys")) : std::nullopt;
+            if (!list || list->contains(0)) throw std::runtime_error{"invalid key allow-list"};
+            keys = *list;
+        }
         Hello hello;
         hello.seed_hash = Env("EDEN_NX2_OOT_COOP_SEED", "0");
         hello.policy_id = Env("EDEN_NX2_OOT_COOP_POLICY", "or-v2");
@@ -806,8 +865,8 @@ void RegisterMain(const Kernel::KProcess* owner, u64 program_id, u64 base,
         hello.name = Env("EDEN_NX2_OOT_COOP_NAME", "Player");
         std::random_device random;
         hello.client_id = fmt::format("{:08x}{:08x}{:08x}{:08x}", random(), random(), random(), random());
-        auto session = std::make_shared<Session>(owner, base, *ParseEndpoint(endpoint_text),
-            std::move(hello), std::move(denied), false, *allowed);
+        auto session = std::make_shared<Session>(kernel, owner, base, *ParseEndpoint(endpoint_text),
+            std::move(hello), std::move(denied), *allowed, std::move(keys));
         std::scoped_lock lock{sessions_mutex};
         current_session = std::move(session);
     } catch (const std::exception& error) {
