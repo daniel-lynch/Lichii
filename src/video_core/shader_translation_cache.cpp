@@ -578,6 +578,14 @@ u32 RecordingEnvironment::TranslateProgramAddress(u32 address) const {
     return inner.TranslateProgramAddress(address);
 }
 
+std::vector<std::pair<u32, u32>> RecordingEnvironment::NullStoragePointerSlots() const {
+    return inner.NullStoragePointerSlots();
+}
+
+std::vector<u64> RecordingEnvironment::MappedStoragePointerKeys() const {
+    return inner.MappedStoragePointerKeys();
+}
+
 bool RecordingEnvironment::IsNativeProgram() const {
     return inner.IsNativeProgram();
 }
