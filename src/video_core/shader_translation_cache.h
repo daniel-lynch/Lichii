@@ -330,7 +330,6 @@ public:
         return Persistent();
     }
 
-
     [[nodiscard]] bool Enabled() const noexcept {
         return enabled;
     }

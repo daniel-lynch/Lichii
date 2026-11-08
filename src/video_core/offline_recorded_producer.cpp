@@ -101,6 +101,12 @@ void ProduceStage(FileEnvironment& env, u64 hash, u32 slot, bool dual_vertex,
     }
 }
 
+// The runtime never looks these stages up (VertexA pipelines and layer emulation bypass the
+// translation cache), so they are neither a production failure nor a lookup miss.
+bool RuntimeLookupDisabled(const RecordedStageLookup& stage) {
+    return stage.reason.starts_with("runtime_cache_disabled_");
+}
+
 RecordedKeyLookup ProcessGraphics(const Vulkan::GraphicsPipelineCacheKey& key,
     std::span<FileEnvironment> envs, const Shader::Profile& profile,
     const Shader::HostTranslateInfo& host, const TC::Digest& config, TC::Store& store,
@@ -304,7 +310,9 @@ RecordedOutcome ProduceRecorded(const std::filesystem::path& source,
                         } else {
                             bool failed{};
                             for (const auto& stage : lookup.stages) {
-                                if (stage.reason == "hit" || stage.reason == "emitted") continue;
+                                if (stage.reason == "hit" || stage.reason == "emitted" ||
+                                    RuntimeLookupDisabled(stage))
+                                    continue;
                                 failed = true;
                                 result.failures.push_back({path, record, pipeline, stage.slot,
                                                           stage.shader, stage.reason});
@@ -363,25 +371,35 @@ std::string RecordedReport(const RecordedOutcome& result) {
             {"pipeline", fmt::format("{:016x}", failure.pipeline)}, {"slot", failure.slot},
             {"shader", fmt::format("{:016x}", failure.shader)}, {"error", failure.error}});
     Json keys = Json::array();
-    u64 key_hits{}, key_misses{}, stage_hits{}, stage_misses{};
+    u64 key_hits{}, key_misses{}, keys_not_looked_up{}, stage_hits{}, stage_misses{},
+        stages_not_looked_up{};
     std::array<u64, static_cast<size_t>(Shader::Stage::Mesh) + 1> hits_by_type{}, misses_by_type{};
     for (const auto& lookup : result.lookups) {
         Json stages = Json::array();
         bool hit = !lookup.stages.empty();
+        bool looked_up = false;
         for (const auto& stage : lookup.stages) {
-            hit &= stage.hit;
-            ++(stage.hit ? stage_hits : stage_misses);
             const auto type = static_cast<size_t>(stage.stage);
-            if (type < hits_by_type.size()) ++(stage.hit ? hits_by_type[type] : misses_by_type[type]);
+            if (RuntimeLookupDisabled(stage)) {
+                ++stages_not_looked_up;
+            } else {
+                looked_up = true;
+                hit &= stage.hit;
+                ++(stage.hit ? stage_hits : stage_misses);
+                if (type < hits_by_type.size()) ++(stage.hit ? hits_by_type[type] : misses_by_type[type]);
+            }
             stages.push_back({{"slot", stage.slot}, {"shader", fmt::format("{:016x}", stage.shader)},
                 {"stage", type}, {"hit", stage.hit}, {"reason", stage.reason},
                 {"stage_key", fmt::format("{:016x}{:016x}", stage.stage_key.hi, stage.stage_key.lo)},
                 {"entry", fmt::format("{:016x}{:016x}", stage.entry.hi, stage.entry.lo)},
                 {"variant", fmt::format("{:016x}{:016x}", stage.variant.hi, stage.variant.lo)}});
         }
-        ++(hit ? key_hits : key_misses);
+        hit &= looked_up;
+        if (!looked_up && !lookup.stages.empty()) ++keys_not_looked_up;
+        else ++(hit ? key_hits : key_misses);
         keys.push_back({{"source", lookup.source.string()}, {"record", lookup.record},
-            {"pipeline", fmt::format("{:016x}", lookup.pipeline)}, {"hit", hit}, {"stages", stages}});
+            {"pipeline", fmt::format("{:016x}", lookup.pipeline)}, {"hit", hit},
+            {"looked_up", looked_up}, {"stages", stages}});
     }
     return Json{{"files", result.files}, {"records", result.records},
         {"failed_records", result.failed_records}, {"stages", result.stages},
@@ -392,7 +410,9 @@ std::string RecordedReport(const RecordedOutcome& result) {
         {"failures", failures},
         {"exact_variants", {{"enabled", result.exact_validation},
             {"reloaded_product", result.validation_reloaded}, {"key_hits", key_hits},
-            {"key_misses", key_misses}, {"stage_hits", stage_hits}, {"stage_misses", stage_misses},
+            {"key_misses", key_misses}, {"keys_not_looked_up", keys_not_looked_up},
+            {"stage_hits", stage_hits}, {"stage_misses", stage_misses},
+            {"stages_not_looked_up", stages_not_looked_up},
             {"hits_by_type", hits_by_type}, {"misses_by_type", misses_by_type}, {"keys", keys}}}}.dump();
 }
 } // namespace VideoCommon::OfflineShaders

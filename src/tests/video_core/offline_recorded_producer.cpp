@@ -408,3 +408,38 @@ TEST_CASE("Exact validation reports modules rejected by the persisted product re
     CHECK(report["exact_variants"]["key_misses"] == 1);
     CHECK(report["exact_variants"]["stage_misses"] == 1);
 }
+
+TEST_CASE("Exact synthesis does not count pipelines the runtime never looks up as misses",
+          "[video_core][offline_recorded_producer]") {
+    namespace TC = VideoCommon::TranslationCache;
+    namespace Offline = VideoCommon::OfflineShaders;
+    TempDir dir;
+    const auto source = dir.path / "vertex-a.bin";
+    ComputeEnvironment vertex_a(false, Shader::Stage::VertexA);
+    ComputeEnvironment vertex_b(false, Shader::Stage::VertexB);
+    Vulkan::GraphicsPipelineCacheKey key{};
+    key.state.point_size = std::bit_cast<u32>(1.0f);
+    key.unique_hashes[0] = 0x111;
+    key.unique_hashes[1] = 0x123;
+    const std::array<const VideoCommon::GenericEnvironment*, 2> envs{&vertex_a, &vertex_b};
+    VideoCommon::SerializePipeline(key, envs, source, VideoCommon::VulkanPipelineCacheVersion);
+    Shader::Profile profile{};
+    profile.supported_spirv = 0x00010500;
+    const auto config = TC::MakeConfigDigest(profile, {}, 0);
+    TC::Store store;
+    store.Open(dir.path / "translations.bin", config);
+    const auto result = Offline::ProduceRecorded(source, profile, {}, config, store, nullptr, 0, {true});
+    INFO(Offline::RecordedReport(result));
+    CHECK(result.failures.empty());
+    CHECK(result.failed_records == 0);
+    REQUIRE(result.lookups.size() == 1);
+    REQUIRE(result.lookups[0].stages.size() == 2);
+    for (const auto& stage : result.lookups[0].stages)
+        CHECK(stage.reason == "runtime_cache_disabled_vertex_a");
+    const auto exact = nlohmann::json::parse(Offline::RecordedReport(result)).at("exact_variants");
+    CHECK(exact.at("keys_not_looked_up") == 1);
+    CHECK(exact.at("stages_not_looked_up") == 2);
+    CHECK(exact.at("key_misses") == 0);
+    CHECK(exact.at("stage_misses") == 0);
+    CHECK(exact.at("keys").at(0).at("looked_up") == false);
+}
