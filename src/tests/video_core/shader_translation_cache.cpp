@@ -78,6 +78,12 @@ public:
     bool IsCbufIndirectStorageBufferPointer(u32, u32, u32 indirect) override {
         return indirect_pointers.contains(indirect);
     }
+    std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override {
+        return null_slots;
+    }
+    std::vector<u64> MappedStoragePointerKeys() const override {
+        return mapped_keys;
+    }
     void Dump(u64, u64) override {}
 
     void SetHeaderWord(size_t word, u32 value) {
@@ -90,6 +96,8 @@ public:
     u32 reads = 0;
     bool fail_cbuf_reads{};
     std::set<u32> indirect_pointers;
+    std::vector<std::pair<u32, u32>> null_slots;
+    std::vector<u64> mapped_keys;
 };
 
 // What a translation does with its environment, for the record/replay tests: the second read
@@ -444,6 +452,22 @@ TEST_CASE("Translation cache records indirect storage pointer classifications",
     // A pointer table that now classifies differently no longer matches.
     env.indirect_pointers.insert(0x08);
     REQUIRE_FALSE(ReplayQueries(queries, env));
+}
+
+TEST_CASE("Translation cache wrapper forwards the storage pointer slots without recording them",
+          "[video_core][translation_cache]") {
+    // The pipeline cache decides a compute null-slot rebuild from these after translation. The
+    // wrapper must answer them as the environment does (the base class answers none) and keep
+    // them out of the query trace: they are not translation queries, so FormatVersion stays.
+    FakeEnvironment env;
+    env.null_slots = {{4, 0xd0}, {4, 0x170}};
+    env.mapped_keys = {(u64{4} << 32) | 0x90, (u64{4} << 32) | 0x130};
+    RecordingEnvironment recording{env};
+    Shader::Environment& wrapped = recording;
+    REQUIRE(wrapped.NullStoragePointerSlots() == env.null_slots);
+    REQUIRE(wrapped.MappedStoragePointerKeys() == env.mapped_keys);
+    REQUIRE(env.reads == 0);
+    REQUIRE(recording.TakeQueries().empty());
 }
 
 TEST_CASE("Translation cache refuses publications from before a reopen",
