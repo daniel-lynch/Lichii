@@ -2594,9 +2594,9 @@ void Store::LogForcedTranslation(const Digest& stage_key, Shader::Stage stage, u
 }
 
 void Store::LogStatistics(std::string_view when) {
-    LOG_INFO(Render_Vulkan, "Translation cache misses ({}): present={} stage_key={} offline_query_replay={} offline_dropped={}",
-             when, PipelineDiagnostics::PresentCount(), entry_key_misses.load(),
-             offline_replay_misses.load(), offline_dropped_misses.load());
+    LOG_INFO(Render_Vulkan, "Translation cache misses ({}): stage_key={} offline_query_replay={} offline_dropped={} present={}",
+             when, entry_key_misses.load(), offline_replay_misses.load(),
+             offline_dropped_misses.load(), PipelineDiagnostics::PresentCount());
     LOG_INFO(Render_Vulkan, "Translation cache ({}): offline entry-only records rejected={}",
              when, offline_entry_only_rejected.load());
     for (size_t stage = 0; stage < offline_outcomes.size(); ++stage) {

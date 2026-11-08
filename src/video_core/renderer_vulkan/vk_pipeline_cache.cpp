@@ -1686,6 +1686,10 @@ bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry)
         const GPUVAddr address{gpu_memory->Read<u64>(slot)};
         if (address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
             gpu_memory->IsFullyMappedRange(address, 1)) {
+            LOG_INFO(Render_Vulkan,
+                     "Rebuilding compute program {:#x}: c{}[{:#x}] was null at translation and "
+                     "now points to {:#x}",
+                     kepler_compute->regs.code_loc.Address() + qmd.program_start, index, offset, address);
             return true;
         }
     }
@@ -2964,9 +2968,10 @@ std::array<std::atomic<u64>, 4> runtime_compute_builds{};
 
 void LogRuntimeComputeBuilds(std::string_view when) {
     LOG_INFO(Render_Vulkan,
-             "Runtime compute pipelines ({}): present={} offline={} cached={} translated={} uncached={}",
-             when, VideoCommon::PipelineDiagnostics::PresentCount(), runtime_compute_builds[1].load(), runtime_compute_builds[2].load(),
-             runtime_compute_builds[3].load(), runtime_compute_builds[0].load());
+             "Runtime compute pipelines ({}): offline={} cached={} translated={} uncached={} present={}",
+             when, runtime_compute_builds[1].load(), runtime_compute_builds[2].load(),
+             runtime_compute_builds[3].load(), runtime_compute_builds[0].load(),
+             VideoCommon::PipelineDiagnostics::PresentCount());
 }
 
 } // Anonymous namespace
@@ -2997,15 +3002,16 @@ void PipelineCache::LogRuntimePipelines(bool shutdown) {
         return std::chrono::nanoseconds{counter.exchange(0, std::memory_order_relaxed)};
     };
     LOG_INFO(Render_Vulkan,
-             "Runtime pipelines in the last 10 s: present={} {} built, {:.1f} ms on the GPU thread "
+             "Runtime pipelines in the last 10 s: {} built, {:.1f} ms on the GPU thread "
              "({:.1f} ms of it graphics SPIR-V), {:.1f} ms graphics SPIR-V on workers, "
              "{:.1f} ms of draws held for unbuilt pipelines, {:.1f} ms compute dispatch-wait "
-             "(active={}, total_ms={:.1f}); window_ms={:.1f} reason={}",
-             VideoCommon::PipelineDiagnostics::PresentCount(), count - reported_pipeline_count,
+             "(active={}, total_ms={:.1f}); window_ms={:.1f} reason={} present={}",
+             count - reported_pipeline_count,
              static_cast<double>(ns - reported_pipeline_ns) / 1e6,
              ms(take(runtime_spirv_ns[0])), ms(take(runtime_spirv_ns[1])), ms(graphics_hold),
              ms(wait.total - reported_compute_wait), wait.active, ms(wait.total),
-             ms(now - runtime_report_time), shutdown ? "shutdown-tail" : "periodic");
+             ms(now - runtime_report_time), shutdown ? "shutdown-tail" : "periodic",
+             VideoCommon::PipelineDiagnostics::PresentCount());
     if (shutdown) {
         LOG_INFO(Render_Vulkan,
                  "Runtime pipelines (shutdown): present={} {} built, {:.1f} ms on the GPU thread, "
