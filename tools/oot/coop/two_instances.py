@@ -45,6 +45,10 @@ def prepare_profile(source, destination, vram_profile=False):
                                    ("dump_directory", "dump"), ("tas_directory", "tas")):
                 config[section][key] = str(destination / directory)
                 config[section][key + "\\default"] = "false"
+        # A run copy never carries the owner's web token (the value is never read out or printed).
+        for section in config.sections():
+            if "eden_token" in config[section]:
+                config[section]["eden_token"] = ""
         if not config.has_section("Miscellaneous"):
             config.add_section("Miscellaneous")
         config["Miscellaneous"]["log_filter"] = "*:Info"

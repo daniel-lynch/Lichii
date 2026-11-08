@@ -105,8 +105,19 @@ class HarnessTests(unittest.TestCase):
             save.write_bytes(b"untouched")
             (source / "config/qt-config.ini").write_text(
                 "[Data%20Storage]\nsave_directory=/original/save\nnand_directory=/original/nand\n")
+            (source / "config/custom").mkdir()
+            (source / "config/custom/game.ini").write_text("[WebService]\neden_token=SECRETVALUE\n")
+            with (source / "config/qt-config.ini").open("a") as stream:
+                stream.write("[WebService]\neden_username=someone\neden_token=SECRETVALUE\n"
+                             "eden_token\\default=false\n")
             harness.prepare_profile(source, dest)
             text = (dest / "config/qt-config.ini").read_text()
+            for ini in ("qt-config.ini", "custom/game.ini"):
+                copied = (dest / "config" / ini).read_text()
+                self.assertNotIn("SECRETVALUE", copied)
+                self.assertIn("eden_token=\n", copied)
+            self.assertIn("eden_username=someone", text)
+            self.assertIn("SECRETVALUE", (source / "config/qt-config.ini").read_text())
             self.assertNotIn("/original", text)
             self.assertIn(str(dest / "nand"), text)
             (dest / "nand/save.bin").write_bytes(b"changed")
