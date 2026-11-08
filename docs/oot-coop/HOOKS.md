@@ -161,6 +161,10 @@ is a satisfied receipt without a write. `baseline` and `observed` identify outbo
 baseline/local mutations. A complete allowed-set read logs `baseline exported`;
 a FIFO state-request after its outgoing acknowledgements logs `baseline exchanged`
 on reply. That is a relay snapshot barrier, not proof of guest/save convergence.
+Until every reviewed key is readable, the first frame that cannot read one logs
+`baseline waiting: class=bit key=<16-hex> unreadable` once; no baseline is exported.
+The Bool64 reader/setter hooks run a full table Bind only when x0 differs from the
+learned manager; a different manager after one is learned quarantines the process.
 
 Unit tests exercise the real JIT's frame→synthetic setter→sentinel→continuation path
 and a fake two-peer observer/queue/application path. These do not validate this game's

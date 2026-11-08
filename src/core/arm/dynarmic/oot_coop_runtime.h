@@ -165,6 +165,11 @@ public:
             Change change{kind, {}, 0, key, 1};
             const auto value = backend.ReadFlag(change);
             if (!value) {
+                if (!baseline && !logged_waiting) {
+                    log(fmt::format("OoT co-op: baseline waiting: class={} key={:016x} unreadable",
+                                    ClassName(kind), key));
+                    logged_waiting = true;
+                }
                 if (baseline) Invalidate();
                 return Report(baseline ? ApplyEvent::Quarantined : ApplyEvent::Blocked, log);
             }
@@ -215,6 +220,6 @@ private:
     GrantApplier<Backend> applier;
     std::map<std::pair<Kind, u64>, bool> observed;
     u64 thread{}, generation{};
-    bool baseline{}, logged_quarantine{};
+    bool baseline{}, logged_quarantine{}, logged_waiting{};
 };
 } // namespace Core::OotCoop

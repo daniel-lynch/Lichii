@@ -759,7 +759,9 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     }
     if (impl->stopped) return false;
     if (point == OotGameDataTrace::Point::BitRead || point == OotGameDataTrace::Point::BitSet) {
-        backend.Bind(jit.GetRegister(0));
+        // Hot path (every Bool64 read): only a new or changed manager needs a full Bind. The
+        // table identity is re-validated by ReadFlag's Bind on every frame visit.
+        if (jit.GetRegister(0) != binding.manager) backend.Bind(jit.GetRegister(0));
         return false;
     }
     if (point != OotGameDataTrace::Point::Frame || !thread) return false;
