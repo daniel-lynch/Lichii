@@ -170,9 +170,16 @@ indices/bytes and exhausted probe budgets fail closed. No entire Bool table scan
 The `bit` class remains the Bool64 adapter for pickups, breakables and enemies, with
 deferred setter main+0x3761720 and x2=reviewed actor key. Both adapters validate mapped
 ranges, stable table/queue identity, original setter instructions and queue headroom.
-Application requires two frame visits with a valid manager binding. A
-changed binding, unreadable post-baseline state, or observed true→false rollback quarantines
-injection for this process; receipts are never reset while the old guest can return.
+Application requires two frame visits with a valid manager binding. Each frame first
+compares the manager cell and every bound table/queue identity with the binding. If the
+cell was cleared or moved, or a table was reallocated (title screen ↔ save load), and no
+synthetic call is in flight, the drain forgets that epoch's baseline, unbinds, logs
+`manager moved <old> -> <new>; baseline re-bound` (first 16 times) and exports a new
+baseline once the new tables are readable. A grant awaiting its commit is re-read
+against the new tables; receipts and echo suppression survive. A move while a call is
+in flight, unreadable post-baseline state, or an observed true→false rollback under the
+same binding quarantines injection for this process; receipts are never reset while
+the old guest can return.
 The process epoch is currently 1. This is conservative detection, **not a proven
 save-load/transition lifecycle hook**; same-address reloads and event scheduling still
 need the field checks below.
@@ -242,8 +249,9 @@ a FIFO state-request after its outgoing acknowledgements logs `baseline exchange
 on reply. That is a relay snapshot barrier, not proof of guest/save convergence.
 Until every reviewed key is readable, the first frame that cannot read one logs
 `baseline waiting: class=bool key=<16-hex> unreadable` once; no baseline is exported.
-The frame hook reads the manager cell every time; a changed or cleared learned manager
-quarantines the process. Per-class table identity is rechecked when reading flags.
+The frame hook reads the manager cell every time; a changed or cleared manager re-binds
+the baseline (above) instead of quarantining. Per-class table identity is also rechecked
+when reading flags, and a change found there mid-frame still quarantines.
 
 Unit tests exercise the real JIT's frame→synthetic setter→sentinel→continuation path
 and a fake two-peer observer/queue/application path. These do not validate this game's

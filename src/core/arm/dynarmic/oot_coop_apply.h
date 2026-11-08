@@ -160,6 +160,18 @@ public:
         return ApplyEvent::None;
     }
 
+    // The GameData manager or one of its tables moved (title screen <-> save load). A call in
+    // flight would return into the old manager, so that stays a quarantine. A grant awaiting its
+    // commit is re-read against the new tables (it is still pending.front()); receipts stay.
+    bool Rebind() {
+        if (phase == ApplyPhase::Calling || phase == ApplyPhase::Quarantined) return false;
+        if (phase == ApplyPhase::AwaitingCommit) {
+            active.reset();
+            phase = ApplyPhase::Idle;
+        }
+        return true;
+    }
+
     // Called only after the old guest thread/process is destroyed, never while it can return.
     void ResetAfterGuestStopped() {
         pending.clear();

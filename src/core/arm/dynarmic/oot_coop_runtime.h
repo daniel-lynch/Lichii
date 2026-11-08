@@ -53,6 +53,28 @@ public:
         : jit{jit_}, memory{memory_}, binding{binding_}, tls{tls_}, tls_ro{tls_ro_},
           clear_exclusive{std::move(clear_exclusive_)} {}
 
+    /// Did the manager cell or a bound table change since binding? Unreadable counts as moved.
+    bool Moved() {
+        using namespace OotGameDataTrace::Detail;
+        if (!binding.manager) return false;
+        const u64 m = binding.manager;
+        if (Read64(memory, binding.base + 0x4E842A8) != m) return true;
+        if (binding.bool_data &&
+            (Read32(memory, m + 0x10) != binding.bool_count ||
+             Read64(memory, m + 0x18) != binding.bool_data ||
+             Read64(memory, m + 0x38) != binding.bool_queue ||
+             Read64(memory, m + 0x20) != binding.bool_hashes ||
+             Read32(memory, m + 0x2C) != binding.bool_capacity)) return true;
+        return binding.data && (Read32(memory, m + 0xC58) != binding.count ||
+                                Read64(memory, m + 0xC60) != binding.data ||
+                                Read64(memory, m + 0xC70) != binding.queue);
+    }
+
+    /// Forget the manager and table identities; the private stack and sentinel stay owned.
+    void Unbind() {
+        binding = GuestBinding{binding.base, 0, 0, 0, binding.sentinel, binding.stack};
+    }
+
     bool BindFromCell() {
         const auto manager = OotGameDataTrace::Detail::Read64(memory, binding.base + 0x4E842A8);
         return BindManager(manager.value_or(0));
@@ -224,6 +246,23 @@ public:
     bool Calling() const { return applier.Phase() == ApplyPhase::Calling; }
     bool BaselineReady() const { return baseline; }
     void Invalidate() { applier.Invalidate(); }
+
+    /// The manager moved or went away (title screen <-> save load): forget the old epoch's
+    /// baseline instead of reading the new tables as a rollback, then bind afresh. Fails, and
+    /// quarantines, only while a synthetic call could still return into the old manager.
+    template <typename Log>
+    bool Rebind(Backend& backend, Log log) {
+        if (!applier.Rebind()) {
+            Invalidate();
+            Report(ApplyEvent::Quarantined, log);
+            return false;
+        }
+        observed.clear();
+        baseline = false;
+        logged_waiting = false;
+        backend.Unbind();
+        return true;
+    }
 
     template <typename Send, typename Log>
     ApplyEvent Frame(Backend& backend, const DrainContext& site, Send send, Log log) {

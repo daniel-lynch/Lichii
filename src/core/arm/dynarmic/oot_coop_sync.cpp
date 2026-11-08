@@ -460,7 +460,7 @@ struct Session::Impl {
     std::mutex guest_mutex;
     GuestBinding binding;
     std::unique_ptr<FrameDrain<Backend>> runtime;
-    u64 frame_thread{}, tick{};
+    u64 frame_thread{}, tick{}, rebinds{};
     bool stable_frame{};
     bool baseline_ready{};
     bool logged_class{};
@@ -782,6 +782,18 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     if (!impl->frame_thread) impl->frame_thread = thread;
     if (impl->frame_thread != thread) return false;
     ++impl->tick;
+    if (!binding.invalid && backend.Moved()) {
+        const u64 old = binding.manager;
+        const auto now = OotGameDataTrace::Detail::Read64(memory, binding.base + 0x4E842A8);
+        if (runtime.Rebind(backend, log)) {
+            impl->stable_frame = false;
+            if (impl->rebinds < 16) {
+                log(fmt::format("OoT co-op: manager moved {:#x} -> {:#x}; baseline re-bound", old,
+                                now.value_or(0)));
+            }
+            ++impl->rebinds;
+        }
+    }
     const bool bound = backend.BindFromCell();
     if (binding.invalid || (!bound && impl->stable_frame)) {
         runtime.Invalidate();

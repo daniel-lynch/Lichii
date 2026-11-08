@@ -119,7 +119,9 @@ Finally save B, close both games so the harness checker runs on clean logs, then
 relaunch B alone with co-op unset and verify the intended key persisted and unrelated
 flags stayed unchanged. Do not reload inside the harness session: a title-screen or
 earlier-save reload can read the key false again, which the observer treats as a
-rollback and quarantines, failing the checker after an otherwise good pass. The checker cannot prove persistence, event safety or actor
+rollback and quarantines, failing the checker after an otherwise good pass. (A reload that
+moves or clears the manager cell logs `baseline re-bound` instead; only a same-address
+reload reads as a rollback.) The checker cannot prove persistence, event safety or actor
 notification behavior. If an actor needs reload to reflect the flag, record that as a
 separate notification limitation. Repeat B→A with another reviewed key.
 

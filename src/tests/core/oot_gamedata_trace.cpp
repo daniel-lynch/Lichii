@@ -615,10 +615,72 @@ TEST_CASE("OoT flat Bool polling and deferred chest grants", "[oot_coop]") {
         REQUIRE_FALSE(backend.ReadFlag(grant));
         REQUIRE(binding.invalid);
     }
-    SECTION("changed manager cell quarantines") {
+    SECTION("an unhandled manager cell change still quarantines the backend") {
         env.Write64(Base + 0x4E842A8, 0);
         REQUIRE_FALSE(backend.BindFromCell());
         REQUIRE(binding.invalid);
+    }
+    SECTION("a moved or cleared manager re-binds the baseline instead of quarantining") {
+        REQUIRE_FALSE(backend.Moved());
+        env.bytes[data + 0x18 + 0x16] = 1;
+        drain.Frame(backend, {7, 9, 2, true}, send, log);
+        REQUIRE(sent.size() == 1);
+        // Back to the title screen: the cell is cleared.
+        env.Write64(Base + 0x4E842A8, 0);
+        REQUIRE(backend.Moved());
+        REQUIRE(drain.Rebind(backend, log));
+        REQUIRE_FALSE(binding.invalid);
+        REQUIRE(binding.manager == 0);
+        REQUIRE(binding.sentinel == sentinel);
+        REQUIRE_FALSE(backend.Moved());
+        REQUIRE_FALSE(backend.BindFromCell());
+        REQUIRE_FALSE(drain.BaselineReady());
+        // A save loads into a new manager whose tables read the key false: no rollback.
+        constexpr u64 moved = Data + 0x5000, moved_data = Data + 0x6000;
+        for (u64 i = 0; i < 0x48; ++i)
+            if (env.bytes.contains(manager + i)) env.bytes[moved + i] = env.bytes.at(manager + i);
+        for (u64 i = moved_data; i < moved_data + 0x30; ++i) env.bytes[i] = 0;
+        env.Write64(moved + 0x18, moved_data);
+        env.Write64(Base + 0x4E842A8, moved);
+        REQUIRE(backend.BindFromCell());
+        REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) == Coop::ApplyEvent::None);
+        REQUIRE(drain.BaselineReady());
+        REQUIRE(binding.bool_data == moved_data);
+        REQUIRE_FALSE(backend.Moved());
+        REQUIRE(sent.size() == 1);
+        env.bytes[moved_data + 0x18 + 0x16] = 1;
+        drain.Frame(backend, {7, 9, 4, true}, send, log);
+        REQUIRE(sent.size() == 2); // A new epoch's local open is observed again.
+        // Same manager, reallocated table: also a move.
+        env.Write64(moved + 0x18, data);
+        REQUIRE(backend.Moved());
+        REQUIRE(std::none_of(logs.begin(), logs.end(), [](const auto& line) {
+            return line.find("quarantined") != std::string::npos;
+        }));
+    }
+    SECTION("a grant awaiting commit is re-read against the moved tables") {
+        REQUIRE(drain.Queue(grant));
+        REQUIRE(drain.Frame(backend, {7, 9, 2, true}, send, log) == Coop::ApplyEvent::Started);
+        REQUIRE(drain.Sentinel(backend, {7, 9, 2, true}, sentinel, log) ==
+                Coop::ApplyEvent::Returned);
+        env.Write64(Base + 0x4E842A8, 0);
+        REQUIRE(backend.Moved());
+        REQUIRE(drain.Rebind(backend, log));
+        env.Write64(Base + 0x4E842A8, manager);
+        REQUIRE(backend.BindFromCell());
+        env.bytes[data + 0x18 + 0x16] = 1; // The new epoch already holds it: no second call.
+        REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) == Coop::ApplyEvent::Committed);
+        REQUIRE(sent.empty());
+        REQUIRE(drain.Suppress(grant));
+    }
+    SECTION("a move while a synthetic call is in flight quarantines") {
+        REQUIRE(drain.Queue(grant));
+        REQUIRE(drain.Frame(backend, {7, 9, 2, true}, send, log) == Coop::ApplyEvent::Started);
+        env.Write64(Base + 0x4E842A8, 0);
+        REQUIRE(backend.Moved());
+        REQUIRE_FALSE(drain.Rebind(backend, log));
+        REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) ==
+                Coop::ApplyEvent::Quarantined);
     }
 }
 
