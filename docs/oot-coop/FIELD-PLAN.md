@@ -102,8 +102,11 @@ wrong-thread return or return-stack failure. A setter that stalls before another
 cannot trip the frame-clock watchdog; use the live debugger to diagnose it, never
 rewind arbitrary code that may hold locks.
 
-Finally save/reload B and independently verify the intended key persisted and unrelated
-flags stayed unchanged. The checker cannot prove persistence, event safety or actor
+Finally save B, close both games so the harness checker runs on clean logs, then
+relaunch B alone with co-op unset and verify the intended key persisted and unrelated
+flags stayed unchanged. Do not reload inside the harness session: a title-screen or
+earlier-save reload can read the key false again, which the observer treats as a
+rollback and quarantines, failing the checker after an otherwise good pass. The checker cannot prove persistence, event safety or actor
 notification behavior. If an actor needs reload to reflect the flag, record that as a
 separate notification limitation. Repeat B→A with another reviewed key.
 
