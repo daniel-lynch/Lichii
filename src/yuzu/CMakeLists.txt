@@ -161,6 +161,12 @@ add_executable(yuzu
     debugger/console.cpp
     debugger/console.h
     debugger/controller.cpp
+    coop/coop_boot.cpp
+    coop/coop_boot.h
+    coop/coop_panel.cpp
+    coop/coop_panel.h
+    configuration/configure_coop.cpp
+    configuration/configure_coop.h
     debugger/controller.h
 
     game/game_list.cpp game/game_list.h

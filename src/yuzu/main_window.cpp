@@ -31,6 +31,9 @@
 // Other Yuzu stuff //
 #include "debugger/console.h"
 #include "debugger/controller.h"
+#include "coop/coop_boot.h"
+#include "coop/coop_panel.h"
+#include "core/arm/dynarmic/oot_coop_gui.h"
 
 #include "about_dialog.h"
 #include "data_dialog.h"
@@ -1273,6 +1276,13 @@ void MainWindow::InitializeDebugWidgets() {
 
     controller_dialog = new ControllerDialog(QtCommon::system->HIDCore(), input_subsystem, this);
     controller_dialog->hide();
+    coop_panel = new CoopPanel(*QtCommon::system, this);
+    coop_panel->hide();
+    ui->menu_View->addAction(coop_panel->toggleViewAction());
+    connect(coop_panel, &CoopPanel::ReconnectRequested, this, &MainWindow::OnRestartGame);
+    // Field-test hook: open a game's properties (the Co-op page) without a click.
+    if (const auto open = qEnvironmentVariable("EDEN_NX2_OOT_COOP_GUI_OPEN"); !open.isEmpty())
+        QTimer::singleShot(3000, this, [this, open] { OnGameListOpenPerGameProperties(open.toStdString()); });
     debug_menu->addAction(controller_dialog->toggleViewAction());
 }
 
@@ -2011,6 +2021,9 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
                                           ? Common::FS::PathToUTF8String(file_path.filename())
                                           : fmt::format("{:016X}", title_id);
         QtConfig per_game_config(config_file_name, Config::ConfigType::PerGameConfig);
+        if (Core::OotCoop::Gui::CoopTitle(title_id)) {
+            ApplyCoopEnvironment(title_id, per_game_config);
+        }
         QtCommon::system->HIDCore().ReloadInputDevices();
         QtCommon::system->ApplySettings();
     }
