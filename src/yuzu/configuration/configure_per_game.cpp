@@ -49,6 +49,7 @@
 #include "common/settings_input.h"
 #include "common/string_util.h"
 #include "configuration/shared_widget.h"
+#include "core/arm/dynarmic/oot_coop_gui.h"
 #include "core/core.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/nup_container.h"
@@ -65,6 +66,7 @@
 #include "yuzu/configuration/configuration_shared.h"
 #include "yuzu/configuration/configure_applets.h"
 #include "yuzu/configuration/configure_audio.h"
+#include "yuzu/configuration/configure_coop.h"
 #include "yuzu/configuration/configure_cpu.h"
 #include "yuzu/configuration/configure_graphics.h"
 #include "yuzu/configuration/configure_graphics_advanced.h"
@@ -390,6 +392,10 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
 
     ui->setupUi(this);
 
+    if (Core::OotCoop::Gui::CoopTitle(title_id) || !game_config->ReadRawSection("Coop").empty()) {
+        coop_tab = std::make_unique<ConfigureCoop>(title_id, game_config.get(), this);
+        ui->tabWidget->addTab(coop_tab.get(), tr("Co-op"));
+    }
     ui->tabWidget->addTab(addons_tab.get(), tr("Add-Ons"));
     ui->tabWidget->addTab(system_tab.get(), tr("System"));
     ui->tabWidget->addTab(cpu_tab.get(), tr("CPU"));
@@ -476,6 +482,7 @@ void ConfigurePerGame::ApplyConfiguration() {
         tab->ApplyConfiguration();
     }
     addons_tab->ApplyConfiguration();
+    if (coop_tab) coop_tab->ApplyConfiguration();
     input_tab->ApplyConfiguration();
     network_tab->ApplyConfiguration();
     applets_tab->ApplyConfiguration();
@@ -517,6 +524,7 @@ void ConfigurePerGame::LoadFromFile(FileSys::VirtualFile file_) {
 }
 
 void ConfigurePerGame::LoadConfiguration() {
+    if (coop_tab) coop_tab->LoadConfiguration();
     if (file == nullptr) {
         return;
     }

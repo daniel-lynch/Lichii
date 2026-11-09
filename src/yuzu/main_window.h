@@ -52,6 +52,7 @@ class GRenderWindow;
 class LoadingScreen;
 class OverlayDialog;
 class ControllerDialog;
+class CoopPanel;
 class QLabel;
 class MultiplayerState;
 class QPushButton;
@@ -585,6 +586,7 @@ private:
 
     // Debugger panes
     ControllerDialog* controller_dialog = nullptr;
+    CoopPanel* coop_panel = nullptr;
 
     QAction* actions_recent_files[max_recent_files_item];
 

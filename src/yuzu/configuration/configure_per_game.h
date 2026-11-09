@@ -32,6 +32,7 @@ namespace InputCommon {
 class InputSubsystem;
 }
 
+class ConfigureCoop;
 class ConfigurePerGameAddons;
 class ConfigureAudio;
 class ConfigureCpu;
@@ -106,6 +107,7 @@ private:
     std::unique_ptr<ConfigurationShared::Builder> builder;
     std::shared_ptr<std::vector<ConfigurationShared::Tab*>> tab_group;
 
+    std::unique_ptr<ConfigureCoop> coop_tab;
     std::unique_ptr<ConfigurePerGameAddons> addons_tab;
     std::unique_ptr<ConfigureAudio> audio_tab;
     std::unique_ptr<ConfigureCpu> cpu_tab;

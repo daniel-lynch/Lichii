@@ -404,8 +404,7 @@ void RendererVulkan::RenderScreenshot(std::span<const Tegra::FramebufferConfig> 
 }
 
 void RendererVulkan::DrawCoopOverlay(Frame* frame) {
-    static const bool wanted = Core::OotCoop::Ux::Switch("TOAST") || Core::OotCoop::Ux::Switch("NAMETAG");
-    if (!wanted) {
+    if (Core::OotCoop::Ux::Current().Empty()) {
         return;
     }
     try {

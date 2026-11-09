@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""LAN-only, in-memory OoT co-op relay. Protocol details: docs/oot-coop/PROTOCOL.md."""
+"""LAN-only OoT co-op relay with optional campaign persistence. Protocol details: docs/oot-coop/PROTOCOL.md."""
 
 import argparse
 import asyncio
@@ -9,6 +9,11 @@ import contextlib
 import json
 import math
 import re
+import os
+import secrets
+import tempfile
+import time
+from datetime import datetime, timezone
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,9 +25,13 @@ MAX_SEQ = (1 << 53) - 1
 MAX_KEYS = 2048
 MAX_ORIGIN_RECEIPTS = 4096
 MAX_SENDERS = 256
+SENDER_IDLE_EVICT = 3600  # an offline sender idle this long may give its high-water slot to a new one
 MAX_CLIENTS = 128
 MAX_ROOMS = 32
 MAX_TEAMS = 16
+MAX_LEDGER = 4096
+CATCHUP_PAGE = 256
+MAX_STATE_BYTES = 64 * 1024 * 1024
 MAX_REPLAY = 512
 MAX_OUTBOX = 256
 MAX_OUTBOX_BYTES = 2 * MAX_FRAME
@@ -158,13 +167,25 @@ def collectible_origin(packet):
     return kind, key, partner
 
 
+def mod_hash(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ProtocolError("invalid mod hash")
+    return value
+
+
 def validate_hello(packet):
     fields(packet, ("type", "version", "build_id", "seed_hash", "room", "team", "client_id", "name", "policy_id"),
-           ("world_wallet", "animation", "ghost_equipment_v2"))
+           ("world_wallet", "animation", "ghost_equipment_v2", "mod_hash", "quest", "teleport"))
+    if "mod_hash" in packet:
+        mod_hash(packet["mod_hash"])
+    if "quest" in packet:
+        integer(packet["quest"], 1, 1)
     if "ghost_equipment_v2" in packet and type(packet["ghost_equipment_v2"]) is not bool:
         raise ProtocolError("expected equipment capability boolean")
     if packet["type"] != "hello" or type(packet["version"]) is not int or packet["version"] not in (LEGACY_VERSION, VERSION):
         raise ProtocolError("protocol version mismatch")
+    if "teleport" in packet:
+        integer(packet["teleport"], 1, 1)
     if "animation" in packet:
         if packet["version"] != VERSION:
             raise ProtocolError("animation needs protocol v4")
@@ -189,6 +210,17 @@ def validate_animation(value):
     integer(value["av"], 1, 1)
     if not isinstance(value["table_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["table_sha256"]):
         raise ProtocolError("invalid animation table hash")
+
+
+def validate_quest(packet, origin):
+    fields(packet, ("type", "origin", "seq", "challenge", "step", "index"))
+    if packet["type"] != "quest_step" or packet["origin"] != origin:
+        raise ProtocolError("quest origin/type mismatch")
+    identifier(origin)
+    integer(packet["seq"], 1, MAX_SEQ)
+    integer(packet["challenge"], 1, (1 << 32) - 1)
+    integer(packet["step"], 1, (1 << 32) - 1)
+    integer(packet["index"], 0, 255)
 
 
 def validate_change(packet, origin):
@@ -308,6 +340,42 @@ def validate_pose(packet, size=None):
         raise ProtocolError("pose too large")
 
 
+TELEPORT_REASONS = {"loading", "event", "pause", "state", "airborne", "scene", "busy",
+                    "unready", "disabled", "unavailable", "rate", "age"}
+
+
+def validate_teleport(packet, size=None):
+    common = ("type", "target", "request_id")
+    if packet.get("type") == "teleport_request":
+        fields(packet, common)
+    elif packet.get("type") == "teleport_to":
+        if packet.get("status") == "denied":
+            fields(packet, common + ("status", "reason"))
+            if not isinstance(packet["reason"], str) or packet["reason"] not in TELEPORT_REASONS:
+                raise ProtocolError("invalid teleport reason")
+        elif packet.get("status") == "ok":
+            fields(packet, common + ("status", "banc", "room", "pos", "yaw", "age"))
+            if not isinstance(packet["banc"], str) or not re.fullmatch(r"[A-Za-z0-9_]{1,63}", packet["banc"]):
+                raise ProtocolError("invalid teleport banc")
+            if packet["room"] is not None:
+                integer(packet["room"], 0, 255)
+            if type(packet["pos"]) is not list or len(packet["pos"]) != 3:
+                raise ProtocolError("invalid teleport position")
+            for value in packet["pos"]:
+                finite(value, MAX_POSE_COORD)
+            finite(packet["yaw"], 360)
+            if packet["age"] not in ("child", "adult"):
+                raise ProtocolError("invalid teleport age")
+        else:
+            raise ProtocolError("invalid teleport status")
+    else:
+        raise ProtocolError("invalid teleport type")
+    identifier(packet["target"])
+    integer(packet["request_id"], 1, MAX_SEQ)
+    if (size if size is not None else len(encode(packet)) - 4) > 512:
+        raise ProtocolError("teleport frame too large")
+
+
 def state_key(packet):
     return packet["type"], packet.get("hash", packet.get("actor"))
 
@@ -321,13 +389,19 @@ def fold(state, packet):
 @dataclass
 class Team:
     current: dict = field(default_factory=dict)
+    quest: dict = field(default_factory=dict)
     checkpoint: dict = field(default_factory=dict)
     seen: dict = field(default_factory=dict)
     benefit_receipts: set = field(default_factory=set)
+    sender_active: dict = field(default_factory=dict)  # sender -> wall time of its last join/change
     replay: deque = field(default_factory=deque)
     clients: dict = field(default_factory=dict)
     revision: int = 0
     checkpoint_revision: int = 0
+
+    ledger: deque = field(default_factory=deque)
+    ledger_floor: int = 0
+    chest_owner: dict = field(default_factory=dict)
 
     def accept(self, packet, deny):
         validate_change(packet, packet["origin"])
@@ -367,14 +441,65 @@ class Team:
             oldest = self.replay.popleft()
             fold(self.checkpoint, oldest)
             self.checkpoint_revision = oldest["rev"]
+        if kind in EVENT_TYPES:
+            owner = (origin, packet.get("chest_transaction"))
+            record = True
+            if source and source[0] == "chest":
+                chest = source[1]
+                if chest in self.chest_owner:
+                    record = self.chest_owner[chest] == owner
+                elif len(self.chest_owner) < MAX_KEYS:
+                    self.chest_owner[chest] = owner
+            if record:
+                self.ledger.append(event)
+                if len(self.ledger) > MAX_LEDGER:
+                    self.ledger_floor = self.ledger.popleft()["rev"]
         return event
 
-    def snapshot(self):
+    def catchup(self, epoch, after):
+        integer(after, 0, MAX_SEQ)
+        through = self.revision
+        remaining = [event for event in self.ledger if after < event["rev"] <= through]
+        grants = remaining[:CATCHUP_PAGE]
+        while True:
+            packet = {"type": "catchup", "epoch": epoch, "floor": self.ledger_floor,
+                      "through": through, "after": after, "grants": grants,
+                      "more": len(remaining) > len(grants)}
+            try:
+                encode(packet)
+                return packet
+            except ProtocolError:
+                if not grants:
+                    raise
+                grants = grants[:-1]
+                if not grants and remaining:
+                    raise ProtocolError("catchup grant exceeds frame limit")
+
+    def accept_quest(self, packet, deny):
+        validate_quest(packet, packet["origin"])
+        origin, seq, challenge = packet["origin"], packet["seq"], packet["challenge"]
+        if seq <= self.seen.get(origin, 0):
+            return None
+        if origin not in self.seen and len(self.seen) >= MAX_SENDERS:
+            raise ProtocolError("sender capacity reached")
+        old = self.quest.get(challenge)
+        accepted = challenge not in deny and (old is None or packet["index"] > old["index"])
+        if accepted and old is None and len(self.quest) >= 256:
+            raise ProtocolError("quest capacity reached")
+        self.seen[origin] = seq
+        if not accepted:
+            return None
+        self.quest[challenge] = {key: packet[key] for key in ("type", "challenge", "step", "index")}
+        return dict(packet)
+
+    def snapshot(self, quest=False):
         # seen is current, after replay and no-ops. Reconstruct checkpoint + replay first;
         # do not use these highwaters to discard the replay that accompanies this snapshot.
         packet = {"type": "team_state", "revision": self.checkpoint_revision,
                   "changes": list(self.checkpoint.values()), "seen": dict(self.seen),
                   "replay": list(self.replay)}
+        if quest:
+            packet["quest"] = list(self.quest.values())
         wallets = {client_id: dict(client.state["world_wallet"])
                    for client_id, client in self.clients.items() if "world_wallet" in client.state}
         if wallets:
@@ -389,6 +514,9 @@ class Room:
     policy_id: str
     teams: dict = field(default_factory=dict)
     empty_since: float | None = None
+    epoch: str = field(default_factory=lambda: secrets.token_hex(8))
+    mod_hash: str | None = None
+    last_active: float = field(default_factory=time.time)
 
 
 class Client:
@@ -406,6 +534,7 @@ class Client:
         self.pose_times = deque()
         self.room = self.team = None
         self.client_id = None
+        self.quest = False
         self.state = {}
         self.last_receive = asyncio.get_running_loop().time()
         self.last_heartbeat = self.last_receive
@@ -479,9 +608,16 @@ class Client:
 
 class Relay:
     def __init__(self, *, heartbeat_interval=30, idle_timeout=90, room_ttl=300,
-                 cleanup_interval=1, deny_list=()):
+                 cleanup_interval=1, deny_list=(), state_file=None, room_ttl_days=30):
         if min(heartbeat_interval, idle_timeout, room_ttl, cleanup_interval) <= 0:
             raise ValueError("timeouts must be positive")
+        if not math.isfinite(room_ttl_days) or room_ttl_days <= 0:
+            raise ValueError("room TTL days must be positive")
+        self.state_file = Path(state_file) if state_file is not None else None
+        self.room_ttl_days = room_ttl_days
+        self.dirty = False
+        self.last_write = float("-inf")
+        self.write_errors = set()
         self.heartbeat_interval = heartbeat_interval
         self.idle_timeout = idle_timeout
         self.room_ttl = room_ttl
@@ -491,6 +627,212 @@ class Relay:
         self.clients = set()
         self.tasks = set()
         self.server = self.maintenance_task = None
+        if self.state_file is not None:
+            self.load_state()
+        self.rooms_loaded = len(self.rooms)
+
+    def evict_sender(self, room_name, team):
+        """Every emulator process is a new sender ID; a persistent room would fill MAX_SENDERS. Only an
+        offline sender idle for SENDER_IDLE_EVICT gives up its high-water (a live process that kept an
+        unacknowledged outbox reconnects within its 30 s backoff, long before that)."""
+        now = time.time()
+        idle = [(team.sender_active.get(sender, 0), sender) for sender in team.seen
+                if sender not in team.clients and now - team.sender_active.get(sender, 0) >= SENDER_IDLE_EVICT]
+        if not idle:
+            raise ProtocolError("sender capacity reached")
+        _, sender = min(idle)
+        del team.seen[sender]
+        team.sender_active.pop(sender, None)
+        self.dirty = True
+        print(f"OoT co-op relay: room {room_name}: idle sender {sender} forgotten (sender capacity)", flush=True)
+
+    def evict_room(self):
+        empty = [(room.last_active, name) for name, room in self.rooms.items()
+                 if not any(team.clients for team in room.teams.values())]
+        if not empty:
+            raise ProtocolError("room capacity reached")
+        active, name = min(empty)
+        del self.rooms[name]
+        self.dirty = True
+        stamp = datetime.fromtimestamp(active, timezone.utc).isoformat()
+        print(f"OoT co-op relay: room {name} evicted (capacity; idle since {stamp})", flush=True)
+
+    def state_document(self):
+        return {"format": 1, "rooms": {
+            name: {"build_id": room.build_id, "seed_hash": room.seed_hash,
+                   "policy_id": room.policy_id, "epoch": room.epoch, "mod_hash": room.mod_hash,
+                   "last_active": room.last_active, "teams": {
+                       name: {"revision": team.revision, "current": list(team.current.values()),
+                              "seen": team.seen, "benefit_receipts": sorted(team.benefit_receipts),
+                              "ledger": list(team.ledger), "ledger_floor": team.ledger_floor,
+                              "sender_active": dict(team.sender_active),
+                              "chest_owner": [[key, *owner] for key, owner in sorted(team.chest_owner.items())]}
+                       for name, team in room.teams.items()}}
+            for name, room in self.rooms.items()}}
+
+    def persist(self, *, strict=False):
+        if self.state_file is None or not self.dirty:
+            return
+        temporary = None
+        try:
+            data = json.dumps(self.state_document(), separators=(",", ":"), allow_nan=False).encode()
+            if len(data) > MAX_STATE_BYTES:
+                raise ValueError("state exceeds 64 MiB")
+            fd, temporary = tempfile.mkstemp(prefix=self.state_file.name + ".", suffix=".tmp",
+                                             dir=self.state_file.parent)
+            with os.fdopen(fd, "wb") as output:
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self.state_file)
+            temporary = None
+            directory = os.open(self.state_file.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            self.dirty = False
+        except (OSError, ValueError) as exc:
+            if strict:
+                raise
+            error = str(exc)
+            if error not in self.write_errors:
+                self.write_errors.add(error)
+                print(f"OoT co-op relay: state write failed: {error}", flush=True)
+        finally:
+            if temporary is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(temporary)
+
+    def load_state(self):
+        try:
+            with self.state_file.open("rb") as source:
+                data = source.read(MAX_STATE_BYTES + 1)
+        except FileNotFoundError as exc:
+            if self.state_file.is_symlink():
+                raise ValueError(f"cannot load relay state {self.state_file}: {exc}") from exc
+            return
+        except OSError as exc:
+            raise ValueError(f"cannot load relay state {self.state_file}: {exc}") from exc
+        try:
+            if len(data) > MAX_STATE_BYTES:
+                raise ValueError("state exceeds 64 MiB")
+            def unique(items):
+                result = {}
+                for key, value in items:
+                    if key in result:
+                        raise ValueError("duplicate field")
+                    result[key] = value
+                return result
+            doc = json.loads(data, object_pairs_hook=unique)
+            fields(doc, ("format", "rooms"))
+            if type(doc["format"]) is not int or doc["format"] != 1:
+                raise ValueError("unsupported state format")
+            if type(doc["rooms"]) is not dict or len(doc["rooms"]) > MAX_ROOMS:
+                raise ValueError("invalid rooms")
+            loaded = {}
+            for name, value in doc["rooms"].items():
+                identifier(name)
+                fields(value, ("build_id", "seed_hash", "policy_id", "epoch", "mod_hash", "last_active", "teams"))
+                validate_hello(dict(type="hello", version=VERSION, room=name, team="check", client_id="check",
+                                    name="check", **{k: value[k] for k in ("build_id", "seed_hash", "policy_id")}))
+                if not isinstance(value["epoch"], str) or not re.fullmatch(r"[0-9a-f]{16}", value["epoch"]):
+                    raise ValueError("invalid room epoch")
+                if value["mod_hash"] is not None:
+                    mod_hash(value["mod_hash"])
+                active = value["last_active"]
+                if type(active) not in (int, float) or not math.isfinite(active) or active < 0:
+                    raise ValueError("invalid room time")
+                datetime.fromtimestamp(active, timezone.utc)  # Also valid for eviction diagnostics.
+                if type(value["teams"]) is not dict or len(value["teams"]) > MAX_TEAMS:
+                    raise ValueError("invalid teams")
+                room = Room(value["build_id"], value["seed_hash"], value["policy_id"],
+                            epoch=value["epoch"], mod_hash=value["mod_hash"], last_active=active)
+                for team_name, saved in value["teams"].items():
+                    identifier(team_name)
+                    fields(saved, ("revision", "current", "seen", "benefit_receipts", "ledger", "ledger_floor", "chest_owner"),
+                           ("sender_active",))
+                    team = Team(revision=integer(saved["revision"], 0, MAX_SEQ),
+                                ledger_floor=integer(saved["ledger_floor"], 0, MAX_SEQ))
+                    if team.ledger_floor > team.revision:
+                        raise ValueError("floor beyond revision")
+                    for key, limit in (("current", MAX_KEYS), ("ledger", MAX_LEDGER),
+                                       ("benefit_receipts", MAX_ORIGIN_RECEIPTS), ("chest_owner", MAX_KEYS)):
+                        if type(saved[key]) is not list or len(saved[key]) > limit:
+                            raise ValueError(f"invalid {key}")
+                    if type(saved["seen"]) is not dict or len(saved["seen"]) > MAX_SENDERS:
+                        raise ValueError("invalid senders")
+                    team.seen = {identifier(sender): integer(seq, 0, MAX_SEQ) for sender, seq in saved["seen"].items()}
+                    for flag in saved["current"]:
+                        validate_change(dict(flag, origin="check", seq=1), "check")
+                        if flag["type"] in EVENT_TYPES or flag.get("value") is not True or \
+                                any(k in flag for k in ("origin", "seq", "rev")) or state_key(flag) in team.current:
+                            raise ValueError("invalid folded flag")
+                        fold(team.current, flag)
+                    for receipt in saved["benefit_receipts"]:
+                        if type(receipt) is not list or not receipt or receipt[0] not in ("bit", "token"):
+                            raise ValueError("invalid benefit receipt")
+                        source = {"origin_kind": receipt[0], "origin_key64": receipt[1]}
+                        if len(receipt) != (3 if receipt[0] == "token" else 2):
+                            raise ValueError("invalid benefit receipt")
+                        if receipt[0] == "token":
+                            source["origin_partner"] = receipt[2]
+                        parsed = collectible_origin(source)
+                        if parsed in team.benefit_receipts:
+                            raise ValueError("duplicate receipt")
+                        team.benefit_receipts.add(parsed)
+                    for owner in saved["chest_owner"]:
+                        if type(owner) is not list or len(owner) != 3:
+                            raise ValueError("invalid chest owner")
+                        key = integer(owner[0], 1, (1 << 32) - 1)
+                        sender = identifier(owner[1])
+                        tx = None if owner[2] is None else integer(owner[2], 1, MAX_SEQ)
+                        if key in team.chest_owner:  # its sender may have been forgotten (evict_sender)
+                            raise ValueError("inconsistent chest owner")
+                        team.chest_owner[key] = sender, tx
+                    previous = team.ledger_floor
+                    ids, ledger_benefits, ledger_seen = set(), set(), {}
+                    for event in saved["ledger"]:
+                        rev = integer(event["rev"], previous + 1, team.revision)
+                        change = {k: v for k, v in event.items() if k != "rev"}
+                        validate_change(change, identifier(change["origin"]))
+                        event_id = change["origin"], change["seq"]
+                        if change["type"] not in EVENT_TYPES or (change["origin"] in team.seen and change["seq"] > team.seen[change["origin"]]) or event_id in ids:
+                            raise ValueError("inconsistent ledger")
+                        source = collectible_origin(change)
+                        if source and source[0] == "chest" and source[1] in team.chest_owner and \
+                                team.chest_owner[source[1]] != (change["origin"], change.get("chest_transaction")):
+                            raise ValueError("ledger chest owner mismatch")
+                        if source and source[0] in ("bit", "token") and source not in team.benefit_receipts:
+                            raise ValueError("ledger missing benefit receipt")
+                        if change["seq"] <= ledger_seen.get(change["origin"], 0):
+                            raise ValueError("backward ledger sender sequence")
+                        if source and source[0] in ("bit", "token"):
+                            if source in ledger_benefits:
+                                raise ValueError("duplicate ledger benefit")
+                            ledger_benefits.add(source)
+                        if source and source[0] == "chest" and source[1] not in team.chest_owner and len(team.chest_owner) < MAX_KEYS:
+                            raise ValueError("ledger missing chest owner")
+                        ledger_seen[change["origin"]] = change["seq"]
+                        ids.add(event_id)
+                        team.ledger.append(event)
+                        previous = rev
+                    if len(team.current) > team.revision or len(team.ledger) > team.revision:
+                        raise ValueError("inconsistent revision")
+                    active = saved.get("sender_active", {})
+                    if type(active) is not dict or len(active) > MAX_SENDERS:
+                        raise ValueError("invalid sender times")
+                    for sender, when in active.items():
+                        if sender not in team.seen or type(when) not in (int, float) or not math.isfinite(when):
+                            raise ValueError("invalid sender time")
+                        team.sender_active[sender] = when
+                    team.checkpoint = dict(team.current)
+                    team.checkpoint_revision = team.revision
+                    room.teams[team_name] = team
+                loaded[name] = room
+            self.rooms = loaded
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError, RecursionError, OverflowError, OSError) as exc:
+            raise ValueError(f"cannot load relay state {self.state_file}: {exc}") from exc
 
     async def start(self, bind="127.0.0.1", port=43390):
         self.server = await asyncio.start_server(self.connected, bind, port, limit=MAX_FRAME)
@@ -512,16 +854,23 @@ class Relay:
         room = self.rooms.get(packet["room"])
         if room is None:
             if len(self.rooms) >= MAX_ROOMS:
-                raise ProtocolError("room capacity reached")
+                self.evict_room()
             room = Room(packet["build_id"], packet["seed_hash"], packet["policy_id"],
                         empty_since=asyncio.get_running_loop().time())
             self.rooms[packet["room"]] = room
+            self.dirty = True
         if room.build_id != packet["build_id"]:
             raise ProtocolError("build id mismatch")
         if room.seed_hash != packet["seed_hash"]:
             raise ProtocolError("seed hash mismatch")
         if room.policy_id != packet["policy_id"]:
             raise ProtocolError("policy id mismatch")
+        supplied_hash = packet.get("mod_hash")
+        if supplied_hash is not None and room.mod_hash is not None and supplied_hash != room.mod_hash:
+            print(f"OoT co-op relay: handshake refused: mod mismatch room={packet['room']} "
+                  f"team={packet['team']} client={packet['client_id']} "
+                  f"room_hash={room.mod_hash[:12]} client_hash={supplied_hash[:12]}", flush=True)
+            raise ProtocolError(f"mod mismatch (room {room.mod_hash[:12]}, client {supplied_hash[:12]})")
         team = room.teams.get(packet["team"])
         if team is None:
             if len(room.teams) >= MAX_TEAMS:
@@ -532,9 +881,23 @@ class Relay:
         if client_id in team.clients:
             raise ProtocolError("client id already connected")
         if client_id not in team.seen and len(team.seen) >= MAX_SENDERS:
-            raise ProtocolError("sender capacity reached")
+            self.evict_sender(packet["room"], team)
+        if supplied_hash is None:
+            print(f"OoT co-op relay: client {client_id} joined room {packet['room']} "
+                  "without a mod hash (legacy client, unchecked)", flush=True)
+        elif room.mod_hash is None:
+            room.mod_hash = supplied_hash
+        room.last_active = time.time()
+        self.dirty = True
         team.seen.setdefault(client_id, 0)
+        team.sender_active[client_id] = time.time()
         client.client_id, client.room, client.team = client_id, room, team
+        client.quest = packet.get("quest") == 1
+        client.teleport = packet.get("teleport") == 1
+        client.teleport_times = deque()
+        client.teleport_pending = {}  # id -> (target connection, creation time)
+        client.teleport_last = 0
+        client.teleport_dropped = 0
         client.version = packet["version"]
         client.animation = packet.get("animation")
         client.ghost_equipment_v2 = packet.get("ghost_equipment_v2", False)
@@ -549,8 +912,15 @@ class Relay:
             ack["animation"] = client.animation
         if "ghost_equipment_v2" in packet:
             ack["ghost_equipment_v2"] = client.ghost_equipment_v2
+        if supplied_hash is not None:
+            ack["ledger"] = {"v": 1, "epoch": room.epoch, "floor": team.ledger_floor}
+            ack["mod_hash"] = room.mod_hash
+        if client.quest:
+            ack["quest"] = 1
+        if client.teleport:
+            ack["teleport"] = 1
         client.send(ack)
-        client.send(team.snapshot())
+        client.send(team.snapshot(client.quest))
         for peer in team.clients.values():
             if peer is not client:
                 self.send_presence(peer, client)
@@ -558,9 +928,11 @@ class Relay:
 
     @staticmethod
     def send_presence(source, recipient):
-        state = {key: value for key, value in source.state.items() if key != "animation"}
+        state = {key: value for key, value in source.state.items() if key not in ("animation", "teleport")}
         if recipient.version == VERSION and source.animation is not None:
             state["animation"] = source.animation
+        if recipient.teleport and source.teleport:
+            state["teleport"] = 1
         recipient.send({"type": "client_state", "origin": source.client_id, "state": state})
 
     @staticmethod
@@ -573,20 +945,46 @@ class Relay:
         kind = packet["type"]
         if kind == "pose":
             self.pose(client, packet, size)
+        elif kind == "quest_step":
+            if not client.quest:
+                raise ProtocolError("unsupported message type")  # preserve the legacy refusal without capability
+            validate_quest(packet, client.client_id)
+            previous = client.team.seen.get(client.client_id, 0)
+            event = client.team.accept_quest(packet, self.deny_list)
+            if client.team.seen.get(client.client_id, 0) != previous:  # C16 merge: the shared high-water persists
+                client.room.last_active = client.team.sender_active[client.client_id] = time.time()
+                self.dirty = True
+            client.send({"type": "ack", "seq": packet["seq"]})
+            if event is not None:
+                for peer in tuple(client.team.clients.values()):
+                    if peer is not client and peer.quest:
+                        peer.send(event)
+        elif kind in ("teleport_request", "teleport_to"):
+            self.teleport(client, packet, size)
         elif kind in CHANGE_TYPES:
             validate_change(packet, client.client_id)
+            previous = client.team.seen.get(client.client_id, 0)
             event = client.team.accept(packet, self.deny_list)
+            if client.team.seen.get(client.client_id, 0) != previous:
+                client.room.last_active = client.team.sender_active[client.client_id] = time.time()
+                self.dirty = True
             client.send({"type": "ack", "seq": packet["seq"]})
             if event is not None:
                 self.broadcast(client, event)
+        elif kind == "catchup_request":
+            fields(packet, ("type", "after"))
+            client.send(client.team.catchup(client.room.epoch, packet["after"]))
         elif kind == "team_state_request":
             fields(packet, ("type",), ("world_wallet",))
             if "world_wallet" in packet:
                 validate_wallet(packet["world_wallet"])
                 client.state["world_wallet"] = dict(packet["world_wallet"])
-                self.broadcast(client, {"type": "client_state", "origin": client.client_id,
-                                        "state": client.state})
-            client.send(client.team.snapshot())
+                # Per recipient, like every other presence: a client_state is a full state, so a raw
+                # client.state (no negotiated animation) would make v4 peers drop this client's animation.
+                for peer in tuple(client.team.clients.values()):
+                    if peer is not client:
+                        self.send_presence(client, peer)
+            client.send(client.team.snapshot(client.quest))
         elif kind in ("heartbeat", "heartbeat_ack"):
             fields(packet, ("type",))
             if kind == "heartbeat":
@@ -604,6 +1002,51 @@ class Relay:
                     self.send_presence(client, peer)
         else:
             raise ProtocolError("unsupported message type")
+
+    @staticmethod
+    def teleport(client, packet, size=None):
+        if not client.teleport:
+            raise ProtocolError("teleport not negotiated")
+        validate_teleport(packet, size)
+        now = asyncio.get_running_loop().time()
+        # Prune on every packet; each sender can retain at most four entries.
+        for peer in client.team.clients.values():
+            peer.teleport_pending = {n: row for n, row in peer.teleport_pending.items()
+                                     if now - row[1] < 10 and not getattr(row[0], "failed", False)
+                                     and client.team.clients.get(row[0].client_id) is row[0]}
+        n, target = packet["request_id"], packet["target"]
+        if packet["type"] == "teleport_request":
+            def deny(reason):
+                client.send({"type": "teleport_to", "origin": target, "request_id": n,
+                             "status": "denied", "reason": reason})
+            if n <= client.teleport_last:
+                client.teleport_dropped += 1
+                return
+            client.teleport_last = n
+            while client.teleport_times and now - client.teleport_times[0] >= 10:
+                client.teleport_times.popleft()
+            if len(client.teleport_times) >= 4:
+                deny("rate")
+                return
+            client.teleport_times.append(now)
+            peer = client.team.clients.get(target)
+            if peer is None or peer is client or not peer.teleport or getattr(peer, "failed", False):
+                deny("unavailable")
+                return
+            client.teleport_pending[n] = (peer, now)
+            peer.send({"type": "teleport_request", "origin": client.client_id, "request_id": n})
+        else:
+            peer = client.team.clients.get(target)
+            pending = peer.teleport_pending.get(n) if peer and peer.teleport else None
+            if pending is None or pending[0] is not client or now - pending[1] >= 10:
+                client.teleport_dropped += 1
+                return
+            forwarded = {k: v for k, v in packet.items() if k != "target"}
+            forwarded["origin"] = client.client_id
+            if len(encode(forwarded)) - 4 > 512:
+                raise ProtocolError("teleport frame too large")
+            del peer.teleport_pending[n]
+            peer.send(forwarded)
 
     @staticmethod
     def pose(client, packet, size=None):
@@ -660,6 +1103,8 @@ class Relay:
                                         "state": {"online": False}})
                 if not any(team.clients for team in client.room.teams.values()):
                     client.room.empty_since = asyncio.get_running_loop().time()
+                    client.room.last_active = time.time()
+                    self.dirty = True
             sending.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await sending
@@ -678,8 +1123,17 @@ class Relay:
                     client.send({"type": "heartbeat"})
                     client.last_heartbeat = now
             for name, room in tuple(self.rooms.items()):
-                if room.empty_since is not None and now - room.empty_since >= self.room_ttl:
+                if self.state_file is not None:
+                    expired = not any(t.clients for t in room.teams.values()) and \
+                        time.time() - room.last_active >= self.room_ttl_days * 86400
+                else:
+                    expired = room.empty_since is not None and now - room.empty_since >= self.room_ttl
+                if expired:
                     del self.rooms[name]
+                    self.dirty = True
+            if now - self.last_write >= 1:
+                self.persist()
+                self.last_write = now
 
     async def close(self):
         if self.server is not None:
@@ -692,6 +1146,7 @@ class Relay:
         for client in tuple(self.clients):
             client.writer.close()
         await asyncio.gather(*tuple(self.tasks), return_exceptions=True)
+        self.persist()
 
 
 def load_deny_list(path):
@@ -707,10 +1162,31 @@ def load_deny_list(path):
     return [integer(x, 0, (1 << 64) - 1) for x in values]
 
 
+def configured(args):
+    return Relay(deny_list=load_deny_list(args.deny_list),
+                 state_file=None if args.no_state else args.state_file, room_ttl_days=args.room_ttl_days)
+
+
+def reset_room(relay, name):
+    if relay.state_file is None:
+        raise ValueError("--reset-room requires a state file")
+    name = identifier(name)
+    if name not in relay.rooms:
+        raise ValueError(f"room {name} does not exist; nothing reset")
+    del relay.rooms[name]
+    relay.dirty = True
+    relay.persist(strict=True)
+    print(f"OoT co-op relay: room {name} reset in {relay.state_file}", flush=True)
+
+
 async def run(args):
-    relay = Relay(deny_list=load_deny_list(args.deny_list))
+    relay = configured(args)
+    if args.reset_room is not None:
+        reset_room(relay, args.reset_room)
+        return
     await relay.start(args.bind, args.port)
-    print(f"OoT co-op relay listening on {args.bind}:{args.port} (LAN only; no authentication)", flush=True)
+    state = f"state {relay.state_file}" if relay.state_file is not None else "memory only"
+    print(f"OoT co-op relay listening on {args.bind}:{args.port} ({state}; {relay.rooms_loaded} rooms loaded)", flush=True)
     try:
         await relay.server.serve_forever()
     finally:
@@ -722,11 +1198,21 @@ def main():
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=43390)
     parser.add_argument("--deny-list", help="user JSON array of opaque numeric hashes")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--state-file", type=Path, default=Path(__file__).with_name("relay-state.json"))
+    group.add_argument("--no-state", action="store_true")
+    parser.add_argument("--room-ttl-days", type=float, default=30)
+    parser.add_argument("--reset-room", metavar="NAME", help="offline: remove one room and exit")
     args = parser.parse_args()
     try:
-        asyncio.run(run(args))
+        if args.reset_room is not None:
+            reset_room(configured(args), args.reset_room)
+        else:
+            asyncio.run(run(args))
     except KeyboardInterrupt:
         pass
+    except (ValueError, OSError) as exc:
+        parser.exit(1, f"OoT co-op relay: {exc}\n")
 
 
 if __name__ == "__main__":

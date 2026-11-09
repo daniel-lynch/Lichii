@@ -28,6 +28,24 @@ namespace FS = Common::FS;
 Config::Config(const ConfigType config_type)
     : type(config_type), global{config_type == ConfigType::GlobalConfig} {}
 
+std::map<std::string, std::string> Config::ReadRawSection(const std::string& section) const {
+    std::map<std::string, std::string> values;
+    CSimpleIniA::TNamesDepend keys;
+    config->GetAllKeys(section.c_str(), keys);
+    for (const auto& key : keys) {
+        values.emplace(key.pItem, config->GetValue(section.c_str(), key.pItem, ""));
+    }
+    return values;
+}
+
+void Config::WriteRawSection(const std::string& section,
+                             const std::map<std::string, std::string>& values) {
+    config->Delete(section.c_str(), nullptr);
+    for (const auto& [key, value] : values) {
+        config->SetValue(section.c_str(), key.c_str(), value.c_str());
+    }
+}
+
 void Config::Initialize(const std::string& config_name) {
     const std::filesystem::path fs_config_loc = FS::GetEdenPath(FS::EdenPath::ConfigDir);
     const auto config_file = fmt::format("{}.ini", config_name);

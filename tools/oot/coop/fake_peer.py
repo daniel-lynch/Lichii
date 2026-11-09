@@ -18,6 +18,8 @@ Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CT
   bit HEX ... origin=token:HEX:PARTNER_HEX   flags belonging to the same collectible transaction
   wallet BALANCE CAPACITY   publish wallet baseline and request the team's wallet baselines
   key HEX DELTA             key_add: a small-key gain of DELTA for the dungeon whose total key is HEX
+  quest CHALLENGE STEP INDEX  send a raw committed quest step (hex hashes; requires --quest)
+  expect-quest CHALLENGE SECS wait for an emulator quest commit; result includes packet
   expect-type TYPE SECS     wait for the emulator's next change of TYPE (rupee_add, key_add, ...)
   dup SEQ                   re-deliver this peer's accepted event SEQ to the other clients (a duplicate)
   expect-item NAME SECS     wait for the emulator's item_give of NAME
@@ -44,10 +46,22 @@ Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CT
   poseequip WORD|off [child=0|1]
                             what later pose streams (posecircle, posepath) carry: an eq32 word (eqseq
                             tracks known changes) and the age; off = no equipment fields
+  tp-request [TARGET]       with --teleport: request current destination (default sole online peer),
+                            wait up to 5 s; result contains teleport_to or timeout
+  tp-answer ok|deny REASON|silent
+                            answer from the last pose SENT (default ok); no pose means unready
+  tp-log                    bounded received requests and sent answers
   posestop                  stop the stream; result has how many poses it sent
+  holdout SECS              kick other clients and refuse their hellos for SECS
+  badmod HEX                probe a second client with this mod hash; return ack or error reason
+  catchup                   return count and (origin, seq, rev, type, name) of ledger grants
   kick                      close the relay's connection to every other client (the emulator), as a
                             network drop would; the peer itself stays connected
   poses [N]                 the last N (default 20) poses received from other origins, and the total
+  leave                     close this peer only (relay announces offline); stops pose streams
+  join                      reconnect with the same client_id, name and completed state
+  finish                    announce finished=true in the full client state
+  presence                  repeat the full client state (no presence transition)
   quit
 Every packet the peer receives is also appended to CTL/received.jsonl with a wall-clock time,
 except poses: only every 15th received pose (the 1st, 16th, ...) is recorded there."""
@@ -56,6 +70,7 @@ import argparse
 import asyncio
 import importlib.util
 import collections
+import contextlib
 import json
 import math
 from pathlib import Path
@@ -81,17 +96,37 @@ class FakePeer:
     """Relay + one scripted client in one event loop. `port=0` picks an ephemeral port."""
 
     def __init__(self, *, port=43390, room="default", team="default", policy="or-v2", seed="0",
-                 name="FakePeer", build_id=client_sim.BUILD_ID, record=None, wallet=0, anim_table=None):
-        self.relay = relay_mod.Relay()
+                 name="FakePeer", build_id=client_sim.BUILD_ID, record=None, wallet=0, anim_table=None, mod_hash=None, state_file=None, quest=False,
+                 teleport=False):
+        self.relay = relay_mod.Relay(state_file=state_file)
+        self.holdout_until = 0.0
+        self.badmod_count = 0
+        join = self.relay.join
+        def held_join(client, packet):
+            if time.monotonic() < self.holdout_until and packet.get("client_id") != self.client.hello["client_id"]:
+                raise relay_mod.ProtocolError("held out (test)")
+            return join(client, packet)
+        self.relay.join = held_join
         self.port = port
         self.client = client_sim.ClientSim(room=room, team=team, name=name, build_id=build_id,
                                            seed_hash=seed, policy_id=policy,
-                                           animation=client_sim.animation_descriptor(anim_table))
+                                           animation=client_sim.animation_descriptor(anim_table), mod_hash=mod_hash,
+                                           quest=quest)
         self.client.hello["ghost_equipment_v2"] = True
+        if teleport:
+            self.client.hello["teleport"] = 1
+        self.teleport = teleport
+        self.tp_mode, self.tp_reason = "ok", "unready"
+        self.tp_seq = 0
+        self.tp_history = collections.deque(maxlen=256)
+        self.tp_seen = {}
+        self.current_pose = None
         self.equipment_seq = 0
         self.equipment_known = {}
         self.stream_eq32, self.stream_child = None, True  # poseequip: what the pose streams carry
         self.record = Path(record) if record else None
+        self.finished = False
+        self.world_wallet = None
         self.wallet = wallet  # the wallet key from the private profile (rupee_add)
         self.received = []
         self.seen = []
@@ -145,6 +180,7 @@ class FakePeer:
             raise ValueError("eqseq requires eq32")
         relay_mod.validate_pose(packet)
         await self.client.send(packet)
+        self.current_pose = dict(packet)
         if eq32 is not None:
             self.equipment_known, self.equipment_seq = known, eqseq
         return packet
@@ -224,9 +260,28 @@ class FakePeer:
                 packet = await self.client.receive(timeout=3600)
             except TimeoutError:
                 continue
+            if packet.get("type") == "teleport_request" and self.teleport:
+                self.tp_history.append(packet)
+                origin, n = packet["origin"], packet["request_id"]
+                if n > self.tp_seen.get(origin, 0):
+                    if len(self.tp_seen) < 128 or origin in self.tp_seen:
+                        self.tp_seen[origin] = n
+                        if self.tp_mode != "silent":
+                            answer = {"type": "teleport_to", "target": origin, "request_id": n,
+                                      "status": "denied", "reason": self.tp_reason}
+                            pose = self.current_pose
+                            if self.tp_mode == "ok" and pose and pose["banc"] and not pose["loading"]:
+                                answer = {"type": "teleport_to", "target": origin, "request_id": n,
+                                          "status": "ok", "room": None, "banc": pose["banc"],
+                                          "pos": list(pose["pos"]), "yaw": pose["yaw"],
+                                          "age": "child" if pose["child"] else "adult"}
+                            elif self.tp_mode == "ok":
+                                answer["reason"] = "loading" if pose and pose["loading"] else "unready"
+                            await self.client.send(answer)
+                            self.tp_history.append(answer)
             self.log(packet)
             self.seen.append(packet)
-            if packet.get("type") in relay_mod.CHANGE_TYPES:
+            if packet.get("type") in relay_mod.CHANGE_TYPES | {"quest_step"}:
                 self.received.append(packet)
             for match, future in tuple(self.waiters):
                 if not future.done() and match(packet):
@@ -275,15 +330,57 @@ class FakePeer:
                                timeout)
 
     async def state(self, world_wallet=None):
+        if world_wallet is not None:
+            self.world_wallet = dict(world_wallet)
+            self.client.hello["world_wallet"] = dict(world_wallet)
         since = len(self.seen)
         await self.client.baseline(world_wallet)
         return await self.wait(lambda p: p.get("type") == "team_state", 5, since)
+
+    async def presence(self):
+        if self.client.writer is None:
+            raise ConnectionError("peer is offline; join first")
+        state = {"name": self.client.hello["name"]}
+        if self.finished:
+            state["finished"] = True
+        if self.world_wallet is not None:
+            state["world_wallet"] = dict(self.world_wallet)
+        await self.client.send({"type": "client_state", "state": state})
+        return {"state": state}
+
+    async def leave(self):
+        await self.stop_stream()
+        if self.task is not None:
+            self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, EOFError, ConnectionError):
+                await self.task
+            self.task = None
+        await self.client.close()
+        # Wait for the local relay's finally block before reusing this identity.
+        async with asyncio.timeout(5):
+            while any(getattr(c, "client_id", None) == self.client.hello["client_id"]
+                      for c in self.relay.clients):
+                await asyncio.sleep(0.01)
 
     async def command(self, line):
         words = line.split()
         if not words:
             raise ValueError("empty command")
         verb = words[0]
+        if verb in ("leave", "join", "finish", "presence"):
+            if len(words) != 1:
+                raise ValueError(verb + " takes no arguments")
+            if verb == "leave":
+                await self.leave()
+                return {"online": False}
+            if verb == "join":
+                if self.client.writer is None:
+                    await self.client.connect("127.0.0.1", self.port)
+                    self.task = asyncio.create_task(self.listen())
+                return {"online": True, **await self.presence()}
+            if verb == "finish":
+                self.finished = True
+            return await self.presence()
         source = {}
         options = [word for word in words[1:] if word.startswith("origin=")]
         if options:
@@ -325,6 +422,27 @@ class FakePeer:
             await self.client.send(packet)
             await self.wait(lambda p: p.get("type") == "ack" and p.get("seq") == packet["seq"], 5, since)
             return {"sent": packet["seq"], "item": packet}
+        if verb == "quest":
+            if len(words) != 4 or self.client.ack.get("quest") != 1:
+                raise ValueError("quest CHALLENGE STEP INDEX requires --quest")
+            packet = {"type": "quest_step", "origin": self.client.hello["client_id"],
+                      "seq": self.client.seq + 1, "challenge": int(words[1], 16),
+                      "step": int(words[2], 16), "index": int(words[3], 0)}
+            relay_mod.validate_quest(packet, self.client.hello["client_id"])
+            self.client.seq += 1
+            since = len(self.seen)
+            await self.client.send(packet)
+            await self.wait(lambda p: p.get("type") == "ack" and p.get("seq") == packet["seq"], 5, since)
+            return {"sent": packet["seq"], "quest": packet}
+        if verb == "expect-quest":
+            if len(words) != 3:
+                raise ValueError("expect-quest CHALLENGE SECS")
+            challenge = int(words[1], 16)
+            try:
+                return {"packet": await self.wait(lambda p: p.get("type") == "quest_step" and
+                                                  p.get("challenge") == challenge, float(words[2]))}
+            except TimeoutError:
+                return {"timeout": True}
         if verb == "key":
             if len(words) != 3:
                 raise ValueError("key HEX DELTA")
@@ -368,6 +486,37 @@ class FakePeer:
             return {"received": self.received}
         if verb == "state":
             return {"state": await self.state()}
+        if verb.startswith("tp-"):
+            if not self.teleport:
+                raise ValueError("requires --teleport")
+            if verb == "tp-log" and len(words) == 1:
+                return {"teleport_log": list(self.tp_history)}
+            if verb == "tp-answer":
+                if words[1:] in (["ok"], ["silent"]):
+                    self.tp_mode = words[1]
+                elif len(words) == 3 and words[1] == "deny" and words[2] in relay_mod.TELEPORT_REASONS:
+                    self.tp_mode, self.tp_reason = "deny", words[2]
+                else:
+                    raise ValueError("tp-answer ok|deny REASON|silent")
+                return {"answer": self.tp_mode}
+            if verb == "tp-request" and len(words) <= 2:
+                peers = [p.client_id for p in self.relay.clients
+                         if p.client_id != self.client.hello["client_id"] and p.team is not None
+                         and p.teleport and p.team is self.relay.rooms[self.client.hello["room"]].teams[self.client.hello["team"]]]
+                if len(words) == 1 and len(peers) != 1:
+                    raise ValueError("specify TARGET when there is not exactly one peer")
+                target = words[1] if len(words) == 2 else peers[0]
+                relay_mod.identifier(target)
+                self.tp_seq += 1
+                since = len(self.seen)
+                await self.client.send({"type": "teleport_request", "target": target, "request_id": self.tp_seq})
+                try:
+                    reply = await self.wait(lambda p: p.get("type") == "teleport_to" and
+                        p.get("request_id") == self.tp_seq and p.get("origin") == target, 5, since)
+                    return {"teleport_to": reply}
+                except TimeoutError:
+                    return {"teleport_to": "timeout"}
+            raise ValueError("invalid teleport command")
         if verb == "pose":
             if len(words) < 7:
                 raise ValueError("pose BANC CHILD X Y Z YAW [LOADING] [aid=N af=F|null ar=R aseq=N] [eq32=WORD [eqseq=N]]")
@@ -440,7 +589,38 @@ class FakePeer:
             self.stream_sent = 0
             self.stream = asyncio.create_task(self.path(banc, points, hz, speed))
             return {"started": {"banc": banc, "points": points, "hz": hz, "speed": speed}}
-        if verb == "kick":
+        if verb == "catchup":
+            # listen() owns the client's receive queue; use its predicate waiters.
+            grants, after = [], 0
+            while True:
+                waiter = asyncio.create_task(self.wait(lambda p: p["type"] == "catchup", 5, len(self.seen)))
+                await asyncio.sleep(0)
+                await self.client.send({"type": "catchup_request", "after": after})
+                page = await waiter
+                grants.extend(page["grants"])
+                if not page["more"]:
+                    return {"count": len(grants), "grants": [[p["origin"], p["seq"], p["rev"], p["type"], p.get("name", "-")] for p in grants]}
+                if not page["grants"] or len(grants) > 16384:
+                    raise ValueError("invalid catchup progress")
+                after = page["grants"][-1]["rev"]
+        if verb == "badmod":
+            self.badmod_count += 1
+            h = self.client.hello
+            probe = client_sim.ClientSim(f"badmod-{self.badmod_count}", room=h["room"], team=h["team"],
+                build_id=h["build_id"], seed_hash=h["seed_hash"], policy_id=h["policy_id"], mod_hash=words[1])
+            try:
+                await probe.connect("127.0.0.1", self.port)
+                return {"result": probe.ack}
+            except ValueError as exc:
+                return {"result": str(exc)}
+            finally:
+                await probe.close()
+        if verb in ("kick", "holdout"):
+            if verb == "holdout":
+                seconds = float(words[1])
+                if not math.isfinite(seconds) or seconds < 0:
+                    raise ValueError("invalid holdout duration")
+                self.holdout_until = time.monotonic() + seconds
             me, kicked = self.client.hello["client_id"], []
             for client in list(self.relay.clients):
                 if getattr(client, "client_id", None) not in (None, me):
@@ -473,7 +653,8 @@ async def serve(args):
     commands.touch()
     peer = FakePeer(port=args.port, room=args.room, team=args.team, policy=args.policy, seed=args.seed,
                     name=args.name, build_id=args.build_id, record=ctl / "received.jsonl",
-                    wallet=args.wallet, anim_table=args.anim_table)
+                    wallet=args.wallet, anim_table=args.anim_table, mod_hash=args.mod_hash, state_file=args.state_file,
+                    quest=args.quest, teleport=args.teleport)
     port = await peer.start()
     print(f"fake peer ready on 127.0.0.1:{port} room={args.room} team={args.team}", flush=True)
     done = len(commands.read_text().splitlines())
@@ -511,8 +692,12 @@ def main():
     parser.add_argument("--name", default="FakePeer")
     parser.add_argument("--build-id", default=client_sim.BUILD_ID)
     parser.add_argument("--anim-table", help="private coop-anim.json sidecar; enables v4 animation negotiation")
+    parser.add_argument("--quest", action="store_true", help="enable quest commands and reception")
+    parser.add_argument("--teleport", action="store_true", help="enable teleport revision 1")
     parser.add_argument("--wallet", type=lambda text: int(text, 0), default=0,
                         help="wallet GameData key for rupee_add (from the private profile)")
+    parser.add_argument("--mod-hash", type=relay_mod.mod_hash)
+    parser.add_argument("--state-file", type=Path, help="optional relay campaign persistence")
     args = parser.parse_args()
     try:
         asyncio.run(serve(args))

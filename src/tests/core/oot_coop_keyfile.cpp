@@ -6,7 +6,8 @@
 //   EDEN_NX2_OOT_COOP_KEYS=<kit>/chest-keys-cNN.json
 //   EDEN_NX2_OOT_COOP_KEYS_BUILD=<40-hex main build id>
 //   tests "[.oot_coop_keyfile]"
-// The sidecars (coop-anim.json, coop-equip.json, coop-ux.json) are read beside the key file.
+// The sidecars (coop-anim.json, coop-equip.json, coop-ux.json, coop-ledger.json) are read beside the key file.
+// Optional: EDEN_NX2_OOT_COOP_KEYS_LOAD=<load/<title id>> also prints the ledger mod hash of that tree.
 
 #include <cstdlib>
 #include <fstream>
@@ -19,6 +20,10 @@
 
 #include "core/arm/dynarmic/oot_coop_anim.h"
 #include "core/arm/dynarmic/oot_coop_equip.h"
+#include "core/arm/dynarmic/oot_coop_ledger.h"
+#include "core/arm/dynarmic/oot_coop_quest.h"
+#include "core/arm/dynarmic/oot_coop_room.h"
+#include "core/arm/dynarmic/oot_coop_teleport.h"
 #include "core/arm/dynarmic/oot_coop_sync.h"
 #include "core/arm/dynarmic/oot_coop_ux.h"
 
@@ -80,4 +85,32 @@ TEST_CASE("OoT co-op private key file loads with the strict decoders", "[.oot_co
     const auto ux = Coop::Ux::LoadConfig(build, &ux_why);
     REQUIRE(ux);
     WARN(fmt::format("coop-ux.json: {} (camera keys {})", ux_why, ux->camera ? "present" : "absent"));
+
+    // C16 sections (integration check): quest, teleport, room window sidecar fields, ledger sidecar.
+    if (profile->quest) {
+        size_t steps = 0;
+        for (const auto& [challenge, list] : profile->quest->mirror) steps += list.size();
+        WARN(fmt::format("quest present (enabled={}): mirror {} challenges / {} safe steps, {} commit observers, "
+                         "deny.quest {}", profile->quest->enabled, profile->quest->mirror.size(), steps,
+                         profile->quest->observers.size(), extras->deny_quest.size()));
+    } else WARN("quest absent");
+    if (profile->teleport) {
+        const auto& t = *profile->teleport;
+        WARN(fmt::format("teleport present (enabled={}): requester [{}] answer [{}], allow bancs {}, deny bancs {}, "
+                         "cross {} (enabled={} explicit={})", t.enabled, fmt::join(t.requester_commands, ","),
+                         fmt::join(t.answer_commands, ","), t.allow_bancs.size(), t.deny_bancs.size(),
+                         t.cross ? "present" : "absent", t.cross && t.cross->enabled,
+                         t.cross && t.cross->explicit_position));
+    } else WARN("teleport absent");
+    if (ux->room) {
+        WARN(fmt::format("coop-ux.json room: {} area names, finish {}, minimap {}", ux->room->area_names.size(),
+                         ux->room->finish ? "present" : "absent", ux->room->minimap ? "present" : "absent"));
+    }
+    std::string ledger_why;
+    const auto pattern = Coop::Ledger::LoadConfig(path, ledger_why);
+    WARN(fmt::format("coop-ledger.json: {}", pattern ? std::string{"save pattern loaded"} : ledger_why));
+    if (const auto load = Env("EDEN_NX2_OOT_COOP_KEYS_LOAD"); !load.empty()) {
+        const auto hash = Coop::Ledger::ModHash(path, load);
+        WARN(fmt::format("mod hash {} ({} mod files, {} bytes)\n{}", hash.digest, hash.files, hash.bytes, hash.text));
+    }
 }

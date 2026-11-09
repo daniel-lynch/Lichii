@@ -19,12 +19,17 @@
 
 #include <boost/asio.hpp>
 
+#include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/thread.h"
+#include "core/arm/dynarmic/oot_coop_ledger.h"
 #include "core/arm/dynarmic/oot_coop_sync.h"
+#include "core/arm/dynarmic/oot_coop_teleport.h"
 #include "core/arm/dynarmic/oot_coop_ghost.h"
 #include "core/arm/dynarmic/oot_coop_runtime.h"
 #include "core/arm/dynarmic/oot_coop_ux.h"
+#include "core/arm/dynarmic/oot_coop_room.h"
+#include "core/arm/dynarmic/oot_coop_gui.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
 #include "dynarmic/interface/A64/a64.h"
@@ -238,7 +243,8 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
         const char* value_field = change.kind == Kind::Rupee || change.kind == Kind::Key ? "delta" : "value";
         if (WireKind(change.kind)) {
             for (const auto& [field, value] : packet.items()) {
-                if (field == "type" || field == key || field == value_field) continue;
+                if (field == "type" || field == key || (change.kind != Kind::Quest && field == value_field)) continue;
+                if (change.kind == Kind::Quest && (field == "step" || field == "index")) continue;
                 if (change.kind == Kind::Bit && World::OriginField(field)) continue;
                 if (!snapshot && (field == "origin" || field == "seq")) continue;
                 if (!snapshot && field == "rev" && Unsigned(value, MaxSequence) && value != 0) continue;
@@ -261,7 +267,7 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
             }
             change.value = packet.at("value").get<bool>() ? 1 : 0;
         } else if (change.kind == Kind::Quest) {
-            if (!Unsigned(packet.at("index"), 255) ||
+            if (!change.key || packet.at("step") == 0 || !Unsigned(packet.at("index"), 255) ||
                 !Unsigned(packet.at("step"), std::numeric_limits<u32>::max())) {
                 return std::nullopt;
             }
@@ -324,7 +330,7 @@ std::optional<Json> DecodeLine(std::string_view line) {
 
 bool WireKind(Kind kind) {
     return kind == Kind::Bool || kind == Kind::Bit || kind == Kind::Rupee || kind == Kind::Item ||
-           kind == Kind::Key;
+           kind == Kind::Key || kind == Kind::Quest;
 }
 
 std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text) {
@@ -338,6 +344,7 @@ std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text) {
         else if (name == "item") result.insert(Kind::Item);
         else if (name == "pose") result.insert(Kind::Pose);
         else if (name == "dungeon") result.insert(Kind::Key);
+        else if (name == "quest") result.insert(Kind::Quest);
         else return std::nullopt;
         if (comma == std::string_view::npos) break;
         text.remove_prefix(comma + 1);
@@ -448,6 +455,15 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                 const auto cell = Number(value, MaxModuleOffset);
                 if (!cell || !*cell || (*cell & 7)) return std::nullopt;
                 (field == "manager_cell" ? profile.manager_cell : profile.pouch_cell) = *cell;
+            } else if (field == "quest") {
+                profile.quest = Quest::DecodeKeys(value);
+                if (!profile.quest) return {};
+                for (const auto& observer : profile.quest->observers)
+                    profile.sites.push_back({Point::StepCommit, observer.entry.offset, observer.entry.words.front()});
+            } else if (field == "teleport") {
+                const auto decoded = Teleport::DecodeKeys(value);
+                if (!decoded) return std::nullopt;
+                profile.teleport = std::make_shared<const Teleport::Keys>(*decoded);
             } else if (field == "anim") {
                 const auto decoded = Anim::DecodeKeys(value);
                 if (!decoded) return std::nullopt;
@@ -768,14 +784,20 @@ Json EncodeHello(const Hello& hello) {
                    {"client_id", hello.client_id}, {"name", hello.name}};
     if (!hello.animation_hash.empty())
         packet["animation"] = {{"av", 1}, {"table_sha256", hello.animation_hash}};
+    if (!hello.mod_hash.empty()) packet["mod_hash"] = hello.mod_hash;
     if (hello.world_wallet) packet["world_wallet"] = World::EncodeWallet(*hello.world_wallet);
     if (hello.ghost_equipment_v2) packet["ghost_equipment_v2"] = true;
+    if (hello.quest) packet["quest"] = 1;
+    if (hello.teleport) packet["teleport"] = 1;
     return packet;
 }
 
 bool MatchesHello(const Json& packet, const Hello& hello) {
     try {
+        if (packet.contains("quest") && (!hello.quest || !Unsigned(packet.at("quest"), 1) || packet.at("quest") != 1)) return false;
         const u32 version = hello.animation_hash.empty() ? ProtocolVersion : 4;
+        if (hello.teleport && (!packet.contains("teleport") || !Unsigned(packet.at("teleport"), 1) || packet.at("teleport") != 1))
+            return false;
         if (!hello.animation_hash.empty() &&
             (!packet.contains("animation") ||
              !AnimationMatches(packet.at("animation"), hello.animation_hash)))
@@ -831,11 +853,11 @@ std::optional<KeyExtras> DecodeKeyExtras(const Json& document) {
         const auto& deny = document.at("deny");
         if (!deny.is_object()) return std::nullopt;
         for (const auto& [name, list] : deny.items()) {
-            if (name != "bool" || !list.is_array() || list.size() > DenyLimit) return std::nullopt;
+            if ((name != "bool" && name != "quest") || !list.is_array() || list.size() > DenyLimit) return std::nullopt;
             for (const auto& value : list) {
-                const auto key = u32_key(value);
-                if (!key) return std::nullopt;
-                extras.deny.insert(*key);
+                const auto key = name == "quest" ? Number(value, 0xffffffff) : std::optional<u64>{u32_key(value)};
+                if (!key || !*key) return std::nullopt;
+                (name == "quest" ? extras.deny_quest : extras.deny).insert(*key);
             }
         }
     }
@@ -971,24 +993,39 @@ struct Session::Impl {
     struct Connection;
     struct GhostPort;
     Impl(Endpoint endpoint_, Hello hello_, std::set<u64> denied_, std::set<Kind> allowed_,
-         std::set<std::pair<Kind, u64>> keys, u64 wallet, const World::Config& world)
+         std::set<std::pair<Kind, u64>> keys, u64 wallet, const World::Config& world, bool quest_enabled)
         : endpoint{std::move(endpoint_)}, hello{std::move(hello_)}, denied{std::move(denied_)},
           local{denied}, remote{denied}, allowed_classes{std::move(allowed_)}, retry{io} {
+        if (!quest_enabled) allowed_classes.erase(Kind::Quest);
         ApplyPolicy policy{true, allowed_classes, {}, wallet};
         for (const auto& [kind, key] : keys) {
             if (!denied.contains(key) && (kind != Kind::Bit || world.families.empty() || world.AdmitsFlag(key)))
                 policy.keys.emplace(kind, key);
         }
-        for (const auto& [kind, key] : policy.keys)
+        for (const auto& [kind, key] : policy.keys) {
             if (kind == Kind::Bit) world_keys.insert(key);
+            if (kind == Kind::Key) ledger_key_targets.insert(key);
+        }
         runtime = std::make_unique<FrameDrain<Backend>>(std::move(policy));
     }
-    ~Impl() { Stop(); }
+    ~Impl() { if (save) Ledger::RemoveWatch(save.get()); Stop(); }
     void Start();
     void Stop();
     void Connect();
     bool Receive(const Json& packet);
 
+    struct CatchupEnd { u64 transaction; };
+    Ledger::Book book;
+    std::set<u64> ledger_key_targets;
+    std::unique_ptr<Ledger::Save> save;
+    std::atomic<bool> ledger_capable{};
+    u64 catchup_serial{}; // io thread only
+    bool LedgerOn() const { return save && save->Enabled(); }
+    bool AdmitEvent(const Change& change) {
+        const bool merged = change.catchup || remote.Merge(change, !change.origin.empty());
+        if (!LedgerOn()) return !change.catchup && merged;
+        return book.Admit(change, merged) == Ledger::Decision::Admit;
+    }
     Endpoint endpoint;
     Hello hello;
     std::set<u64> denied;
@@ -997,7 +1034,9 @@ struct Session::Impl {
     State remote;
     std::set<Kind> allowed_classes;
     std::deque<Change> outgoing;
-    std::deque<std::variant<Change, HighWater>> pending;
+    std::deque<std::variant<Change, HighWater, Impl::CatchupEnd>> pending;
+    u64 pending_pushed{}, pending_drained{}; // transport under mutex / guest thread
+    Room::SyncTally sync_tally;
     u64 next_seq{1};
     std::mutex guest_mutex;
     GuestBinding binding;
@@ -1014,7 +1053,7 @@ struct Session::Impl {
     bool chest_quarantined{};
     /// A chest-tagged benefit this receiver arbitrates (else it takes the ordinary give path).
     bool ChestGuarded(const Change& change) const {
-        return change.kind == Kind::Item && change.source.kind == World::OriginKind::Chest &&
+        return !change.catchup && change.kind == Kind::Item && change.source.kind == World::OriginKind::Chest &&
                !chest_quarantined && chest_bools.contains(static_cast<u32>(change.source.key));
     }
     struct LocalChestGive {
@@ -1038,7 +1077,7 @@ struct Session::Impl {
                 chest_bools.contains(static_cast<u32>(change->key)))
                 claims.RemoteClaim(World::Origin::Chest(static_cast<u32>(change->key)),
                                    change->origin, change->origin.empty());
-            else if (change->kind == Kind::Item && change->source.kind == World::OriginKind::Chest &&
+            else if (!change->catchup && change->kind == Kind::Item && change->source.kind == World::OriginKind::Chest &&
                      chest_bools.contains(static_cast<u32>(change->source.key)) &&
                      allowed_classes.contains(Kind::Item))
                 claims.AcceptRemote(*change);
@@ -1071,6 +1110,18 @@ struct Session::Impl {
     };
     std::optional<CleanupCall> cleanup_call;
     u64 cleanup_stack{};
+    std::unique_ptr<Quest::Controller> quest;
+    std::optional<Backend::Context> quest_saved;
+    u64 quest_stack{};
+    std::atomic<bool> quest_negotiated{};
+    std::atomic<u64> quest_connections{};
+    u64 quest_connection_seen{};
+    bool quest_fallback{}; // transport thread only; one legacy retry for the session
+    // C16 merge: an older relay refused the teleport hello field; teleport is off for this process
+    // (no hello field, no packets: a c15 relay would drop the connection on a teleport packet).
+    std::atomic<bool> teleport_fallback{};
+    bool quest_save_loaded{true}; // frame thread: the save gate (logged on change)
+    u32 quest_gate_lines{};
     u32 cleanup_lines{};
     bool cleanup_walk_only{};
     std::optional<World::Wallet> wallet_probe;
@@ -1110,12 +1161,76 @@ struct Session::Impl {
     std::optional<Backend::Context> ghost_saved;
     u64 ghost_stack{}, poses_in{}, poses_out{};
     bool logged_bad_pose{};
+    std::unique_ptr<Teleport::Controller> teleport; // all access under mutex; immutable pointer
+    Teleport::TriggerFile teleport_trigger{Env("EDEN_NX2_OOT_COOP_TELEPORT_TRIGGER")};
+    std::map<std::string, std::string, std::less<>> teleport_peers; // negotiated presence, under mutex
+    std::optional<Backend::Context> teleport_saved; // guest_mutex only
+    u64 teleport_stack{};
+    bool logged_bad_teleport{};
+    static u64 NowMs() {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count());
+    }
+    std::atomic<u64> teleport_lines{};
+    Teleport::Log TeleportLog() {
+        return [this](std::string_view line) {
+            const u64 n = teleport_lines.fetch_add(1, std::memory_order_relaxed);
+            if (n < 4096) LOG_INFO(Core_ARM, "{}", line);
+            if (n == 4096) LOG_INFO(Core_ARM, "OoT co-op: teleport receipt cap reached (4096 lines)");
+        };
+    }
+    void InvalidateTeleport(std::string_view why) {
+        std::scoped_lock lock{mutex};
+        if (teleport) teleport->Invalidate(TeleportLog(), why);
+    }
     // Relay connection attempts: the delay doubles per failed attempt (1 s .. 30 s) and resets
     // once a connection is ready. Network thread only.
     u32 attempts{}, reconnects{};
     bool ever_ready{};
     std::chrono::seconds backoff{1};
     Ux::SessionUx ux; // toasts and name tags (host only)
+    Room::PresenceBook presence;
+    Room::FinishWatch finish_watch;
+    Room::Window room_window;
+    std::atomic<bool> finished{};
+    std::atomic<int> relay_state{}; // 0 offline, 1 connected, 2 reconnecting
+    std::atomic<u64> relay_rtt{UINT64_MAX};
+    // Room window "mod" field: the kit's mod hash when one was computed (what the two players compare), else
+    // the policy id. Fixed at construction: hello.mod_hash itself is cleared by the network thread on fallback.
+    std::string mod_label;
+    const Room::Config& RoomConfig() const {
+        static const Room::Config empty;
+        const auto* settings = ux.Settings();
+        return settings && settings->room ? *settings->room : empty;
+    }
+    // GUI panel status board (guest thread only): <= 2 Hz, immutable hello fields + atomics + PresenceBook.
+    std::string status_mod_hash; // copied before the io thread starts (the io thread may clear hello.mod_hash)
+    u64 status_ms{};
+    void PublishGuiStatus(const std::optional<Room::RoomPeer>& local, u64 now) {
+        if (status_ms && now - status_ms < 500) return;
+        status_ms = now;
+        Gui::Status s;
+        s.live = true;
+        const int state = relay_state.load();
+        s.relay_state = state == 1 ? "connected" : state == 2 ? "reconnecting" : "offline";
+        if (const auto rtt = relay_rtt.load(); rtt != UINT64_MAX) s.rtt_ms = rtt;
+        s.room = hello.room; s.team = hello.team; s.name = hello.name; s.seed = hello.seed_hash;
+        s.policy = hello.policy_id; s.mod_hash = status_mod_hash; s.teleport = teleport != nullptr;
+        if (local) { s.local_child = local->child; s.local_area = Room::AreaText(*local, RoomConfig()); }
+        for (const auto& p : presence.Peers())
+            s.peers.push_back({p.origin, p.name, Room::AreaText(p, RoomConfig()), p.online, p.has_pose,
+                               p.child, p.loading, p.seen});
+        s.published_ms = now;
+        Gui::PublishStatus(std::move(s));
+    }
+    void RoomFrame(std::optional<Room::RoomPeer> local_pose, u64 now) {
+        PublishGuiStatus(local_pose, now);
+        const auto rtt = relay_rtt.load();
+        const int state = relay_state.load();
+        room_window.Frame({hello.room, hello.seed_hash, mod_label,
+            state == 1 ? "connected" : state == 2 ? "reconnecting" : "offline", hello.name,
+            rtt == UINT64_MAX ? std::nullopt : std::optional{rtt}, std::move(local_pose)},
+            presence, RoomConfig(), now);
+    }
     void OnPose(std::string origin, Pose pose) {
         std::scoped_lock lock{mutex};
         if (!peers.contains(origin)) {
@@ -1140,6 +1255,7 @@ struct Session::Impl {
             const u32 delta = pose.t - track.samples.back().second.t;
             if (!delta || delta >= 0x80000000U) return;
         }
+        presence.Pose(origin, pose.banc, pose.child, pose.loading, Room::NowMs());
         track.Add(static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
                       Clock::now().time_since_epoch()).count()), std::move(pose));
         track.online = true;
@@ -1170,6 +1286,10 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                             std::scoped_lock lock{self->owner.mutex};
                             hello.world_wallet = self->owner.wallet;
                         }
+                        hello.quest = hello.quest && !self->owner.quest_fallback;
+                        self->sent_mod_hash = !hello.mod_hash.empty();
+                        self->sent_quest = hello.quest;
+                        self->sent_teleport = hello.teleport;
                         self->Send(EncodeHello(hello));
                         self->Read();
                     });
@@ -1178,6 +1298,11 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
 
     void Fail(std::string_view why = "connection error") {
         if (std::exchange(failed, true)) return;
+        owner.ledger_capable = false;
+        if (catchup_active) owner.book.Abort(transaction);
+        if (!owner.stopped) Room::Dispatch(owner.presence.Lost(Room::NowMs()));
+        owner.relay_state = owner.stopped ? 0 : 2;
+        owner.relay_rtt = UINT64_MAX;
         size_t dropped = 0;
         {
             // No relay, no live peers: their ghosts park until poses arrive again.
@@ -1186,8 +1311,11 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
             owner.peers.clear();
             owner.peer_wallets.clear();
             owner.animation_peers.clear();
+            owner.teleport_peers.clear();
+            if (owner.teleport) owner.teleport->Invalidate(owner.TeleportLog(), "connection lost", true);
             owner.pose_out.reset();
             owner.equipment_negotiated = false;
+            owner.quest_negotiated = false;
         }
         resolver.cancel();
         boost::system::error_code ignored;
@@ -1207,18 +1335,147 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
         });
     }
 
+    bool CatchupReady() const {
+        return ready && baseline_exchanged && capable && owner.LedgerOn() && owner.save->Bound();
+    }
+    void StartCatchup() {
+        if (catchup_active || !CatchupReady()) return;
+        catchup_started = catchup_active = true;
+        transaction = ++owner.catchup_serial;
+        catchup_after = catchup_count = 0;
+        catchup_through = 0;
+        catchup_saved_through = owner.book.Snapshot().through;
+        warned_floor = false;
+        waiting_page = true;
+        Send({{"type", "catchup_request"}, {"after", 0}});
+    }
+    void FlushLive() {
+        for (const auto& packet : deferred_live)
+            if (!owner.Receive(packet)) { Fail("pending queue full after catchup"); break; }
+        deferred_live.clear();
+    }
+    void AbandonCatchup(std::string_view reason) {
+        LOG_WARNING(Core_ARM, "OoT co-op: catchup abandoned: {}", reason);
+        catchup_active = waiting_page = next_page = false;
+        owner.book.Abort(transaction);
+        FlushLive();
+    }
+    void Catchup(const Json& packet) {
+        if (!catchup_active || !waiting_page) {
+            LOG_WARNING(Core_ARM, "OoT co-op: ignored unsolicited catchup page");
+            return;
+        }
+        const auto page = Ledger::DecodePage(packet.dump(), epoch, catchup_after);
+        if (!page || page->through < catchup_through || page->floor < floor)
+            return AbandonCatchup("invalid page");
+        if (!owner.LedgerOn()) return AbandonCatchup("ledger disabled");
+        if (catchup_count + page->grants.size() > 16384) return AbandonCatchup("16384 grant limit");
+        {
+            std::scoped_lock lock{owner.mutex};
+            if (owner.pending.size() + page->grants.size() + 1 > QueueLimit) {
+                // No partially admitted page and no disconnect for a malformed/oversized transaction.
+                next_page = false;
+            } else next_page = true;
+        }
+        if (!next_page) return AbandonCatchup("pending queue full");
+        if (page->floor && catchup_saved_through < page->floor && !warned_floor) {
+            warned_floor = true;
+            LOG_WARNING(Core_ARM, "OoT co-op: catchup warning: the relay ledger window starts after rev {}; older gives cannot be replayed", page->floor);
+        }
+        owner.book.Begin(transaction, epoch, page->floor, page->through);
+        owner.book.Through(page->through);
+        {
+            std::scoped_lock lock{owner.mutex};
+            for (auto change : page->grants) {
+                change.catchup_transaction = transaction;
+                owner.pending.emplace_back(std::move(change));
+                ++owner.pending_pushed; // C16 merge: ux2's drain tally counts every queued entry
+            }
+            if (!page->more) {
+                owner.pending.emplace_back(Impl::CatchupEnd{transaction});
+                ++owner.pending_pushed;
+            }
+        }
+        catchup_count += page->grants.size();
+        catchup_through = page->through;
+        floor = page->floor;
+        if (!page->grants.empty()) catchup_after = packet.at("grants").back().at("rev").get<u64>();
+        waiting_page = false;
+        next_page = page->more;
+        if (!page->more) {
+            catchup_active = false;
+            FlushLive();
+            if (resync_pending) {
+                resync_pending = false;
+                baseline_exchanged = false;
+                catchup_started = false;
+                Send({{"type", "team_state_request"}});
+            }
+        }
+    }
     void Tick() {
         timer.expires_after(50ms);
         timer.async_wait([self = shared_from_this()](auto error) {
             if (error || self->failed) return;
             const auto now = Clock::now();
+            Room::Dispatch(self->owner.presence.Tick(Room::NowMs()));
             if (now - self->last_receive > (self->ready ? 90s : 10s))
                 return self->Fail(self->ready ? "nothing received for 90 s" : "no handshake within 10 s");
             if (self->ready) {
+                if (!self->owner.LedgerOn() && !self->deferred_live.empty()) self->FlushLive();
+                if (!self->catchup_started && self->CatchupReady()) self->StartCatchup();
+                if (self->catchup_active && self->next_page) {
+                    bool room;
+                    {
+                        std::scoped_lock lock{self->owner.mutex};
+                        room = self->owner.pending.size() + 257 <= QueueLimit;
+                    }
+                    if (room) {
+                        self->next_page = false;
+                        self->waiting_page = true;
+                        self->Send({{"type", "catchup_request"}, {"after", self->catchup_after}});
+                    }
+                }
+                if (now - self->last_resync >= 1s) {
+                    self->last_resync = now;
+                    std::error_code error;
+                    const auto path = Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) / "coop-resync";
+                    if (std::filesystem::remove(path, error)) {
+                        LOG_INFO(Core_ARM, "OoT co-op: resync requested (coop-resync)");
+                        self->Send({{"type", "team_state_request"}});
+                        if (self->catchup_active) self->resync_pending = true;
+                        else if (self->CatchupReady()) {
+                            self->baseline_exchanged = false;
+                            self->catchup_started = false;
+                        } else LOG_INFO(Core_ARM, "OoT co-op: resync catchup unavailable (capable={} on={} bound={})",
+                                        self->capable, self->owner.LedgerOn(),
+                                        self->owner.save && self->owner.save->Bound());
+                    }
+                }
+                if (self->owner.finished && !self->finished_sent) self->SendState();
+                if (self->owner.teleport && !self->owner.teleport_fallback) {
+                    std::deque<Teleport::Packet> packets;
+                    {
+                        std::scoped_lock lock{self->owner.mutex};
+                        auto& controller = *self->owner.teleport;
+                        const auto ms = Impl::NowMs();
+                        controller.Tick(ms, self->owner.TeleportLog());
+                        std::vector<Teleport::Peer> peers;
+                        for (const auto& [id, name] : self->owner.teleport_peers) peers.push_back({id, name});
+                        for (const auto& line : self->owner.teleport_trigger.Poll(ms)) {
+                            if (const auto target = Teleport::ResolveTrigger(line, peers))
+                                controller.Trigger(*target, ms, self->owner.TeleportLog());
+                            else self->owner.TeleportLog()("OoT co-op: teleport refused reason=unavailable (invalid or ambiguous trigger)");
+                        }
+                        packets = controller.TakeOutput();
+                    }
+                    for (const auto& packet : packets) self->Send(Teleport::EncodePacket(packet));
+                }
                 std::vector<Change> changes;
                 {
                     std::scoped_lock lock{self->owner.mutex};
                     for (const auto& change : self->owner.outgoing) {
+                        if (change.kind == Kind::Quest && !self->owner.quest_negotiated) continue;
                         if (change.seq > self->sent_seq && changes.size() < 64) {
                             changes.push_back(change);
                         }
@@ -1260,13 +1517,29 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                     }
                     self->Send(request);
                 }
-                if (now - self->last_heartbeat >= 30s) {
-                    self->Send({{"type", "heartbeat"}});
-                    self->last_heartbeat = now;
+                if (now - self->last_heartbeat >= 30s) { // keepalive even if an ack is late
+                    self->Heartbeat();
                 }
             }
             self->Tick();
         });
+    }
+
+    void Heartbeat() {
+        last_heartbeat = Clock::now();
+        heartbeat_pending = true;
+        Send({{"type", "heartbeat"}});
+    }
+    void SendState() {
+        Json state{{"apply_enabled", !owner.allowed_classes.empty()}, {"name", owner.hello.name}};
+        finished_sent = owner.finished.load();
+        if (finished_sent) {
+            // The relay replaces its cached state with each client_state: keep our wallet in it.
+            state["finished"] = true;
+            std::scoped_lock lock{owner.mutex};
+            if (owner.wallet) state["world_wallet"] = World::EncodeWallet(*owner.wallet);
+        }
+        Send({{"type", "client_state"}, {"state", std::move(state)}});
     }
 
     void Send(const Json& packet) {
@@ -1310,6 +1583,43 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                     self->last_receive = Clock::now();
                     const auto type = packet->at("type").get<std::string>();
                     if (!self->handshaken) {
+                        if (type == "error" && packet->contains("reason") && packet->at("reason").is_string()) {
+                            const auto reason = packet->at("reason").get<std::string>();
+                            if (reason.starts_with("mod mismatch")) {
+                                LOG_WARNING(Core_ARM, "OoT co-op: handshake refused: mod mismatch (ours {}; {}); co-op stays off until restart with the room's kit",
+                                            self->owner.hello.mod_hash.substr(0, 12), reason);
+                                self->owner.stopped = true;
+                                return self->Fail("mod mismatch");
+                            }
+                            // C16 merge: an older relay refuses any hello field it does not know with exactly this
+                            // reason, and cannot say which one. Drop every C16 capability we sent in ONE legacy
+                            // retry (ledger mod hash, quest, teleport), so the fallbacks never take turns reconnecting.
+                            if (reason == "missing or unknown fields" &&
+                                (self->sent_mod_hash || self->sent_quest || self->sent_teleport)) {
+                                if (self->sent_mod_hash) {
+                                    self->owner.hello.mod_hash.clear();
+                                    if (self->owner.save) self->owner.save->Disable();
+                                    LOG_WARNING(Core_ARM, "OoT co-op: relay predates the ledger (c16): no mod check, no catch-up; playing on");
+                                }
+                                if (self->sent_quest) {
+                                    self->owner.quest_fallback = true;
+                                    {
+                                        std::scoped_lock lock{self->owner.mutex};
+                                        std::erase_if(self->owner.outgoing, [](const Change& c) { return c.kind == Kind::Quest; });
+                                    }
+                                    LOG_INFO(Core_ARM, "OoT co-op: quest class off: relay does not support it");
+                                }
+                                if (self->sent_teleport) {
+                                    self->owner.hello.teleport = false;
+                                    self->owner.teleport_fallback = true;
+                                    LOG_INFO(Core_ARM, "OoT co-op: teleport off: relay does not support it (pre-c16 relay)");
+                                }
+                                return self->Fail("retry legacy hello");
+                            }
+                        }
+                        // C16 smoke B-1: quest's own any-error retry is gone. A refusal that is not about an unknown
+                        // field (held out, client id already connected, sender capacity, a relay restarting) used to
+                        // latch quest off for the whole process; such refusals now just reconnect with the same hello.
                         if (!MatchesHello(*packet, self->owner.hello)) {
                             LOG_WARNING(Core_ARM, "OoT co-op: handshake refused or mismatched");
                             return self->Fail(type == "error" && packet->contains("reason") &&
@@ -1317,11 +1627,36 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                                                   ? "handshake: " + packet->at("reason").get<std::string>().substr(0, 80)
                                                   : std::string{"handshake mismatch"});
                         }
+                        if (packet->contains("ledger")) {
+                            auto capability = Ledger::DecodeCapability(packet->at("ledger").dump());
+                            if (!capability) return self->Fail("invalid ledger capability");
+                            self->epoch = capability->first;
+                            self->floor = capability->second;
+                            self->capable = true;
+                            self->owner.ledger_capable = true;
+                            if (self->owner.save) self->owner.save->Epoch(self->epoch);
+                        }
                         self->owner.equipment_negotiated = self->owner.hello.ghost_equipment_v2 &&
                             packet->contains("ghost_equipment_v2") && (*packet)["ghost_equipment_v2"] == true;
+                        self->owner.quest_negotiated = self->owner.hello.quest && !self->owner.quest_fallback &&
+                            packet->contains("quest") && Unsigned(packet->at("quest"), 1) && packet->at("quest") == 1;
+                        if (self->owner.quest_negotiated) ++self->owner.quest_connections;
+                        if (!self->owner.quest_negotiated) {
+                            std::scoped_lock lock{self->owner.mutex};
+                            std::erase_if(self->owner.outgoing, [](const Change& c) { return c.kind == Kind::Quest; });
+                        }
                         self->handshaken = true;
                     } else if (type == "heartbeat") {
                         self->Send({{"type", "heartbeat_ack"}});
+                    } else if (type == "teleport_request" || type == "teleport_to") {
+                        const auto decoded = self->input.size() <= 512 ? Teleport::DecodePacket(*packet) : std::nullopt;
+                        if (decoded && self->owner.teleport) {
+                            std::scoped_lock lock{self->owner.mutex};
+                            self->owner.teleport->Receive(*decoded, Impl::NowMs(), self->owner.TeleportLog());
+                        } else if (!self->owner.logged_bad_teleport) {
+                            self->owner.logged_bad_teleport = true;
+                            self->owner.TeleportLog()("OoT co-op: teleport ignored malformed or unnegotiated packet");
+                        }
                     } else if (type == "pose") {
                         // Poses are never grants: a bad one is ignored, never a disconnect.
                         std::string origin;
@@ -1337,6 +1672,19 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                     } else if (type == "client_state") {
                         // A peer that went offline hides its ghost (the frame drain parks it).
                         const auto& state = packet->at("state");
+                        if (self->owner.teleport && Identity(packet->at("origin")) && state.is_object()) {
+                            const auto id = packet->at("origin").get<std::string>();
+                            std::scoped_lock lock{self->owner.mutex};
+                            const bool capable = state.contains("teleport") && Unsigned(state.at("teleport"), 1) && state.at("teleport") == 1 &&
+                                (!state.contains("online") || state.at("online") == true) && id != self->owner.hello.client_id;
+                            if (capable && state.contains("name") && state.at("name").is_string() && state.at("name").get_ref<const std::string&>().size() <= 96 &&
+                                (self->owner.teleport_peers.size() < 128 || self->owner.teleport_peers.contains(id)))
+                                self->owner.teleport_peers[id] = state.at("name").get<std::string>();
+                            else {
+                                self->owner.teleport_peers.erase(id);
+                                self->owner.teleport->PeerGone(id, self->owner.TeleportLog());
+                            }
+                        }
                         if (state.is_object() && state.contains("world_wallet")) {
                             const auto wallet = World::DecodeWallet(state.at("world_wallet"));
                             if (!wallet || !Identity(packet->at("origin"))) return self->Fail("invalid wallet baseline");
@@ -1365,6 +1713,11 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                                                    state.at("name").get<std::string>());
                         }
                         if (packet->contains("origin") && packet->at("origin").is_string() &&
+                            packet->at("origin") != self->owner.hello.client_id) {
+                            Room::Dispatch(self->owner.presence.Receive(*packet,
+                                self->owner.ux.Name(packet->at("origin").get<std::string>()), Room::NowMs()));
+                        }
+                        if (packet->contains("origin") && packet->at("origin").is_string() &&
                             state.is_object() && state.contains("online") &&
                             state.at("online") == false) {
                             const auto origin = packet->at("origin").get<std::string>();
@@ -1374,8 +1727,19 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                             if (self->owner.peers.erase(origin))
                                 LOG_INFO(Core_ARM, "OoT co-op: peer {} offline (relay)", origin.substr(0, 8));
                         }
+                    } else if (type == "catchup") {
+                        self->Catchup(*packet);
+                    } else if (self->capable && self->owner.LedgerOn() &&
+                               (self->catchup_active || !self->catchup_started) &&
+                               (type == "item_give" || type == "rupee_add" || type == "key_add")) {
+                        if (self->deferred_live.size() >= QueueLimit) return self->Fail("catchup live queue full");
+                        self->deferred_live.push_back(*packet);
                     } else if (type == "heartbeat_ack") {
-                        // Liveness only.
+                        if (self->heartbeat_pending) {
+                            self->owner.relay_rtt = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                Clock::now() - self->last_heartbeat).count());
+                            self->heartbeat_pending = false;
+                        }
                     } else if (type == "error") {
                         LOG_WARNING(Core_ARM, "OoT co-op: relay rejected a packet");
                         return self->Fail("relay error");
@@ -1384,12 +1748,18 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                         if (!self->owner.Receive(*packet)) return self->Fail("rejected " + type);
                         if (self->baseline_requested && type == "team_state") {
                             LOG_INFO(Core_ARM, "OoT co-op: baseline exchanged");
+                            self->baseline_exchanged = true;
+                            if (self->resync_pending && !self->catchup_active) {
+                                self->resync_pending = false;
+                                self->catchup_started = false;
+                            }
                         }
                         if (!self->ready) {
                             self->ready = true;
-                            self->Send({{"type", "client_state"},
-                                        {"state", {{"apply_enabled", !self->owner.allowed_classes.empty()},
-                                                   {"name", self->owner.hello.name}}}});
+                            self->owner.relay_state = 1;
+                            Room::Dispatch(self->owner.presence.Ready(Room::NowMs()));
+                            self->SendState();
+                            self->Heartbeat();
                             const bool again = std::exchange(self->owner.ever_ready, true);
                             if (again) ++self->owner.reconnects;
                             self->owner.attempts = 0;
@@ -1416,10 +1786,17 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
     boost::asio::steady_timer timer;
     Clock::time_point last_receive{Clock::now()};
     Clock::time_point last_heartbeat{Clock::now()};
+    Clock::time_point last_resync{};
+    std::string epoch;
+    u64 floor{}, transaction{}, catchup_after{}, catchup_count{}, catchup_through{}, catchup_saved_through{};
+    bool capable{}, sent_mod_hash{}, baseline_exchanged{}, catchup_started{}, catchup_active{};
+    bool waiting_page{}, next_page{}, warned_floor{}, resync_pending{};
+    std::deque<Json> deferred_live;
     bool failed{};
     bool handshaken{};
     bool baseline_requested{};
-    bool ready{};
+    bool ready{}, finished_sent{}, heartbeat_pending{};
+    bool sent_quest{}, sent_teleport{}; // C16 merge: what the hello on this connection carried
     u64 sent_seq{};
     std::array<char, 4> header{};
     std::string input;
@@ -1496,26 +1873,34 @@ bool Session::Impl::Receive(const Json& packet) {
                 (value.at("type") == "rupee_add" || value.at("type") == "item_give" ||
                  value.at("type") == "key_add")) continue;
             const auto change = DecodeChange(value, true);
-            if (!change || !WireKind(change->kind)) return false;
+            if (!change || !WireKind(change->kind) || change->kind == Kind::Quest) return false;
             checkpoint.Merge(*change, false);
         }
         u64 revision = packet.at("revision").get<u64>();
         for (const auto& value : packet.at("replay")) {
             const auto change = DecodeChange(value);
-            if (!change || !WireKind(change->kind) || !Unsigned(value.at("rev"), MaxSequence) ||
+            if (!change || !WireKind(change->kind) || change->kind == Kind::Quest || !Unsigned(value.at("rev"), MaxSequence) ||
                 value.at("rev").get<u64>() != ++revision) return false;
             if (!EventKind(change->kind)) checkpoint.Merge(*change);
-            else if (ever_ready && change->kind == Kind::Item &&
+            else if (!(ledger_capable && LedgerOn()) && ever_ready && change->kind == Kind::Item &&
                      (change->source.kind == World::OriginKind::Bit || change->source.kind == World::OriginKind::Token ||
                       change->source.kind == World::OriginKind::Chest))
                 world_replay.push_back(*change);
         }
         changes = checkpoint.Snapshot();
         changes.insert(changes.end(), world_replay.begin(), world_replay.end());
+        if (packet.contains("quest")) {
+            if (!quest_negotiated) return false;
+            const auto quests = Quest::DecodeSnapshot(packet.at("quest"));
+            if (!quests) return false;
+            for (const auto& q : *quests) changes.push_back({Kind::Quest, {}, 0, q.challenge, q.index, q.step});
+        }
     } else {
         const auto change = DecodeChange(packet);
-        if (!change || !WireKind(change->kind) || !Unsigned(packet.at("rev"), MaxSequence) ||
-            packet.at("rev") == 0) return false;
+        if (!change || !WireKind(change->kind)) return false;
+        if (change->kind == Kind::Quest) {
+            if (!quest_negotiated || packet.contains("rev")) return false;
+        } else if (!Unsigned(packet.at("rev"), MaxSequence) || packet.at("rev") == 0) return false;
         changes.push_back(*change);
     }
     std::scoped_lock lock{mutex};
@@ -1527,8 +1912,12 @@ bool Session::Impl::Receive(const Json& packet) {
         return false;
     }
     if (type == "team_state") peer_wallets = std::move(wallets);
-    for (auto& change : changes) pending.emplace_back(std::move(change));
-    if (type == "team_state") pending.emplace_back(std::move(snapshot_seen));
+    const u64 first = pending_pushed + 1;
+    for (auto& change : changes) { pending.emplace_back(std::move(change)); ++pending_pushed; }
+    if (type == "team_state") {
+        pending.emplace_back(std::move(snapshot_seen));
+        sync_tally.Snapshot(first, ++pending_pushed);
+    }
     return true;
 }
 
@@ -1615,12 +2004,19 @@ struct Session::Impl::GhostPort {
 Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_,
                  std::shared_ptr<const OotGameDataTrace::Profile> profile_, Endpoint endpoint, Hello hello,
                  std::set<u64> denied, std::set<Kind> allowed_classes,
-                 std::set<std::pair<Kind, u64>> allowed_keys)
+                 std::set<std::pair<Kind, u64>> allowed_keys, std::set<u64> denied_quests)
     : owner{owner_}, base{base_}, profile{std::move(profile_)},
       impl{std::make_unique<Impl>(std::move(endpoint), std::move(hello), std::move(denied),
                                    std::move(allowed_classes), std::move(allowed_keys),
-                                   profile->wallet_hash, profile->world)} {
+                                   profile->wallet_hash, profile->world, profile->quest && profile->quest->enabled)} {
     impl->binding.base = base;
+    impl->hello.quest = false;
+    impl->mod_label = impl->hello.mod_hash.empty() ? impl->hello.policy_id : impl->hello.mod_hash;
+    if (profile->quest && profile->quest->enabled && impl->allowed_classes.contains(Kind::Quest)) {
+        denied_quests.insert(impl->denied.begin(), impl->denied.end());
+        impl->quest = std::make_unique<Quest::Controller>(profile->quest, std::move(denied_quests), base);
+        impl->hello.quest = true;
+    }
     impl->cleanup_walk_only = Env("EDEN_NX2_OOT_COOP_WORLD_CLEANUP") == "walk";
     if (profile->world.cleanup == World::Cleanup::Death)
         LOG_INFO(Core_ARM, "OoT co-op: world cleanup {}", !profile->world.resolver ? "flag_only (no resolver in the key file)"
@@ -1726,10 +2122,61 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
             LOG_INFO(Core_ARM, "OoT co-op: equipment v2 enabled (sword, shield, tunic, mask; boots deferred)");
         } else LOG_WARNING(Core_ARM, "OoT co-op: equipment disabled: missing or invalid coop-equip.json");
     }
+    std::string ledger_why;
+    auto pattern = Ledger::LoadConfig(Env("EDEN_NX2_OOT_COOP_KEYS"), ledger_why);
+    if (Env("EDEN_NX2_OOT_COOP_LEDGER") == "0") ledger_why = "disabled by environment";
+    else if (!profile->ghost.Valid()) ledger_why = "valid pose offsets required";
+    else if (!impl->allowed_classes.contains(Kind::Item)) ledger_why = "item class disabled";
+    else if (pattern) {
+        auto* self = impl.get();
+        impl->save = std::make_unique<Ledger::Save>(impl->book, std::move(*pattern),
+            Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir), impl->hello.room + "/" + impl->hello.team,
+            [self](std::function<void()> work) { boost::asio::post(self->io, std::move(work)); });
+    }
+    if (impl->save) LOG_INFO(Core_ARM, "OoT co-op: ledger on (save pattern loaded)");
+    else LOG_INFO(Core_ARM, "OoT co-op: ledger off: {}", ledger_why);
+    impl->hello.teleport = impl->pose_enabled && profile->teleport && profile->teleport->enabled &&
+        profile->anim && profile->anim->player && profile->event_got;
+    if (impl->hello.teleport) {
+        impl->teleport = std::make_unique<Teleport::Controller>(*profile->teleport);
+        LOG_INFO(Core_ARM, "OoT co-op: teleport on (experimental; cross-scene requires teleport.cross.enabled)");
+    } else {
+        LOG_INFO(Core_ARM, "OoT co-op: teleport off: {}", !profile->teleport || !profile->teleport->enabled ? "key-file disabled" :
+            !impl->pose_enabled ? "pose/ghost/private call memory unavailable" : "anim.player or event_got missing");
+    }
+    impl->status_mod_hash = impl->hello.mod_hash;
     impl->Start();
 }
 Session::~Session() = default;
-void Session::Stop() { impl->Stop(); }
+void Session::Stop() {
+    if (impl->save) Ledger::RemoveWatch(impl->save.get());
+    impl->Stop();
+}
+
+bool Session::Traps(OotGameDataTrace::Point point) const {
+    return OotGameDataTrace::CoopPoint(point) ||
+           (point == OotGameDataTrace::Point::StepCommit && impl->quest != nullptr) ||
+           (profile->chest.interaction_pc && point == OotGameDataTrace::Point::StructBoolSet);
+}
+
+Quest::Port Session::QuestPort(Memory::Memory& memory) {
+    using namespace OotGameDataTrace::Detail;
+    Quest::Port port;
+    port.range = [&](u64 at, u64 size) { return at && size && at + size > at &&
+        memory.IsValidVirtualAddressRange(at, size); };
+    port.r8 = [&](u64 at) -> std::optional<u8> {
+        if (!at || !memory.IsValidVirtualAddressRange(at, 1)) return {};
+        return memory.Read8(at);
+    };
+    port.r16 = [&](u64 at) -> std::optional<u16> {
+        if (!at || at + 2 <= at || !memory.IsValidVirtualAddressRange(at, 2)) return {};
+        return memory.Read16(at);
+    };
+    port.r32 = [&](u64 at) { return at && at + 4 > at ? Read32(memory, at) : std::nullopt; };
+    port.r64 = [&](u64 at) { return at && at + 8 > at ? Read64(memory, at) : std::nullopt; };
+    port.log = [](std::string_view line) { LOG_INFO(Core_ARM, "{}", line); };
+    return port;
+}
 
 bool Session::Observe(Change change) {
     // Wallet deltas are observed only at the wallet entry's listed callers (ObserveRupee).
@@ -1743,9 +2190,12 @@ bool Session::Observe(Change change) {
         }
         return false;
     }
-    if (!impl->local.Merge(change, false)) return false;
+    if (change.kind == Kind::Quest) {
+        if (!impl->quest_negotiated || !impl->quest) return false;
+    } else if (!impl->local.Merge(change, false)) return false;
     change.origin = impl->hello.client_id;
     change.seq = impl->next_seq++;
+    if (EventKind(change.kind)) impl->book.Applied(change);
     impl->outgoing.push_back(std::move(change));
     return true;
 }
@@ -1947,7 +2397,11 @@ void Session::ObserveChest(OotGameDataTrace::Point point, Dynarmic::A64::Jit& ji
                      identity->token.actor, jit.GetRegister(19), attempt, !previous);
     }
     if (profile->chest.enforce)
-        impl->runtime->DropPending([&](const Change& c) { return impl->ChestGuarded(c) && !impl->claims.CanApply(c); });
+        impl->runtime->DropPending([&](const Change& c) {
+            const bool drop = impl->ChestGuarded(c) && !impl->claims.CanApply(c);
+            if (drop) impl->book.Dropped(c);
+            return drop;
+        });
 }
 
 void Session::ObserveRupee(Dynarmic::A64::Jit& jit, u64 thread) {
@@ -1985,6 +2439,38 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     };
     const auto log = [](std::string_view line) { LOG_INFO(Core_ARM, "{}", line); };
     const DrainContext site{thread, 1, impl->tick, true};
+    if (binding.sentinel && pc == binding.sentinel && impl->quest_saved && impl->quest) {
+        auto port = QuestPort(memory);
+        const u64 result = jit.GetRegister(0);
+        if (thread != impl->frame_thread || jit.GetSP() != impl->quest_stack || !backend.Restore(*impl->quest_saved)) {
+            impl->quest->Log(port, "sentinel refused: thread or stack mismatch");
+            return false;
+        }
+        impl->quest_saved.reset();
+        impl->quest->Returned(port, result);
+        return true;
+    }
+    if (point == OotGameDataTrace::Point::StepCommit && impl->quest) {
+        auto port = QuestPort(memory);
+        for (const auto& observer : profile->quest->observers)
+            if (base + observer.entry.offset == pc)
+                impl->quest->Dirty(port, jit.GetRegister(observer.state_register), pc);
+        return false;
+    }
+    if (impl->quest_saved) return false;
+    if (binding.sentinel && pc == binding.sentinel && impl->teleport_saved) {
+        const u64 result = jit.GetRegister(0);
+        if (thread != impl->frame_thread || jit.GetSP() != impl->teleport_stack ||
+            !backend.Restore(*impl->teleport_saved)) {
+            log(fmt::format("OoT co-op: teleport sentinel refused thread={} pc={:#x}", thread, pc));
+            return false;
+        }
+        impl->teleport_saved.reset();
+        std::scoped_lock lock{impl->mutex};
+        impl->teleport->Returned(result, impl->TeleportLog());
+        return true;
+    }
+    if (impl->teleport_saved) return false;
     if (binding.sentinel && pc == binding.sentinel && impl->cleanup_saved && impl->cleanup_call) {
         const u64 result = jit.GetRegister(0);
         if (thread != impl->frame_thread || jit.GetSP() != impl->cleanup_stack ||
@@ -2032,13 +2518,15 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     if (binding.sentinel && pc == binding.sentinel) {
         const u64 result = jit.GetRegister(0); // the call's return value, before the restore
         const auto event = runtime.Sentinel(backend, site, pc, log);
+        if (event == ApplyEvent::Quarantined) impl->book.Quarantined();
         if (event == ApplyEvent::Returned && runtime.LastGrant() &&
             runtime.LastGrant()->kind == Kind::Item) {
             log(fmt::format("OoT co-op: item give returned w0={} name={}", result & 1,
                             runtime.LastGrant()->name));
             const auto& grant = *runtime.LastGrant();
             if (result & 1) impl->ux.ItemReceived(grant.origin, grant.seq, grant.name, grant.value);
-            if (grant.source.kind == World::OriginKind::Chest && profile->chest.interaction_pc) {
+            impl->book.Applied(grant);
+            if (!grant.catchup && grant.source.kind == World::OriginKind::Chest && profile->chest.interaction_pc) {
                 // The give ran to its return: one processed attempt, whatever w0 says (like world).
                 impl->claims.RemoteReturned(grant, true);
                 if (impl->race_lines++ < 256)
@@ -2076,6 +2564,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             log(fmt::format("OoT co-op: rupee pending={} after the call (pouch {:#x})",
                             static_cast<s32>(pending.value_or(0)), pouch));
             const auto& grant = *runtime.LastGrant();
+            impl->book.Applied(grant);
             impl->ux.RupeeReceived(grant.origin, grant.seq, grant.value);
         }
         // An unowned/invalid sentinel must reach the normal breakpoint fault, never resume.
@@ -2216,9 +2705,20 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             OotGameDataTrace::Detail::Read64(memory, binding.base + profile->manager_cell);
         if (impl->equipment) impl->equipment->Invalidate();
         if (impl->ghost) impl->ghost->DropAll(log, "save or title: GameData moved");
+        bool teleport_transition = false;
+        {
+            std::scoped_lock lock{impl->mutex};
+            if (impl->teleport) {
+                const auto sample = Teleport::ReadSample(memory, base, now.value_or(0), *profile);
+                teleport_transition = impl->teleport->Rebinding(sample, Impl::NowMs(), now == old, impl->TeleportLog());
+            }
+        }
+        if (!teleport_transition) impl->InvalidateTeleport("GameData moved");
         if (runtime.Rebind(backend, log)) {
             impl->stable_frame = false;
+            if (impl->quest) impl->quest->Reset();
             impl->key_watch.clear(); // a new save epoch: re-baseline the key counts
+            impl->finish_watch.Rebaseline();
             impl->pickups.Clear();
             impl->local_pickups.clear();
             if (profile->chest.interaction_pc) {
@@ -2236,18 +2736,72 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             ++impl->rebinds;
         }
     }
+    Room::Dispatch(impl->presence.Tick(Room::NowMs()));
     const bool bound = backend.BindFromCell();
     if (binding.invalid || (!bound && impl->stable_frame)) {
+        if (impl->quest) impl->quest->Reset();
         if (impl->equipment) impl->equipment->Invalidate();
         if (impl->ghost) impl->ghost->DropAll(log, "GameData binding lost");
+        impl->InvalidateTeleport("binding lost");
         runtime.Invalidate();
         runtime.Frame(backend, {thread, 1, impl->tick, true}, [](Change, bool) {}, log);
+        impl->book.Quarantined();
         return false;
     }
-    if (!bound) return false;
+    if (!bound) { if (impl->quest) impl->quest->Reset(); return false; }
     if (!std::exchange(impl->stable_frame, true)) return false;
 
-    std::deque<std::variant<Change, HighWater>> batch;
+    bool teleport_exclusive = false;
+    {
+        std::scoped_lock lock{impl->mutex};
+        teleport_exclusive = impl->teleport && impl->teleport->CrossActive();
+    }
+    // C16 merge: a cross-scene teleport owns the frame before anything else may call the guest
+    // (ledger's baseline observation, grants, quest, cleanup, ghost, equipment).
+    if (teleport_exclusive) {
+        FramePose(backend, memory, log, runtime.Calling() || impl->cleanup_saved.has_value());
+        return runtime.Calling() || impl->cleanup_saved.has_value() || impl->teleport_saved.has_value() ||
+               (impl->ghost && impl->ghost->Calling()) || (impl->equipment && impl->equipment->Calling());
+    }
+
+    if (impl->LedgerOn()) {
+        const auto pose = ReadLocalPose(memory, base, binding.manager, profile->ghost,
+                                        static_cast<u32>(impl->tick));
+        impl->save->Frame(!pose.banc.empty() && !pose.loading);
+        // The game keeps one manager across title/save load. Applying flags before that load
+        // loses them and the drain sees true->false as rollback. Hold FIFO until the save is live.
+        if (!impl->save->Bound()) return false;
+    }
+    if (impl->save && !impl->LedgerOn()) {
+        runtime.DropPending([&](const Change& change) {
+            if (!change.catchup) return false;
+            impl->book.Dropped(change);
+            if (change.source.kind == World::OriginKind::Bit || change.source.kind == World::OriginKind::Token)
+                impl->world_claims.Cancel(change.source, change.origin);
+            return true;
+        });
+    }
+    const auto send = [&](Change change, bool baseline) {
+        impl->book.LocalFlag(change);
+        if (change.kind == Kind::Bit && !profile->world.families.empty()) {
+            if (impl->world_quarantined || !profile->world.AdmitsFlag(change.key)) return;
+            if (const auto source = impl->world_claims.GaveFlag(change.key)) change.source = *source;
+            else if (!baseline) {
+                const auto source = profile->world.Source(change.key);
+                if (source && impl->world_claims.Busy(*source)) return;
+            }
+            if (change.source && !impl->world_flags_sent.insert(change.key).second) return;
+        }
+        Observe(change);
+        log(fmt::format("OoT co-op: {} class={} key={:016x} value=1 path=observer",
+                        baseline ? "baseline" : "observed", ClassName(change.kind), change.key));
+    };
+    if (impl->LedgerOn() && !runtime.BaselineReady()) {
+        // Observe the loaded save before inbound flag receipts suppress the local baseline.
+        runtime.Frame(backend, {thread, 1, impl->tick, true}, send, log);
+        if (!runtime.BaselineReady()) return false;
+    }
+    std::deque<std::variant<Change, HighWater, Impl::CatchupEnd>> batch;
     {
         std::scoped_lock lock{impl->mutex};
         for (size_t count = 0; count < 64 && !impl->pending.empty(); ++count) {
@@ -2256,19 +2810,36 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         }
     }
     for (const auto& entry : batch) {
+        const auto* counted = std::get_if<Change>(&entry);
+        Room::DrainEntry tally_entry{impl->sync_tally, ++impl->pending_drained,
+            counted ? std::optional{counted->kind} : std::nullopt, runtime.Pending(),
+            [&] { return runtime.Pending(); }};
         if (const auto* seen = std::get_if<HighWater>(&entry)) {
             if (!impl->remote.AdoptSeen(*seen)) runtime.Invalidate();
+        } else if (const auto* end = std::get_if<Impl::CatchupEnd>(&entry)) {
+            impl->book.End(end->transaction);
         } else {
             const auto& change = std::get<Change>(entry);
+            if (change.kind == Kind::Quest) {
+                if (!change.origin.empty() && !impl->remote.AdoptSeen({{change.origin, change.seq}})) continue;
+                if (impl->quest) impl->quest->Queue({static_cast<u32>(change.key), change.step,
+                                                    static_cast<u32>(change.value), change.origin});
+                continue;
+            }
             if (change.kind == Kind::Key) {
                 // One gain, two adds: the dungeon's total and its current count. The credit keeps
                 // our own watch from sending the gain back.
                 const auto pair = std::find_if(impl->dungeon_keys.begin(), impl->dungeon_keys.end(),
                                                [&](const DungeonKeys& d) { return d.total == change.key; });
-                if (!impl->remote.Merge(change, !change.origin.empty())) continue;
+                if (!impl->AdmitEvent(change)) continue;
                 Change count = change;
                 if (pair != impl->dungeon_keys.end()) count.key = pair->count;
-                if (pair == impl->dungeon_keys.end() || !runtime.Queue(change) || !runtime.Queue(count)) {
+                const bool pair_allowed = impl->allowed_classes.contains(Kind::Key) &&
+                    impl->ledger_key_targets.contains(change.key) && impl->ledger_key_targets.contains(count.key);
+                if (pair == impl->dungeon_keys.end() ||
+                    (impl->LedgerOn() && (!pair_allowed || runtime.Pending() + 2 > QueueLimit)) ||
+                    !runtime.Queue(change) || !runtime.Queue(count)) {
+                    impl->book.Dropped(change);
                     if (!impl->logged_class) {
                         log("OoT co-op: not applied: class/key policy disabled or queue full");
                         impl->logged_class = true;
@@ -2287,6 +2858,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                 if (!std::all_of(flags.begin(), flags.end(), [&](u64 key) { return impl->world_keys.contains(key); }) ||
                     impl->world_quarantined || !profile->world.Admits(change.source) ||
                     !impl->allowed_classes.contains(Kind::Bit)) {
+                    if (change.catchup && impl->AdmitEvent(change)) impl->book.Dropped(change);
                     // Not ours to apply (policy differs, world off): the sender keeps its benefit.
                     if (impl->world_lines++ < 64)
                         log(fmt::format("OoT co-op: world {} key={:016x} from {} not applied ({})", ClassName(change.kind),
@@ -2295,13 +2867,18 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                     continue;
                 }
                 if (change.kind == Kind::Item) {
-                    if (!impl->allowed_classes.contains(Kind::Item) ||
-                        !impl->remote.Merge(change, !change.origin.empty())) continue;
+                    if (!impl->allowed_classes.contains(Kind::Item)) {
+                        if (change.catchup && impl->AdmitEvent(change)) impl->book.Dropped(change);
+                        continue;
+                    }
+                    if (!impl->AdmitEvent(change)) continue;
                     if (!impl->world_claims.Reserve(change.source, change.origin)) {
+                        impl->book.Dropped(change);
                         log("OoT co-op: pickup race: peer give dropped (source reserved or applied)");
                         continue;
                     }
                     if (!runtime.Queue(change)) {
+                        impl->book.Dropped(change);
                         impl->world_claims.Cancel(change.source, change.origin);
                         impl->world_quarantined = true;
                         log("OoT co-op: world give queue full; world quarantined");
@@ -2320,17 +2897,19 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             if (profile->chest.interaction_pc && impl->ChestGuarded(change)) {
                 // Sender/sequence dedupe first; the chest receipts then reject semantic duplicates
                 // (a fresh sequence, a second transaction, another opener).
-                if (!impl->remote.Merge(change, !change.origin.empty())) continue;
+                if (!impl->AdmitEvent(change)) continue;
                 const bool accepted = impl->claims.AcceptRemote(change);
                 if (!accepted && profile->chest.enforce) {
+                    impl->book.Dropped(change);
                     if (impl->race_lines++ < 256)
                         log(fmt::format("OoT co-op: chest race: peer give dropped name={} chest={:08x} owner={} "
                                         "transaction={} part={}", change.name, change.source.key,
                                         impl->claims.Owner(change.source), change.chest_transaction, change.chest_part));
                     continue;
                 }
-                if (!runtime.Queue(change) && !impl->logged_class) {
-                    log("OoT co-op: not applied: class/key policy disabled or queue full");
+                if (!runtime.Queue(change)) {
+                    impl->book.Dropped(change);
+                    if (!impl->logged_class) log("OoT co-op: not applied: class/key policy disabled or queue full");
                     impl->logged_class = true;
                 }
                 continue;
@@ -2340,30 +2919,19 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                 impl->claims.RemoteClaim(World::Origin::Chest(static_cast<u32>(change.key)), change.origin,
                                          change.origin.empty());
             }
-            if (impl->remote.Merge(change, !change.origin.empty()) && !runtime.Queue(change) &&
-                !runtime.Suppress(change) && !impl->logged_class) {
-                log("OoT co-op: not applied: class/key policy disabled or queue full");
-                impl->logged_class = true;
+            if ((EventKind(change.kind) ? impl->AdmitEvent(change) :
+                 impl->remote.Merge(change, !change.origin.empty())) && !runtime.Queue(change)) {
+                if (EventKind(change.kind)) impl->book.Dropped(change);
+                if (!runtime.Suppress(change) && !impl->logged_class) {
+                    log("OoT co-op: not applied: class/key policy disabled or queue full");
+                    impl->logged_class = true;
+                }
             }
             // A live peer flag of a collectible (not a baseline): its loaded actor goes too.
             if (change.kind == Kind::Bit && !change.origin.empty() && !impl->world_quarantined)
                 QueueCleanup(change.key);
         }
     }
-    const auto send = [&](Change change, bool baseline) {
-        if (change.kind == Kind::Bit && !profile->world.families.empty()) {
-            if (impl->world_quarantined || !profile->world.AdmitsFlag(change.key)) return;
-            if (const auto source = impl->world_claims.GaveFlag(change.key)) change.source = *source;
-            else if (!baseline) {
-                const auto source = profile->world.Source(change.key);
-                if (source && impl->world_claims.Busy(*source)) return;
-            }
-            if (change.source && !impl->world_flags_sent.insert(change.key).second) return;
-        }
-        Observe(change);
-        log(fmt::format("OoT co-op: {} class={} key={:016x} value=1 path=observer",
-                        baseline ? "baseline" : "observed", ClassName(change.kind), change.key));
-    };
     if (profile->world.capacity_hash && impl->allowed_classes.contains(Kind::Rupee) &&
         !runtime.Calling() && !runtime.Pending() && impl->local_pickups.empty()) {
         using OotGameDataTrace::Detail::Read32;
@@ -2425,13 +2993,32 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     }
     if (profile->chest.enforce) {
         const auto dropped = runtime.DropPending([&](const Change& c) {
-            return impl->ChestGuarded(c) && !impl->claims.CanApply(c);
+            const bool drop = impl->ChestGuarded(c) && !impl->claims.CanApply(c);
+            if (drop) impl->book.Dropped(c);
+            return drop;
         });
         if (dropped && impl->race_lines++ < 256)
             log(fmt::format("OoT co-op: chest race: {} pending loser/duplicate parts dropped before apply", dropped));
     }
     const auto event = runtime.Frame(backend, {thread, 1, impl->tick, true}, send, log);
-    if (event == ApplyEvent::Started && runtime.LastGrant() &&
+    if (event == ApplyEvent::Quarantined) impl->book.Quarantined();
+    if (event == ApplyEvent::Committed && runtime.LastGrant() && runtime.LastGrant()->kind == Kind::Key) {
+        const auto& grant = *runtime.LastGrant();
+        if (std::ranges::any_of(impl->dungeon_keys, [&](const DungeonKeys& d) { return d.count == grant.key; }))
+            impl->book.Applied(grant);
+    }
+    for (const auto& result : impl->sync_tally.Settle(Room::NowMs(), !runtime.Calling() && runtime.Pending() == 0)) {
+        Ux::Notify(fmt::format("sync/{}", result.id), result.Text());
+        log(fmt::format("OoT co-op: team sync toast flags={} items={} (snapshot entries={})",
+                       result.flags, result.items, result.entries));
+    }
+    if (const auto key = impl->RoomConfig().finish; key && runtime.BaselineReady() && impl->tick % 30 == 0) {
+        if (impl->finish_watch.Sample(backend.ReadFlag(Change{Kind::Bool, {}, 0, *key, 1}))) {
+            impl->finished = true;
+            Ux::Notify("local-finish", "You finished the game");
+        }
+    }
+    if (event == ApplyEvent::Started && runtime.LastGrant() && !runtime.LastGrant()->catchup &&
         runtime.LastGrant()->kind == Kind::Item &&
         runtime.LastGrant()->source.kind == World::OriginKind::Chest && profile->chest.interaction_pc)
         impl->claims.StartRemote(*runtime.LastGrant());
@@ -2487,9 +3074,62 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         }
     }
     const bool cleaning = !runtime.Calling() && FrameCleanup(backend, memory, log);
-    if (impl->pose_enabled) FramePose(backend, memory, log, runtime.Calling() || cleaning);
-    return runtime.Calling() || cleaning || (impl->ghost && impl->ghost->Calling()) ||
+    // C16 frame order (one guest call per frame, first taker wins; every later step is told the
+    // slot is used): a live cross-scene teleport owns the whole frame (early return above); then
+    // grants (runtime.Frame) -> FrameCleanup -> FrameQuest -> FramePose, which runs the room
+    // window / name tags (no call), the teleport step, the ghost driver, then the equipment budget
+    // (ghost first; equipment takes the ghost's idle frames and every 4th frame first).
+    const bool quest_call = FrameQuest(backend, memory, log, !runtime.Calling() && !cleaning);
+    if (impl->pose_enabled) FramePose(backend, memory, log, runtime.Calling() || cleaning || quest_call);
+    else impl->RoomFrame(std::nullopt, Room::NowMs());
+    return runtime.Calling() || cleaning || quest_call || impl->teleport_saved.has_value() || (impl->ghost && impl->ghost->Calling()) ||
            (impl->equipment && impl->equipment->Calling());
+}
+
+template <typename Backend, typename Log>
+bool Session::FrameQuest(Backend& backend, Memory::Memory& memory, Log log, bool available) {
+    if (!impl->quest) return false;
+    auto port = QuestPort(memory);
+    const u64 connection = impl->quest_connections;
+    if (connection != impl->quest_connection_seen) {
+        impl->quest->Rebaseline();
+        impl->quest_connection_seen = connection;
+    }
+    port.log = log;
+    port.ready = [&] { return backend.CallReady() && backend.ItemReady(); };
+    port.send = [&](const Quest::Target& t) { return Observe({Kind::Quest, {}, 0, t.challenge, t.index, t.step}); };
+    port.call = [&](const Quest::Entry& entry, const std::array<u64, 8>& args) {
+        const auto verified = backend.VerifiedEntry({entry.offset, entry.words});
+        if (!verified || !port.ready()) return false;
+        auto saved = backend.Capture();
+        if (!saved) return false;
+        const u64 sp = impl->binding.stack - ItemFrame;
+        ApplyTarget call{true, false, 0, 0, *verified, impl->binding.sentinel, sp, args};
+        call.stores = {{sp, 0}, {sp + 8, 0}, {sp + 0x10, 0}, {sp + 0x18, 0}};
+        if (!backend.Redirect(call)) return false;
+        impl->quest_saved = std::move(saved);
+        impl->quest_stack = sp;
+        return true;
+    };
+    available = available && !impl->cleanup_saved && !impl->ghost_saved && !impl->teleport_saved &&
+        !(impl->ghost && impl->ghost->Calling()) && !(impl->equipment && impl->equipment->Calling());
+    // The title screen runs on a bound, stable GameData manager with default data and a live
+    // challenge manager (field, C16 s2: a late-join target applied there, then the save load
+    // restored over it). A save is loaded once the wallet capacity Int is non-zero (the world
+    // class's signal: 0 at boot and title, the bag size in game). No capacity key: no gate.
+    bool loaded = true;
+    if (profile->world.capacity_hash) {
+        const auto capacity = backend.ReadInt(profile->world.capacity_hash);
+        loaded = capacity && *capacity > 0;
+    }
+    if (loaded != impl->quest_save_loaded) {
+        impl->quest_save_loaded = loaded;
+        if (impl->quest_gate_lines++ < 16)
+            log(loaded ? "OoT co-op: quest save gate open (wallet capacity non-zero)"
+                       : "OoT co-op: quest save gate closed (no loaded save: title or boot)");
+    }
+    return impl->quest->Frame(port, impl->tick, impl->rebinds,
+        impl->stable_frame && impl->runtime->BaselineReady() && loaded, impl->quest_negotiated, available);
 }
 
 void Session::QueueCleanup(u64 key) {
@@ -2629,6 +3269,47 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
                                  peer.pose->pos}); // name: the origin, resolved by the session
         }
         impl->ux.Frame(memory, base, local.banc, local.loading, std::move(tag_peers), log);
+        {
+            std::scoped_lock lock{impl->mutex};
+            for (const auto& [origin, track] : impl->peers) {
+                if (track.samples.empty()) continue;
+                const auto& latest = track.samples.back().second;
+                impl->presence.Pose(origin, latest.banc, latest.child, latest.loading, track.last_ms);
+            }
+        }
+        impl->RoomFrame(Room::RoomPeer{{}, impl->hello.name, local.banc, true, true,
+                                      local.child, local.loading, now}, now);
+        std::vector<Ux::Marker> markers;
+        if (const auto& keys = impl->RoomConfig().minimap; keys && !local.loading) {
+            if (const auto map = Room::ReadMinimap(memory, base, *keys)) {
+                u8 colour = 0;
+                for (const auto& peer : peers) {
+                    if (!peer.pose || peer.pose->loading || peer.pose->banc != local.banc) continue;
+                    if (const auto at = Room::PlaceMarker(*map, local.pos, local.yaw, peer.pose->pos))
+                        markers.push_back({{at->x, at->y}, colour++, impl->ux.Name(peer.origin).front()});
+                }
+            }
+        }
+        Ux::PublishMarkers(std::move(markers));
+    }
+    if (impl->teleport) {
+        const auto sample = Teleport::ReadSample(memory, base, impl->binding.manager, *profile);
+        Teleport::Port teleport_port{
+            [&](const Player::Resident& resident) { return Player::Validate(memory, base, resident, *profile->anim->player); },
+            [&](const Player::Resident& resident, const Teleport::Packet& destination) {
+                static_assert(ItemFrame == 0x100);
+                return Teleport::Issue(memory, backend, *profile, base, impl->binding.stack,
+                    impl->binding.sentinel, resident, destination, impl->teleport_saved, impl->teleport_stack);
+            }, impl->TeleportLog(),
+            [&](Teleport::CrossStep step, size_t event, const Teleport::Packet& destination) {
+                return Teleport::IssueCross(memory, backend, *profile, base, impl->binding.stack,
+                    impl->binding.sentinel, step, event, destination, impl->teleport_saved, impl->teleport_stack);
+            }};
+        std::scoped_lock lock{impl->mutex};
+        const bool can_call = !grant_calling && !impl->cleanup_saved && !impl->ghost->Calling() &&
+            (!impl->equipment || !impl->equipment->Calling()) && !impl->teleport_saved;
+        const bool cross_active = impl->teleport->CrossActive();
+        if (impl->teleport->Frame(sample, now, can_call, teleport_port) || cross_active || impl->teleport->CrossActive()) return;
     }
     // Grants keep priority: the one call slot of this frame is theirs when they used it.
     if (grant_calling) return;
@@ -2676,6 +3357,7 @@ void BeginSession() {
     }
     if (old) old->Stop();
     Ux::Reset();
+    Gui::ClearStatus();
 }
 
 void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 program_id, u64 base,
@@ -2711,6 +3393,7 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
         if (!allowed) throw std::runtime_error{"invalid grant class allow-list"};
         std::set<std::pair<Kind, u64>> keys;
         std::vector<DungeonKeys> dungeon_keys;
+        std::set<u64> denied_quests;
         const auto keys_path = Env("EDEN_NX2_OOT_COOP_KEYS");
         if (!keys_path.empty()) {
             std::ifstream in{std::filesystem::path{keys_path}};
@@ -2725,6 +3408,7 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
             const auto extras = DecodeKeyExtras(parsed->at("keys"));
             if (!extras) throw std::runtime_error{"invalid key file deny/dungeon section"};
             denied.insert(extras->deny.begin(), extras->deny.end());
+            denied_quests = extras->deny_quest;
             if (allowed->contains(Kind::Key)) {
                 for (const u32 key : extras->dungeon_bools) keys.emplace(Kind::Bool, key);
                 for (const auto& pair : extras->dungeon_keys) {
@@ -2741,6 +3425,17 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
             }
         }
         Hello hello;
+        if (Env("EDEN_NX2_OOT_COOP_MOD_HASH") != "0") {
+            try {
+                const auto hash = Ledger::ModHash(keys_path,
+                    Common::FS::GetEdenPath(Common::FS::EdenPath::LoadDir) / fmt::format("{:016X}", program_id));
+                hello.mod_hash = hash.digest;
+                LOG_INFO(Core_ARM, "OoT co-op: mod hash {} (keys + 4 sidecars + {} mod files, {:.2f} MiB)",
+                         hash.digest.substr(0, 12), hash.files, static_cast<double>(hash.bytes) / (1024 * 1024));
+            } catch (const std::exception& error) {
+                LOG_WARNING(Core_ARM, "OoT co-op: mod hash failed: {} (sending no mod_hash)", error.what());
+            }
+        }
         hello.build_id = std::string{build_id};
         hello.seed_hash = Env("EDEN_NX2_OOT_COOP_SEED", "0");
         hello.policy_id = Env("EDEN_NX2_OOT_COOP_POLICY", "or-v2");
@@ -2751,7 +3446,7 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
         hello.client_id = fmt::format("{:08x}{:08x}{:08x}{:08x}", random(), random(), random(), random());
         auto session = std::make_shared<Session>(kernel, owner, base, std::move(profile),
             *ParseEndpoint(endpoint_text),
-            std::move(hello), std::move(denied), *allowed, std::move(keys));
+            std::move(hello), std::move(denied), *allowed, std::move(keys), std::move(denied_quests));
         session->SetDungeonKeys(std::move(dungeon_keys));
         std::scoped_lock lock{sessions_mutex};
         current_session = std::move(session);

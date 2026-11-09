@@ -54,16 +54,20 @@ def animation_descriptor(path):
 class ClientSim:
     def __init__(self, client_id=None, *, room="default", team="default", name="Player",
                  build_id=BUILD_ID, seed_hash="0", policy_id="or-v2", auto_heartbeat=True,
-                 on_pose=None, world_wallet=None, animation=None):
+                 on_pose=None, world_wallet=None, animation=None, mod_hash=None, quest=False):
         self.hello = {"type": "hello", "version": wire.VERSION if animation else wire.LEGACY_VERSION, "build_id": build_id,
                       "seed_hash": seed_hash, "room": room, "team": team,
                       "client_id": client_id or uuid.uuid4().hex, "name": name, "policy_id": policy_id}
+        if quest:
+            self.hello["quest"] = 1
         if world_wallet is not None:
             wire.validate_wallet(world_wallet)
             self.hello["world_wallet"] = dict(world_wallet)
         if animation is not None:
             wire.validate_animation(animation)
             self.hello["animation"] = dict(animation)
+        if mod_hash is not None:
+            self.hello["mod_hash"] = wire.mod_hash(mod_hash)
         self.peer_animations = {}
         self.auto_heartbeat = auto_heartbeat
         self.seq = 0
@@ -87,9 +91,13 @@ class ClientSim:
             await self.close()
             raise ValueError(self.ack.get("reason", "handshake refused"))
         if (self.ack.get("version") != self.hello["version"] or
-                self.ack.get("animation") != self.hello.get("animation")):
+                self.ack.get("animation") != self.hello.get("animation") or
+                ("teleport" in self.hello and (type(self.ack.get("teleport")) is not int or self.ack["teleport"] != 1))):
             await self.close()
             raise ValueError("animation handshake mismatch")
+        if self.hello.get("quest") == 1 and (type(self.ack.get("quest")) is not int or self.ack["quest"] != 1):
+            await self.close()
+            raise ValueError("quest capability refused")
         self.snapshot = await self.read()
         if self.snapshot["type"] != "team_state":
             await self.close()
@@ -142,6 +150,20 @@ class ClientSim:
             wire.validate_wallet(world_wallet)
             packet["world_wallet"] = dict(world_wallet)
         await self.send(packet)
+
+    async def catchup(self):
+        grants, after = [], 0
+        while True:
+            await self.send({"type": "catchup_request", "after": after})
+            page = await self.receive("catchup")
+            if page["after"] != after or (page["more"] and not page["grants"]):
+                raise ValueError("invalid catchup progress")
+            grants.extend(page["grants"])
+            if len(grants) > 16384:
+                raise ValueError("catchup transaction too large")
+            if not page["more"]:
+                return grants
+            after = page["grants"][-1]["rev"]
 
     def animation_matches(self, origin):
         animation = self.hello.get("animation")
@@ -215,15 +237,17 @@ async def run(args):
                        build_id=args.build_id, seed_hash=args.seed, policy_id=args.policy,
                        world_wallet=dict(zip(("balance", "capacity"), args.world_wallet))
                        if args.world_wallet else None,
-                       animation=animation_descriptor(args.anim_table),
+                       animation=animation_descriptor(args.anim_table), mod_hash=args.mod_hash, quest=args.quest,
                        on_pose=lambda packet: print(json.dumps(packet), flush=True) if args.show_poses else None)
     try:
         await client.connect(args.host, args.port)
         print(json.dumps(client.ack), flush=True)
         print(json.dumps(client.snapshot), flush=True)
+        if args.catchup:
+            print(json.dumps(await client.catchup()), flush=True)
         for raw in args.send:
             packet = json.loads(raw)
-            if packet.get("type") in wire.CHANGE_TYPES:
+            if packet.get("type") in wire.CHANGE_TYPES | {"quest_step"}:
                 kind = packet.pop("type")
                 await client.change(kind, **packet)
             else:
@@ -260,10 +284,13 @@ def main():
     parser.add_argument("--policy", default="or-v2")
     parser.add_argument("--world-wallet", type=int, nargs=2, metavar=("BALANCE", "CAPACITY"))
     parser.add_argument("--anim-table", help="private coop-anim.json sidecar (exact-byte SHA256 negotiation)")
+    parser.add_argument("--quest", action="store_true", help="negotiate quest; --send accepts quest_step")
     parser.add_argument("--duration", type=float, default=30)
     parser.add_argument("--send", action="append", default=[], help="JSON packet; change origin/seq are automatic")
     parser.add_argument("--pose", action="append", default=[], help="'BANC CHILD X Y Z YAW [LOADING]' (v3 pose)")
     parser.add_argument("--show-poses", action="store_true", help="print received poses (otherwise only counted)")
+    parser.add_argument("--mod-hash", type=wire.mod_hash)
+    parser.add_argument("--catchup", action="store_true")
     args = parser.parse_args()
     try:
         asyncio.run(run(args))
