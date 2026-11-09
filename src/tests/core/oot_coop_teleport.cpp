@@ -195,9 +195,11 @@ TEST_CASE("teleport calls once with the native matrix then verifies and settles"
     r.Frame(); REQUIRE_FALSE(r.Logged("teleport arrived"));
     r.sample.info_pos = Reply().pos; r.Frame(); REQUIRE_FALSE(r.Logged("teleport arrived"));
     r.sample.actor_pos = Reply().pos; r.Frame(); REQUIRE(r.Logged("teleport arrived"));
-    for (int i = 0; i < 60; ++i) r.Frame(); REQUIRE(r.Logged("+1s stable"));
+    for (int i = 0; i < 60; ++i) r.Frame();
+    REQUIRE(r.Logged("+1s stable"));
     r.sample.info_pos[1] -= 5; r.sample.actor_pos = r.sample.info_pos;
-    for (int i = 0; i < 120; ++i) r.Frame(); REQUIRE(r.Logged("+3s moved"));
+    for (int i = 0; i < 120; ++i) r.Frame();
+    REQUIRE(r.Logged("+3s moved"));
     REQUIRE(r.calls.size() == 1); REQUIRE_FALSE(r.controller.Busy());
 }
 
@@ -589,11 +591,14 @@ TEST_CASE("teleport cross arrival needs a moved agreed position and consecutive 
     // Field (C16 s2): the resident survives the banc change with the same actor and generation.
     r.sample.resident = Sample().resident;
     r.Agree(Sample().info_pos); // both views agree but still at the source point: not arrived
-    for (int i = 0; i < 10; ++i) r.Frame(); REQUIRE(r.calls.empty());
+    for (int i = 0; i < 10; ++i) r.Frame();
+    REQUIRE(r.calls.empty());
     r.Agree();
-    for (int i = 0; i < 4; ++i) r.Frame(); REQUIRE(r.calls.empty());
+    for (int i = 0; i < 4; ++i) r.Frame();
+    REQUIRE(r.calls.empty());
     r.sample.block_bools_ok = false; r.Frame(); r.sample.block_bools_ok = true;
-    for (int i = 0; i < 4; ++i) r.Frame(); REQUIRE(r.calls.empty());
+    for (int i = 0; i < 4; ++i) r.Frame();
+    REQUIRE(r.calls.empty());
     REQUIRE(r.Frame()); REQUIRE(r.calls.size() == 1); REQUIRE(r.Logged("correction issued"));
     const auto matrix = Core::OotCoop::YawMatrix(r.Destination().pos, r.Destination().yaw);
     REQUIRE(r.calls[0].arguments[0] == r.sample.resident->actor);
@@ -607,7 +612,8 @@ TEST_CASE("teleport cross arrival needs a moved agreed position and consecutive 
 TEST_CASE("teleport explicit within tolerance skips correction", "[oot_coop]") {
     CrossRig r{true}; r.Reserve(); r.Live(); r.Load(); r.Agree(r.Destination().pos); r.ReadyFrames();
     REQUIRE(r.Logged("arrived (no correction)")); REQUIRE(r.calls.empty()); REQUIRE_FALSE(r.controller.Busy());
-    for (int i = 0; i < 180; ++i) r.Frame(); REQUIRE(r.Logged("+3s stable"));
+    for (int i = 0; i < 180; ++i) r.Frame();
+    REQUIRE(r.Logged("+3s stable"));
 }
 
 TEST_CASE("teleport cross fails once on timeout unexpected banc age or disconnect", "[oot_coop]") {
