@@ -131,10 +131,9 @@ std::optional<Packet> DecodePacket(const Json& value, bool child) {
 }
 std::shared_ptr<const Keys> DecodeKeys(const Json& j) {
     try {
-        if (!j.is_object() || j.size() != 8) return {};
+        if (!j.is_object() || j.size() != 6) return {};
         auto k = std::make_shared<Keys>();
-        for (auto [name, target] : {std::pair{"enabled", &k->enabled}, {"boots_enabled", &k->boots_enabled},
-                                   {"recreate_none", &k->recreate_none}}) {
+        for (auto [name, target] : {std::pair{"enabled", &k->enabled}, {"recreate_none", &k->recreate_none}}) {
             if (!j.at(name).is_boolean()) return {};
             *target = j.at(name).get<bool>();
         }
@@ -181,18 +180,6 @@ std::shared_ptr<const Keys> DecodeKeys(const Json& j) {
                 (*target)[i] = *n;
             }
         }
-        const auto& guard = j.at("guard");
-        if (!guard.is_object() || guard.size() != 5) return {};
-        const auto at = Number(guard.at("at"), 0x10000000), resume = Number(guard.at("resume"), 0x10000000);
-        const auto er = Number(guard.at("equipment_register"), 30), sr = Number(guard.at("slot_register"), 30);
-        if (!at || !resume || !er || !sr || !guard.at("words").is_array() || guard.at("words").size() > 128) return {};
-        k->guard.at = *at; k->guard.resume = *resume;
-        k->guard.equipment_register = static_cast<u32>(*er); k->guard.slot_register = static_cast<u32>(*sr);
-        for (const auto& w : guard.at("words")) {
-            const auto n = Number(w, 0xffffffff); if (!n) return {};
-            k->guard.words.push_back(static_cast<u32>(*n));
-        }
-        if (!k->guard.Valid() || ((k->guard.words[0] >> 10) & 0xfff) != k->slots[3].create) return {};
         return k;
     } catch (const Json::exception&) { return {}; }
 }
@@ -285,7 +272,10 @@ bool Related(const Port& p, const Keys& k, u64 base, u64 owner, u64 child) {
 
 bool Reconciler::Desired(Packet packet, u8 age) {
     const auto a = Unpack(packet.word, age == 0);
-    if (!a || a->age == 3 || (sequence && packet.sequence != *sequence && !Newer(packet.sequence, *sequence))) return false;
+    // Poses arrive in order on one TCP stream and every one carries the full snapshot, so the
+    // newest packet is the truth; eqseq is not compared here (a peer that restarts its client
+    // restarts its sequence, and a stale-rejection would freeze its ghost's equipment).
+    if (!a || a->age == 3) return false;
     auto values = Values(desired); const auto incoming = Values(*a);
     for (size_t i = 0; i < Unknown.size(); ++i) {
         if (incoming[i] == Unknown[i]) continue;
@@ -299,7 +289,7 @@ bool Reconciler::Desired(Packet packet, u8 age) {
 }
 bool Reconciler::WantsNone() const { return desired.sword == 0 || desired.shield == 0; }
 Work Reconciler::Step(const std::array<Observation, SlotCount>& o, const Names& names, u8 age,
-                     bool eligible, bool recreate_none, bool boots_guarded) {
+                     bool eligible, bool recreate_none) {
     if (quarantined) return {Action::Quarantine};
     if (!eligible || !sequence) return {};
     for (size_t i = 0; i < 5; ++i) {
@@ -318,9 +308,10 @@ Work Reconciler::Step(const std::array<Observation, SlotCount>& o, const Names& 
         }
         const u8 id = Id(desired, s);
         if (!Known(s, id)) continue;
-        // Boots require both explicit opt-in and the verified instruction guard. Child clothing
-        // and adult masks are unsupported combinations, rather than guessed conversions.
-        if ((s == Slot::Boots && (!boots_guarded || age == 0)) || (age == 0 && s == Slot::Tunic) || (age == 1 && s == Slot::Head && id != 0)) continue;
+        // Boots are deferred: the native lower-body request writes global game data (research
+        // section 4) and no guard is installed. Child clothing and adult masks are unsupported
+        // combinations, rather than guessed conversions.
+        if (s == Slot::Boots || (age == 0 && s == Slot::Tunic) || (age == 1 && s == Slot::Head && id != 0)) continue;
         if (i < 2 && id == 0) {
             if (v.child && recreate_none) return {Action::Recreate, s};
             continue;
@@ -365,51 +356,46 @@ std::array<u64, 8> Arguments(const Keys& k, Work w, u64 e, u64 cell) {
     return args;
 }
 
-bool BootGuard::Valid() const {
-    if (!at || (at & 3) || resume <= at || words.size() < 2 || words.size() > 128 ||
-        resume - at != words.size() * sizeof(u32) || equipment_register > 30 || slot_register > 30)
-        return false;
-    // Only CMP Wn,#imm (unshifted) followed by B.NE to the declared continuation.
-    if ((words[0] & 0xffc0001fU) != 0x7100001fU || ((words[0] >> 5) & 31) != slot_register ||
-        (words[1] & 0xff00001fU) != 0x54000001U) return false;
-    const s32 delta = static_cast<s32>((words[1] & 0x00ffffe0U) << 8) >> 11;
-    return static_cast<s64>(at + 4) + delta == static_cast<s64>(resume);
+
+std::optional<u64> NameTable::Cell(Port& p, std::string_view name) {
+    for (const auto& [text, cell] : cells) if (text == name) return cell;
+    if (!SafeName(name)) return {};
+    const u64 bytes = (8 + name.size() + 1 + 7) & ~u64{7};
+    if (used + bytes > size) {
+        if (!std::exchange(full_logged, true)) p.log("OoT co-op: equipment name table full; request refused");
+        return {};
+    }
+    const u64 cell = at + used;
+    std::array<u8, 8 + 64> entry{};
+    const u64 text = cell + 8;
+    std::memcpy(entry.data(), &text, 8);
+    std::memcpy(entry.data() + 8, name.data(), name.size());
+    if (!p.write(cell, entry.data(), 8 + name.size() + 1)) return {};
+    used += bytes;
+    cells.emplace_back(std::string{name}, cell);
+    return cell;
 }
-u32 CompareFlags(u32 left, u32 right, u32 pstate) {
-    const u32 result = left - right;
-    const bool overflow = ((left ^ right) & (left ^ result) & 0x80000000U) != 0;
-    return (pstate & 0x0fffffffU) | (result & 0x80000000U) |
-        (result == 0 ? 0x40000000U : 0) | (left >= right ? 0x20000000U : 0) |
-        (overflow ? 0x10000000U : 0);
-}
-bool VerifyBootGuard(const Port& p, const Keys& k, u64 base) {
-    if (!k.guard.Valid()) return false;
-    for (size_t i = 0; i < k.guard.words.size(); ++i)
-        if (p.r32(base + k.guard.at + i * sizeof(u32)) != k.guard.words[i]) return false;
-    return true;
-}
-std::optional<u64> Controller::Guard(Port& p, u64 pc, u64 e, u32 slot) {
-    if (!keys->boots_enabled || pending.call != Call::Work || pending.work.action != Action::Create ||
-        pending.work.slot != Slot::Boots || !pending.accept || pending.tree >= trees.size() || pc != base + keys->guard.at ||
-        slot != keys->slots[3].create || e != pending.token.equipment ||
-        trees[pending.tree].token != pending.token || trees[pending.tree].retired ||
-        !valid(p, pending.token) || !VerifyBootGuard(p, *keys, base)) return {};
-    const auto* name = names.Find(Slot::Boots, pending.work.id, pending.token.age);
-    const u64 cell = trees[pending.tree].scratch + static_cast<size_t>(Slot::Boots) * 96;
-    const auto actual = Text(p, cell + 8);
-    if (!name || p.r64(cell) != cell + 8 || !actual || *actual != name->target) return {};
-    pending.guard_hit = true;
-    p.log(fmt::format("OoT co-op: equipment boots guard hit epoch={} generation={} E={:#x}",
-        pending.token.epoch, pending.token.generation, e));
-    return base + keys->guard.resume;
+std::optional<u64> NameTable::Park(Port& p) {
+    if (park) return park;
+    // Identity rotation, translated far below any scene (the ghost driver's own park height).
+    const std::array<float, 12> matrix{1, 0, 0, 0, 0, 1, 0, -10000, 0, 0, 1, 0};
+    if (used + sizeof(matrix) > size || !p.write(at + used, matrix.data(), sizeof(matrix))) return {};
+    park = at + used;
+    used += sizeof(matrix);
+    return park;
 }
 
 Controller::Controller(std::shared_ptr<const Keys> keys_, Names names_, OotGameDataTrace::GhostOffsets ghost_,
-                       u64 base_, u64 scratch_)
-    : keys{std::move(keys_)}, names{std::move(names_)}, ghost{std::move(ghost_)}, base{base_}, scratch{scratch_} {
+                       u64 base_, u64 table_, u64 table_bytes)
+    : keys{std::move(keys_)}, names{std::move(names_)}, ghost{std::move(ghost_)}, table{table_, table_bytes},
+      base{base_} {
     trees.reserve(MaxTrees);
 }
 bool Controller::Calling() const { return pending.call != Call::None; }
+Controller::Tree* Controller::find(u64 id) {
+    for (auto& t : trees) if (t.id == id) return &t;
+    return nullptr;
+}
 std::optional<u64> Controller::equipment(const Port& p, u64 actor, bool private_owner) const {
     const auto& k = *keys;
     const auto h = p.r64(actor + k.Get("holder"));
@@ -467,178 +453,193 @@ bool Controller::start(Port& p, const OotGameDataTrace::Entry& entry, std::array
 void Controller::dump(Port& p, const Tree& tree, std::string_view reason) const {
     const auto& t = tree.token;
     p.log(fmt::format("OoT co-op: equipment {} peer={} scene={} epoch={} actor={:#x} generation={} E={:#x} age={} desired={:#x}",
-        reason, t.peer, t.scene, t.epoch, t.actor, t.generation, t.equipment, t.age, Pack(tree.reconcile.Desired()).value_or(0)));
+        reason, t.peer.substr(0, 8), t.scene, t.epoch, t.actor, t.generation, t.equipment, t.age,
+        Pack(tree.reconcile.Desired()).value_or(0)));
     for (size_t i = 0; i < SlotCount; ++i) {
         const auto& o = tree.observed[i];
-        p.log(fmt::format("OoT co-op: equipment slot={} handle={:#x} bookkeeping={}/{} bits={:#x} errors={:#x} child={:#x} id={} name={} actual={} readable={} idle={}",
+        p.log(fmt::format("OoT co-op: equipment slot={} handle={:#x} bookkeeping={:#x}/{:#x} bits={:#x} errors={:#x} child={:#x} id={:#x} name={} actual={} readable={} idle={}",
             SlotNames[i], o.handle, o.phase, o.detail, o.bits, o.errors, o.child ? o.child->actor : 0,
             o.child ? o.child->generation : 0xffffffff, o.child ? std::string_view{o.child->name} : std::string_view{"-"}, o.actual, o.readable, o.idle));
     }
 }
+void Controller::retire(Port& p, Tree& tree, bool recreate, std::string_view reason) {
+    if (tree.retired) return;
+    tree.retired = true;
+    tree.recreate = recreate;
+    tree.retired_tick = tick;
+    dump(p, tree, reason);
+}
+void Controller::remember(Tree& tree, const Child& child) {
+    if (std::any_of(tree.children.begin(), tree.children.end(), [&](const Child& c) {
+            return c.actor == child.actor && c.generation == child.generation; }))
+        return;
+    if (tree.children.size() >= MaxChildren) { tree.reconcile.Quarantine(); return; }
+    tree.children.push_back(child);
+}
 bool Controller::Blocked(u64 actor, u32 generation) const {
-    for (const auto& t : trees) if (t.token.actor == actor && t.token.generation == generation && (t.retired || t.reconcile.Quarantined())) return true;
-    return trees.size() >= MaxTrees && std::none_of(trees.begin(), trees.end(), [actor, generation](const Tree& t) { return t.token.actor == actor && t.token.generation == generation; });
+    return std::any_of(trees.begin(), trees.end(), [&](const Tree& t) {
+        return t.token.actor == actor && t.token.generation == generation && t.retired &&
+               (t.recreate || t.reconcile.Quarantined());
+    });
 }
 bool Controller::Recreate(u64 actor, u32 generation) const {
-    for (const auto& t : trees) if (t.token.actor == actor && t.token.generation == generation && t.recreate) return true;
-    return false;
+    return std::any_of(trees.begin(), trees.end(), [&](const Tree& t) {
+        return t.token.actor == actor && t.token.generation == generation && t.retired && t.recreate;
+    });
 }
 void Controller::Invalidate() {
     ++epoch;
-    for (auto& t : trees) t.retired = true;
+    for (auto& t : trees) if (!t.retired) { t.retired = true; t.retired_tick = tick; }
     player.reset(); local_packet.reset(); local_stage = 0; sequence.Reset(); absent_samples = {};
 }
 std::optional<Packet> Controller::Local(bool child) const {
-    if (!local_packet || tick - local_tick > 60 || !Unpack(local_packet->word, child)) return {};
+    if (!local_packet || tick - local_tick > 4 * SampleEvery || !Unpack(local_packet->word, child)) return {};
     return local_packet;
 }
 
-bool Controller::Frame(Port& p, const std::vector<Root>& roots, std::string_view scene_, bool eligible) {
+bool Controller::Frame(Port& p, const std::vector<Root>& roots, std::string_view scene_, bool eligible, bool send) {
     if (Calling() || !keys->enabled) return false;
     ++tick;
     if (scene != scene_) { Invalidate(); scene = scene_; }
-    if (!eligible) { player.reset(); local_packet.reset(); local_stage = 0; }
-    for (auto& tree : trees) {
-        auto found = std::find_if(roots.begin(), roots.end(), [&](const Root& root) {
-            return root.token.actor == tree.token.actor && root.token.record == tree.token.record &&
-                   root.token.generation == tree.token.generation && root.token.peer == tree.token.peer &&
-                   root.token.scene == tree.token.scene && root.token.age == tree.token.age;
-        });
-        if (found == roots.end() || !found->eligible) {
-            if (!tree.retired) { tree.retired = true; tree.recreate = std::any_of(roots.begin(), roots.end(), [&](const Root& root) {
-                return root.token.actor == tree.token.actor && root.token.generation == tree.token.generation;
-            }); dump(p, tree, "retired"); }
+    if (!eligible || !send) { player.reset(); local_packet.reset(); local_stage = 0; }
+    const auto root_of = [&](const Tree& tree) -> const Root* {
+        for (const auto& root : roots) {
+            if (root.token.actor == tree.token.actor && root.token.record == tree.token.record &&
+                root.token.generation == tree.token.generation && root.token.peer == tree.token.peer &&
+                root.token.scene == tree.token.scene && root.token.age == tree.token.age) return &root;
         }
-    }
+        return nullptr;
+    };
+    // An owner whose root left the ghost driver (dropped, abandoned, re-aged, reassigned) retires
+    // with its whole tree. A root that is only ineligible for now (peer loading, elsewhere, stale)
+    // keeps its tree suspended: no requests, no timeout progress, nothing parked or recreated.
+    for (auto& tree : trees) if (!tree.retired && !root_of(tree)) retire(p, tree, false, "retired (owner left the ghost driver)");
+    // A retired tree is forgotten once its owner is gone (the game deleted it with its children)
+    // or its children had the park window; a quarantined owner still listed stays, so it stays blocked.
+    std::erase_if(trees, [&](const Tree& t) {
+        if (!t.retired || (Calling() && pending.tree == t.id)) return false;
+        if (!valid(p, t.token)) return true;
+        return tick - t.retired_tick > RetireWindow && !root_of(t);
+    });
     for (const auto& root : roots) {
-        if (!root.eligible || !root.desired || Blocked(root.token.actor, root.token.generation)) continue;
+        if (!root.eligible || !root.desired) continue;
         auto it = std::find_if(trees.begin(), trees.end(), [&](const Tree& t) {
             return t.token.actor == root.token.actor && t.token.generation == root.token.generation;
         });
         if (it == trees.end()) {
-            if (trees.size() >= MaxTrees) { p.log("OoT co-op: equipment tree budget exhausted; restart disposable session"); break; }
+            if (trees.size() >= MaxTrees) {
+                if (!std::exchange(budget_logged, true)) p.log("OoT co-op: equipment owner budget full; ghost shown without equipment");
+                continue;
+            }
             auto token = root.token;
             token.epoch = epoch;
             token.equipment = equipment(p, token.actor, true).value_or(0);
             if (!valid(p, token)) continue;
-            Tree tree; tree.token = token; tree.scratch = scratch + trees.size() * TreeBytes;
+            Tree tree; tree.id = next_tree++; tree.token = token;
             trees.push_back(std::move(tree)); it = std::prev(trees.end());
             dump(p, *it, "owner ready");
         }
-        it->reconcile.Desired(*root.desired, root.token.age);
+        if (!it->retired) it->reconcile.Desired(*root.desired, root.token.age);
     }
-    std::array<Work, MaxTrees> work{};
-    for (size_t ti = 0; eligible && ti < trees.size(); ++ti) {
-        auto& t = trees[ti];
-        if (t.retired || !valid(p, t.token)) continue;
+    std::vector<std::pair<u64, Work>> work;
+    for (auto& t : trees) {
+        const Root* root = root_of(t);
+        if (!eligible || t.retired || !root || !root->eligible || !valid(p, t.token)) continue;
         for (size_t i = 0; i < SlotCount; ++i) {
             auto fresh = observe(p, t.token, static_cast<Slot>(i), t.observed[i].child ? &*t.observed[i].child : nullptr);
             if (fresh.child && t.queried[i] == fresh.child && tick - t.query_ticks[i] < 30) fresh.actual = t.observed[i].actual;
-            if (t.observed[i].child && fresh.child != t.observed[i].child) {
-                if (t.retired_children.size() >= 64) t.reconcile.Quarantine();
-                else t.retired_children.push_back(*t.observed[i].child);
-            }
+            if (fresh.child) remember(t, *fresh.child);
             t.observed[i] = std::move(fresh);
         }
         if (t.reconcile.WantsNone() && !keys->recreate_none && !std::exchange(t.none_logged, true))
-            dump(p, t, "none deferred (removal probe disabled)");
-        const auto w = t.reconcile.Step(t.observed, names, t.token.age, true, keys->recreate_none, keys->boots_enabled && VerifyBootGuard(p, *keys, base));
+            dump(p, t, "none deferred (kept as is; removal is a separate probe)");
+        if (t.reconcile.Desired().boots != 0 && t.reconcile.Desired().boots != 3 && !std::exchange(t.boots_logged, true))
+            dump(p, t, "boots deferred (no guarded lower-body request)");
+        const auto w = t.reconcile.Step(t.observed, names, t.token.age, true, keys->recreate_none);
         if (w.action == Action::Quarantine || w.action == Action::Recreate) {
-            t.retired = true; t.recreate = w.action == Action::Recreate;
-            dump(p, t, t.recreate ? "none retire/recreate" : "timeout/quarantined");
+            retire(p, t, w.action == Action::Recreate, w.action == Action::Recreate ? "none retire/recreate" : "timeout/quarantined");
             continue;
         }
-        work[ti] = w;
-    }
-    if (tick % 4 == 1) return false; // Reserve regular updates for root movement and animation.
-    // Retirement is polled indefinitely, but bounded by MaxTrees and the existing root cap.
-    // This catches native completions arriving after the root was parked or its slot reused.
-    if (eligible && !trees.empty() && tick % 3 == 0) {
-        for (size_t n = 0; n < trees.size(); ++n) {
-            const size_t ti = (retire_cursor + n) % trees.size(); auto& t = trees[ti];
-            if (!t.retired || !valid(p, t.token)) continue;
-            for (size_t i = 0; i < SlotCount; ++i) {
-                const auto o = observe(p, t.token, static_cast<Slot>(i));
-                if (o.child && std::none_of(t.retired_children.begin(), t.retired_children.end(), [&](const Child& c) {
-                    return c.actor == o.child->actor && c.generation == o.child->generation;
-                }) && t.retired_children.size() < 64) t.retired_children.push_back(*o.child);
-            }
-            // Cycle through the root and every associated child, revalidating each generation.
-            const size_t which = (tick / 3 / trees.size()) % (t.retired_children.size() + 1);
-            u64 actor = t.token.actor;
-            std::optional<Child> child;
-            if (which) {
-                child = t.retired_children[which - 1];
-                const auto& k = *keys;
-                const auto life = p.r32(child->actor + k.Get("lifecycle"));
-                if (p.r32(child->record + k.Get("record_id")) != child->generation ||
-                    p.r64(child->record + k.Get("record_actor")) != child->actor || !life ||
-                    (*life >= k.Get("lifecycle_lo") && *life <= k.Get("lifecycle_hi")) ||
-                    !Related(p, k, base, t.token.actor, child->actor)) continue;
-                actor = child->actor;
-            }
-            const auto h = p.r64(actor + keys->Get("holder"));
-            const auto model = h && *h ? p.r64(*h + keys->Get("model")) : std::nullopt;
-            retire_cursor = (ti + 1) % trees.size();
-            if (model && *model && tick % 2 == 0 && ghost.alpha_set &&
-                start(p, ghost.alpha_set, {*model}, {Call::Hide, ti, 0, t.token, {}, child}, 0.0f)) return true;
-            std::array<float, 12> matrix{1,0,0,0, 0,1,0,-10000, 0,0,1,0};
-            if (p.write(t.scratch + 0x300, matrix.data(), sizeof(matrix)) &&
-                start(p, ghost.set_mtx, {actor, t.scratch + 0x300, 0}, {Call::Park, ti, 0, t.token, {}, child})) return true;
-        }
+        if (w.action != Action::None) work.emplace_back(t.id, w);
     }
     if (!eligible) return false;
-    // One sender call on alternate updates leaves receiver and root movement lanes time.
-    if (tick % 2 == 0 && sender(p)) return true;
-    for (size_t n = 0; n < trees.size(); ++n) {
-        const size_t ti = (active_cursor + n) % trees.size();
-        auto& t = trees[ti];
-        if (t.retired || !valid(p, t.token)) continue;
-        const auto w = work[ti];
-        if (w.action == Action::None) continue;
+    // Parking a retired owner's children comes first: they must not linger where the owner was.
+    if (tick % 2 == 1 && park(p)) return true;
+    if (send && tick % 2 == 0 && sender(p)) return true;
+    for (size_t n = 0; n < work.size(); ++n) {
+        const auto& [id, w] = work[(active_cursor + n) % work.size()];
+        Tree* t = find(id);
+        if (!t || t->retired || !valid(p, t->token)) continue;
         const size_t si = static_cast<size_t>(w.slot);
-        const auto& o = t.observed[si];
-        const u64 cell = t.scratch + si * 96;
+        const auto& o = t->observed[si];
+        u64 cell = 0;
         if (w.action == Action::Create) {
-            const auto* name = names.Find(w.slot, w.id, t.token.age);
-            if (!name || (w.slot == Slot::Boots && (!keys->boots_enabled || !VerifyBootGuard(p, *keys, base)))) continue;
-            std::array<u8, 80> bytes{};
-            const u64 text = cell + 8;
-            std::memcpy(bytes.data(), &text, 8);
-            std::memcpy(bytes.data() + 8, name->target.c_str(), name->target.size() + 1);
-            if (!p.write(cell, bytes.data(), bytes.size())) {
-                t.reconcile.Quarantine(); t.retired = true; dump(p, t, "scratch refused; quarantined");
-                continue;
-            }
+            const auto* name = names.Find(w.slot, w.id, t->token.age);
+            const auto at = name ? table.Cell(p, name->target) : std::nullopt;
+            if (!at) { t->reconcile.Quarantine(); retire(p, *t, false, "name cell refused; quarantined"); continue; }
+            cell = *at;
         }
         const auto& entry = w.action == Action::Create ? (si < 2 ? keys->dynamic : keys->statik) :
                             w.action == Action::Query ? keys->state : w.action == Action::Draw ? keys->draw : keys->sheathe;
-        if (!valid(p, t.token)) continue;
-        if (start(p, entry, Arguments(*keys, w, t.token.equipment, cell), {Call::Work, ti, si, t.token, w, o.child})) {
-            active_cursor = (ti + 1) % trees.size();
-            t.reconcile.Issued(w, o);
+        if (start(p, entry, Arguments(*keys, w, t->token.equipment, cell), {Call::Work, id, si, t->token, w, o.child})) {
+            active_cursor = active_cursor + n + 1;
+            t->reconcile.Issued(w, o);
             if (w.action != Action::Query) {
-                t.queried[si].reset(); t.observed[si].actual = 3;
+                t->queried[si].reset(); t->observed[si].actual = 3;
                 if (w.action == Action::Create && w.slot == Slot::Sword) {
-                    t.queried[1].reset(); t.observed[1].actual = 3;
+                    t->queried[1].reset(); t->observed[1].actual = 3;
                 }
-                dump(p, t, w.action == Action::Create ? "request issued" : "state setter issued");
+                dump(p, *t, w.action == Action::Create ? "request issued" : "state setter issued");
             }
             return true;
         }
-        t.reconcile.Quarantine(); t.retired = true; dump(p, t, "entry/call refused; quarantined");
+        t->reconcile.Quarantine(); retire(p, *t, false, "entry/call refused; quarantined");
+    }
+    return false;
+}
+
+bool Controller::park(Port& p) {
+    for (size_t n = 0; n < trees.size(); ++n) {
+        auto& t = trees[(retire_cursor + n) % trees.size()];
+        if (!t.retired || tick - t.retired_tick > RetireWindow || !valid(p, t.token)) continue;
+        // A late native completion on the retired owner joins the list and is parked too.
+        for (size_t i = 0; i < SlotCount; ++i)
+            if (const auto o = observe(p, t.token, static_cast<Slot>(i)); o.child) remember(t, *o.child);
+        while (t.parked < t.children.size()) {
+            const auto child = t.children[t.parked++];
+            const auto& k = *keys;
+            const auto life = p.r32(child.actor + k.Get("lifecycle"));
+            if (p.r32(child.record + k.Get("record_id")) != child.generation ||
+                p.r64(child.record + k.Get("record_actor")) != child.actor || !life ||
+                (*life >= k.Get("lifecycle_lo") && *life <= k.Get("lifecycle_hi")) ||
+                !Related(p, k, base, t.token.actor, child.actor)) continue;
+            const auto matrix = table.Park(p);
+            if (!matrix) return false;
+            retire_cursor = (retire_cursor + n + 1) % trees.size();
+            p.log(fmt::format("OoT co-op: equipment parking child {:#x} id={:#x} name={} of retired owner {:#x}",
+                child.actor, child.generation, std::string_view{child.name}, t.token.actor));
+            if (start(p, ghost.set_mtx, {child.actor, *matrix, 0}, {Call::Park, t.id, 0, t.token, {}, child})) return true;
+        }
     }
     return false;
 }
 
 bool Controller::sender(Port& p) {
     const auto& k = *keys;
-    if (local_stage && (!player || ReadLink(p, k, player->link) != player ||
+    if (local_stage && (!player || ReadLink(p, k, player->link, &*player) != player ||
                         equipment(p, player->actor, false) != player_equipment)) {
         local_stage = 0; player.reset(); local_packet.reset(); absent_samples = {};
     }
     if (!local_stage) {
-        if (tick - local_tick < 8) return false;
+        if (tick - local_tick < SampleEvery) return false;
+        local_tick = tick;
+        // The resident player link stays valid while its record/generation/name hold: select it
+        // natively only when that check fails, and refresh it every Reselect updates.
+        if (player && tick - select_tick < Reselect && ReadLink(p, k, player->link, &*player) == player &&
+            equipment(p, player->actor, false) == player_equipment) {
+            snapshot(p);
+            return false;
+        }
         const auto system = p.r64(base + k.Get("player_system"));
         const auto registry = system && *system ? p.r64(*system + k.Get("registry")) : std::nullopt;
         const auto count = registry && *registry ? p.r32(*registry + k.Get("registry_count")) : std::nullopt;
@@ -647,12 +648,12 @@ bool Controller::sender(Port& p) {
         if (!count || *count < k.Get("registry_min") || *count > 4096 || !resident || !*resident) {
             local_packet.reset(); return false;
         }
-        local_tick = tick;
+        select_tick = tick;
         return start(p, k.select_player, {*resident}, {Call::Select});
     }
     if (local_stage <= 2) {
         const size_t si = local_stage - 1;
-        if (!local_children[si]) { ++local_stage; return false; }
+        if (!local_children[si]) { ++local_stage; return sender(p); }
         return start(p, k.state, {player_equipment, k.slots[si].dynamic},
                      {Call::LocalState, 0, si, {}, {}, local_children[si]});
     }
@@ -660,12 +661,39 @@ bool Controller::sender(Port& p) {
     for (size_t i = 0; i < SlotCount; ++i) {
         if (ReadLink(p, k, player_equipment + k.slots[i].link) != local_children[i]) consistent = false;
     }
-    consistent = consistent && player && ReadLink(p, k, player->link, &*player) == player &&
-        equipment(p, player->actor, false) == player_equipment;
+    consistent = consistent && equipment(p, player->actor, false) == player_equipment;
     if (consistent) local_packet = Packet{*Pack(local), sequence.Sample(local)};
     else local_packet.reset();
     local_stage = 0;
     return false;
+}
+void Controller::snapshot(Port& p) {
+    const auto& k = *keys;
+    local = {}; local.age = player->name == names.players[0] ? 0 : 1;
+    Token token; token.actor = player->actor; token.equipment = player_equipment;
+    std::array<u8*, 5> ids{&local.sword, &local.shield, &local.tunic, &local.boots, &local.mask};
+    for (size_t i = 0; i < SlotCount; ++i) {
+        auto o = observe(p, token, static_cast<Slot>(i), local_children[i] ? &*local_children[i] : nullptr);
+        local_children[i] = o.child;
+        if (i >= ids.size()) continue;
+        if (o.child) {
+            *ids[i] = names.Identify(static_cast<Slot>(i), o.child->name, local.age);
+            absent_samples[i] = 0;
+        } else if (o.idle && ++absent_samples[i] >= 3) {
+            // A missing link is pending/unknown during async creation; it reads as none/base
+            // only after three consecutive idle samples with no request in flight.
+            *ids[i] = 0;
+            if (i == 0) local.sword_state = 0;
+            if (i == 1) local.shield_state = 0;
+        } else if (!o.idle) {
+            absent_samples[i] = 0;
+        }
+    }
+    const auto h = p.r64(player->actor + k.Get("holder"));
+    const auto u = h && *h ? p.r64(*h + k.Get("user")) : std::nullopt;
+    const auto guard = u && *u ? p.r8(*u + k.Get("guard")) : std::nullopt;
+    local.guard = guard && (*guard & k.Get("guard_mask")) ? 1 : 0;
+    local_stage = 1;
 }
 void Controller::CheckContext(const std::vector<Root>& roots, std::string_view current_scene, bool eligible) {
     if (!Calling()) return;
@@ -676,10 +704,6 @@ void Controller::CheckContext(const std::vector<Root>& roots, std::string_view c
                 r.token.actor == pending.token.actor && r.token.record == pending.token.record &&
                 r.token.generation == pending.token.generation && r.token.age == pending.token.age;
         });
-        if (!accept && pending.tree < trees.size()) {
-            trees[pending.tree].retired = true;
-            trees[pending.tree].recreate = true;
-        }
     }
     pending.accept = pending.accept && accept;
 }
@@ -687,33 +711,22 @@ void Controller::CheckContext(const std::vector<Root>& roots, std::string_view c
 void Controller::Returned(Port& p, u64 result) {
     const auto done = std::exchange(pending, {});
     const auto& k = *keys;
-    if (!done.accept) { local_packet.reset(); local_stage = 0; return; }
+    if (done.call == Call::Park) return;
+    if (!done.accept) {
+        if (done.call == Call::Select || done.call == Call::LocalState) { local_packet.reset(); local_stage = 0; }
+        return; // a work result is never accepted out of context; the next observation re-reads E
+    }
     if (done.call == Call::Select) {
         const auto found = ReadLink(p, k, result);
         if (!found || (found->name != names.players[0] && found->name != names.players[1])) {
             player.reset(); local_packet.reset(); return;
         }
-        if (player != found) { absent_samples = {}; local_packet.reset(); }
-        player = found;
-        const auto e = equipment(p, player->actor, false);
+        const auto e = equipment(p, found->actor, false);
         if (!e) { player.reset(); local_packet.reset(); return; }
+        if (player != found || player_equipment != *e) { absent_samples = {}; local_children = {}; }
+        player = found;
         player_equipment = *e;
-        local = {}; local.age = player->name == names.players[0] ? 0 : 1;
-        Token token; token.actor = player->actor; token.equipment = *e;
-        std::array<u8*, 5> ids{&local.sword, &local.shield, &local.tunic, &local.boots, &local.mask};
-        for (size_t i = 0; i < SlotCount; ++i) {
-            auto o = observe(p, token, static_cast<Slot>(i), local_children[i] ? &*local_children[i] : nullptr); local_children[i] = o.child;
-            if (i >= ids.size()) continue;
-            if (o.child) {
-                *ids[i] = names.Identify(static_cast<Slot>(i), o.child->name, local.age); absent_samples[i] = 0;
-            } else if (o.idle && i >= 2 && ++absent_samples[i] >= 3) *ids[i] = 0;
-            else absent_samples[i] = o.idle ? absent_samples[i] : 0;
-        }
-        const auto h = p.r64(player->actor + k.Get("holder"));
-        const auto u = h && *h ? p.r64(*h + k.Get("user")) : std::nullopt;
-        const auto guard = u && *u ? p.r8(*u + k.Get("guard")) : std::nullopt;
-        local.guard = guard && (*guard & k.Get("guard_mask")) ? 1 : 0;
-        local_stage = 1;
+        snapshot(p);
         return;
     }
     if (done.call == Call::LocalState) {
@@ -727,21 +740,20 @@ void Controller::Returned(Port& p, u64 result) {
         ++local_stage;
         return;
     }
-    if (done.tree >= trees.size()) return;
-    auto& tree = trees[done.tree];
-    if (tree.token != done.token || !valid(p, done.token)) return;
-    if (done.call != Call::Work || tree.retired) return;
+    Tree* tree = find(done.tree);
+    if (!tree || tree->token != done.token || tree->retired || done.call != Call::Work || !valid(p, done.token)) return;
     if (done.work.action == Action::Query) {
-        const auto child = ReadLink(p, k, tree.token.equipment + k.slots[done.slot].link);
-        if (child != done.child || !child || !Related(p, k, base, tree.token.actor, child->actor) ||
-            ReadLink(p, k, child->link, &*child) != child || !valid(p, tree.token)) return;
-        tree.observed[done.slot].actual = result <= 2 ? static_cast<u8>(result) : 3;
-        tree.queried[done.slot] = child;
-        tree.query_ticks[done.slot] = tick;
-        dump(p, tree, "actual state receipt");
-    } else if (done.work.action == Action::Create && (!(result & 1) ||
-               (done.work.slot == Slot::Boots && !done.guard_hit))) {
-        tree.reconcile.Quarantine(); tree.retired = true; dump(p, tree, "request refused; quarantined");
+        const auto child = ReadLink(p, k, tree->token.equipment + k.slots[done.slot].link);
+        if (child != done.child || !child || !Related(p, k, base, tree->token.actor, child->actor) ||
+            ReadLink(p, k, child->link, &*child) != child) return;
+        const u8 actual = result <= 2 ? static_cast<u8>(result) : 3;
+        if (tree->queried[done.slot] != child || tree->observed[done.slot].actual != actual)
+            dump(p, *tree, fmt::format("actual state receipt slot={} state={}", SlotNames[done.slot], actual));
+        tree->observed[done.slot].actual = actual;
+        tree->queried[done.slot] = child;
+        tree->query_ticks[done.slot] = tick;
+    } else if (done.work.action == Action::Create && !(result & 1)) {
+        tree->reconcile.Quarantine(); retire(p, *tree, false, "request refused; quarantined");
     }
 }
 } // namespace Core::OotCoop::Equip

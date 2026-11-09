@@ -233,10 +233,12 @@ it settles. IDs index the private allowlist sidecar; names, guest pointers and n
 never travel in these fields. Runtime entries such as `main+0x????` come from the private profile.
 
 `eqseq` changes only when a known ID, actual state or age changes; unknown observations and the
-guard bit do not increment it. Compare wrapping values using `0 < ((new-old) & 65535) < 32768`,
-and reset history on a new session or scene epoch. Outer pose `t`, freshness and scene identity
-still reject stale snapshots; equipment sequence is not an action count. Send the latest full
-snapshot at the existing cadence and coalesce before issuing any guest calls.
+guard bit do not increment it; it wraps at 65536 and is not an action count. Receivers apply
+equipment snapshots in arrival order (one ordered stream, every packet a full snapshot) and do not
+reject by `eqseq`, since a restarted client restarts its sequence; outer pose `t`, freshness and
+scene identity still reject stale poses. Send the latest full snapshot at the existing cadence and
+coalesce before issuing any guest calls. Boots identities travel on the wire, but the receiver
+defers them: no guarded native boots path exists yet.
 
 The kit controller's `peer pose <banc> 1 <x> <y> <z> <yaw> eq32=<word> [eqseq=<u16>]`
 accepts decimal or `0x` equipment words. Omitted `eqseq` tracks known changes and wraps at 65536;

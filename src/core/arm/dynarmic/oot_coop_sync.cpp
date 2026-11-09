@@ -1325,6 +1325,9 @@ bool Session::Impl::Receive(const Json& packet) {
 // The ghost's persistent guest memory: the rest of our sentinel page (the brk word is at +0).
 inline constexpr u64 GhostBlock = 0x400;
 static_assert(GhostBlock + GhostSlots * GhostDriver<int>::SlotSize <= 0x1000);
+// The equipment name table: the free tail of the same page (write-once cells and strings).
+inline constexpr u64 EquipBlock = GhostBlock + GhostSlots * GhostDriver<int>::SlotSize;
+static_assert(EquipBlock + 0x200 <= 0x1000);
 
 struct Session::Impl::GhostPort {
     Backend& backend;
@@ -1333,8 +1336,7 @@ struct Session::Impl::GhostPort {
     std::optional<u64> R64(u64 address) { return OotGameDataTrace::Detail::Read64(memory, address); }
     std::optional<u32> R32(u64 address) { return OotGameDataTrace::Detail::Read32(memory, address); }
     bool Write(u64 address, const void* data, size_t size) {
-        const u64 low = impl.binding.sentinel + GhostBlock;
-        const u64 high = impl.binding.sentinel + (impl.equipment ? Equip::PersistentBytes : 0x1000);
+        const u64 low = impl.binding.sentinel + GhostBlock, high = impl.binding.sentinel + 0x1000;
         if (!impl.binding.sentinel || address < low || address + size > high ||
             !memory.IsValidVirtualAddressRange(address, size))
             return false;
@@ -1407,8 +1409,7 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
     for (const auto& [member, key] : profile->chest_members) impl->chest_bools.insert(key);
     if (!impl->allowed_classes.empty()) {
         Kernel::KProcessAddress stack{}, sentinel{};
-        const auto result = owner->AllocateDebugCallMemory(kernel, &stack, &sentinel,
-            profile->equip && profile->equip->enabled ? Equip::PersistentBytes : 0x1000);
+        const auto result = owner->AllocateDebugCallMemory(kernel, &stack, &sentinel);
         if (result.IsSuccess()) {
             impl->binding.stack = GetInteger(stack);
             impl->binding.sentinel = GetInteger(sentinel);
@@ -1442,12 +1443,12 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
         impl->ux.Configure(Ux::LoadConfig(profile->build_id, &why));
         LOG_INFO(Core_ARM, "OoT co-op: UX {}", why);
     }
-    if (impl->pose_enabled && profile->equip && profile->equip->enabled) {
+    if (impl->pose_enabled && impl->ghost && profile->equip && profile->equip->enabled) {
         if (auto names = Equip::LoadNames(profile->build_id)) {
             impl->equipment = std::make_unique<Equip::Controller>(profile->equip, std::move(*names),
-                profile->ghost, base, impl->binding.sentinel + Equip::ScratchOffset);
+                profile->ghost, base, impl->binding.sentinel + EquipBlock, 0x1000 - EquipBlock);
             impl->hello.ghost_equipment_v2 = true;
-            LOG_INFO(Core_ARM, "OoT co-op: equipment v2 enabled; boots require opt-in and verified scoped guard");
+            LOG_INFO(Core_ARM, "OoT co-op: equipment v2 enabled (sword, shield, tunic, mask; boots deferred)");
         } else LOG_WARNING(Core_ARM, "OoT co-op: equipment disabled: missing or invalid coop-equip.json");
     }
     impl->Start();
@@ -1555,12 +1556,6 @@ bool Session::IsSentinel(u64 pc) const {
     return impl->binding.sentinel && pc == impl->binding.sentinel;
 }
 
-bool Session::EquipmentGuardSite(u64 pc, u32 instruction) const {
-    return profile->equip && profile->equip->enabled && profile->equip->boots_enabled &&
-        profile->equip->guard.Valid() && pc == base + profile->equip->guard.at &&
-        instruction == profile->equip->guard.words[0];
-}
-
 bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& jit,
                    Memory::Memory& memory, u64 thread, u64& tls, u64& tls_ro,
                    std::function<void()> clear_exclusive) {
@@ -1570,21 +1565,6 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     Impl::Backend backend{jit, memory, binding, *profile, tls, tls_ro, std::move(clear_exclusive)};
     const auto log = [](std::string_view line) { LOG_INFO(Core_ARM, "{}", line); };
     const DrainContext site{thread, 1, impl->tick, true};
-    if (profile->equip && EquipmentGuardSite(pc, memory.Read32(pc))) {
-        const auto& guard = profile->equip->guard;
-        Impl::GhostPort port{backend, memory, *impl};
-        auto equipment_port = port.EquipmentPort();
-        port.CheckEquipmentContext(profile->ghost);
-        if (thread == impl->frame_thread && impl->equipment) {
-            const auto resume = impl->equipment->Guard(equipment_port, pc,
-                jit.GetRegister(guard.equipment_register), static_cast<u32>(jit.GetRegister(guard.slot_register)));
-            if (resume) { jit.SetPC(*resume); return true; }
-        }
-        jit.SetPstate(Equip::CompareFlags(static_cast<u32>(jit.GetRegister(guard.slot_register)),
-            (guard.words[0] >> 10) & 0xfff, jit.GetPstate()));
-        jit.SetPC(pc + sizeof(u32));
-        return true;
-    }
     if (binding.sentinel && pc == binding.sentinel &&
         ((impl->ghost && impl->ghost->Calling()) || (impl->equipment && impl->equipment->Calling()))) {
         const u64 result = jit.GetRegister(0);
@@ -1835,7 +1815,14 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
     // Grants keep priority: the one call slot of this frame is theirs when they used it.
     if (grant_calling) return;
     Impl::GhostPort port{backend, memory, *impl};
-    if (impl->equipment) {
+    if (!impl->equipment) {
+        impl->ghost->Frame(port, impl->binding.sentinel + GhostBlock, local, peers, log);
+        return;
+    }
+    // One guest call per frame between them. The ghost driver (movement, animation) goes first;
+    // equipment takes the frames it leaves idle, and every fourth frame first, so neither starves.
+    const auto equipment = [&] {
+        if (impl->ghost->Calling()) return false;
         std::vector<Equip::Root> roots;
         for (const auto& slot : impl->ghost->Slots()) {
             if (slot.state != GhostDriver<Impl::GhostPort>::State::Live) continue;
@@ -1849,14 +1836,17 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
         }
         auto equipment_port = port.EquipmentPort();
         const bool called = impl->equipment->Frame(equipment_port, roots, local.banc,
-            !local.loading && !local.banc.empty());
+            !local.loading && !local.banc.empty(), impl->equipment_negotiated);
         for (const auto& slot : impl->ghost->Slots()) {
             if (slot.actor && impl->equipment->Blocked(slot.actor, slot.generation))
                 impl->ghost->RetireEquipment(slot.actor, impl->equipment->Recreate(slot.actor, slot.generation));
         }
-        if (called) return;
-    }
-    impl->ghost->Frame(port, impl->binding.sentinel + GhostBlock, local, peers, log);
+        return called;
+    };
+    const bool equipment_first = impl->tick % 4 == 0;
+    if (equipment_first && equipment()) return;
+    if (impl->ghost->Frame(port, impl->binding.sentinel + GhostBlock, local, peers, log)) return;
+    if (!equipment_first) equipment();
 }
 
 void BeginSession() {

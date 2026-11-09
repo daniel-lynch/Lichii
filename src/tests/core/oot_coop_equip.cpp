@@ -105,16 +105,10 @@ Memory LinkMemory() {
     return memory;
 }
 
-Equip::BootGuard BootGuard() {
-    // Synthetic CMP W5,#23; B.NE +12; NOP; NOP. No native game instructions or offsets.
-    return {0xa000, 0xa010, 4, 5,
-            {0x7100001fU | (23U << 10) | (5U << 5), 0x54000061U, 0xd503201fU, 0xd503201fU}};
-}
-
 struct ControllerFixture {
     static constexpr u64 Base = 0x1000, Actor = 0x10000, Record = 0x11000,
                          Equipment = 0x12000, Holder = 0x13000, Param = 0x14000,
-                         NameAt = 0x15000, Model = 0x16000, Scratch = 0x80000;
+                         NameAt = 0x15000, Model = 0x16000, Table = 0x80000, TableBytes = 0x400;
     static constexpr u64 CreateEntry = 0x9000, ParkEntry = 0x9010, HideEntry = 0x9020;
     struct Call {
         u64 entry{};
@@ -129,7 +123,7 @@ struct ControllerFixture {
     std::vector<std::string> logs;
     std::unique_ptr<Equip::Controller> controller;
 
-    explicit ControllerFixture(bool guarded_boots = false) {
+    ControllerFixture() {
         *keys = MemoryKeys();
         keys->enabled = true;
         keys->fields.insert({{"holder", 0x100}, {"equipment", 0x20}, {"owner", 0x28},
@@ -170,7 +164,7 @@ struct ControllerFixture {
         memory.Text(NameAt, "PrivateOwner");
         port = memory.Port();
         port.write = [this](u64 at, const void* bytes, size_t size) {
-            if (at < Scratch || at + size > Scratch + Equip::MaxTrees * Equip::TreeBytes) return false;
+            if (at < Table || at + size > Table + TableBytes) return false;
             const auto* data = static_cast<const u8*>(bytes);
             for (size_t i = 0; i < size; ++i) memory.bytes[at + i] = data[i];
             return true;
@@ -195,22 +189,35 @@ struct ControllerFixture {
         desired.age = 0;
         root = {{"peerA", "SceneA", 1, Actor, Record, Equipment, 10, 0}, true, Packet(desired)};
         auto names = Names();
-        if (guarded_boots) {
-            keys->boots_enabled = true;
-            keys->guard = BootGuard();
-            for (size_t i = 0; i < keys->guard.words.size(); ++i)
-                memory.Write(Base + keys->guard.at + i * 4, keys->guard.words[i], 4);
-            names.rows.push_back({Slot::Boots, 1, 1, "SourceBoots", "PrivateBoots", {}});
-            desired = {};
-            desired.age = 1;
-            desired.boots = 1;
-            root.token.age = 1;
-            root.desired = Packet(desired);
-        }
-        controller = std::make_unique<Equip::Controller>(keys, std::move(names), ghost, Base, Scratch);
+        controller = std::make_unique<Equip::Controller>(keys, std::move(names), ghost, Base, Table, TableBytes);
     }
 
-    bool Frame() { return controller->Frame(port, {root}, root.token.scene, true); }
+    /// A validated child at `slot`, related to the owner through a one-entry dependency ring.
+    void AddChild(Slot slot, u64 child, u32 generation, std::string_view name) {
+        const u64 link = Equipment + keys->slots[Index(slot)].link, record = child + 0x800,
+                  text = child + 0x900, manager = 0x30000, indices = 0x31000, pairs = 0x32000;
+        memory.Write(link, record, 8);
+        memory.Write(link + 8, generation, 4);
+        memory.Write(record, child, 8);
+        memory.Write(record + 8, generation, 4);
+        memory.Write(child + 0x120, text, 8);
+        memory.Write(child + 0x130, 6, 4);
+        memory.Text(text, name);
+        memory.Write(Base + 64, manager, 8);
+        memory.Write(Actor + 80, indices, 8);
+        memory.Write(Actor + 88, 1, 4);
+        memory.Write(Actor + 92, 0, 4);
+        memory.Write(Actor + 96, 1, 4);
+        memory.Write(manager + 16, pairs, 8);
+        memory.Write(manager + 24, 1, 4);
+        memory.Write(indices, 0, 4);
+        memory.Write(pairs, Actor, 8);
+        memory.Write(pairs + 16, child, 8);
+    }
+    bool Frame(bool eligible = true) {
+        root.eligible = eligible;
+        return controller->Frame(port, {root}, root.token.scene, true);
+    }
     void UntilCall() {
         for (unsigned i = 0; i < 32; ++i) if (Frame()) return;
         FAIL("expected a bounded equipment call");
@@ -218,7 +225,7 @@ struct ControllerFixture {
 };
 } // namespace
 
-TEST_CASE("Equipment word exhausts each mod field", "[oot][coop][equip]") {
+TEST_CASE("Equipment word exhausts each mod field", "[core][oot_coop][equip]") {
     constexpr std::array members{&Equip::Appearance::sword, &Equip::Appearance::shield,
         &Equip::Appearance::sword_state, &Equip::Appearance::shield_state,
         &Equip::Appearance::tunic, &Equip::Appearance::boots, &Equip::Appearance::mask,
@@ -246,7 +253,7 @@ TEST_CASE("Equipment word exhausts each mod field", "[oot][coop][equip]") {
     }
 }
 
-TEST_CASE("Equipment rejects malformed words and contradictory age", "[oot][coop][equip]") {
+TEST_CASE("Equipment rejects malformed words and contradictory age", "[core][oot_coop][equip]") {
     for (u64 word : {~u64{}, u64{1} << 32, u64{0}, u64{0x10200000}, u64{0x10080000},
                      u64{0x10000004}, u64{0x1002c000}, u64{0x20000000}}) {
         CAPTURE(word);
@@ -268,7 +275,7 @@ TEST_CASE("Equipment rejects malformed words and contradictory age", "[oot][coop
     REQUIRE_FALSE(Equip::Settled(1, 3));
 }
 
-TEST_CASE("Equipment packet requires actual JSON integers", "[oot][coop][equip]") {
+TEST_CASE("Equipment packet requires actual JSON integers", "[core][oot_coop][equip]") {
     const Json good{{"eq32", 0x10000000}, {"eqseq", 65535}};
     REQUIRE(Equip::DecodePacket(good, true) == Equip::Packet{0x10000000, 65535});
     REQUIRE_FALSE(Equip::DecodePacket(good, false));
@@ -286,7 +293,7 @@ TEST_CASE("Equipment packet requires actual JSON integers", "[oot][coop][equip]"
     REQUIRE_FALSE(Equip::DecodePacket(Json{{"eq32", 0x10000000}, {"eqseq", 65536}}, true));
 }
 
-TEST_CASE("Equipment sequence tracks known settled changes and wraps", "[oot][coop][equip]") {
+TEST_CASE("Equipment sequence tracks known settled changes and wraps", "[core][oot_coop][equip]") {
     Equip::Sequence sequence;
     Equip::Appearance appearance;
     REQUIRE(sequence.Sample(appearance) == 0);
@@ -315,7 +322,7 @@ TEST_CASE("Equipment sequence tracks known settled changes and wraps", "[oot][co
     REQUIRE(Equip::Newer(32767, 0));
 }
 
-TEST_CASE("Equipment reconciliation waits for sword and private sheath before other slots", "[oot][coop][equip]") {
+TEST_CASE("Equipment reconciliation waits for sword and private sheath before other slots", "[core][oot_coop][equip]") {
     Equip::Reconciler reconcile;
     Equip::Appearance appearance{1, 1, 1, 1, 1, 3, 0, 1, 0};
     REQUIRE(reconcile.Desired(Packet(appearance), 1));
@@ -348,7 +355,7 @@ TEST_CASE("Equipment reconciliation waits for sword and private sheath before ot
     REQUIRE(work.slot == Slot::Shield);
 }
 
-TEST_CASE("Equipment replacements coalesce behind their predecessor generation", "[oot][coop][equip]") {
+TEST_CASE("Equipment replacements coalesce behind their predecessor generation", "[core][oot_coop][equip]") {
     Equip::Reconciler reconcile;
     Equip::Appearance appearance;
     appearance.age = 0;
@@ -364,7 +371,7 @@ TEST_CASE("Equipment replacements coalesce behind their predecessor generation",
     reconcile.Issued(work, observations[0]);
     appearance.sword = 3;
     REQUIRE(reconcile.Desired(Packet(appearance, 0), 0));
-    REQUIRE_FALSE(reconcile.Desired(Packet(appearance, 65534), 0));
+    REQUIRE(reconcile.Desired(Packet(appearance, 65534), 0)); // arrival order, never eqseq, decides
     Child(observations, Slot::Sword, "PrivateB", 10);
     Child(observations, Slot::Sheath, "PrivateCaseB");
     REQUIRE(reconcile.Step(observations, names, 0, true, false).action == Action::None);
@@ -381,7 +388,7 @@ TEST_CASE("Equipment replacements coalesce behind their predecessor generation",
     REQUIRE_FALSE(reconcile.Desired(Packet(appearance, 2), 0));
 }
 
-TEST_CASE("Equipment cannot skip an unreadable or busy earlier slot", "[oot][coop][equip]") {
+TEST_CASE("Equipment cannot skip an unreadable or busy earlier slot", "[core][oot_coop][equip]") {
     Equip::Reconciler reconcile;
     Equip::Appearance appearance{1, 1, 2, 2, 3, 3, 15, 0, 0};
     REQUIRE(reconcile.Desired(Packet(appearance), 0));
@@ -393,7 +400,7 @@ TEST_CASE("Equipment cannot skip an unreadable or busy earlier slot", "[oot][coo
     REQUIRE(reconcile.Step(observations, Names(), 0, true, false).action == Action::None);
 }
 
-TEST_CASE("Equipment timeout counts eligible updates and latches quarantine", "[oot][coop][equip]") {
+TEST_CASE("Equipment timeout counts eligible updates and latches quarantine", "[core][oot_coop][equip]") {
     Equip::Reconciler reconcile;
     Equip::Appearance appearance;
     appearance.age = 0;
@@ -415,7 +422,7 @@ TEST_CASE("Equipment timeout counts eligible updates and latches quarantine", "[
     REQUIRE(reconcile.Step(observations, names, 0, true, false).action == Action::Quarantine);
 }
 
-TEST_CASE("Equipment none defaults to preservation and boots stay blocked", "[oot][coop][equip]") {
+TEST_CASE("Equipment none defaults to preservation and boots stay blocked", "[core][oot_coop][equip]") {
     Equip::Reconciler reconcile;
     Equip::Appearance appearance;
     appearance.age = 0;
@@ -432,7 +439,7 @@ TEST_CASE("Equipment none defaults to preservation and boots stay blocked", "[oo
     REQUIRE(reconcile.Step(observations, names, 0, true, true).action == Action::Recreate);
 }
 
-TEST_CASE("Equipment native arguments keep creation and dynamic slot domains separate", "[oot][coop][equip]") {
+TEST_CASE("Equipment native arguments keep creation and dynamic slot domains separate", "[core][oot_coop][equip]") {
     Equip::Keys keys;
     keys.dynamic_arguments = {2, 0xffffffff, 1, 0, 0};
     keys.static_arguments = {0, 1, 0, 0, 0};
@@ -456,7 +463,7 @@ TEST_CASE("Equipment native arguments keep creation and dynamic slot domains sep
     }
 }
 
-TEST_CASE("Equipment child links reject stale records and retiring lifecycle", "[oot][coop][equip]") {
+TEST_CASE("Equipment child links reject stale records and retiring lifecycle", "[core][oot_coop][equip]") {
     auto memory = LinkMemory();
     auto port = memory.Port();
     const auto keys = MemoryKeys();
@@ -481,7 +488,7 @@ TEST_CASE("Equipment child links reject stale records and retiring lifecycle", "
     REQUIRE_FALSE(Equip::ReadLink(port, keys, 0));
 }
 
-TEST_CASE("Equipment links revalidate generation after reading the child", "[oot][coop][equip]") {
+TEST_CASE("Equipment links revalidate generation after reading the child", "[core][oot_coop][equip]") {
     auto memory = LinkMemory();
     auto port = memory.Port();
     const auto read = port.r8;
@@ -492,7 +499,7 @@ TEST_CASE("Equipment links revalidate generation after reading the child", "[oot
     REQUIRE_FALSE(Equip::ReadLink(port, MemoryKeys(), 0x1000));
 }
 
-TEST_CASE("Equipment child names require bounded valid guest strings", "[oot][coop][equip]") {
+TEST_CASE("Equipment child names require bounded valid guest strings", "[core][oot_coop][equip]") {
     auto memory = LinkMemory();
     const auto port = memory.Port();
     const auto keys = MemoryKeys();
@@ -505,7 +512,7 @@ TEST_CASE("Equipment child names require bounded valid guest strings", "[oot][co
     REQUIRE_FALSE(Equip::ReadLink(port, keys, 0x1000));
 }
 
-TEST_CASE("Equipment relationship validates bounded wrapped owner rings and races", "[oot][coop][equip]") {
+TEST_CASE("Equipment relationship validates bounded wrapped owner rings and races", "[core][oot_coop][equip]") {
     Memory memory;
     const auto keys = MemoryKeys();
     constexpr u64 base = 0x1000, owner = 0x2000, manager = 0x3000, indices = 0x4000,
@@ -540,39 +547,87 @@ TEST_CASE("Equipment relationship validates bounded wrapped owner rings and race
     REQUIRE_FALSE(Equip::Related(port, keys, base, owner, child));
 }
 
-TEST_CASE("Equipment controller rejects stale owner returns and never reuses generation scratch", "[oot][coop][equip]") {
+TEST_CASE("Equipment controller rejects stale owner returns and writes each name cell once", "[core][oot_coop][equip]") {
     ControllerFixture fixture;
     fixture.UntilCall();
     REQUIRE(fixture.controller->Calling());
     REQUIRE(fixture.calls.size() == 1);
     REQUIRE(fixture.calls[0].entry == ControllerFixture::CreateEntry);
-    const auto old_cell = fixture.calls[0].args[2];
-    REQUIRE(old_cell == ControllerFixture::Scratch);
-    REQUIRE(fixture.memory.Read(old_cell, 8) == old_cell + 8);
+    const auto cell = fixture.calls[0].args[2];
+    REQUIRE(cell == ControllerFixture::Table);
+    REQUIRE(fixture.memory.Read(cell, 8) == cell + 8);
+    const auto before = fixture.memory.bytes;
 
+    // The owner is re-created (new generation) while its request is in flight.
     fixture.memory.Write(ControllerFixture::Actor + 0x118, 11, 4);
     fixture.memory.Write(ControllerFixture::Record + 8, 11, 4);
     fixture.root.token.generation = 11;
-    fixture.controller->Returned(fixture.port, 0);
+    fixture.controller->Returned(fixture.port, 0); // would quarantine if accepted
     REQUIRE_FALSE(fixture.controller->Calling());
+    REQUIRE_FALSE(fixture.controller->Blocked(ControllerFixture::Actor, 10));
     REQUIRE_FALSE(fixture.controller->Blocked(ControllerFixture::Actor, 11));
     fixture.UntilCall();
     REQUIRE(fixture.calls.size() == 2);
-    REQUIRE(fixture.calls[1].entry == ControllerFixture::CreateEntry);
-    REQUIRE(fixture.calls[1].args[2] == old_cell + Equip::TreeBytes);
-    REQUIRE(fixture.memory.Read(old_cell, 8) == old_cell + 8);
-    REQUIRE(fixture.controller->Blocked(ControllerFixture::Actor, 10));
-    REQUIRE_FALSE(fixture.controller->Blocked(ControllerFixture::Actor, 11));
+    // The same allowlisted name reuses its immutable cell; nothing in the table was rewritten.
+    REQUIRE(fixture.calls[1].args[2] == cell);
+    for (const auto& [address, value] : before)
+        if (address >= ControllerFixture::Table && address < ControllerFixture::Table + ControllerFixture::TableBytes)
+            REQUIRE(fixture.memory.bytes.at(address) == value);
     REQUIRE(std::none_of(fixture.logs.begin(), fixture.logs.end(), [](const std::string& line) {
         return line.find("request refused") != std::string::npos;
     }));
     fixture.controller->Returned(fixture.port, 1);
 }
 
-TEST_CASE("Equipment controller timeout retires and parks without another create", "[oot][coop][equip]") {
+TEST_CASE("Equipment name table is bounded, aligned and refuses unsafe names", "[core][oot_coop][equip]") {
+    Memory memory;
+    auto port = memory.Port();
+    std::vector<std::pair<u64, size_t>> writes;
+    port.write = [&](u64 at, const void* bytes, size_t size) {
+        writes.emplace_back(at, size);
+        const auto* data = static_cast<const u8*>(bytes);
+        for (size_t i = 0; i < size; ++i) memory.bytes[at + i] = data[i];
+        return true;
+    };
+    port.log = [](std::string_view) {};
+    Equip::NameTable table{0x1000, 0x40};
+    const auto a = table.Cell(port, "Abc");
+    REQUIRE(a == 0x1000);
+    REQUIRE(memory.Read(0x1000, 8) == 0x1008);
+    REQUIRE(table.Cell(port, "Abc") == a);
+    REQUIRE(writes.size() == 1);
+    const auto b = table.Cell(port, "Defgh");
+    REQUIRE(b == 0x1010);
+    REQUIRE(*b % 8 == 0);
+    REQUIRE_FALSE(table.Cell(port, "bad name"));
+    REQUIRE_FALSE(table.Cell(port, std::string(40, 'x'))); // does not fit: refused, not truncated
+    REQUIRE(table.Cell(port, "Ij") == 0x1020);
+    REQUIRE_FALSE(table.Park(port)); // 48 bytes no longer fit
+}
+
+TEST_CASE("Equipment suspends, never retires, an owner that is only ineligible", "[core][oot_coop][equip]") {
     ControllerFixture fixture;
     fixture.UntilCall();
     fixture.controller->Returned(fixture.port, 1);
+    for (unsigned i = 0; i < 2000; ++i) REQUIRE_FALSE(fixture.Frame(false));
+    REQUIRE_FALSE(fixture.controller->Blocked(ControllerFixture::Actor, 10));
+    REQUIRE(std::none_of(fixture.logs.begin(), fixture.logs.end(), [](const std::string& line) {
+        return line.find("retired") != std::string::npos || line.find("quarantined") != std::string::npos;
+    }));
+    // Back in view: the pending request resumes its timeout from where it stood, once.
+    fixture.AddChild(Slot::Sword, 0x40000, 77, "PrivateA");
+    fixture.AddChild(Slot::Sheath, 0x50000, 78, "PrivateCaseA");
+    for (unsigned i = 0; i < 32 && !fixture.controller->Calling(); ++i) fixture.Frame();
+    REQUIRE(fixture.controller->Calling());
+    REQUIRE(fixture.calls.back().entry == ControllerFixture::CreateEntry + 8); // actual-state query
+}
+
+TEST_CASE("Equipment controller timeout quarantines, parks its children once and never re-creates", "[core][oot_coop][equip]") {
+    ControllerFixture fixture;
+    fixture.UntilCall();
+    fixture.controller->Returned(fixture.port, 1);
+    // A wrong child arrives (not the requested name): the request never settles.
+    fixture.AddChild(Slot::Sword, 0x40000, 77, "PrivateB");
     for (unsigned i = 0; i < 1000 && !fixture.controller->Blocked(ControllerFixture::Actor, 10); ++i) {
         if (fixture.Frame()) fixture.controller->Returned(fixture.port, 1);
     }
@@ -581,126 +636,38 @@ TEST_CASE("Equipment controller timeout retires and parks without another create
     REQUIRE(std::any_of(fixture.logs.begin(), fixture.logs.end(), [](const std::string& line) {
         return line.find("timeout/quarantined") != std::string::npos;
     }));
-    for (unsigned i = 0; i < 60; ++i) {
+    for (unsigned i = 0; i < 700; ++i) {
         if (fixture.Frame()) fixture.controller->Returned(fixture.port, 1);
     }
     REQUIRE(std::count_if(fixture.calls.begin(), fixture.calls.end(), [](const ControllerFixture::Call& call) {
         return call.entry == ControllerFixture::CreateEntry;
     }) == 1);
-    REQUIRE(std::any_of(fixture.calls.begin(), fixture.calls.end(), [](const ControllerFixture::Call& call) {
-        return call.entry == ControllerFixture::ParkEntry && call.args[0] == ControllerFixture::Actor;
-    }));
+    REQUIRE(std::count_if(fixture.calls.begin(), fixture.calls.end(), [](const ControllerFixture::Call& call) {
+        return call.entry == ControllerFixture::ParkEntry && call.args[0] == 0x40000;
+    }) == 1);
+    // Still listed by the ghost driver: the quarantine holds past the park window.
+    REQUIRE(fixture.controller->Blocked(ControllerFixture::Actor, 10));
 }
 
-TEST_CASE("Equipment boots guard validates compare branch and the whole byte span", "[oot][coop][equip]") {
-    const auto guard = BootGuard();
-    REQUIRE(guard.Valid());
-    for (unsigned change = 0; change < 10; ++change) {
-        auto bad = guard;
-        switch (change) {
-        case 0: bad.at = 0; break;
-        case 1: ++bad.at; break;
-        case 2: bad.resume = bad.at; break;
-        case 3: bad.resume += 4; break;
-        case 4: bad.equipment_register = 31; break;
-        case 5: bad.slot_register = 6; break;
-        case 6: bad.words[0] |= 1U << 22; break; // shifted immediate
-        case 7: bad.words[0] |= 1U << 31; break; // 64-bit compare
-        case 8: bad.words[1] &= ~1U; break;     // B.EQ instead of B.NE
-        case 9: bad.words[1] += 1U << 5; break; // different continuation
-        }
-        CAPTURE(change);
-        REQUIRE_FALSE(bad.Valid());
-    }
-    auto bad = guard;
-    bad.words.resize(1);
-    REQUIRE_FALSE(bad.Valid());
-    bad.words.resize(129);
-    REQUIRE_FALSE(bad.Valid());
-
-    Memory memory;
-    Equip::Keys keys;
-    keys.guard = guard;
-    constexpr u64 base = 0x100000;
-    for (size_t i = 0; i < guard.words.size(); ++i)
-        memory.Write(base + guard.at + i * 4, guard.words[i], 4);
-    const auto port = memory.Port();
-    REQUIRE(Equip::VerifyBootGuard(port, keys, base));
-    for (size_t i = 0; i < guard.words.size(); ++i) {
-        const u64 at = base + guard.at + i * 4;
-        memory.Write(at, guard.words[i] ^ 1U, 4);
-        REQUIRE_FALSE(Equip::VerifyBootGuard(port, keys, base));
-        memory.Write(at, guard.words[i], 4);
-    }
-    memory.bytes.erase(base + guard.resume - 1);
-    REQUIRE_FALSE(Equip::VerifyBootGuard(port, keys, base));
-}
-
-TEST_CASE("Equipment guarded compare updates NZCV and preserves other processor flags", "[oot][coop][equip]") {
-    struct Case { u32 left, right, nzcv; };
-    constexpr std::array cases{Case{0, 0, 0x60000000}, Case{1, 0, 0x20000000},
-        Case{0, 1, 0x80000000}, Case{0x80000000, 1, 0x30000000},
-        Case{0x7fffffff, 0xffffffff, 0x90000000}, Case{0xffffffff, 0, 0xa0000000}};
-    for (const auto& test : cases) {
-        for (u32 old_flags = 0; old_flags < 16; ++old_flags) {
-            constexpr u32 preserved = 0x01234567;
-            REQUIRE(Equip::CompareFlags(test.left, test.right, (old_flags << 28) | preserved) ==
-                    (test.nzcv | preserved));
-        }
-    }
-}
-
-TEST_CASE("Equipment guarded boots follow tunic and precede default head", "[oot][coop][equip]") {
-    auto names = Names();
-    names.rows.push_back({Slot::Boots, 1, 1, "SourceBoots", "PrivateBoots", {}});
-    Equip::Appearance appearance;
-    appearance.age = 1;
-    appearance.tunic = 1;
-    appearance.boots = 1;
-    appearance.mask = 0;
-    Equip::Reconciler reconcile;
-    REQUIRE(reconcile.Desired(Packet(appearance), 1));
-    auto observations = Empty();
-    auto work = reconcile.Step(observations, names, 1, true, false, true);
-    REQUIRE(work.action == Action::Create);
-    REQUIRE(work.slot == Slot::Tunic);
-    reconcile.Issued(work, observations[Index(Slot::Tunic)]);
-    REQUIRE(reconcile.Step(observations, names, 1, true, false, true).action == Action::None);
-    Child(observations, Slot::Tunic, "PrivateE");
-    work = reconcile.Step(observations, names, 1, true, false, true);
-    REQUIRE(work.action == Action::Create);
-    REQUIRE(work.slot == Slot::Boots);
-    reconcile.Issued(work, observations[Index(Slot::Boots)]);
-    REQUIRE(reconcile.Step(observations, names, 1, true, false, true).action == Action::None);
-    Child(observations, Slot::Boots, "PrivateBoots");
-    work = reconcile.Step(observations, names, 1, true, false, true);
-    REQUIRE(work.action == Action::Create);
-    REQUIRE(work.slot == Slot::Head);
-
-    Equip::Reconciler disabled;
-    appearance.tunic = 3;
-    appearance.mask = 15;
-    REQUIRE(disabled.Desired(Packet(appearance), 1));
-    REQUIRE(disabled.Step(Empty(), names, 1, true, false).action == Action::None);
-}
-
-TEST_CASE("Equipment boots bypass is scoped to its pending owner and verified request", "[oot][coop][equip]") {
-    ControllerFixture fixture{true};
-    const u64 pc = ControllerFixture::Base + fixture.keys->guard.at;
-    const u32 slot = fixture.keys->slots[Index(Slot::Boots)].create;
-    REQUIRE_FALSE(fixture.controller->Guard(fixture.port, pc, ControllerFixture::Equipment, slot));
+TEST_CASE("Equipment forgets a retired owner once the game deleted it", "[core][oot_coop][equip]") {
+    ControllerFixture fixture;
     fixture.UntilCall();
-    REQUIRE(fixture.calls.back().entry == ControllerFixture::CreateEntry + 4);
-    REQUIRE_FALSE(fixture.controller->Guard(fixture.port, pc + 4, ControllerFixture::Equipment, slot));
-    REQUIRE_FALSE(fixture.controller->Guard(fixture.port, pc, ControllerFixture::Equipment + 8, slot));
-    REQUIRE_FALSE(fixture.controller->Guard(fixture.port, pc, ControllerFixture::Equipment, slot + 1));
-    const u64 cell = fixture.calls.back().args[2];
-    fixture.memory.Text(cell + 8, "WrongBoots");
-    REQUIRE_FALSE(fixture.controller->Guard(fixture.port, pc, ControllerFixture::Equipment, slot));
-    fixture.memory.Text(cell + 8, "PrivateBoots");
-    REQUIRE(fixture.controller->Guard(fixture.port, pc, ControllerFixture::Equipment, slot) ==
-            ControllerFixture::Base + fixture.keys->guard.resume);
-    fixture.memory.Write(ControllerFixture::Record + 8, 11, 4);
-    REQUIRE_FALSE(fixture.controller->Guard(fixture.port, pc, ControllerFixture::Equipment, slot));
     fixture.controller->Returned(fixture.port, 1);
+    fixture.controller->Invalidate(); // scene change
+    fixture.memory.Write(ControllerFixture::Record + 8, 12, 4); // the record now names another actor
+    fixture.Frame();
+    REQUIRE_FALSE(fixture.controller->Blocked(ControllerFixture::Actor, 10));
+    // Many owners over a long session never exhaust a budget: each new generation gets a tree.
+    for (u32 generation = 20; generation < 60; ++generation) {
+        fixture.memory.Write(ControllerFixture::Actor + 0x118, generation, 4);
+        fixture.memory.Write(ControllerFixture::Record + 8, generation, 4);
+        fixture.root.token.generation = generation;
+        const auto calls = fixture.calls.size();
+        for (unsigned i = 0; i < 32 && fixture.calls.size() == calls; ++i)
+            if (fixture.Frame()) fixture.controller->Returned(fixture.port, 1);
+        REQUIRE(fixture.calls.size() > calls);
+    }
+    REQUIRE(std::none_of(fixture.logs.begin(), fixture.logs.end(), [](const std::string& line) {
+        return line.find("budget") != std::string::npos;
+    }));
 }
