@@ -20,6 +20,8 @@
 #include "common/settings.h"
 #include "core/core_timing.h"
 #include "core/frontend/graphics_context.h"
+#include "core/arm/dynarmic/oot_coop_ux.h"
+#include "video_core/coop_overlay.h"
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
 #include "video_core/present.h"
@@ -267,11 +269,14 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         Frame* generated = present_manager.GetRenderFrame();
         blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
         frame_gen.GenerateInto(device, generated, generation);
+        DrawCoopOverlay(generated);
         scheduler.Flush(*generated->render_ready);
         present_manager.Present(generated);
     }
 #endif
 
+    // After frame generation consumed the real frame, so the text never feeds the interpolation.
+    DrawCoopOverlay(frame);
     if (trace) {
         scheduler.MarkFrameEnd(++trace_frame);
     }
@@ -378,8 +383,39 @@ void RendererVulkan::RenderScreenshot(std::span<const Tegra::FramebufferConfig> 
 
     std::memcpy(renderer_settings.screenshot_bits, dst_buffer.Mapped().data(),
                 dst_buffer.Mapped().size());
+    static const bool coop_shots = Core::OotCoop::Ux::Switch("OVERLAY_SHOTS");
+    if (coop_shots) {
+        const auto coop = Core::OotCoop::Ux::Current();
+        if (!coop.Empty()) {
+            const VideoCore::CoopOverlay::Rect screen{
+                static_cast<s32>(layout.screen.left), static_cast<s32>(layout.screen.top),
+                static_cast<s32>(layout.screen.right), static_cast<s32>(layout.screen.bottom)};
+            VideoCore::CoopOverlay::BlendBgra(
+                std::span<u8>{static_cast<u8*>(renderer_settings.screenshot_bits),
+                              size_t{layout.width} * layout.height * 4},
+                layout.width, layout.height,
+                VideoCore::CoopOverlay::Layout(coop, screen, layout.width, layout.height));
+        }
+    }
     renderer_settings.screenshot_complete_callback(false);
     renderer_settings.screenshot_requested = false;
+}
+
+void RendererVulkan::DrawCoopOverlay(Frame* frame) {
+    static const bool wanted = Core::OotCoop::Ux::Switch("TOAST") || Core::OotCoop::Ux::Switch("NAMETAG");
+    if (!wanted) {
+        return;
+    }
+    try {
+        if (!coop_overlay) {
+            coop_overlay = std::make_unique<CoopOverlay>(memory_allocator, scheduler);
+        }
+        coop_overlay->Draw(*frame->image, swapchain.GetImageFormat(), frame->width, frame->height,
+                           render_window.GetFramebufferLayout());
+    } catch (const std::exception& error) {
+        LOG_WARNING(Render_Vulkan, "OoT co-op overlay off: {}", error.what());
+        coop_overlay.reset();
+    }
 }
 
 std::vector<u8> RendererVulkan::GetAppletCaptureBuffer() {

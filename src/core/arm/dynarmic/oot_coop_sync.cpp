@@ -24,6 +24,7 @@
 #include "core/arm/dynarmic/oot_coop_sync.h"
 #include "core/arm/dynarmic/oot_coop_ghost.h"
 #include "core/arm/dynarmic/oot_coop_runtime.h"
+#include "core/arm/dynarmic/oot_coop_ux.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
 #include "dynarmic/interface/A64/a64.h"
@@ -854,6 +855,7 @@ struct Session::Impl {
     u32 attempts{}, reconnects{};
     bool ever_ready{};
     std::chrono::seconds backoff{1};
+    Ux::SessionUx ux; // toasts and name tags (host only)
     void OnPose(std::string origin, Pose pose) {
         std::scoped_lock lock{mutex};
         if (!peers.contains(origin)) {
@@ -1031,6 +1033,11 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                         // A peer that went offline hides its ghost (the frame drain parks it).
                         const auto& state = packet->at("state");
                         if (packet->contains("origin") && packet->at("origin").is_string() &&
+                            state.is_object() && state.contains("name") && state.at("name").is_string()) {
+                            self->owner.ux.SetName(packet->at("origin").get<std::string>(),
+                                                   state.at("name").get<std::string>());
+                        }
+                        if (packet->contains("origin") && packet->at("origin").is_string() &&
                             state.is_object() && state.contains("online") &&
                             state.at("online") == false) {
                             const auto origin = packet->at("origin").get<std::string>();
@@ -1052,7 +1059,8 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                         if (!self->ready) {
                             self->ready = true;
                             self->Send({{"type", "client_state"},
-                                        {"state", {{"apply_enabled", !self->owner.allowed_classes.empty()}}}});
+                                        {"state", {{"apply_enabled", !self->owner.allowed_classes.empty()},
+                                                   {"name", self->owner.hello.name}}}});
                             const bool again = std::exchange(self->owner.ever_ready, true);
                             if (again) ++self->owner.reconnects;
                             self->owner.attempts = 0;
@@ -1250,6 +1258,11 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
                         profile->ghost.Valid() ? "no private call memory" : "the private profile has no ghost object");
         }
     }
+    {
+        std::string why;
+        impl->ux.Configure(Ux::LoadConfig(profile->build_id, &why));
+        LOG_INFO(Core_ARM, "OoT co-op: UX {}", why);
+    }
     impl->Start();
 }
 Session::~Session() = default;
@@ -1281,7 +1294,10 @@ void Session::ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory) {
         ++impl->item_lines;
         LOG_INFO(Core_ARM, "OoT co-op: {}", call.line);
     }
-    if (call.forward) Observe(call.change);
+    if (call.forward) {
+        Observe(call.change);
+        impl->ux.ItemShared(call.change.name, call.change.value);
+    }
 }
 
 bool Session::IsSentinel(u64 pc) const {
@@ -1317,6 +1333,8 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             runtime.LastGrant()->kind == Kind::Item) {
             log(fmt::format("OoT co-op: item give returned w0={} name={}", result & 1,
                             runtime.LastGrant()->name));
+            const auto& grant = *runtime.LastGrant();
+            if (result & 1) impl->ux.ItemReceived(grant.origin, grant.seq, grant.name, grant.value);
         }
         if (event == ApplyEvent::Returned && runtime.LastGrant() &&
             runtime.LastGrant()->kind == Kind::Rupee) {
@@ -1328,6 +1346,8 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             const auto pending = pouch ? Read32(memory, pouch + 0x3BD4) : std::nullopt;
             log(fmt::format("OoT co-op: rupee pending={} after the call (pouch {:#x})",
                             static_cast<s32>(pending.value_or(0)), pouch));
+            const auto& grant = *runtime.LastGrant();
+            impl->ux.RupeeReceived(grant.origin, grant.seq, grant.value);
         }
         // An unowned/invalid sentinel must reach the normal breakpoint fault, never resume.
         if (event != ApplyEvent::Returned) {
@@ -1433,6 +1453,15 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
         }
         for (const auto& [origin, track] : impl->peers) peers.push_back({origin, track.At(now)});
     }
+    {
+        std::vector<Ux::TagPeer> tag_peers;
+        for (const auto& peer : peers) {
+            if (!peer.pose) continue;
+            tag_peers.push_back({peer.origin, peer.pose->banc, peer.pose->loading, peer.pose->child,
+                                 peer.pose->pos}); // name: the origin, resolved by the session
+        }
+        impl->ux.Frame(memory, base, local.banc, local.loading, std::move(tag_peers), log);
+    }
     // Grants keep priority: the one call slot of this frame is theirs when they used it.
     if (grant_calling) return;
     Impl::GhostPort port{backend, memory, *impl};
@@ -1446,6 +1475,7 @@ void BeginSession() {
         old = std::exchange(current_session, nullptr);
     }
     if (old) old->Stop();
+    Ux::Reset();
 }
 
 void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 program_id, u64 base,
