@@ -930,6 +930,7 @@ struct Session::Impl {
     // Class dungeon (guest side, under guest_mutex): small-key Int pairs and their watches.
     std::vector<DungeonKeys> dungeon_keys;
     std::map<u32, KeyWatch> key_watch; // by total key
+    u64 key_lines{};
     bool stable_frame{};
     bool baseline_ready{};
     bool logged_class{};
@@ -1541,20 +1542,32 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     // Class dungeon: watch every dungeon's small-key pair; send a local gain as key_add.
     if (runtime.BaselineReady() && impl->allowed_classes.contains(Kind::Key) &&
         !runtime.Calling()) {
+        // A real pickup gains one key in one dungeon. Several dungeons at once, or more than two keys
+        // in a frame, is a save load or a reset seen in place: re-baseline, never forward.
+        std::vector<std::pair<u32, s64>> gains;
         for (const auto& pair : impl->dungeon_keys) {
             auto& watch = impl->key_watch[pair.total];
             const auto total = backend.ReadInt(pair.total), count = backend.ReadInt(pair.count);
             const bool first = !watch.total;
             const s64 gain = watch.Step(total, count);
-            if (first && watch.total) {
+            if (first && watch.total && impl->key_lines < 64) {
+                ++impl->key_lines;
                 log(fmt::format("OoT co-op: key baseline total={:08x}={} count={:08x}={}", pair.total,
                                 *watch.total, pair.count, *watch.count));
             }
-            if (gain > 0 && KeyGain(gain)) {
-                log(fmt::format("OoT co-op: key gain observed total={:08x} now {} count {} +{}",
-                                pair.total, *watch.total, *watch.count, gain));
-                Observe(Change{Kind::Key, {}, 0, pair.total, gain});
+            if (gain > 0) gains.emplace_back(pair.total, gain);
+        }
+        const bool bulk = gains.size() > 1 ||
+                          std::any_of(gains.begin(), gains.end(), [](const auto& g) { return g.second > 2; });
+        for (const auto& [total_key, gain] : gains) {
+            const auto& watch = impl->key_watch[total_key];
+            if (impl->key_lines < 64) {
+                ++impl->key_lines;
+                log(fmt::format("OoT co-op: key gain {} total={:08x} now {} count {} +{}",
+                                bulk ? "not forwarded (bulk change: a load, not a pickup)" : "observed",
+                                total_key, watch.total.value_or(0), watch.count.value_or(0), gain));
             }
+            if (!bulk && KeyGain(gain)) Observe(Change{Kind::Key, {}, 0, total_key, gain});
         }
     }
     if (runtime.BaselineReady()) {
