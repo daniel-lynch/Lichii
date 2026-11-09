@@ -5,6 +5,8 @@
 #include <bit>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
+#include <vector>
 #include <catch2/catch_test_macros.hpp>
 #include "core/arm/dynarmic/oot_coop_anim.h"
 
@@ -575,4 +577,60 @@ TEST_CASE("OoT animation private key decoder rejects partial and unknown configu
     bad = keys;
     bad["phase_known_ids"] = {1, 1};
     REQUIRE_FALSE(Anim::DecodeKeys(bad));
+}
+
+TEST_CASE("OoT player command watch delivers one event per slot transition", "[core][oot_coop][oot_coop_anim]") {
+    Anim::Snapshot snapshot;
+    snapshot.controllers = {{1280, 1, "SyntheticAction", 3, 1}, {1792, Anim::UnknownCommand, "", 0, 0}};
+    Anim::Player player{256, 512, 768, 7, true};
+    Anim::CommandWatch watch;
+    REQUIRE_FALSE(watch.HasSubscribers());
+    std::vector<Anim::CommandChange> seen;
+    watch.Subscribe([&](const Anim::CommandChange& change, const Anim::Snapshot& s, const Anim::Player& p) {
+        REQUIRE(&s == &snapshot);
+        REQUIRE(p == player);
+        seen.push_back(change);
+    });
+    watch.Subscribe([](const Anim::CommandChange&, const Anim::Snapshot&, const Anim::Player&) {
+        throw std::runtime_error("a failing consumer");
+    });
+    REQUIRE(watch.HasSubscribers());
+    REQUIRE(watch.Observe(snapshot, player) == 2); // first sight of each slot
+    REQUIRE_FALSE(seen[0].previous);
+    REQUIRE(seen[0].next.name == "SyntheticAction");
+    REQUIRE(seen[1].slot == 1);
+    seen.clear();
+    snapshot.controllers[0].frame = 9; // frame and rate alone are not transitions
+    snapshot.controllers[0].rate = 2;
+    REQUIRE(watch.Observe(snapshot, player) == 0);
+    snapshot.controllers[0] = {1280, 0, "SyntheticIdle", 0, 1};
+    REQUIRE(watch.Observe(snapshot, player) == 1);
+    REQUIRE(seen.size() == 1);
+    REQUIRE(seen[0].slot == 0);
+    REQUIRE(seen[0].previous->index == 1);
+    REQUIRE(seen[0].previous->name == "SyntheticAction");
+    REQUIRE(seen[0].next.index == 0);
+    seen.clear();
+    ++player.generation; // a new player identity restarts the history
+    REQUIRE(watch.Observe(snapshot, player) == 2);
+    REQUIRE_FALSE(seen[0].previous);
+    watch.Reset();
+    seen.clear();
+    REQUIRE(watch.Observe(snapshot, player) == 2);
+}
+
+TEST_CASE("OoT animation sender numbers a watched transition once", "[core][oot_coop][oot_coop_anim]") {
+    Memory memory;
+    auto keys = MemoryKeys(memory);
+    const auto table = Anim::Table::Parse(Document().dump());
+    REQUIRE(table);
+    const auto snapshot = Anim::ReadSnapshot(memory, 256, true, keys, [] { return true; });
+    REQUIRE(snapshot);
+    Anim::Sender sender;
+    const auto first = sender.Sample(*table, keys, *snapshot, true, 0);
+    REQUIRE(sender.Sample(*table, keys, *snapshot, true, 0).aseq == first.aseq);
+    sender.Transition(); // the command watch saw a source-slot transition this frame
+    const auto next = sender.Sample(*table, keys, *snapshot, true, 0);
+    REQUIRE(next.aseq == first.aseq + 1);
+    REQUIRE(sender.Sample(*table, keys, *snapshot, true, 0).aseq == next.aseq); // consumed
 }

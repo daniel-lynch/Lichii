@@ -122,6 +122,35 @@ struct Player {
     bool operator==(const Player&) const = default;
 };
 
+/// One local-player controller command transition (index, name or controller changed).
+struct CommandChange {
+    u32 slot{};
+    std::optional<Controller> previous; ///< Unset: first observation of this player/generation/age
+    Controller next;
+};
+/// The per-frame command-transition event source. The frame drain reads one Snapshot of the
+/// local player and feeds it here; consumers (the animation sender first, claim triggers later)
+/// subscribe instead of re-reading the controller chain. A subscriber runs on the guest thread
+/// inside the frame hook: it must not block or issue guest calls; exceptions are contained.
+class CommandWatch {
+public:
+    using Callback = std::function<void(const CommandChange&, const Snapshot&, const Player&)>;
+    void Subscribe(Callback callback) { subscribers.push_back(std::move(callback)); }
+    [[nodiscard]] bool HasSubscribers() const { return !subscribers.empty(); }
+    /// Fires once per slot whose command changed since the previous observation of the same
+    /// player; a different player (actor, link, record, generation or age) restarts the history.
+    /// Returns the number of transitions delivered.
+    size_t Observe(const Snapshot& snapshot, const Player& player);
+    void Reset() {
+        previous.clear();
+        owner.reset();
+    }
+private:
+    std::vector<Callback> subscribers;
+    std::vector<Controller> previous;
+    std::optional<Player> owner;
+};
+
 // Checked reads are shared by the sender snapshot and the ghost's end-of-clip observation.
 template <typename Memory>
 class Reader {
@@ -278,7 +307,8 @@ std::optional<float> ReadControllerFrame(Memory& memory, u64 actor, const Keys& 
 template <typename Memory, typename Validate>
 std::optional<Snapshot> ReadSnapshot(Memory& memory, u64 actor, bool child, const Keys& keys,
                                      Validate validate) {
-    if (!keys.sender_enabled || keys.ctl_chain.empty() || !validate()) return std::nullopt;
+    // The caller decides whether a snapshot is wanted (sender, command watch); keys only bound it.
+    if (keys.ctl_chain.empty() || !validate()) return std::nullopt;
     const Reader r{memory};
     Snapshot snapshot;
     snapshot.actor = actor;
@@ -334,9 +364,12 @@ public:
     [[nodiscard]] State Sample(const Table& table, const Keys& keys, const Snapshot& snapshot,
                                 bool child, u32 legacy_category,
                                 std::optional<u64> successful_start = std::nullopt);
+    /// The command watch reported a source-slot transition this frame (consumed by Sample).
+    void Transition() { transition = true; }
     void Reset();
 private:
     State last;
+    bool transition{};
     std::optional<Controller> previous;
     std::optional<u64> start;
     u64 actor{};

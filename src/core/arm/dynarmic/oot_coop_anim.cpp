@@ -9,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <utility>
 #include <openssl/evp.h>
 
 namespace Core::OotCoop::Anim {
@@ -464,7 +465,8 @@ State Sender::Sample(const Table& table, const Keys& keys, const Snapshot& snaps
         !std::isfinite(controller.frame) || controller.frame < 0) state = {0, last.aseq, {}, 0};
     if (entry && state.aid && (entry->phase_known || keys.phase_known_ids.contains(entry->aid)) &&
         controller.frame <= entry->frames) state.af = controller.frame;
-    const bool changed = !previous || actor != snapshot.actor || age != child ||
+    const bool changed = std::exchange(transition, false) || !previous || actor != snapshot.actor ||
+                         age != child ||
                          previous->address != controller.address || previous->index != controller.index ||
                          previous->name != controller.name || last.aid != state.aid;
     const bool observed_restart = successful_start && start && *successful_start != *start;
@@ -478,6 +480,32 @@ State Sender::Sample(const Table& table, const Keys& keys, const Snapshot& snaps
     last = state;
     return state;
 }
+size_t CommandWatch::Observe(const Snapshot& snapshot, const Player& player) {
+    if (!owner || *owner != player) {
+        previous.clear();
+        owner = player;
+    }
+    size_t fired{};
+    for (size_t slot = 0; slot < snapshot.controllers.size(); ++slot) {
+        const auto& next = snapshot.controllers[slot];
+        const Controller* before = slot < previous.size() ? &previous[slot] : nullptr;
+        if (before && before->address == next.address && before->index == next.index &&
+            before->name == next.name) continue;
+        const CommandChange change{static_cast<u32>(slot),
+                                   before ? std::optional<Controller>{*before} : std::nullopt, next};
+        for (const auto& subscriber : subscribers) {
+            try {
+                subscriber(change, snapshot, player);
+            } catch (...) {
+                // A consumer's failure never reaches the frame hook or the other consumers.
+            }
+        }
+        ++fired;
+    }
+    previous = snapshot.controllers;
+    return fired;
+}
+
 void Sender::Reset() {
     const u32 sequence = last.aseq;
     *this = {};

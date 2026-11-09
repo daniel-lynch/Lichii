@@ -985,10 +985,10 @@ struct Session::Impl {
     bool pose_enabled{};
     PoseSender sender;
     Anim::Sender anim_sender;
+    Anim::CommandWatch command_watch; // guest thread: per-frame player command transitions
     std::optional<Anim::Player> anim_player;
     std::string anim_scene;
-    std::vector<std::string> anim_slot_names;
-    u64 anim_snapshot_lines{};
+    u64 anim_snapshot_lines{}, command_lines{};
     std::shared_ptr<const Anim::Table> anim_table;
     std::map<std::string, std::string, std::less<>> animation_peers; // under mutex
     u64 peer_session{};
@@ -1380,7 +1380,8 @@ bool Session::Impl::Receive(const Json& packet) {
 
 // The ghost's persistent guest memory: the rest of our sentinel page (the brk word is at +0).
 inline constexpr u64 GhostBlock = 0x400;
-inline constexpr u64 AnimSourceLines = 512; ///< Sender source/blackboard lines per session
+inline constexpr u64 AnimSourceLines = 512; ///< Source-slot blackboard lines per session
+inline constexpr u64 CommandLines = 2048;   ///< Player command transition lines per session
 static_assert(GhostBlock + GhostSlots * GhostDriver<int>::SlotSize <= 0x1000);
 
 struct Session::Impl::GhostPort {
@@ -1469,6 +1470,45 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
             }
             impl->ghost = std::make_unique<GhostDriver<Impl::GhostPort>>(impl->ghost_offsets, base,
                 profile->anim, impl->anim_table);
+            // Command watch consumers, in order: the sender (it numbers transitions), then the
+            // bounded transition log that records which command each action uses. Claim
+            // triggers subscribe the same way. EDEN_NX2_OOT_COOP_COMMAND_LOG=1 logs without sending.
+            if (profile->anim && (profile->anim->sender_enabled || Env("EDEN_NX2_OOT_COOP_COMMAND_LOG") == "1")) {
+                Impl* const self = impl.get();
+                const auto keys = profile->anim;
+                if (keys->sender_enabled)
+                    self->command_watch.Subscribe([self, keys](const Anim::CommandChange& change,
+                                                               const Anim::Snapshot&, const Anim::Player&) {
+                        if (change.slot == keys->source_slot) self->anim_sender.Transition();
+                    });
+                self->command_watch.Subscribe([self, keys](const Anim::CommandChange& change,
+                                                           const Anim::Snapshot& snapshot,
+                                                           const Anim::Player& player) {
+                    if (self->command_lines < CommandLines) {
+                        const auto& next = change.next;
+                        const auto name = [](const Anim::Controller& c) {
+                            return c.index == Anim::UnknownCommand ? std::string{"-"} : c.name;
+                        };
+                        LOG_INFO(Core_ARM,
+                                 "OoT co-op: player command slot={} {} -> {}:{} frame={:.2f} rate={:.2f} "
+                                 "actor={:#x} generation={:#x} child={}{}",
+                                 change.slot,
+                                 change.previous ? fmt::format("{}:{}", change.previous->index,
+                                                               name(*change.previous))
+                                                 : std::string{"(first)"},
+                                 next.index, name(next), next.frame, next.rate, player.actor,
+                                 player.generation, player.child,
+                                 ++self->command_lines == CommandLines ? " (command log cap reached)" : "");
+                    }
+                    if (change.slot != keys->source_slot) return;
+                    for (const auto& value : snapshot.blackboard) {
+                        if (self->anim_snapshot_lines >= AnimSourceLines) break;
+                        ++self->anim_snapshot_lines;
+                        LOG_INFO(Core_ARM, "OoT co-op: player blackboard type={} index={} name={} value={}",
+                                 value.field.type, value.field.index, value.field.name, value.value);
+                    }
+                });
+            }
             LOG_INFO(Core_ARM, "OoT co-op: pose class on (ghost block {:#x})",
                      impl->binding.sentinel + GhostBlock);
         } else {
@@ -1818,40 +1858,22 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
         Clock::now().time_since_epoch()).count());
     const auto local = ReadLocalPose(memory, base, impl->binding.manager, profile->ghost,
                                      static_cast<u32>(impl->tick));
+    // One snapshot per frame feeds the command watch (and through it the sender); it is read
+    // only while something consumes it.
     std::optional<Anim::Snapshot> animation_snapshot;
-    if (profile->anim && impl->anim_table && profile->anim->sender_enabled &&
+    const bool sending = profile->anim && impl->anim_table && profile->anim->sender_enabled;
+    if (profile->anim && (sending || impl->command_watch.HasSubscribers()) &&
         !local.banc.empty() && !local.loading) {
         if (const auto player = Anim::FindPlayer(memory, base, local.child, *profile->anim)) {
             if (impl->anim_player != player || impl->anim_scene != local.banc) {
                 impl->anim_sender.Reset();
                 impl->anim_player = player;
                 impl->anim_scene = local.banc;
-                impl->anim_slot_names.clear();
             }
             animation_snapshot = Anim::ReadSnapshot(memory, player->actor, local.child, *profile->anim,
                 [&] { return Anim::ValidatePlayer(memory, *player, *profile->anim); });
-            if (animation_snapshot) {
-                impl->anim_slot_names.resize(animation_snapshot->controllers.size());
-                for (size_t i = 0; i < animation_snapshot->controllers.size(); ++i) {
-                    const auto& ctl = animation_snapshot->controllers[i];
-                    if (impl->anim_slot_names[i] == ctl.name) continue;
-                    impl->anim_slot_names[i] = ctl.name;
-                    // One budget for every source line (blackboard values included).
-                    const auto line = [&](std::string text) {
-                        if (impl->anim_snapshot_lines >= AnimSourceLines) return;
-                        if (++impl->anim_snapshot_lines == AnimSourceLines)
-                            text = "OoT co-op: anim source log cap reached";
-                        log(text);
-                    };
-                    line(fmt::format("OoT co-op: anim source slot={} index={} name={} frame={} rate={} generation={}",
-                                     i, ctl.index, ctl.name.empty() ? "-" : ctl.name, ctl.frame, ctl.rate,
-                                     player->generation));
-                    if (i != profile->anim->source_slot) continue;
-                    for (const auto& value : animation_snapshot->blackboard)
-                        line(fmt::format("OoT co-op: anim source blackboard type={} index={} name={} value={}",
-                                         value.field.type, value.field.index, value.field.name, value.value));
-                }
-            }
+            if (animation_snapshot) impl->command_watch.Observe(*animation_snapshot, *player);
+            if (!sending) animation_snapshot.reset();
         }
     }
     std::vector<PeerView> peers;
