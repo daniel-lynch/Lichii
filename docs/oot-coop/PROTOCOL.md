@@ -931,3 +931,29 @@ A fresh destination is used once, only for the same scene and age and a reviewed
 readiness predicate. Guest call return values are diagnostic only: arrival requires both
 native position views to converge. No cross-scene load or continuous position tracking
 is implemented.
+
+## C16 integration: capabilities together, old-relay fallback, frame order
+
+A C16 hello may carry `mod_hash` (ledger), `quest: 1` and `teleport: 1` together; the C16 relay
+echoes each in hello_ack (`ledger` + `mod_hash`, `quest`, `teleport`). `finished` (ux2) is
+client_state, not hello.
+
+The deployed c15 relay refuses any hello field it does not know with exactly
+`missing or unknown fields`, without naming the field. A C16 client that sent any of the three
+reacts ONCE: it drops every C16 capability it sent (mod hash -> no mod gate, no catch-up; quest
+class off; teleport off, no trigger polling and no teleport packets) and reconnects with the c15
+hello. Log lines, one each:
+
+```text
+OoT co-op: relay predates the ledger (c16): no mod check, no catch-up; playing on
+OoT co-op: quest class off: relay does not support it
+OoT co-op: teleport off: relay does not support it (pre-c16 relay)
+```
+
+`mod mismatch` is checked first and latches co-op off (never a fallback). Any other refusal of a
+quest hello keeps quest's own single retry without quest. Fallbacks last for the process.
+
+Frame order (one guest call per frame): cross-scene teleport (exclusive while active) ->
+grants -> world cleanup -> quest -> pose step (room window, name tags; teleport step; ghost
+driver; equipment). Quest and teleport also refuse to call while any other call is outstanding.
+

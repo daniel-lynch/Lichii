@@ -1656,6 +1656,28 @@ class LedgerUnitTests(unittest.TestCase):
         server.persist(strict=True)
         return server, a
 
+    def test_c16_combined_hello_and_quest_highwater_persists(self):
+        # C16 integration: one hello carries mod_hash + quest + teleport; the ack echoes all three, and a
+        # quest_step that advances the shared sender high-water is persisted like a change.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            server = relay.Relay(state_file=path)
+            hello = client_sim.ClientSim('a', mod_hash='a' * 64, quest=True).hello
+            hello['teleport'] = 1
+            messages = []
+            a = SimpleNamespace(send=messages.append, messages=messages)
+            server.join(a, hello)
+            ack = messages[0]
+            self.assertEqual((ack['quest'], ack['teleport'], ack['mod_hash']), (1, 1, 'a' * 64))
+            self.assertEqual(ack['ledger']['v'], 1)
+            self.assertEqual(messages[1]['quest'], [])
+            server.persist(strict=True)
+            self.assertFalse(server.dirty)
+            server.receive(a, dict(type='quest_step', origin='a', seq=5, challenge=101, step=55, index=3))
+            self.assertTrue(server.dirty)
+            server.persist(strict=True)
+            self.assertEqual(relay.Relay(state_file=path).rooms['default'].teams['default'].seen['a'], 5)
+
     def test_persist_reload_checkpoint_epoch_hash_revision(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'state.json'

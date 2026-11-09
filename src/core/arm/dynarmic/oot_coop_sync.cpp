@@ -3054,6 +3054,11 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         }
     }
     const bool cleaning = !runtime.Calling() && FrameCleanup(backend, memory, log);
+    // C16 frame order (one guest call per frame, first taker wins; every later step is told the
+    // slot is used): a live cross-scene teleport owns the whole frame (early return above); then
+    // grants (runtime.Frame) -> FrameCleanup -> FrameQuest -> FramePose, which runs the room
+    // window / name tags (no call), the teleport step, the ghost driver, then the equipment budget
+    // (ghost first; equipment takes the ghost's idle frames and every 4th frame first).
     const bool quest_call = FrameQuest(backend, memory, log, !runtime.Calling() && !cleaning);
     if (impl->pose_enabled) FramePose(backend, memory, log, runtime.Calling() || cleaning || quest_call);
     else impl->RoomFrame(std::nullopt, Room::NowMs());
