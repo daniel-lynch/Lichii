@@ -378,7 +378,133 @@ class ProtocolTests(unittest.TestCase):
         hello = dict(client_sim.ClientSim("a").hello, version=2)
         with self.assertRaisesRegex(relay.ProtocolError, "protocol version mismatch"):
             relay.validate_hello(hello)
-        self.assertEqual(relay.VERSION, 3)
+        self.assertEqual((relay.LEGACY_VERSION, relay.VERSION), (3, 4))
+
+    def test_animation_hello_validation(self):
+        packet = dict(client_sim.ClientSim("a").hello, version=4,
+                      animation={"av": 1, "table_sha256": "a" * 64})
+        relay.validate_hello(packet)
+        for animation in (None, [], {}, {"av": 2, "table_sha256": "a" * 64},
+                          {"av": True, "table_sha256": "a" * 64},
+                          {"av": 1, "table_sha256": "A" * 64},
+                          {"av": 1, "table_sha256": "a" * 63},
+                          {"av": 1, "table_sha256": "a" * 64, "extra": 1}):
+            with self.subTest(animation=animation), self.assertRaises(relay.ProtocolError):
+                relay.validate_hello(dict(packet, animation=animation))
+        with self.assertRaises(relay.ProtocolError):
+            relay.validate_hello(dict(packet, version=3))
+
+    def test_animation_pose_validation(self):
+        packet = pose(av=1, aid=1, af=3.125, ar=1.5, aseq=0xffffffff)
+        relay.validate_pose(packet)
+        relay.validate_pose(dict(packet, aid=0, af=None, ar=0, aseq=0))
+        for changes in ({"av": 2}, {"av": True}, {"av": 1.0}, {"aid": -1},
+                        {"aid": 1.0}, {"aid": True}, {"aid": 1 << 32}, {"aseq": 0.5},
+                        {"aseq": -1}, {"aseq": 1 << 32}, {"ar": -0.1}, {"ar": 4.01},
+                        {"ar": float("nan")}, {"ar": float("inf")}, {"af": float("nan")},
+                        {"af": float("inf")}, {"af": -1}, {"af": True}, {"af": 1000001}):
+            with self.subTest(changes=changes), self.assertRaises(relay.ProtocolError):
+                relay.validate_pose(dict(packet, **changes))
+        for key in relay.ANIM_POSE_FIELDS:
+            missing = dict(packet)
+            del missing[key]
+            with self.subTest(missing=key), self.assertRaises(relay.ProtocolError):
+                relay.validate_pose(missing)
+
+    def test_animation_negotiation_and_presence(self):
+        server = self.memory_server()
+        descriptor = {"av": 1, "table_sha256": "a" * 64}
+        a = self.stalled(server, "a", animation=descriptor)
+        b = self.stalled(server, "b", animation=descriptor)
+        mismatch = self.stalled(server, "m", animation={"av": 1, "table_sha256": "b" * 64})
+        legacy = self.stalled(server, "old")
+        self.assertEqual(self.queued(a)[0]["animation"], descriptor)
+        self.assertEqual(self.queued(a)[0]["version"], 4)
+        self.assertEqual(self.queued(legacy)[0]["version"], 3)
+        self.assertTrue(all("animation" not in p.get("state", {}) for p in self.queued(legacy)))
+        presence = [p for p in self.queued(b) if p["type"] == "client_state" and p["origin"] == "a"]
+        self.assertEqual(presence[0]["state"]["animation"], descriptor)
+        for peer in (a, b, mismatch, legacy):
+            self.drain(peer)
+        packet = pose(av=1, aid=7, af=None, ar=1, aseq=9)
+        server.receive(a, packet)
+        self.assertEqual(self.queued(b), [dict(packet, origin="a")])
+        for peer in (mismatch, legacy):
+            self.assertEqual(self.queued(peer), [dict(pose(), origin="a")])
+        with self.assertRaisesRegex(relay.ProtocolError, "not negotiated"):
+            server.receive(legacy, packet)
+        self.drain(b)
+        server.receive(a, {"type": "client_state", "state": {"animation": {"forged": True}}})
+        self.assertEqual(self.queued(b)[0]["state"]["animation"], descriptor)
+
+    def test_forwarded_animation_pose_size_includes_origin(self):
+        server = self.memory_server()
+        a = self.stalled(server, "a" * 64, animation={"av": 1, "table_sha256": "a" * 64})
+        packet = pose(av=1, aid=7, af=2.5, ar=1, aseq=1)
+        payload_size = len(relay.encode(packet)) - 4
+        with mock.patch.object(relay, "MAX_POSE_FRAME", payload_size + 1):
+            relay.validate_pose(packet)
+            with self.assertRaisesRegex(relay.ProtocolError, "after origin"):
+                server.receive(a, packet)
+
+    def test_animation_late_join_gets_negotiation_but_no_cached_pose(self):
+        server = self.memory_server()
+        descriptor = {"av": 1, "table_sha256": "d" * 64}
+        a = self.stalled(server, "a", animation=descriptor)
+        b = self.stalled(server, "b", animation=descriptor)
+        server.receive(a, pose(av=1, aid=7, af=3, ar=0, aseq=1))
+        late = self.stalled(server, "late", animation=descriptor)
+        mismatch = self.stalled(server, "mismatch", animation={"av": 1, "table_sha256": "e" * 64})
+        for peer in (late, mismatch):
+            packets = self.queued(peer)
+            self.assertFalse(any(p["type"] == "pose" for p in packets))
+            presence = next(p for p in packets if p["type"] == "client_state" and p["origin"] == "a")
+            self.assertEqual(presence["state"]["animation"], descriptor)
+            self.drain(peer)
+        server.receive(a, pose(av=1, aid=7, af=4, ar=0, aseq=1))
+        self.assertEqual(self.queued(late)[0]["af"], 4)
+        self.assertNotIn("aid", self.queued(mismatch)[0])
+        self.assertFalse(any("aid" in p for p in a.team.snapshot()["replay"]))
+
+    def test_animation_sidecar_hashes_exact_bytes_and_is_bounded(self):
+        import hashlib
+        data = b'{"synthetic": true}\n'
+        with mock.patch.object(client_sim.Path, "open", mock.mock_open(read_data=data)):
+            self.assertEqual(client_sim.animation_descriptor("synthetic.json"),
+                             {"av": 1, "table_sha256": hashlib.sha256(data).hexdigest()})
+        for invalid in (b"", b"x" * (16 * 1024 * 1024 + 1)):
+            with mock.patch.object(client_sim.Path, "open", mock.mock_open(read_data=invalid)), \
+                    self.assertRaises(ValueError):
+                client_sim.animation_descriptor("synthetic.json")
+
+    def test_animation_client_refuses_unmatched_peer(self):
+        client = client_sim.ClientSim("a", animation={"av": 1, "table_sha256": "a" * 64})
+        with self.assertRaisesRegex(ValueError, "matching"):
+            client.pose_packet("Field_1", True, [0, 0, 0], 0, aid=7)
+        client.peer_animations["b"] = {"av": 1, "table_sha256": "b" * 64}
+        with self.assertRaises(ValueError):
+            client.pose_packet("Field_1", True, [0, 0, 0], 0, aid=7)
+        client.peer_animations["b"] = client.hello["animation"]
+        packet = client.pose_packet("Field_1", True, [0, 0, 0], 0, aid=7, af=2.125, ar=0, aseq=3)
+        self.assertEqual((packet["aid"], packet["af"], packet["ar"], packet["aseq"]), (7, 2.125, 0, 3))
+
+    def test_animation_fake_peer_commands_without_transport(self):
+        async def commands():
+            peer = fake_peer.FakePeer()
+            descriptor = {"av": 1, "table_sha256": "f" * 64}
+            peer.client.hello.update(version=4, animation=descriptor)
+            peer.client.peer_animations["synthetic"] = descriptor
+            peer.client.send = mock.AsyncMock()
+            first = (await peer.command("pose Field_1 1 0 0 0 0 aid=7 af=0 ar=0"))["sent"]
+            second = (await peer.command("pose Field_1 1 0 0 0 0 aid=7 af=4.125 ar=1 aseq=1"))["sent"]
+            third = (await peer.command("pose Field_1 1 0 0 0 0 aid=7 af=null ar=1"))["sent"]
+            self.assertEqual((first["aseq"], second["aseq"], third["aseq"]), (1, 1, 2))
+            self.assertEqual((second["af"], third["af"]), (4.125, None))
+            for options in ("aid=1.5", "aid=7 ar=nan", "aid=7 af=inf", "af=3", "aid=7 aid=8"):
+                with self.subTest(options=options), self.assertRaises(ValueError):
+                    await peer.command("pose Field_1 1 0 0 0 0 " + options)
+            self.assertEqual(peer.client.send.await_count, 3)
+        asyncio.run(commands())
 
     def test_pose_validation(self):
         relay.validate_pose(pose())
@@ -739,6 +865,27 @@ class FakePeerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.emu.close()
         await self.peer.close()
+
+    async def test_animation_pose_commands_and_same_sequence_steps(self):
+        await self.emu.close()
+        await self.peer.close()
+        descriptor = {"av": 1, "table_sha256": "c" * 64}
+        with mock.patch.object(fake_peer.client_sim, "animation_descriptor", return_value=descriptor):
+            self.peer = fake_peer.FakePeer(port=0, anim_table="synthetic.json")
+        self.port = await self.peer.start()
+        self.emu = client_sim.ClientSim("emu", animation=descriptor)
+        await self.emu.connect("127.0.0.1", self.port)
+        await self.peer.wait(lambda p: p.get("type") == "client_state" and p.get("origin") == "emu", 2)
+        first = (await self.peer.command("pose Field_1 1 0 0 0 90 aid=7 af=0 ar=0"))["sent"]
+        got = await self.emu.receive_pose(since=0)
+        self.assertEqual((got["aid"], got["af"], got["ar"], got["aseq"]), (7, 0, 0, 1))
+        second = (await self.peer.command("pose Field_1 1 0 0 0 90 aid=7 af=4.125 ar=1 aseq=1"))["sent"]
+        self.assertEqual((second["aseq"], second["af"]), (first["aseq"], 4.125))
+        third = (await self.peer.command("pose Field_1 1 0 0 0 90 aid=7 af=null ar=1"))["sent"]
+        self.assertEqual((third["aseq"], third["af"]), (2, None))
+        for options in ("aid=1.5", "aid=7 ar=nan", "aid=7 af=inf", "af=3", "aid=7 aid=8"):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                await self.peer.command("pose Field_1 1 0 0 0 0 " + options)
 
     async def test_records_the_emulator_broadcast(self):
         await self.emu.change("bool_set", hash=0xC1, value=True)
