@@ -982,6 +982,7 @@ struct Session::Impl {
     PoseSender sender;
     std::optional<Pose> pose_out;                         // under mutex: newest unsent own pose
     std::map<std::string, PeerTrack, std::less<>> peers;  // under mutex: by origin
+    OotGameDataTrace::GhostOffsets ghost_offsets;         // the driver holds a reference to it
     std::unique_ptr<GhostDriver<GhostPort>> ghost;        // guest side, under guest_mutex
     std::optional<Backend::Context> ghost_saved;
     u64 ghost_stack{}, poses_in{}, poses_out{};
@@ -1424,7 +1425,14 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
     if (impl->allowed_classes.contains(Kind::Pose)) {
         if (profile->ghost.Valid() && impl->binding.sentinel) {
             impl->pose_enabled = true;
-            impl->ghost = std::make_unique<GhostDriver<Impl::GhostPort>>(profile->ghost, base);
+            impl->ghost_offsets = profile->ghost;
+            // The tint setter reaches only the eyes (C10/C11), so a whole-eye colour is off
+            // unless asked for; the key-file chain stays for a future whole-body path.
+            if (impl->ghost_offsets.tint_set && Env("EDEN_NX2_OOT_COOP_TINT") != "1") {
+                impl->ghost_offsets.tint_set = {};
+                LOG_INFO(Core_ARM, "OoT co-op: ghost tint disabled (eyes-only setter)");
+            }
+            impl->ghost = std::make_unique<GhostDriver<Impl::GhostPort>>(impl->ghost_offsets, base);
             LOG_INFO(Core_ARM, "OoT co-op: pose class on (ghost block {:#x})",
                      impl->binding.sentinel + GhostBlock);
         } else {
@@ -1782,7 +1790,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                     }
                     continue;
                 }
-                impl->key_watch[change.key].credit += change.value;
+                impl->key_watch[change.key].Credit(change.value);
                 log(fmt::format("OoT co-op: key gain queued total={:08x} count={:08x} +{}", change.key,
                                 count.key, change.value));
                 continue;
