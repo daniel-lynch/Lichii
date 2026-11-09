@@ -724,12 +724,10 @@ TEST_CASE("Equipment sender finds the resident player by reads and reports settl
     REQUIRE_FALSE(fixture.controller->Local(true));
 }
 
-TEST_CASE("Equipment treats a request bit without a child as in flight", "[core][oot_coop][equip]") {
+TEST_CASE("Equipment request bits are telemetry, not readiness", "[core][oot_coop][equip]") {
     ControllerFixture fixture;
-    fixture.memory.Write(ControllerFixture::Equipment + 0x700, 1, 4); // sword bit, no sword child
-    for (unsigned i = 0; i < 64; ++i) REQUIRE_FALSE(fixture.Frame());
-    REQUIRE(fixture.calls.empty());
-    fixture.memory.Write(ControllerFixture::Equipment + 0x700, 0, 4);
+    // Field C15: bits stay set after removals and creations alike; a set bit never blocks a request.
+    fixture.memory.Write(ControllerFixture::Equipment + 0x700, 0xffffffffU, 4);
     fixture.UntilCall();
     REQUIRE(fixture.calls.back().entry == ControllerFixture::CreateEntry);
 }

@@ -446,11 +446,12 @@ Observation Controller::observe(const Port& p, const Token& t, Slot slot, const 
     o.readable = phase && detail && bits && errors && handle && id && (o.child || *id == 0xffffffff);
     o.phase = phase.value_or(0); o.detail = detail.value_or(0); o.bits = bits.value_or(0);
     o.errors = errors.value_or(0); o.handle = handle.value_or(0);
-    // Idle: empty component-owned handle, no inspected error, and the slot's request bit either clear
-    // or backed by a validated child. Field C15: the bit stays set once the slot holds its child
-    // (0x9 with a live sword and sheath, both lifecycle 4, sword DE active/sheathed), so it marks an
-    // occupied slot; set with no child, it is a request in flight. Phase words remain telemetry.
-    o.idle = o.readable && !o.handle && (!(o.bits & s.request_mask) || o.child) && !(o.errors & k.Get("error_mask"));
+    // Idle: empty component-owned handle and no inspected error. The request bits and the two
+    // phase words are telemetry only. Field C15: the bits stayed set after sword/sheath/head
+    // creation (children live), cleared after a shield swap, and stayed set after the normal-upper
+    // removal with no child, so they never told completion from in-flight. Each request instead
+    // settles on its own receipt (new validated child / removal / actual state), one at a time.
+    o.idle = o.readable && !o.handle && !(o.errors & k.Get("error_mask"));
     return o;
 }
 bool Controller::start(Port& p, const OotGameDataTrace::Entry& entry, std::array<u64, 8> args,
