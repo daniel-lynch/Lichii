@@ -318,6 +318,24 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(len(team.replay), 3)
         self.assertEqual(team.benefit_receipts, set())
 
+    def test_chest_legacy_semantic_retry_reaches_client_receipts(self):
+        team = relay.Team()
+        packet = item(origin_key=17)
+        self.assertIsNotNone(team.accept(packet, set()))
+        self.assertIsNone(team.accept(packet, set()))
+        # A fresh wire seq is not a new benefit; the receiver's retained chest receipt decides.
+        retry = dict(packet, seq=2)
+        forwarded = team.accept(retry, set())
+        self.assertEqual(forwarded["origin_key"], 17)
+        self.assertEqual(team.benefit_receipts, set())
+        self.assertEqual(team.current, {})
+
+    def test_chest_transaction_fields_require_relay_extension(self):
+        for fields in ({"chest_transaction": 51}, {"chest_part": 0}, {"chest_final": True},
+                       {"chest_transaction": 51, "chest_part": 0, "chest_final": True}):
+            with self.subTest(fields=fields), self.assertRaises(relay.ProtocolError):
+                relay.validate_change(item(origin_key=17, **fields), "a")
+
     def test_world_token_flags_share_origin_but_not_benefit_receipt(self):
         source = {"origin_kind": "token", "origin_key64": (1 << 63) + 9,
                   "origin_partner": (1 << 63) + 11}

@@ -836,59 +836,19 @@ TEST_CASE("OoT co-op profile: wallet observation and the Int add entry", "[core]
     REQUIRE_FALSE(load({{"rupee_callers", "0x160004"}}));
 }
 
-TEST_CASE("OoT co-op same-chest race: one opener's gives per chest, every order", "[core][oot_coop]") {
-    using Open = Coop::ChestClaims::Open;
-    const auto K = Coop::World::Origin::Chest(0xC1);
-    const auto give = [](std::string origin, u64 seq, Coop::World::Origin key) {
-        Change c{Kind::Item, std::move(origin), seq, Coop::PackItem({6, 7, {0, 0, 1, 0}}), 1};
-        c.name = "Item_Test_Slingshot";
-        c.source = key;
-        return c;
-    };
-    SECTION("local first: our open owns the chest, the peer's later gives are dropped") {
-        Coop::ChestClaims claims;
-        REQUIRE(claims.LocalOpen(K, 0x100) == Open::Ours);
-        REQUIRE_FALSE(claims.SkipLocal(0x100));
-        claims.Hold(0x100);
-        REQUIRE(claims.End(0x100) == K); // our held give goes out tagged with the chest
-        REQUIRE_FALSE(claims.AcceptRemote(give("R", 1, K)));
-        REQUIRE(claims.Owner(K) == "us");
-    }
-    SECTION("remote first: the peer's claim arrived, our open skips our gives, the peer's apply") {
-        Coop::ChestClaims claims;
-        claims.RemoteClaim(K, "R"); // its bool_set
-        REQUIRE(claims.LocalOpen(K, 0x200) == Open::SkipLocal);
-        REQUIRE(claims.SkipLocal(0x200));
-        REQUIRE(claims.AcceptRemote(give("R", 2, K)));
-        REQUIRE_FALSE(claims.AcceptRemote(give("S", 1, K))); // a third opener's copy
-        REQUIRE(claims.End(0x200) == K);
-        REQUIRE_FALSE(claims.SkipLocal(0x200));
-    }
-    SECTION("simultaneous: we gave before the chest flag, the peer's give is queued: we take over") {
-        Coop::ChestClaims claims;
-        claims.Hold(0x300);                             // our give ran first in the event
-        REQUIRE(claims.AcceptRemote(give("R", 1, K)));  // the peer's give arrives mid-event (queued)
-        REQUIRE(claims.LocalOpen(K, 0x300) == Open::TakeOver); // the session drops its queued gives
-        REQUIRE_FALSE(claims.AcceptRemote(give("R", 2, K)));   // and every later one
-        REQUIRE(claims.Owner(K) == "us");
-    }
-    SECTION("simultaneous: both opens before either claim arrives: each keeps its own") {
-        Coop::ChestClaims a, b;
-        REQUIRE(a.LocalOpen(K, 1) == Open::Ours);
-        REQUIRE(b.LocalOpen(K, 1) == Open::Ours);
-        b.RemoteClaim(K, "A"); // A's bool_set reaches B: B already owns it
-        REQUIRE_FALSE(a.AcceptRemote(give("B", 1, K)));
-        REQUIRE_FALSE(b.AcceptRemote(give("A", 1, K)));
-    }
-    SECTION("untagged gives always apply; an event with no chest or two chests sends untagged") {
-        Coop::ChestClaims claims;
-        REQUIRE(claims.AcceptRemote(give("R", 1, {})));
-        claims.Hold(0x400);
-        REQUIRE(!claims.End(0x400));
-        claims.LocalOpen(K, 0x500);
-        claims.LocalOpen(Coop::World::Origin::Chest(0xC2), 0x500);
-        REQUIRE(!claims.End(0x500));
-    }
+TEST_CASE("OoT co-op same-chest race begins before the give, not at a flag", "[core][oot_coop]") {
+    Coop::Chest::Claims claims;
+    const Coop::Chest::Identity identity{{0x1000, 0x2000, 3, 1}, 99, 17, 0xC1};
+    const auto attempt = claims.LocalBegin(identity, 1, 1);
+    REQUIRE(attempt);
+    REQUIRE(claims.BindEvent(attempt, {0x3000, 1}));
+    claims.RemoteClaim(Coop::World::Origin::Chest(0xC1), "peer");
+    const auto gate = claims.Gate(attempt);
+    REQUIRE(gate.decision == Coop::Chest::Decision::Allow);
+    REQUIRE(claims.Returned(attempt, gate.part, true));
+    claims.EndEvent({0x3000, 1});
+    REQUIRE(claims.Owner(Coop::World::Origin::Chest(0xC1)) == "us");
+    REQUIRE(claims.Find(0xC1)->closed);
 }
 
 TEST_CASE("OoT co-op item give origin key: wire and queued-give removal", "[core][oot_coop]") {

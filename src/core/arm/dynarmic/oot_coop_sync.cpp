@@ -469,6 +469,19 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
             } else if (field == "pickup" || field == "wallet" || field == "token" || field == "world" ||
                        field == "cleanup") {
                 if (!World::DecodeProfileSection(field, value, profile)) return {};
+            } else if (field == "chest") {
+                if (!Chest::DecodeConfig(value, profile.chest)) return {};
+                const auto& chest = profile.chest;
+                for (u64 pc : {chest.interaction_pc, chest.confirm_pc, chest.return_pc})
+                    if (!pc || pc > MaxModuleOffset || (pc & 3)) return {};
+                // These are instruction classes/register operands, never game-specific words.
+                if ((chest.interaction_word & 0xFFC003FF) != 0x39400001 ||
+                    ((chest.interaction_word >> 10) & 0xFFF) != chest.reserved_offset ||
+                    (chest.confirm_word & 0xFC000000) != 0x94000000 ||
+                    (chest.return_word & 0x9F00001F) != 0x90000008) return {};
+                profile.sites.push_back({Point::ChestInteraction, chest.interaction_pc, chest.interaction_word});
+                profile.sites.push_back({Point::ChestConfirm, chest.confirm_pc, chest.confirm_word});
+                profile.sites.push_back({Point::ChestReturn, chest.return_pc, chest.return_word});
             } else if (field == "give") {
                 // Generic gives: {"body": [lo, hi], "deny_callers": [...], "per_player": [names
                 // from a pickup caller], "never": [names from any caller]}.
@@ -673,6 +686,11 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
             }
         }
         if (!World::ValidateProfile(profile)) return {};
+        if (profile.chest.interaction_pc && (profile.chest_members.empty() || !profile.event_got ||
+            !profile.item_entry || !profile.SiteOffset(Point::ItemGive) ||
+            !profile.SiteOffset(Point::StructBoolSet) ||
+            std::find(profile.item_callers.begin(), profile.item_callers.end(), profile.chest.return_pc) ==
+                profile.item_callers.end())) return {};
         // Two sites at one offset would make Identify ambiguous.
         for (size_t i = 0; i < profile.sites.size(); ++i)
             for (size_t j = i + 1; j < profile.sites.size(); ++j)
@@ -946,7 +964,43 @@ struct Session::Impl {
     std::vector<DungeonKeys> dungeon_keys;
     std::map<u32, KeyWatch> key_watch; // by total key
     // Same-chest race (guest side, under guest_mutex).
-    ChestClaims claims;
+    Chest::Claims claims;
+    Chest::Events chest_events;
+    u64 chest_unknown{}, chest_lines{};
+    std::array<u64, 4> chest_hits{}; // interaction, confirmation, give return, struct setter traps
+    bool chest_quarantined{};
+    /// A chest-tagged benefit this receiver arbitrates (else it takes the ordinary give path).
+    bool ChestGuarded(const Change& change) const {
+        return change.kind == Kind::Item && change.source.kind == World::OriginKind::Chest &&
+               !chest_quarantined && chest_bools.contains(static_cast<u32>(change.source.key));
+    }
+    struct LocalChestGive {
+        Change change;
+        u64 attempt{}, stack{}, tick{}, epoch{};
+    };
+    std::map<u64, LocalChestGive> local_chest_gives;
+    Chest::EventToken SampleChestEvent(std::optional<u64> pointer) {
+        const auto token = chest_events.Sample(pointer);
+        for (const auto ended : chest_events.TakeEnded()) claims.EndEvent(ended);
+        if (chest_events.Overflowed()) chest_quarantined = true;
+        return token;
+    }
+    void PendingChestClaims() {
+        // Called under guest_mutex; transport only appends under mutex, in arrival order.
+        std::scoped_lock lock{mutex};
+        for (const auto& entry : pending) {
+            const auto* change = std::get_if<Change>(&entry);
+            if (!change) continue;
+            if (change->kind == Kind::Bool && change->value == 1 &&
+                chest_bools.contains(static_cast<u32>(change->key)))
+                claims.RemoteClaim(World::Origin::Chest(static_cast<u32>(change->key)),
+                                   change->origin, change->origin.empty());
+            else if (change->kind == Kind::Item && change->source.kind == World::OriginKind::Chest &&
+                     chest_bools.contains(static_cast<u32>(change->source.key)) &&
+                     allowed_classes.contains(Kind::Item))
+                claims.AcceptRemote(*change);
+        }
+    }
     World::Claims world_claims;
     World::Pickups pickups;
     struct LocalPickup {
@@ -982,11 +1036,12 @@ struct Session::Impl {
 
     struct HeldGive {
         Change change;
-        u64 event{}, tick{};
+        u64 attempt{}, tick{};
+        bool wire_wait_logged{};
     };
     std::vector<HeldGive> held_gives;
     std::set<u32> chest_bools; // the backing Bools of profile->chest_members
-    u64 actor_flags{}, race_lines{};
+    u64 race_lines{}, chest_traps{};
     u64 key_lines{};
     bool stable_frame{};
     bool baseline_ready{};
@@ -1349,7 +1404,8 @@ bool Session::Impl::Receive(const Json& packet) {
                 value.at("rev").get<u64>() != ++revision) return false;
             if (!EventKind(change->kind)) checkpoint.Merge(*change);
             else if (ever_ready && change->kind == Kind::Item &&
-                     (change->source.kind == World::OriginKind::Bit || change->source.kind == World::OriginKind::Token))
+                     (change->source.kind == World::OriginKind::Bit || change->source.kind == World::OriginKind::Token ||
+                      change->source.kind == World::OriginKind::Chest))
                 world_replay.push_back(*change);
         }
         changes = checkpoint.Snapshot();
@@ -1427,6 +1483,9 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
         LOG_INFO(Core_ARM, "OoT co-op: world cleanup {}", !profile->world.resolver ? "flag_only (no resolver in the key file)"
                  : impl->cleanup_walk_only ? "walk only (EDEN_NX2_OOT_COOP_WORLD_CLEANUP=walk)" : "death request");
     for (const auto& [member, key] : profile->chest_members) impl->chest_bools.insert(key);
+    if (profile->chest.interaction_pc)
+        LOG_INFO(Core_ARM, "OoT co-op: chest hooks enabled mode={} members={} (interaction, confirmation, give return, completion)",
+                 profile->chest.enforce ? "enforce" : "observe", profile->chest_members.size());
     if (!impl->allowed_classes.empty()) {
         Kernel::KProcessAddress stack{}, sentinel{};
         const auto result = owner->AllocateDebugCallMemory(kernel, &stack, &sentinel);
@@ -1468,22 +1527,23 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
 Session::~Session() = default;
 void Session::Stop() { impl->Stop(); }
 
-void Session::Observe(Change change) {
+bool Session::Observe(Change change) {
     // Wallet deltas are observed only at the wallet entry's listed callers (ObserveRupee).
-    if (impl->stopped || !WireKind(change.kind)) return;
-    if (change.kind == Kind::Item && !ValidItem(change)) return;
+    if (impl->stopped || !WireKind(change.kind)) return false;
+    if (change.kind == Kind::Item && !ValidItem(change)) return false;
     std::scoped_lock lock{impl->mutex};
     if (impl->outgoing.size() >= QueueLimit || impl->next_seq > MaxSequence) {
         if (!impl->logged_overflow) {
             LOG_WARNING(Core_ARM, "OoT co-op: outgoing queue full; observation skipped");
             impl->logged_overflow = true;
         }
-        return;
+        return false;
     }
-    if (!impl->local.Merge(change, false)) return;
+    if (!impl->local.Merge(change, false)) return false;
     change.origin = impl->hello.client_id;
     change.seq = impl->next_seq++;
     impl->outgoing.push_back(std::move(change));
+    return true;
 }
 
 void Session::ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory, u64 thread) {
@@ -1496,15 +1556,63 @@ void Session::ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory, u64 t
     }
     if (call.replay || call.nested || (impl->runtime->Calling() && thread == impl->frame_thread) ||
         !impl->allowed_classes.contains(Kind::Item)) return;
-    const u64 event = EventContext(memory).value_or(0);
-    if (!profile->chest_members.empty() && impl->claims.SkipLocal(event)) {
-        // This event opens a chest a peer opened first and whose gives we take: return from the
-        // give at once, as if it had run (w0 = 1); the event's presentation goes on.
-        jit.SetRegister(0, 1);
-        jit.SetPC(jit.GetRegister(30));
-        LOG_INFO(Core_ARM, "OoT co-op: chest race: local give skipped name={} (the chest was claimed by a "
-                           "peer first; its give is the one)", call.change.name);
-        return;
+    const auto event = impl->SampleChestEvent(EventContext(memory));
+    if (profile->chest.interaction_pc && call.forward && !impl->chest_quarantined &&
+        jit.GetRegister(30) == base + profile->chest.return_pc) {
+        impl->PendingChestClaims();
+        const auto actor = Chest::ReadNodeActor(memory, jit.GetRegister(19), profile->chest);
+        const auto identity = actor ? Chest::ReadActor(memory, *actor, impl->rebinds,
+            profile->chest, profile->chest_members) : std::nullopt;
+        auto attempt = impl->claims.Attribute(identity ? std::optional{identity->token} : std::nullopt, event);
+        // Event attribution must still name the same live actor generation, even if the action
+        // node belongs to the event's pouch actor rather than the chest.
+        if (attempt) {
+            const auto* pending = impl->claims.FindAttempt(*attempt);
+            const auto live = pending ? Chest::ReadActor(memory, pending->identity.token.actor,
+                impl->rebinds, profile->chest, profile->chest_members) : std::nullopt;
+            if (!live || live->token != pending->identity.token || live->key != pending->identity.key ||
+                (identity && identity->token != pending->identity.token)) attempt.reset();
+        }
+        if (attempt && !impl->local_chest_gives.contains(thread)) {
+            const auto gate = impl->claims.Gate(*attempt);
+            const auto* pending = impl->claims.FindAttempt(*attempt);
+            if (gate.decision == Chest::Decision::Skip) {
+                if (impl->race_lines++ < 256)
+                    LOG_INFO(Core_ARM, "OoT co-op: chest race: local give {} name={} chest={:08x} owner={}",
+                             profile->chest.enforce ? "skipped" : "kept (observe mode), not forwarded",
+                             call.change.name, pending->identity.key,
+                             impl->claims.Owner(World::Origin::Chest(pending->identity.key)));
+                if (!profile->chest.enforce) return;
+                // Before the entry's first instruction: return success as if the give ran.
+                jit.SetRegister(0, 1);
+                jit.SetPC(jit.GetRegister(30));
+                return;
+            }
+            if (gate.decision == Chest::Decision::Allow && impl->local_chest_gives.size() < 64) {
+                auto change = call.change;
+                change.source = World::Origin::Chest(pending->identity.key);
+                change.chest_transaction = gate.transaction;
+                change.chest_part = gate.part;
+                impl->local_chest_gives.emplace(thread, Impl::LocalChestGive{change, *attempt,
+                    jit.GetSP(), impl->tick, impl->rebinds});
+                if (impl->race_lines++ < 256)
+                    LOG_INFO(Core_ARM, "OoT co-op: chest give gated name={} chest={:08x} attempt={} part={} event={:#x}",
+                             change.name, change.source.key, *attempt, gate.part, event.pointer);
+                return;
+            }
+        }
+        if (attempt) {
+            if (impl->race_lines++ < 256)
+                LOG_INFO(Core_ARM, "OoT co-op: chest give unresolved attempt={} (no untagged outbound)", *attempt);
+            return;
+        }
+        // With no chest attempt alive and no chest owner this is an ordinary (NPC/shop) give.
+        if (identity || impl->claims.Active()) {
+            ++impl->chest_unknown;
+            if (impl->race_lines++ < 256)
+                LOG_INFO(Core_ARM, "OoT co-op: chest attribution unknown count={} node={:#x} event={:#x} name={}",
+                         impl->chest_unknown, jit.GetRegister(19), event.pointer, call.change.name);
+        }
     }
     // World pickups: only the verified outer-give returns consume the component capture, and only
     // for a give nested in that component invocation (same thread, lower stack).
@@ -1549,12 +1657,6 @@ void Session::ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory, u64 t
         // A dynamic drop, a gated family or the bit class off: the C13 generic path below.
         LOG_INFO(Core_ARM, "OoT co-op: pickup unlinked; generic give path name={}", call.change.name);
     }
-    if (event && !profile->chest_members.empty()) {
-        // Held until the event ends, then sent tagged with the chest the event opened.
-        impl->claims.Hold(event);
-        impl->held_gives.push_back({call.change, event, impl->tick});
-        return;
-    }
     Observe(call.change);
     impl->ux.ItemShared(call.change.name, call.change.value);
 }
@@ -1567,27 +1669,81 @@ std::optional<u64> Session::EventContext(Memory::Memory& memory) const {
     return events && *events ? Read64(memory, *events + 0x68) : std::nullopt;
 }
 
-void Session::ObserveActorFlag(Dynarmic::A64::Jit& jit, Memory::Memory& memory) {
-    if (++impl->actor_flags % 20000 == 0) {
-        LOG_INFO(Core_ARM, "OoT co-op: actor flag setter trapped {} times", impl->actor_flags);
+void Session::ObserveChest(OotGameDataTrace::Point point, Dynarmic::A64::Jit& jit,
+                           Memory::Memory& memory, u64 thread) {
+    using OotGameDataTrace::Point;
+    if (!profile->chest.interaction_pc || impl->chest_quarantined ||
+        (impl->runtime->Calling() && thread == impl->frame_thread)) return;
+    ++impl->chest_traps;
+    ++impl->chest_hits[point == Point::ChestInteraction ? 0 : point == Point::ChestConfirm ? 1 : 3];
+    const auto context = EventContext(memory);
+    const auto event = impl->SampleChestEvent(context);
+    if (point == Point::StructBoolSet) {
+        if (!(jit.GetRegister(1) & 1)) return;
+        const auto record = Chest::Detail::Read(memory, jit.GetRegister(2), 0, 8);
+        if (!record || Chest::Detail::Read(memory, *record, 0, 4) != profile->chest.struct_hash) return;
+        const auto member = static_cast<u32>(jit.GetRegister(3));
+        const auto found = profile->chest_members.find(member);
+        if (found == profile->chest_members.end()) return;
+        const auto* claim = impl->claims.Find(found->second);
+        const auto* pending = claim ? impl->claims.FindAttempt(claim->attempt) : nullptr;
+        const auto live = pending ? Chest::ReadActor(memory, pending->identity.token.actor,
+            impl->rebinds, profile->chest, profile->chest_members) : std::nullopt;
+        if (pending && !pending->ended && live && live->token == pending->identity.token &&
+            live->key == found->second) {
+            impl->claims.Complete(found->second);
+            if (impl->race_lines++ < 256)
+                LOG_INFO(Core_ARM, "OoT co-op: chest complete key={:08x} phase=setter event={:#x}",
+                         found->second, event.pointer);
+        }
+        return;
     }
-    if ((jit.GetRegister(1) & 1) == 0) return;
-    const auto member = OotGameDataTrace::Detail::Read32(memory, jit.GetRegister(8) + 8);
-    const auto it = member ? profile->chest_members.find(*member) : profile->chest_members.end();
-    if (it == profile->chest_members.end()) return;
-    const u32 key = it->second;
-    const u64 event = EventContext(memory).value_or(0);
-    const auto open = impl->claims.LocalOpen(World::Origin::Chest(key), event);
-    size_t dropped = 0;
-    if (open == ChestClaims::Open::TakeOver) {
-        dropped = impl->runtime->DropPending(
-            [&](const Change& c) { return c.kind == Kind::Item && c.source == World::Origin::Chest(key); });
+    const bool interaction = point == Point::ChestInteraction;
+    const auto identity = interaction
+        ? Chest::ReadInteraction(memory, jit.GetRegister(0), base, impl->rebinds,
+                                 profile->chest, profile->chest_members)
+        : Chest::ReadActor(memory, jit.GetRegister(0), impl->rebinds,
+                           profile->chest, profile->chest_members);
+    if (!identity) {
+        // The selector is generic: a door's accepted Open passes the same filter. Count all,
+        // log the first few.
+        if ((!interaction || Chest::SelectedInteraction(memory, jit.GetRegister(0), base, profile->chest))) {
+            if (++impl->chest_unknown <= 16 && impl->race_lines++ < 256)
+                LOG_INFO(Core_ARM, "OoT co-op: chest attribution unknown phase={} node_or_actor={:#x} count={}",
+                         interaction ? "interaction" : "confirmation", jit.GetRegister(0), impl->chest_unknown);
+        }
+        return;
     }
-    LOG_INFO(Core_ARM, "OoT co-op: chest open (local) key={:08x} event={:#x}: {}", key, event,
-             open == ChestClaims::Open::Ours ? "ours (first claim)"
-             : open == ChestClaims::Open::SkipLocal
-                 ? "claimed by a peer first: our gives in this event are skipped"
-                 : fmt::format("we had already given locally: ours; {} queued peer give(s) dropped", dropped));
+    impl->PendingChestClaims();
+    const auto previous = impl->claims.FindActor(identity->token);
+    if (!interaction && (!context || !event)) {
+        if (impl->race_lines++ < 256)
+            LOG_INFO(Core_ARM, "OoT co-op: chest event unresolved key={:08x} actor={:#x}",
+                     identity->key, identity->token.actor);
+        return;
+    }
+    const u64 attempt = impl->claims.LocalBegin(*identity, impl->rebinds, impl->tick);
+    if (!attempt) return;
+    if (interaction && !previous && impl->race_lines++ < 256) {
+        LOG_INFO(Core_ARM, "OoT co-op: chest open (local) key={:08x} phase=interaction actor={:#x} "
+                          "event={:#x} node={:#x} instance={:016x} member={:08x} lifetime={} attempt={} owner={} "
+                          "metadata={:#x} thread={} tick={} traps={} lr={:#x}",
+                 identity->key, identity->token.actor, event.pointer, jit.GetRegister(0), identity->instance,
+                 identity->member, identity->token.lifetime, attempt,
+                 impl->claims.Owner(World::Origin::Chest(identity->key)),
+                 Chest::Detail::Read(memory, identity->token.actor, profile->chest.metadata_offset, 8).value_or(0),
+                 thread, impl->tick, impl->chest_traps, jit.GetRegister(30));
+    }
+    if (!interaction) {
+        const bool bound = impl->claims.BindEvent(attempt, event);
+        if (impl->race_lines++ < 256)
+            LOG_INFO(Core_ARM, "OoT co-op: chest event {} key={:08x} event={:#x} generation={} actor={:#x} "
+                              "node={:#x} attempt={} missing_interaction={}",
+                     bound ? "bound" : "unresolved", identity->key, event.pointer, event.generation,
+                     identity->token.actor, jit.GetRegister(19), attempt, !previous);
+    }
+    if (profile->chest.enforce)
+        impl->runtime->DropPending([&](const Change& c) { return impl->ChestGuarded(c) && !impl->claims.CanApply(c); });
 }
 
 void Session::ObserveRupee(Dynarmic::A64::Jit& jit, u64 thread) {
@@ -1619,6 +1775,10 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     auto& binding = impl->binding;
     auto& runtime = *impl->runtime;
     Impl::Backend backend{jit, memory, binding, *profile, tls, tls_ro, std::move(clear_exclusive)};
+    backend.item_gate = [&](const Change& change) {
+        if (!profile->chest.enforce || !impl->ChestGuarded(change)) return true;
+        return impl->claims.CanApply(change) && !impl->claims.LocalActive(static_cast<u32>(change.source.key));
+    };
     const auto log = [](std::string_view line) { LOG_INFO(Core_ARM, "{}", line); };
     const DrainContext site{thread, 1, impl->tick, true};
     if (binding.sentinel && pc == binding.sentinel && impl->cleanup_saved && impl->cleanup_call) {
@@ -1656,6 +1816,13 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                             runtime.LastGrant()->name));
             const auto& grant = *runtime.LastGrant();
             if (result & 1) impl->ux.ItemReceived(grant.origin, grant.seq, grant.name, grant.value);
+            if (grant.source.kind == World::OriginKind::Chest && profile->chest.interaction_pc) {
+                // The give ran to its return: one processed attempt, whatever w0 says (like world).
+                impl->claims.RemoteReturned(grant, true);
+                if (impl->race_lines++ < 256)
+                    log(fmt::format("OoT co-op: chest peer return key={:08x} transaction={} part={} processed={}",
+                        grant.source.key, grant.chest_transaction, grant.chest_part, (result & 1) != 0));
+            }
             if (grant.source.kind == World::OriginKind::Bit || grant.source.kind == World::OriginKind::Token) {
                 // The give ran to its return on our sentinel: one attempt, whatever the game decided.
                 // w0=0 (e.g. a full wallet) is the receiver's own clamp of a collectible the sender
@@ -1740,20 +1907,77 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     }
     if (point == OotGameDataTrace::Point::ItemGive) {
         ObserveItem(jit, memory, thread);
-        return false;
+        return jit.GetPC() == jit.GetRegister(30);
     }
     if (point == OotGameDataTrace::Point::RupeeAdd) {
         ObserveRupee(jit, thread);
         return false;
     }
-    if (point == OotGameDataTrace::Point::ActorFlagSet) {
-        ObserveActorFlag(jit, memory);
+    if (point == OotGameDataTrace::Point::ChestInteraction ||
+        point == OotGameDataTrace::Point::ChestConfirm || point == OotGameDataTrace::Point::StructBoolSet) {
+        ObserveChest(point, jit, memory, thread);
+        return false;
+    }
+    if (point == OotGameDataTrace::Point::ChestReturn) {
+        ++impl->chest_hits[2];
+        const auto it = impl->local_chest_gives.find(thread);
+        if (it == impl->local_chest_gives.end()) return false;
+        const auto local = it->second;
+        const auto* attempt = impl->claims.FindAttempt(local.attempt);
+        const auto live = attempt ? Chest::ReadActor(memory, attempt->identity.token.actor, impl->rebinds,
+            profile->chest, profile->chest_members) : std::nullopt;
+        const bool valid = live && live->token == attempt->identity.token &&
+            live->key == attempt->identity.key && local.stack == jit.GetSP() &&
+            local.epoch == impl->rebinds && impl->tick >= local.tick && impl->tick - local.tick <= 1800;
+        impl->local_chest_gives.erase(it);
+        // A verified return is the processed receipt whatever w0 says (a full wallet clamps on
+        // each client); the peer still gets its copy. Only an unverifiable return is unresolved.
+        if (impl->claims.Returned(local.attempt, local.change.chest_part, valid)) {
+            impl->held_gives.push_back({local.change, local.attempt, impl->tick});
+            if (impl->race_lines++ < 256)
+                log(fmt::format("OoT co-op: chest give returned chest={:08x} attempt={} part={} w0={}",
+                                local.change.source.key, local.attempt, local.change.chest_part,
+                                jit.GetRegister(0) & 0xFFFFFFFF));
+        } else if (impl->race_lines++ < 256) {
+            log("OoT co-op: chest give return unverified; receipt retained, nothing forwarded");
+        }
         return false;
     }
     if (point != OotGameDataTrace::Point::Frame || !thread) return false;
     if (!impl->frame_thread) impl->frame_thread = thread;
     if (impl->frame_thread != thread) return false;
     ++impl->tick;
+    if (profile->chest.interaction_pc) {
+        impl->SampleChestEvent(EventContext(memory));
+        for (const u32 key : impl->claims.MissingBenefits(impl->tick)) {
+            // Usually a reward that bypasses the give entry (dungeon Bool/Int); a lost benefit
+            // arrives with the relay replay on reconnect. Diagnostic only.
+            if (impl->race_lines++ < 256)
+                log(fmt::format("OoT co-op: chest missing-benefit key={:08x}: peer-selected, no tagged give yet", key));
+        }
+        std::erase_if(impl->local_chest_gives, [&](const auto& entry) {
+            const auto& local = entry.second;
+            if (local.epoch == impl->rebinds && impl->tick >= local.tick &&
+                impl->tick - local.tick < 1800) return false;
+            impl->claims.Returned(local.attempt, local.change.chest_part, false);
+            if (impl->race_lines++ < 256)
+                log(fmt::format("OoT co-op: chest give return expired attempt={} part={} unresolved", local.attempt,
+                    local.change.chest_part));
+            return true;
+        });
+        for (const u64 attempt : impl->claims.Expire(impl->tick)) {
+            if (impl->race_lines++ < 256)
+                log(fmt::format("OoT co-op: chest attempt={} never confirmed by an event; ended (released if unpaid)",
+                                attempt));
+        }
+        if (impl->tick % 3600 == 0 && impl->chest_lines < 64 &&
+            std::ranges::any_of(impl->chest_hits, [](u64 n) { return n != 0; })) {
+            ++impl->chest_lines;
+            log(fmt::format("OoT co-op: chest traps interaction={} confirmation={} return={} setter={} (tick {})",
+                            impl->chest_hits[0], impl->chest_hits[1], impl->chest_hits[2], impl->chest_hits[3],
+                            impl->tick));
+        }
+    }
     if (std::erase_if(impl->local_pickups, [&](const auto& entry) {
             return entry.second.epoch != impl->rebinds || impl->tick - entry.second.tick > 1800;
         })) {
@@ -1774,6 +1998,10 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             impl->key_watch.clear(); // a new save epoch: re-baseline the key counts
             impl->pickups.Clear();
             impl->local_pickups.clear();
+            if (profile->chest.interaction_pc) {
+                impl->chest_quarantined = true;
+                log("OoT co-op: chest save generation changed; pending transactions quarantined; restart with matched save");
+            }
             if (!profile->world.families.empty()) {
                 impl->world_quarantined = true;
                 log("OoT co-op: world save identity changed; world quarantined (restart with a matched save)");
@@ -1865,17 +2093,28 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                     continue;
                 }
             }
-            if (change.kind == Kind::Item && change.source.kind == World::OriginKind::Chest && !profile->chest_members.empty() &&
-                !impl->claims.AcceptRemote(change)) {
-                if (impl->remote.Merge(change, !change.origin.empty()) && impl->race_lines++ < 256) {
-                    log(fmt::format("OoT co-op: chest race: peer give dropped name={} chest={:08x} (owner {})",
-                                    change.name, change.source.key, impl->claims.Owner(change.source)));
+            if (profile->chest.interaction_pc && impl->ChestGuarded(change)) {
+                // Sender/sequence dedupe first; the chest receipts then reject semantic duplicates
+                // (a fresh sequence, a second transaction, another opener).
+                if (!impl->remote.Merge(change, !change.origin.empty())) continue;
+                const bool accepted = impl->claims.AcceptRemote(change);
+                if (!accepted && profile->chest.enforce) {
+                    if (impl->race_lines++ < 256)
+                        log(fmt::format("OoT co-op: chest race: peer give dropped name={} chest={:08x} owner={} "
+                                        "transaction={} part={}", change.name, change.source.key,
+                                        impl->claims.Owner(change.source), change.chest_transaction, change.chest_part));
+                    continue;
+                }
+                if (!runtime.Queue(change) && !impl->logged_class) {
+                    log("OoT co-op: not applied: class/key policy disabled or queue full");
+                    impl->logged_class = true;
                 }
                 continue;
             }
-            if (change.kind == Kind::Bool && !change.origin.empty() && change.value == 1 &&
+            if (change.kind == Kind::Bool && change.value == 1 &&
                 impl->chest_bools.contains(static_cast<u32>(change.key))) {
-                impl->claims.RemoteClaim(World::Origin::Chest(static_cast<u32>(change.key)), change.origin);
+                impl->claims.RemoteClaim(World::Origin::Chest(static_cast<u32>(change.key)), change.origin,
+                                         change.origin.empty());
             }
             if (impl->remote.Merge(change, !change.origin.empty()) && !runtime.Queue(change) &&
                 !runtime.Suppress(change) && !impl->logged_class) {
@@ -1939,29 +2178,52 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     } else {
         impl->wallet_probe.reset();
     }
+    // Finish local transactions and reject losers before the runtime can issue a remote call.
+    if (profile->chest.interaction_pc) {
+        for (auto& held : impl->held_gives) {
+            const auto* attempt = impl->claims.FindAttempt(held.attempt);
+            const auto* record = attempt ? impl->claims.Find(attempt->identity.key) : nullptr;
+            if (!attempt || !record || (!attempt->ended && (attempt->event || !record->closed)) ||
+                attempt->unresolved || record->unresolved ||
+                !record->final_part || !attempt->applying.empty()) continue;
+            // The current relay rejects transaction fields. Never serialize a multi-part reward
+            // as unrelated legacy gives: its receiver would retain only the first part.
+            if (*record->final_part != 0) {
+                if (!std::exchange(held.wire_wait_logged, true) && impl->race_lines++ < 256)
+                    log(fmt::format("OoT co-op: chest transaction unresolved key={:08x} attempt={} (multipart wire support required)",
+                        held.change.source.key, held.attempt));
+                continue;
+            }
+            held.change.chest_final = held.change.chest_part == *record->final_part;
+            if (impl->race_lines++ < 256)
+                log(fmt::format("OoT co-op: item give sent after its event name={} chest={:08x} transaction={} part={} final={}",
+                    held.change.name, held.change.source.key, held.change.chest_transaction,
+                    held.change.chest_part, held.change.chest_final));
+            if (Observe(held.change)) {
+                impl->ux.ItemShared(held.change.name, held.change.value);
+                held.attempt = 0;
+            }
+        }
+        std::erase_if(impl->held_gives, [](const auto& held) { return held.attempt == 0; });
+    }
+    if (profile->chest.enforce) {
+        const auto dropped = runtime.DropPending([&](const Change& c) {
+            return impl->ChestGuarded(c) && !impl->claims.CanApply(c);
+        });
+        if (dropped && impl->race_lines++ < 256)
+            log(fmt::format("OoT co-op: chest race: {} pending loser/duplicate parts dropped before apply", dropped));
+    }
     const auto event = runtime.Frame(backend, {thread, 1, impl->tick, true}, send, log);
+    if (event == ApplyEvent::Started && runtime.LastGrant() &&
+        runtime.LastGrant()->kind == Kind::Item &&
+        runtime.LastGrant()->source.kind == World::OriginKind::Chest && profile->chest.interaction_pc)
+        impl->claims.StartRemote(*runtime.LastGrant());
     // A give waits while an event runs or a guard pointer is dead; say so now and then.
     if (event == ApplyEvent::Blocked && runtime.Pending() && runtime.LastGrant() &&
         runtime.LastGrant()->kind == Kind::Item && impl->tick - impl->item_waiting_logged >= 600) {
         impl->item_waiting_logged = impl->tick;
         log(fmt::format("OoT co-op: item give waiting name={} (event running, guard null or "
                         "not callable)", runtime.LastGrant()->name));
-    }
-    // Same-chest race: a held local give goes out once its event has ended, tagged with the chest.
-    if (!impl->held_gives.empty()) {
-        const u64 now_event = EventContext(memory).value_or(0);
-        std::map<u64, World::Origin> ended;
-        for (auto& held : impl->held_gives) {
-            if (held.event == now_event && impl->tick - held.tick < 1800) continue;
-            if (!ended.contains(held.event)) ended[held.event] = impl->claims.End(held.event);
-            held.change.source = ended[held.event];
-            log(fmt::format("OoT co-op: item give sent after its event name={} chest={:08x}", held.change.name,
-                            held.change.source.key));
-            Observe(held.change);
-            impl->ux.ItemShared(held.change.name, held.change.value);
-            held.event = ~u64{0}; // sent
-        }
-        std::erase_if(impl->held_gives, [](const auto& h) { return h.event == ~u64{0}; });
     }
     // Class dungeon: watch every dungeon's small-key pair; send a local gain as key_add.
     if (runtime.BaselineReady() && impl->allowed_classes.contains(Kind::Key) &&

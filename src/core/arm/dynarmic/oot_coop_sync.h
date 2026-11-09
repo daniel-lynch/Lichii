@@ -85,6 +85,9 @@ struct Change {
     u32 step{};
     std::string name; // Item only: the actor name passed to the give call
     World::Origin source; ///< Typed source identity, independent of sender origin/sequence.
+    u64 chest_transaction{};
+    u32 chest_part{};
+    bool chest_final{};
     bool operator==(const Change&) const = default;
 };
 
@@ -184,71 +187,6 @@ struct KeyWatch {
 
 using HighWater = std::map<std::string, u64, std::less<>>;
 
-/// The same-chest race (C13): two players open one chest before either's chest Bool arrives. Every
-/// client applies the gives of one chest from exactly ONE opener: itself when it opened the chest
-/// first (or had already given locally in that event), else the first peer that claimed it (its
-/// bool_set or its tagged give, whichever arrives first). Local gives are held until their event
-/// ends and then sent tagged with the chest the event opened.
-class ChestClaims {
-public:
-    enum class Open { Ours, SkipLocal, TakeOver };
-    /// A chest of ours really opened (the actor flag setter) during `event`. Ours: first claim.
-    /// SkipLocal: a peer owns it and we have not given yet in this event: skip our gives (the peer's
-    /// copy is the one). TakeOver: we already gave locally: we own it, drop the peer's pending gives.
-    Open LocalOpen(World::Origin key, u64 event) {
-        auto& slot = event_key[event];
-        slot = slot == World::Origin{} || slot == key ? key : Ambiguous;
-        const auto it = owner.find(key);
-        if (it == owner.end() || it->second.empty()) {
-            owner[key] = {};
-            return Open::Ours;
-        }
-        if (held[event] == 0) {
-            skip.insert(event);
-            return Open::SkipLocal;
-        }
-        it->second.clear();
-        return Open::TakeOver;
-    }
-    /// A peer's chest Bool (its open): the first claimant owns the chest.
-    void RemoteClaim(World::Origin key, const std::string& origin) {
-        if (key && !origin.empty()) owner.try_emplace(key, origin);
-    }
-    /// An inbound give: apply it? Untagged gives always apply; a tagged one only from the owner
-    /// (the sender becomes the owner of an unclaimed chest).
-    bool AcceptRemote(const Change& give) {
-        if (!give.source) return true;
-        const auto [it, fresh] = owner.try_emplace(give.source, give.origin);
-        return fresh || (!it->second.empty() && it->second == give.origin);
-    }
-    /// A local, forwardable top-level give during `event` (0 = none): skip it, or hold it.
-    bool SkipLocal(u64 event) const { return event && skip.contains(event); }
-    void Hold(u64 event) { ++held[event]; }
-    /// The event ended: the chest its gives came from (0 = none or more than one), and forget it.
-    World::Origin End(u64 event) {
-        const auto it = event_key.find(event);
-        const auto key = it == event_key.end() || it->second == Ambiguous ? World::Origin{} : it->second;
-        event_key.erase(event);
-        held.erase(event);
-        skip.erase(event);
-        return key;
-    }
-    std::string_view Owner(World::Origin key) const {
-        const auto it = owner.find(key);
-        if (it == owner.end()) return "none";
-        if (it->second.empty()) return "us";
-        return it->second;
-    }
-    size_t Size() const { return owner.size(); }
-
-private:
-    static constexpr World::Origin Ambiguous{World::OriginKind::None, 1, 0};
-    std::map<World::Origin, std::string> owner; ///< "" = we opened it
-    std::map<u64, World::Origin> event_key;
-    std::map<u64, u32> held;
-    std::set<u64> skip;
-};
-
 // Protocol state only. A successful Merge does NOT mean anything was applied to the guest.
 class State {
 public:
@@ -274,16 +212,14 @@ public:
             std::set<std::pair<Kind, u64>> allowed_keys = {});
     ~Session();
     void Stop();
-    void Observe(Change change);
+    bool Observe(Change change);
     bool Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& jit,
               Memory::Memory& memory, u64 thread, u64& tls, u64& tls_ro,
               std::function<void()> clear_exclusive);
     bool IsSentinel(u64 pc) const;
-    /// The points this session traps: the co-op set, plus the actor flag setter when the profile
-    /// maps chest members (the same-chest race guard).
     bool Traps(OotGameDataTrace::Point point) const {
         return OotGameDataTrace::CoopPoint(point) ||
-               (point == OotGameDataTrace::Point::ActorFlagSet && !profile->chest_members.empty());
+               (profile->chest.interaction_pc && point == OotGameDataTrace::Point::StructBoolSet);
     }
     /// Class dungeon: the small-key Int pairs to watch and apply (from the key file).
     void SetDungeonKeys(std::vector<DungeonKeys> keys);
@@ -296,8 +232,8 @@ private:
     void ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory, u64 thread);
     /// The wallet entry trapped here: forward a reviewed gameplay caller's signed delta (class rupee).
     void ObserveRupee(Dynarmic::A64::Jit& jit, u64 thread);
-    /// The actor flag setter trapped here: a chest of the profile really opening (claim it).
-    void ObserveActorFlag(Dynarmic::A64::Jit& jit, Memory::Memory& memory);
+    void ObserveChest(OotGameDataTrace::Point point, Dynarmic::A64::Jit& jit,
+                      Memory::Memory& memory, u64 thread);
     /// The running event's context (EventMgr+0x68), 0 when none, nothing when unreadable.
     std::optional<u64> EventContext(Memory::Memory& memory) const;
     struct Impl;

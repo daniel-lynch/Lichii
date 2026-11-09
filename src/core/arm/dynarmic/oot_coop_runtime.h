@@ -364,7 +364,11 @@ public:
         return true;
     }
 
+    // The Session supplies source ownership/lifetime checks at the actual issue point.
+    std::function<bool(const Change&)> item_gate;
+
     std::optional<ApplyTarget> ResolveItem(const Change& change) {
+        if (item_gate && !item_gate(change)) return {};
         using namespace OotGameDataTrace::Detail;
         if (!ValidItem(change) || !binding.manager || !Callable() || binding.stack < ItemStackNeed ||
             !Range(binding.stack - ItemStackNeed, ItemStackNeed) || !ItemReady()) return {};

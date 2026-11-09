@@ -185,6 +185,14 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
         const auto point = original ? OotGameDataTrace::Identify(profile, base, pc, *original)
                                     : OotGameDataTrace::Point::None;
         if (point != OotGameDataTrace::Point::None) {
+            const bool before = point == OotGameDataTrace::Point::ChestInteraction ||
+                                point == OotGameDataTrace::Point::ChestConfirm ||
+                                point == OotGameDataTrace::Point::ChestReturn ||
+                                point == OotGameDataTrace::Point::ItemGive ||
+                                point == OotGameDataTrace::Point::StructBoolSet;
+            // Observe the original arguments before the displaced instruction (especially BL).
+            // A give rejection returns before its prologue and intentionally bypasses Resume.
+            if (before && m_oot_coop && coop_hook(point)) return;
             // Resume exactly once, whether tracing, co-op, or both registered the breakpoint.
             if (m_gamedata_trace) {
                 OotGameDataTrace::Handle(*m_gamedata_trace, pc, *m_parent.m_jit, m_memory);
@@ -192,7 +200,7 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
                 OotGameDataTrace::Resume(point, *m_parent.m_jit, m_memory, pc);
             }
             // Resume the original instruction before capturing context or redirecting PC.
-            if (m_oot_coop) coop_hook(point);
+            if (!before && m_oot_coop) coop_hook(point);
             return;
         }
     }

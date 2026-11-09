@@ -33,6 +33,8 @@ Coop::Change Give(Origin source, std::string sender = "peer", u64 seq = 1) {
 
 struct Registers {
     std::array<u64, 31> values{};
+    u64 pc{};
+    void SetPC(u64 value) { pc = value; }
     u64 GetRegister(size_t index) const { return values.at(index); }
     void SetRegister(size_t index, u64 value) { values.at(index) = value; }
 };
@@ -46,6 +48,7 @@ struct Memory {
     }
     u64 Read64(u64 address) { ++reads; return words.at(address); }
     u32 Read32(u64 address) const { return instructions.at(address); }
+    u8 Read8(u64 address) const { return static_cast<u8>(instructions.at(address)); }
 };
 
 Json ProfileFields() {
@@ -416,11 +419,16 @@ TEST_CASE("OoT world pickup return resumes ADRP x8 across page and sign boundari
 }
 
 TEST_CASE("OoT world typed chest claims keep ambiguous events unlinked", "[core][oot_coop]") {
-    Coop::ChestClaims claims;
-    claims.LocalOpen(Origin::Chest(101), 1);
-    claims.LocalOpen(Origin::Chest(102), 1);
-    claims.LocalOpen(Origin::Chest(103), 1);
-    REQUIRE_FALSE(claims.End(1));
+    Coop::Chest::Claims claims;
+    const Coop::Chest::EventToken event{0x7000, 1};
+    for (u32 key : {101U, 102U, 103U}) {
+        const Coop::Chest::Identity identity{{u64{key} * 0x100, u64{key} * 0x100 + 8, 1, 1}, key, key, key};
+        const auto attempt = claims.LocalBegin(identity, 1, 1);
+        claims.BindEvent(attempt, event);
+    }
+    REQUIRE_FALSE(claims.FindEvent(event));
+    REQUIRE_FALSE(claims.Attribute(std::nullopt, event));
+    claims.EndEvent(event);
 }
 
 namespace {

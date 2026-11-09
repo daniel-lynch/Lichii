@@ -14,8 +14,10 @@ add_library(core STATIC
     arm/dynarmic/oot_coop_runtime.h
     arm/dynarmic/oot_coop_sync.h
     arm/dynarmic/oot_coop_ux.cpp
+    arm/dynarmic/oot_coop_chest.cpp
     arm/dynarmic/oot_coop_world.cpp
     arm/dynarmic/oot_coop_ux.h
+    arm/dynarmic/oot_coop_chest.h
     arm/dynarmic/oot_coop_world.h
     arm/exec_coverage.cpp
     arm/exec_coverage.h

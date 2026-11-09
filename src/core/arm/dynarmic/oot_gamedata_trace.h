@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "core/arm/dynarmic/oot_coop_chest.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -64,8 +66,11 @@ enum class Point : u8 {
     RupeeAdd,
     Pickup,
     PickupReturn,
+    ChestInteraction,
+    ChestConfirm,
+    ChestReturn,
 };
-inline constexpr size_t PointCount = 13;
+inline constexpr size_t PointCount = 16;
 
 struct Site {
     Point point;
@@ -181,9 +186,10 @@ struct Profile {
     /// Wallet observation: reviewed gameplay return addresses for signed deltas.
     /// The optional world profile also admits its shop caller; replay calls are suppressed.
     std::vector<u64> rupee_callers;
-    /// Same-chest race (C13): the chest-opened struct's member hash -> its backing Bool (the key
-    /// the bool class syncs). The actor flag setter names the member when a chest really opens.
+    /// The chest-opened struct's member hash -> its backing Bool. Interaction identity resolves
+    /// the member before a give; the local struct setter is a completion receipt.
     std::map<u32, u32> chest_members;
+    OotCoop::Chest::Config chest;
     u64 event_got{};                ///< Module offset of the GOT slot of the event manager's cell
     /// {cell, field}: *(*(main + cell) + field) must be non-zero before a give is replayed.
     std::vector<std::pair<u64, u64>> item_guards;
@@ -197,12 +203,12 @@ struct Profile {
     }
 };
 
-/// Co-op alone hooks only the frame boundary: it binds GameData from the manager cell there, and
-/// its handler ignores every other point. The Bool64 accessors are hot (the actor reader copy
-/// runs per actor per frame), so hooking them without tracing would cost a trap each.
+/// Co-op observation points. Hot Bool64 accessors remain trace-only; chest completion is
+/// additionally enabled by Session::Traps when the private chest configuration is present.
 constexpr bool CoopPoint(Point point) {
     return point == Point::Frame || point == Point::ItemGive || point == Point::RupeeAdd ||
-           point == Point::Pickup || point == Point::PickupReturn;
+           point == Point::Pickup || point == Point::PickupReturn ||
+           point == Point::ChestInteraction || point == Point::ChestConfirm || point == Point::ChestReturn;
 }
 
 /// The trace point at `address` whose original instruction is `instruction`, or None.
@@ -239,6 +245,21 @@ void Resume(Point point, Jit& jit, Memory& memory, u64 pc = 0) {
     case Point::RupeeAdd:
         jit.SetRegister(8, 0x3BD4); // mov w8, #0x3bd4
         break;
+    case Point::ChestInteraction: {
+        // The decoder admits only LDRB W1,[X0,#imm12].
+        const u32 word = memory.Read32(pc);
+        jit.SetRegister(1, memory.Read8(jit.GetRegister(0) + ((word >> 10) & 0xFFF)));
+        break;
+    }
+    case Point::ChestConfirm: {
+        // BL has no flag effects; preserve all registers except its architectural LR write.
+        const u32 word = memory.Read32(pc);
+        const s64 displacement = static_cast<s64>(u64{word & 0x03FFFFFF} << 38) >> 36;
+        jit.SetRegister(30, pc + 4);
+        jit.SetPC(pc + static_cast<u64>(displacement));
+        break;
+    }
+    case Point::ChestReturn:
     case Point::PickupReturn: {
         // Only an ADRP x8 site is admitted by the private profile decoder.
         const u32 word = memory.Read32(pc);
@@ -271,6 +292,9 @@ constexpr std::string_view Name(Point point) {
     case Point::ActorFlagSet: return "actor-flag-set";
     case Point::ItemGive: return "item-give";
     case Point::RupeeAdd: return "rupee-add";
+    case Point::ChestInteraction: return "chest-interaction";
+    case Point::ChestConfirm: return "chest-confirm";
+    case Point::ChestReturn: return "chest-return";
     case Point::Pickup: return "pickup";
     case Point::PickupReturn: return "pickup-return";
     case Point::Frame: return "frame";
@@ -485,6 +509,9 @@ std::string Describe(Point point, u64 base, Jit& jit, Memory& memory) {
     case Point::BitSet:
         return fmt::format("gamedata {} mgr={:#x} key={:016x}", Name(point), x0,
                            jit.GetRegister(2));
+    case Point::ChestInteraction:
+    case Point::ChestConfirm:
+    case Point::ChestReturn:
     case Point::Pickup:
     case Point::PickupReturn:
         return fmt::format("gamedata {} lr={}", Name(point), caller);
