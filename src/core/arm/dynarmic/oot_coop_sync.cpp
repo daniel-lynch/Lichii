@@ -517,6 +517,23 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                             if (!number || !*number || (*number & 7)) return std::nullopt;
                             ghost.actor_fields.push_back(*number);
                         }
+                    } else if (name == "anim") {
+                        if (!item.is_object()) return std::nullopt;
+                        for (const auto& [key, part] : item.items()) {
+                            if (key == "play") {
+                                const auto decoded = entry(part);
+                                if (!decoded) return std::nullopt;
+                                ghost.anim_play = *decoded;
+                            } else if (key == "idle" || key == "walk" || key == "run") {
+                                if (!part.is_string() || !ItemName(part.get<std::string>())) return std::nullopt;
+                                (key == "idle" ? ghost.anim_idle : key == "walk" ? ghost.anim_walk
+                                                                                 : ghost.anim_run) =
+                                    part.get<std::string>();
+                            } else {
+                                return std::nullopt;
+                            }
+                        }
+                        if (!ghost.anim_play) return std::nullopt;
                     } else if (name == "actor_child" || name == "actor_adult") {
                         if (!item.is_string() || !ItemName(item.get<std::string>())) return std::nullopt;
                         (name == "actor_child" ? ghost.actor_child : ghost.actor_adult) = item.get<std::string>();

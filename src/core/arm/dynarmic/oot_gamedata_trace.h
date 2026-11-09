@@ -109,6 +109,10 @@ struct GhostOffsets {
     u64 lifecycle{};
     u32 lifecycle_lo{}, lifecycle_hi{};
     std::string actor_child, actor_adult; ///< Actor names; adult falls back to child
+    /// Optional animation path: the actor's own AS play call (x0 = &0x30-byte request) and the
+    /// command each pose category plays. Empty play entry: statue (no animation calls).
+    Entry anim_play;
+    std::string anim_idle, anim_walk, anim_run;
     bool Valid() const {
         return playing_info_cell && pos && rot && actor_mgr_cell && scale_const && banc_hash &&
                child_hash && loading_hash && str64[0] && str64[1] && str64[2] && create && get &&

@@ -270,7 +270,7 @@ struct PeerView {
     std::optional<Pose> pose;
 };
 
-enum class GhostOp { None, Create, Get, Release, Move };
+enum class GhostOp { None, Create, Get, Release, Move, Play };
 
 /// Per-peer puppet state machine. One synthetic call at most per frame, and only when the grant
 /// drain has not started one. Port:
@@ -293,8 +293,11 @@ public:
         u64 retry_tick{}, pending_tick{};
         bool pending_logged{};
         bool adult_fallback{}; ///< Adult peer, child puppet (no adult puppet in the profile)
+        std::string played;    ///< Pose category whose command was last played ("" = none yet)
+        u32 played_seq{};
+        bool play_logged{};
     };
-    static constexpr u64 SlotSize = 0x180;
+    static constexpr u64 SlotSize = 0x200;
     static constexpr u64 CreateRetry = 1800; ///< frames after a refused/failed create
     static constexpr float ParkY = -10000.0f;
 
@@ -382,6 +385,38 @@ public:
             }
             // Live
             std::array<float, 4> target;
+            if (visible && !slot.parked && g.anim_play) {
+                // Animation category path: play the category's command once per change (the
+                // play call restarts the clip; it is never re-issued per packet).
+                const auto& p = *peer->pose;
+                const std::string& command = p.anim == "walk" ? g.anim_walk : p.anim == "run" ? g.anim_run
+                                                                                              : g.anim_idle;
+                if (!command.empty() && (slot.played != p.anim || slot.played_seq != p.anim_seq)) {
+                    if (const auto why = Dead(port, slot)) {
+                        Drop(log, slot, *why);
+                        continue;
+                    }
+                    // Request at +0x140 (0x30 bytes), command at +0x180 (64 bytes).
+                    std::array<u8, 0x70> req{};
+                    const u64 cmd_at = at + 0x180;
+                    const float rate = std::clamp(p.rate > 0.05f ? p.rate : 1.0f, 0.25f, 4.0f);
+                    const float minus_one = -1.0f;
+                    std::memcpy(req.data(), &slot.actor, 8);
+                    std::memcpy(req.data() + 8, &cmd_at, 8);
+                    std::memcpy(req.data() + 0x14, &rate, 4);
+                    std::memcpy(req.data() + 0x18, &minus_one, 4);
+                    std::memcpy(req.data() + 0x1C, &minus_one, 4);
+                    std::memcpy(req.data() + 0x40, command.data(), std::min<size_t>(command.size(), 63));
+                    slot.played = p.anim;
+                    slot.played_seq = p.anim_seq;
+                    if (port.Write(at + 0x140, req.data(), req.size()) &&
+                        Start(port, g.anim_play, {at + 0x140}, i, GhostOp::Play)) {
+                        slot_name = command;
+                        return true;
+                    }
+                    continue;
+                }
+            }
             if (visible) {
                 const auto& p = *peer->pose;
                 target = {p.pos[0], p.pos[1], p.pos[2], p.yaw};
@@ -466,6 +501,8 @@ public:
             slot.generation = *generation;
             slot.state = State::Live;
             slot.parked = true; // the next visible frame moves it into place
+            slot.played.clear();
+            slot.play_logged = false;
             Line(log, slot, fmt::format("live actor={:#x} generation={:#x}", x0, *generation));
             break;
         }
@@ -473,6 +510,12 @@ public:
             slot.state = State::None;
             slot.retry_tick = tick + CreateRetry;
             Line(log, slot, "create released");
+            break;
+        case GhostOp::Play:
+            if (!(x0 & 1) || !slot.play_logged) {
+                Line(log, slot, fmt::format("anim {} -> {} w0={}", slot.played, slot_name, x0 & 1));
+                slot.play_logged = slot.play_logged || (x0 & 1);
+            }
             break;
         case GhostOp::Move:
         case GhostOp::None:

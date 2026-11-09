@@ -545,3 +545,90 @@ TEST_CASE("OoT co-op ghost lifecycle field is optional and bounded", "[core][oot
     REQUIRE(without);
     REQUIRE(without->ghost.lifecycle == 0);
 }
+
+TEST_CASE("OoT co-op ghost animation path plays a category's command once per change", "[core][oot_coop]") {
+    auto g = Offsets();
+    g.anim_play = {0x404000, {0xD503237F}};
+    g.anim_idle = "Idle_Cmd";
+    g.anim_walk = "Walk_Cmd";
+    Bytes m;
+    Port port{m};
+    m.P64(Base + g.actor_mgr_cell, 0x60000000);
+    for (u64 i = 0; i < 3; ++i) m.PF(Base + g.scale_const + i * 4, 1.0f);
+    Coop::GhostDriver<Port> ghost{g, Base};
+    const Pose local = At("Forest_A", 0, 0);
+    std::vector<Coop::PeerView> peers{{"peer-b", At("Forest_A", 3, 4, 45)}};
+    REQUIRE(ghost.Frame(port, Block, local, peers, NoLog));
+    m.P64(Block, 0x61000000);
+    m.P32(0x61000000, 3);
+    ghost.Returned(port, Block, 1, NoLog);
+    REQUIRE(ghost.Frame(port, Block, local, peers, NoLog));
+    const u64 actor = 0x62000000, record = 0x63000000;
+    m.P64(actor, 0xABC0);
+    m.P64(actor + 0x40, 0x1);
+    m.P64(actor + 0x48, 0x2);
+    m.P64(actor + 0x50, record);
+    m.P32(actor + 0x18, 0x35c);
+    m.P64(record + 0x40, actor);
+    m.P32(record + 0x48, 0x35c);
+    ghost.Returned(port, Block, actor, NoLog);
+    // First visible frame moves (shown), the next plays idle.
+    REQUIRE(ghost.Frame(port, Block, local, peers, NoLog));
+    REQUIRE(port.calls.back().entry == Base + g.set_mtx.offset);
+    ghost.Returned(port, Block, 0, NoLog);
+    REQUIRE(ghost.Frame(port, Block, local, peers, NoLog));
+    REQUIRE(port.calls.back().entry == Base + g.anim_play.offset);
+    const u64 req = port.calls.back().args[0];
+    REQUIRE(m.Read64(req) == actor);
+    std::string cmd;
+    for (u64 a = m.Read64(req + 8); m.b.at(a); ++a) cmd.push_back(static_cast<char>(m.b.at(a)));
+    REQUIRE(cmd == "Idle_Cmd");
+    REQUIRE(m.F(req + 0x14) == 1.0f);
+    REQUIRE(m.F(req + 0x18) == -1.0f);
+    ghost.Returned(port, Block, 1, NoLog);
+    const size_t n = port.calls.size();
+    REQUIRE_FALSE(ghost.Frame(port, Block, local, peers, NoLog)); // same category: nothing
+    REQUIRE(port.calls.size() == n);
+    peers[0].pose->anim = "walk";
+    peers[0].pose->anim_seq = 1;
+    peers[0].pose->rate = 1.5f;
+    REQUIRE(ghost.Frame(port, Block, local, peers, NoLog));
+    REQUIRE(port.calls.back().entry == Base + g.anim_play.offset);
+    REQUIRE(m.F(req + 0x14) == 1.5f);
+    ghost.Returned(port, Block, 1, NoLog);
+    // No command for "run": no call for it.
+    peers[0].pose->anim = "run";
+    peers[0].pose->anim_seq = 2;
+    REQUIRE_FALSE(ghost.Frame(port, Block, local, peers, NoLog));
+    // The key file switch: "anim" needs a play entry, names are checked.
+    Json ghost_json{{"playing_info_cell", "0x300000"}, {"pos", "0x100"}, {"rot", "0x10C"},
+                    {"actor_mgr_cell", "0x300008"}, {"scale_const", "0x300010"},
+                    {"banc_hash", "0x1111"}, {"child_hash", "0x2222"}, {"loading_hash", "0x3333"},
+                    {"str64", Json::array({"0x80", "0x20", "0x8"})},
+                    {"create", {{"at", "0x400000"}, {"words", Json::array({"0xD503237F"})}}},
+                    {"get", {{"at", "0x401000"}, {"words", Json::array({"0xD503237F"})}}},
+                    {"release", {{"at", "0x402000"}, {"words", Json::array({"0xD503237F"})}}},
+                    {"set_mtx", {{"at", "0x403000"}, {"words", Json::array({"0xD503237F"})}}},
+                    {"actor_fields", Json::array({"0x40", "0x48"})},
+                    {"link", Json::array({"0x50", "0x18", "0x40", "0x48"})},
+                    {"actor_child", "Puppet_Child"},
+                    {"anim", {{"play", {{"at", "0x404000"}, {"words", Json::array({"0xD503237F"})}}},
+                              {"idle", "Idle_Cmd"}, {"walk", "Walk_Cmd"}}}};
+    const auto load = [&](const Json& j) {
+        return Coop::DecodeProfile(Json{{"offsets", {{Build, {{"manager_cell", "0x200000"}, {"ghost", j}}}}}}, Build);
+    };
+    const auto profile = load(ghost_json);
+    REQUIRE(profile);
+    REQUIRE(profile->ghost.anim_play.offset == 0x404000);
+    REQUIRE(profile->ghost.anim_walk == "Walk_Cmd");
+    REQUIRE(profile->ghost.anim_run.empty());
+    auto bad = ghost_json;
+    bad["anim"].erase("play");
+    REQUIRE_FALSE(load(bad));
+    bad = ghost_json;
+    bad["anim"]["idle"] = "../x";
+    REQUIRE_FALSE(load(bad));
+    bad = ghost_json;
+    bad["anim"]["frame"] = "x";
+    REQUIRE_FALSE(load(bad));
+}

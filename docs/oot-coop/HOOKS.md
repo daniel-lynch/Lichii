@@ -316,6 +316,8 @@ serves this head and later only:
           "create": {"at": "<offset>", "words": [...]}, "get": {...}, "release": {...}, "set_mtx": {...},
           "actor_fields": ["<field>", ...], "link": ["<field>", "<field>", "<field>", "<field>"],
           "lifecycle": ["<field>", "<lo>", "<hi>"],
+          "anim": {"play": {"at": "<offset>", "words": [...]}, "idle": "<command>", "walk": "<command>",
+                   "run": "<command>"},
           "actor_child": "<actor>", "actor_adult": "<actor>"}
 ```
 
@@ -347,6 +349,14 @@ serves this head and later only:
   way): another guest core could start the teardown between the check and the call's first
   instruction. Deletion is staged (lifecycle first, then the link record, the vtable and the
   memory later), which is what the lifecycle check catches.
+- **Animation (optional `anim`).** Without it the puppet is a statue (whatever its own AI plays).
+  With it, each time a peer's pose category (`anim`/`anim_seq`: idle, walk, run) changes, the
+  receiver calls the actor's own AS play call once (x0 = a 0x30-byte request in the slot: actor,
+  command string, slot 0, the pose's `rate` clamped to 0.25..4, morph and fade-in -1, ignore-same 0)
+  with the category's command; a category without a command plays nothing. The call restarts the
+  clip, so it is never re-issued per packet, and a rate change inside one category is not applied
+  (the play call ignores it without a restart). Phase (`phase`) is not applied: the frame setter
+  takes its frame in s0, and the synthetic call path passes x0..x7 only.
 - **Age.** `actor_adult` is optional. Without it an adult peer is drawn with the child puppet, and
   the create line says so.
 - Field status: `RESULT` of C8 (private).
