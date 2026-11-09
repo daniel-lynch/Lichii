@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <fstream>
 #include <mutex>
@@ -553,7 +554,14 @@ void Save::Note(std::string_view path, std::string_view host, bool write) {
     std::scoped_lock lock{impl->mutex};
     if (!impl->enabled) return;
     auto slot = impl->pattern.Match(path);
-    if (!slot) return;
+    if (!slot) {
+        // EDEN_NX2_OOT_COOP_LEDGER_TRACE=1: the first 64 unmatched opens, to write the private pattern.
+        static const bool trace = [] { const char* v = std::getenv("EDEN_NX2_OOT_COOP_LEDGER_TRACE"); return v && *v == '1'; }();
+        if (trace && impl->lines++ < 64)
+            LOG_INFO(Core_ARM, "OoT co-op: ledger file op={} unmatched path={} host={}",
+                     host.empty() ? "rename" : write ? "write" : "read", path, host);
+        return;
+    }
     if (impl->lines++ < 64)
         LOG_INFO(Core_ARM, "OoT co-op: ledger save file op={} slot={} path={} host={}",
                  host.empty() ? "rename" : write ? "write" : "read", *slot, path, host);
