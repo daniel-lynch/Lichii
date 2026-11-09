@@ -269,7 +269,10 @@ struct Memory {
     u32 Read32(u64 a) const { u32 v; std::memcpy(&v, bytes.data() + a, 4); return v; }
     u64 Read64(u64 a) const { u64 v; std::memcpy(&v, bytes.data() + a, 8); return v; }
     void Put(u64 a, u64 v, size_t n = 8) { std::memcpy(bytes.data() + a, &v, n); }
+    void Write8(u64 a, u8 v) { Put(a, v, 1); }
     void Write16(u64 a, u16 v) { Put(a, v, 2); }
+    void Write32(u64 a, u32 v) { Put(a, v, 4); }
+    void Write64(u64 a, u64 v) { Put(a, v); }
     void Text(u64 a, const char* v) { std::memcpy(bytes.data() + a, v, std::strlen(v) + 1); }
     void Float(u64 a, float f) { Put(a, std::bit_cast<u32>(f), 4); }
 };
@@ -317,7 +320,11 @@ struct Backend {
     bool ready{true}, verified{true}, redirect{true};
     std::function<void()> after_capture = [] {};
     std::optional<Core::OotCoop::ApplyTarget> call;
-    std::optional<u64> VerifiedEntry(const Core::OotGameDataTrace::Entry&) { return verified ? std::optional<u64>{0x4000} : std::nullopt; }
+    std::vector<u64> verified_entries;
+    std::optional<u64> VerifiedEntry(const Core::OotGameDataTrace::Entry& entry) {
+        verified_entries.push_back(entry.offset);
+        return verified ? std::optional<u64>{0x4000} : std::nullopt;
+    }
     bool CallReady() { return ready; }
     std::optional<Context> Capture() { after_capture(); return Context{}; }
     bool Redirect(const Core::OotCoop::ApplyTarget& t) { if (!redirect) return false; call = t; return true; }
@@ -411,4 +418,301 @@ TEST_CASE("teleport source replacement and peer loss cancel before issue", "[oot
     r.Receive(); r.Frame(); REQUIRE(r.calls.empty()); REQUIRE(r.Logged("source scene/age/actor changed"));
     r.Request(); r.Receive(Reply(2)); r.controller.PeerGone("peer-a", r.port.log);
     r.Frame(); REQUIRE(r.calls.empty()); REQUIRE_FALSE(r.controller.Busy());
+}
+
+namespace {
+Json CrossJson(bool explicit_position = false) {
+    Json c{{"enabled", true}, {"mode", explicit_position ? "explicit" : "startpos"},
+        {"request_size", 0x400}, {"request_name_ptr", 0x20}, {"request_name_cap", 0x28},
+        {"reserved_banc", 11}, {"reserved_start", 12}, {"fade_key", 13}, {"fade_value", 14},
+        {"control_key", 15}, {"control_value", 16}, {"events", {"CarrierA", "CarrierB"}},
+        {"start_pos", {{"Field_B", "SpawnA"}}}, {"load_timeout_ms", 10000}, {"arrive_frames", 3}};
+    u32 offset = 0x100;
+    for (auto name : {"string64", "enum", "request_ctor", "request_event"}) {
+        c[name] = {{"at", offset}, {"words", {1, 2, 3, 4}}}; offset += 0x10;
+    }
+    if (explicit_position) {
+        c["vector3"] = {{"at", 0x200}, {"words", {5, 6, 7, 8}}}; c["reserved_position"] = 17;
+    }
+    return c;
+}
+T::Keys CrossKeys(bool explicit_position = false) {
+    auto j = KeyJson(); j["cross"] = CrossJson(explicit_position); j["allow_bancs"].push_back("Field_B");
+    const auto k = T::DecodeKeys(j); REQUIRE(k); return *k;
+}
+struct CrossRig : Rig {
+    MemoryRig m;
+    Backend backend;
+    std::optional<Backend::Context> saved;
+    u64 stack{};
+    static constexpr u64 StackTop = 0x18000, Scratch = StackTop - 0x10000;
+    std::vector<T::CrossStep> steps;
+    std::vector<Core::OotCoop::ApplyTarget> cross_calls;
+    explicit CrossRig(bool explicit_position = false) {
+        const auto k = CrossKeys(explicit_position);
+        controller = T::Controller{k}; *m.keys = k;
+        m.profile.manager_cell = 0x30; m.memory.Put(0x130, 0x10000);
+        port.cross_call = [&](T::CrossStep step, size_t event, const T::Packet& p) {
+            if (!T::IssueCross(m.memory, backend, m.profile, 0x100, StackTop, 0x7000, step, event, p, saved, stack)) return false;
+            steps.push_back(step); cross_calls.push_back(*backend.call); return true;
+        };
+        for (int i = 0; i < 3; ++i) Frame();
+    }
+    T::Packet Destination() { auto p = Reply(); p.banc = "Field_B"; return p; }
+    void Begin() { Request(); Receive(Destination()); }
+    void Return(u64 w0 = 0) {
+        REQUIRE(controller.Calling());
+        if (steps.back() == T::CrossStep::Constructor) {
+            m.memory.Put(Scratch + 0x20, Scratch + 0x100); m.memory.Put(Scratch + 0x28, 64, 4);
+        }
+        saved.reset(); controller.Returned(w0, port.log);
+    }
+    void Reserve(bool refuse_first = false, bool refuse_all = false) {
+        Begin();
+        const unsigned count = m.keys->cross->explicit_position ? 7 : 6;
+        for (unsigned i = 0; i < count; ++i) {
+            REQUIRE(Frame()); REQUIRE(controller.Calling());
+            if (steps.back() == T::CrossStep::Event) Return(refuse_first || refuse_all ? 0 : 3);
+            else Return();
+        }
+        if (refuse_first || refuse_all) {
+            REQUIRE(Frame()); REQUIRE(steps.back() == T::CrossStep::Constructor); Return();
+            REQUIRE(Frame()); REQUIRE(steps.back() == T::CrossStep::Event); Return(refuse_all ? 2 : 1);
+        }
+    }
+    void Live() {
+        sample.event_running = 0x888; REQUIRE(Frame()); REQUIRE(steps.back() == T::CrossStep::Reassert); Return();
+    }
+    void Load() {
+        sample.loading = true; Frame();
+        sample.banc = "Field_B"; sample.resident.reset(); sample.actor_pos.reset(); Frame();
+        sample.loading = false; sample.event_running = 0;
+        sample.resident = Sample().resident; ++sample.resident->generation;
+        sample.actor_pos = T::Vec{7, 8, 9}; Frame();
+    }
+    void Agree(T::Vec position = {7, 8, 9}) { sample.info_pos = position; sample.actor_pos = position; }
+    void ReadyFrames() { for (int i = 0; i < 5; ++i) Frame(); }
+};
+}
+
+TEST_CASE("teleport cross keys strict mode dependent schema", "[oot_coop]") {
+    REQUIRE_FALSE(T::DecodeKeys(KeyJson())->cross);
+    for (bool explicit_position : {false, true}) {
+        auto j = KeyJson(); j["cross"] = CrossJson(explicit_position);
+        REQUIRE(T::DecodeKeys(j)->cross->explicit_position == explicit_position);
+        for (const auto& [field, value] : j["cross"].items()) {
+            auto bad = j; bad["cross"].erase(field); CAPTURE(field); REQUIRE_FALSE(T::DecodeKeys(bad));
+        }
+        for (const Json& delta : {Json{{"unknown", 1}}, Json{{"enabled", 1}}, Json{{"mode", "other"}},
+            Json{{"request_size", 0x2000}}, Json{{"request_size", 0}}, Json{{"request_name_ptr", 0x3FC}},
+            Json{{"request_name_cap", 0x24}}, Json{{"request_name_cap", 0x400}}, Json{{"reserved_banc", 0}},
+            Json{{"events", Json::array()}}, Json{{"events", {"A", "B", "C", "D", "E"}}},
+            Json{{"events", {"A", "A"}}}, Json{{"events", {"bad/name"}}}, Json{{"load_timeout_ms", 999}},
+            Json{{"load_timeout_ms", 120001}}, Json{{"arrive_frames", 0}}, Json{{"arrive_frames", 601}},
+            Json{{"start_pos", {{"Field_B", ""}}}}, Json{{"start_pos", {{"Field_B", true}}}}}) {
+            auto bad = j; bad["cross"].update(delta); REQUIRE_FALSE(T::DecodeKeys(bad));
+        }
+        for (auto name : {"string64", "enum", "request_ctor", "request_event"}) {
+            for (const Json& entry : {Json{{"at", 3}, {"words", {1, 2, 3, 4}}},
+                Json{{"at", 4}, {"words", {1, 2, 3}}}, Json{{"at", 4}, {"words", {1, 2, 3, true}}},
+                Json{{"at", 4}, {"words", {1, 2, 3, 4}}, {"extra", 1}}}) {
+                auto bad = j; bad["cross"][name] = entry; REQUIRE_FALSE(T::DecodeKeys(bad));
+            }
+        }
+        if (!explicit_position) {
+            auto bad = j; bad["cross"]["vector3"] = j["cross"]["string64"]; REQUIRE_FALSE(T::DecodeKeys(bad));
+        }
+    }
+}
+
+TEST_CASE("teleport cross full reservation ABI scratch and event fallback", "[oot_coop]") {
+    for (bool explicit_position : {false, true}) {
+        CrossRig r{explicit_position}; r.Reserve(true);
+        std::vector<T::CrossStep> expected{T::CrossStep::Banc, T::CrossStep::Start};
+        if (explicit_position) expected.push_back(T::CrossStep::Position);
+        for (auto step : {T::CrossStep::Fade, T::CrossStep::Control, T::CrossStep::Constructor,
+                          T::CrossStep::Event, T::CrossStep::Constructor, T::CrossStep::Event}) expected.push_back(step);
+        REQUIRE(r.steps == expected); REQUIRE(r.Logged("event accepted"));
+        const auto& k = *r.m.keys->cross;
+        auto& mem = r.m.memory;
+        const auto text = [&](u64 at) { return std::string{reinterpret_cast<const char*>(mem.bytes.data() + at)}; };
+        REQUIRE(text(r.Scratch + T::BancText) == "Field_B");
+        REQUIRE(text(r.Scratch + T::StartText) == (explicit_position ? "" : "SpawnA"));
+        REQUIRE(mem.Read64(r.Scratch + T::BancCell) == r.Scratch + T::BancText);
+        REQUIRE(mem.Read64(r.Scratch + T::StartCell) == r.Scratch + T::StartText);
+        REQUIRE(text(r.Scratch + 0x100) == "CarrierB");
+        for (size_t i = 0; i < expected.size(); ++i) {
+            const auto& call = r.cross_calls[i];
+            REQUIRE(call.stack == r.StackTop - 0x100); REQUIRE(call.sentinel == 0x7000);
+            REQUIRE(call.stores.size() == 4);
+            for (size_t n = 0; n < 4; ++n) REQUIRE(call.stores[n] == std::pair<u64, u64>{call.stack + n * 8, 0});
+            std::array<u64, 8> args{};
+            switch (expected[i]) {
+            case T::CrossStep::Banc: args = {0x10000, r.Scratch + T::BancCell, k.reserved_banc}; break;
+            case T::CrossStep::Start: args = {0x10000, r.Scratch + T::StartCell, k.reserved_start}; break;
+            case T::CrossStep::Position: args = {0x10000, r.Scratch + T::PositionData, k.reserved_position}; break;
+            case T::CrossStep::Fade: args = {0x10000, k.fade_value, k.fade_key}; break;
+            case T::CrossStep::Control: args = {0x10000, k.control_value, k.control_key}; break;
+            case T::CrossStep::Constructor: args = {r.Scratch}; break;
+            case T::CrossStep::Event: args = {0xC00, r.Scratch}; break;
+            default: FAIL("unexpected call");
+            }
+            REQUIRE(call.arguments == args);
+            u64 entry = k.enumeration.offset;
+            if (expected[i] == T::CrossStep::Banc || expected[i] == T::CrossStep::Start) entry = k.string64.offset;
+            if (expected[i] == T::CrossStep::Position) entry = k.vector3.offset;
+            if (expected[i] == T::CrossStep::Constructor) entry = k.request_ctor.offset;
+            if (expected[i] == T::CrossStep::Event) entry = k.request_event.offset;
+            REQUIRE(r.backend.verified_entries[i] == entry);
+        }
+        if (explicit_position) for (size_t i = 0; i < 3; ++i)
+            REQUIRE(mem.Read32(r.Scratch + T::PositionData + i * 4) == std::bit_cast<u32>(r.Destination().pos[i]));
+        r.Live();
+        REQUIRE(r.cross_calls.back().arguments == std::array<u64, 8>{0x10000, k.control_value, k.control_key});
+        for (int i = 0; i < 5; ++i) r.Frame();
+        REQUIRE(std::count(r.steps.begin(), r.steps.end(), T::CrossStep::Reassert) == 1);
+        REQUIRE(r.calls.empty());
+    }
+}
+
+TEST_CASE("teleport cross event refusal is terminal", "[oot_coop]") {
+    CrossRig r; r.Reserve(false, true);
+    REQUIRE_FALSE(r.controller.Busy()); REQUIRE(r.Logged("event refused"));
+    const auto count = r.steps.size(); for (int i = 0; i < 20; ++i) r.Frame();
+    REQUIRE(r.steps.size() == count); REQUIRE(r.calls.empty());
+}
+
+TEST_CASE("teleport cross arrival needs new generation agreement and consecutive readiness", "[oot_coop]") {
+    CrossRig r; r.Reserve(); r.Live(); r.Load();
+    for (int i = 0; i < 10; ++i) r.Frame(); // stale PlayingInfo after loading fell
+    REQUIRE(r.calls.empty()); REQUIRE(r.Logged("loading off"));
+    r.Agree();
+    r.sample.resident = Sample().resident; // identical old actor/generation cannot be the destination
+    for (int i = 0; i < 10; ++i) r.Frame(); REQUIRE(r.calls.empty());
+    ++r.sample.resident->generation;
+    for (int i = 0; i < 4; ++i) r.Frame(); REQUIRE(r.calls.empty());
+    r.sample.block_bools_ok = false; r.Frame(); r.sample.block_bools_ok = true;
+    for (int i = 0; i < 4; ++i) r.Frame(); REQUIRE(r.calls.empty());
+    REQUIRE(r.Frame()); REQUIRE(r.calls.size() == 1); REQUIRE(r.Logged("correction issued"));
+    const auto matrix = Core::OotCoop::YawMatrix(r.Destination().pos, r.Destination().yaw);
+    REQUIRE(r.calls[0].arguments[0] == r.sample.resident->actor);
+    REQUIRE(r.calls[0].stores[4].second == (u64{std::bit_cast<u32>(matrix[0])} | (u64{std::bit_cast<u32>(matrix[1])} << 32)));
+    r.controller.Returned(0, r.port.log); r.Agree(r.Destination().pos); r.Frame();
+    REQUIRE(r.Logged("cross arrived")); REQUIRE_FALSE(r.controller.Busy());
+    for (int i = 0; i < 180; ++i) r.Frame();
+    REQUIRE(r.Logged("+1s stable")); REQUIRE(r.Logged("+3s stable")); REQUIRE(r.calls.size() == 1);
+}
+
+TEST_CASE("teleport explicit within tolerance skips correction", "[oot_coop]") {
+    CrossRig r{true}; r.Reserve(); r.Live(); r.Load(); r.Agree(r.Destination().pos); r.ReadyFrames();
+    REQUIRE(r.Logged("arrived (no correction)")); REQUIRE(r.calls.empty()); REQUIRE_FALSE(r.controller.Busy());
+    for (int i = 0; i < 180; ++i) r.Frame(); REQUIRE(r.Logged("+3s stable"));
+}
+
+TEST_CASE("teleport cross fails once on timeout unexpected banc age or disconnect", "[oot_coop]") {
+    for (int scenario = 0; scenario < 6; ++scenario) {
+        CrossRig r; r.Reserve();
+        if (scenario == 0) r.now += 10001;
+        if (scenario == 1) r.sample.banc = "Field_C";
+        if (scenario == 2) r.sample.child = false;
+        if (scenario == 3) r.controller.PeerGone("peer-a", r.port.log);
+        if (scenario == 4) { r.now += 10001; r.controller.Tick(r.now, r.port.log); }
+        if (scenario == 5) r.controller.Invalidate(r.port.log, "connection lost", true);
+        r.Frame(); REQUIRE_FALSE(r.controller.Busy()); REQUIRE(r.Logged("cross failed")); REQUIRE(r.calls.empty());
+    }
+    CrossRig r; r.Begin(); REQUIRE(r.Frame());
+    r.now += 10001; r.controller.Tick(r.now, r.port.log);
+    REQUIRE(r.controller.Calling()); REQUIRE(r.saved);
+    r.Return(); REQUIRE_FALSE(r.controller.Busy()); REQUIRE_FALSE(r.saved);
+    r.Frame(); REQUIRE(r.steps.size() == 1);
+}
+
+TEST_CASE("teleport cross survives same manager table relocation only during load", "[oot_coop]") {
+    CrossRig r; r.Reserve(); r.Live(); r.sample.loading = true; r.Frame();
+    REQUIRE(r.controller.Rebinding(r.sample, r.now, true, r.port.log));
+    REQUIRE(r.controller.TransitionWait());
+    r.Load(); r.Agree(); r.ReadyFrames(); REQUIRE(r.calls.size() == 1);
+    for (int scenario = 0; scenario < 4; ++scenario) {
+        CrossRig bad; bad.Reserve(); bad.Live(); bad.sample.loading = true;
+        if (scenario == 0) bad.sample.banc.clear();
+        if (scenario == 1) bad.sample.child = false;
+        if (scenario == 2) bad.sample.banc = "Other";
+        REQUIRE_FALSE(bad.controller.Rebinding(bad.sample, bad.now, scenario != 3, bad.port.log));
+        REQUIRE_FALSE(bad.controller.Busy()); REQUIRE(bad.calls.empty());
+    }
+}
+
+TEST_CASE("teleport cross scratch bounds fingerprints and in flight guard", "[oot_coop]") {
+    for (int scenario = 0; scenario < 8; ++scenario) {
+        CrossRig r; r.Begin();
+        for (int i = 0; i < 5; ++i) { REQUIRE(r.Frame()); r.Return(); }
+        REQUIRE(r.steps.back() == T::CrossStep::Constructor);
+        auto& m = r.m.memory;
+        if (scenario == 0) m.Put(r.Scratch + 0x20, r.Scratch - 1);
+        if (scenario == 1) m.Put(r.Scratch + 0x20, r.Scratch + 0x400);
+        if (scenario == 2) m.Put(r.Scratch + 0x28, 3, 4);
+        if (scenario == 3) m.Put(r.Scratch + 0x28, 0x400, 4);
+        if (scenario == 4) m.Put(r.Scratch + 0x20, r.Scratch + 0x20);
+        if (scenario == 5) r.backend.verified = false;
+        if (scenario == 6) r.backend.ready = false;
+        if (scenario == 7) m.Put(0xB00, 0);
+        const auto before = m.bytes;
+        REQUIRE_FALSE(r.Frame()); REQUIRE_FALSE(r.controller.Busy()); REQUIRE(m.bytes == before);
+        REQUIRE(r.calls.empty());
+    }
+    CrossRig r; r.Begin(); REQUIRE(r.Frame()); const auto before = r.m.memory.bytes;
+    REQUIRE_FALSE(T::IssueCross(r.m.memory, r.backend, r.m.profile, 0x100, r.StackTop, 0x7000,
+        T::CrossStep::Start, 0, r.Destination(), r.saved, r.stack));
+    REQUIRE(r.m.memory.bytes == before);
+    r.saved.reset();
+    for (u64 top : {u64{0xFFFF}, u64{0x30000}})
+        REQUIRE_FALSE(T::IssueCross(r.m.memory, r.backend, r.m.profile, 0x100, top, 0x7000,
+            T::CrossStep::Start, 0, r.Destination(), r.saved, r.stack));
+}
+
+TEST_CASE("teleport cross destination policy stays fail closed", "[oot_coop]") {
+    for (int scenario = 0; scenario < 7; ++scenario) {
+        CrossRig r;
+        auto k = CrossKeys();
+        if (scenario == 0) k.cross->enabled = false;
+        if (scenario == 1) k.cross->start_pos.clear();
+        if (scenario == 2) k.deny_bancs.push_back("Field_B");
+        if (scenario == 3) k.allow_bancs = {"Field_A"};
+        r.controller = T::Controller{k}; for (int i = 0; i < 3; ++i) r.Frame();
+        r.Request(); auto p = r.Destination();
+        if (scenario == 4) p.child = false;
+        if (scenario == 5) p.room = 1;
+        if (scenario == 6) r.sample.block_bools_ok = false;
+        r.Receive(p); r.Frame(); REQUIRE(r.steps.empty()); REQUIRE(r.calls.empty()); REQUIRE_FALSE(r.controller.Busy());
+    }
+}
+
+TEST_CASE("teleport cross defers control until slot free and snapshots destination", "[oot_coop]") {
+    CrossRig r; r.Reserve(); r.sample.event_running = 0x888;
+    for (int i = 0; i < 4; ++i) REQUIRE_FALSE(r.Frame(false));
+    REQUIRE(std::count(r.steps.begin(), r.steps.end(), T::CrossStep::Reassert) == 0);
+    REQUIRE(r.Frame()); r.Return();
+    REQUIRE(std::count(r.steps.begin(), r.steps.end(), T::CrossStep::Reassert) == 1);
+    auto changed = r.Destination(); changed.pos = {80, 90, 100}; r.Receive(changed);
+    r.Load(); r.Agree(); r.ReadyFrames(); REQUIRE(r.calls.size() == 1);
+    const auto expected = T::MatrixCall(0x4000, 0x5000, 0x6000, r.sample.resident->actor, r.Destination());
+    REQUIRE(r.calls[0].stores == expected.stores);
+}
+
+TEST_CASE("teleport cross aborts reservation source changes without further calls", "[oot_coop]") {
+    for (int scenario = 0; scenario < 4; ++scenario) {
+        CrossRig r; r.Begin(); REQUIRE(r.Frame()); r.Return();
+        if (scenario == 0) ++r.sample.resident->generation;
+        if (scenario == 1) r.sample.loading = true;
+        if (scenario == 2) r.sample.banc = "Field_B";
+        if (scenario == 3) r.sample.child = false;
+        r.Frame(); REQUIRE_FALSE(r.controller.Busy()); REQUIRE(r.steps.size() == 1); REQUIRE(r.calls.empty());
+    }
+}
+
+TEST_CASE("teleport cross resolves manager cells after context capture", "[oot_coop]") {
+    CrossRig r;
+    r.backend.after_capture = [&] { r.m.memory.Put(0x130, 0); };
+    r.Begin(); REQUIRE_FALSE(r.Frame()); REQUIRE_FALSE(r.saved); REQUIRE(r.steps.empty());
+    REQUIRE_FALSE(r.controller.Busy());
 }

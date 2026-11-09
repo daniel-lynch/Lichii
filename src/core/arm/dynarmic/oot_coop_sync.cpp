@@ -1801,7 +1801,7 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
         profile->anim && profile->anim->player && profile->event_got;
     if (impl->hello.teleport) {
         impl->teleport = std::make_unique<Teleport::Controller>(*profile->teleport);
-        LOG_INFO(Core_ARM, "OoT co-op: teleport on (same-scene experimental matrix call)");
+        LOG_INFO(Core_ARM, "OoT co-op: teleport on (experimental; cross-scene requires teleport.cross.enabled)");
     } else {
         LOG_INFO(Core_ARM, "OoT co-op: teleport off: {}", !profile->teleport || !profile->teleport->enabled ? "key-file disabled" :
             !impl->pose_enabled ? "pose/ghost/private call memory unavailable" : "anim.player or event_got missing");
@@ -2309,7 +2309,15 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             OotGameDataTrace::Detail::Read64(memory, binding.base + profile->manager_cell);
         if (impl->equipment) impl->equipment->Invalidate();
         if (impl->ghost) impl->ghost->DropAll(log, "save or title: GameData moved");
-        impl->InvalidateTeleport("GameData moved");
+        bool teleport_transition = false;
+        {
+            std::scoped_lock lock{impl->mutex};
+            if (impl->teleport) {
+                const auto sample = Teleport::ReadSample(memory, base, now.value_or(0), *profile);
+                teleport_transition = impl->teleport->Rebinding(sample, Impl::NowMs(), now == old, impl->TeleportLog());
+            }
+        }
+        if (!teleport_transition) impl->InvalidateTeleport("GameData moved");
         if (runtime.Rebind(backend, log)) {
             impl->stable_frame = false;
             impl->key_watch.clear(); // a new save epoch: re-baseline the key counts
@@ -2341,6 +2349,17 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     }
     if (!bound) return false;
     if (!std::exchange(impl->stable_frame, true)) return false;
+
+    bool teleport_exclusive = false;
+    {
+        std::scoped_lock lock{impl->mutex};
+        teleport_exclusive = impl->teleport && impl->teleport->CrossActive();
+    }
+    if (teleport_exclusive) {
+        FramePose(backend, memory, log, runtime.Calling() || impl->cleanup_saved.has_value());
+        return runtime.Calling() || impl->cleanup_saved.has_value() || impl->teleport_saved.has_value() ||
+               (impl->ghost && impl->ghost->Calling()) || (impl->equipment && impl->equipment->Calling());
+    }
 
     std::deque<std::variant<Change, HighWater>> batch;
     {
@@ -2733,11 +2752,16 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
                 static_assert(ItemFrame == 0x100);
                 return Teleport::Issue(memory, backend, *profile, base, impl->binding.stack,
                     impl->binding.sentinel, resident, destination, impl->teleport_saved, impl->teleport_stack);
-            }, impl->TeleportLog()};
+            }, impl->TeleportLog(),
+            [&](Teleport::CrossStep step, size_t event, const Teleport::Packet& destination) {
+                return Teleport::IssueCross(memory, backend, *profile, base, impl->binding.stack,
+                    impl->binding.sentinel, step, event, destination, impl->teleport_saved, impl->teleport_stack);
+            }};
         std::scoped_lock lock{impl->mutex};
         const bool can_call = !grant_calling && !impl->cleanup_saved && !impl->ghost->Calling() &&
             (!impl->equipment || !impl->equipment->Calling()) && !impl->teleport_saved;
-        if (impl->teleport->Frame(sample, now, can_call, teleport_port)) return;
+        const bool cross_active = impl->teleport->CrossActive();
+        if (impl->teleport->Frame(sample, now, can_call, teleport_port) || cross_active || impl->teleport->CrossActive()) return;
     }
     // Grants keep priority: the one call slot of this frame is theirs when they used it.
     if (grant_calling) return;

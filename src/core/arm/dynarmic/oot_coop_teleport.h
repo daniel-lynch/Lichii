@@ -17,6 +17,16 @@ struct FallOrigin {
     u64 owner{}, field{};
     u16 bit{}; // mask, exactly one bit
 };
+struct CrossKeys {
+    bool enabled{}, explicit_position{};
+    OotGameDataTrace::Entry string64, enumeration, vector3, request_ctor, request_event;
+    u32 request_size{}, request_name_ptr{}, request_name_cap{};
+    u32 reserved_banc{}, reserved_start{}, reserved_position{}, fade_key{}, fade_value{}, control_key{}, control_value{};
+    std::vector<std::string> events;
+    std::map<std::string, std::string, std::less<>> start_pos;
+    u32 load_timeout_ms{}, arrive_frames{};
+};
+enum class CrossStep { Banc, Start, Position, Fade, Control, Constructor, Event, Reassert };
 struct Keys {
     bool enabled{};
     u64 actor_pos{}, event_active{};
@@ -26,6 +36,7 @@ struct Keys {
     float settle_epsilon{}, agree_epsilon{};
     std::array<float, 2> tolerance{};
     std::optional<FallOrigin> fall_origin;
+    std::optional<CrossKeys> cross;
 };
 [[nodiscard]] std::optional<Keys> DecodeKeys(const nlohmann::json& value);
 [[nodiscard]] bool Reason(std::string_view reason);
@@ -99,40 +110,137 @@ Sample ReadSample(Memory& memory, u64 base, u64 manager, const OotGameDataTrace:
     return s;
 }
 
+// Entry verification and full saved context are shared by matrix and transition calls.
+template <typename Backend, typename Prepare>
+bool IssueCall(Backend& backend, const OotGameDataTrace::Entry& entry, u64 stack_top,
+               u64 sentinel, std::optional<typename Backend::Context>& saved_context,
+               u64& call_stack, Prepare prepare) {
+    if (saved_context || stack_top < 0x100 || !backend.CallReady()) return false;
+    const auto address = backend.VerifiedEntry(entry);
+    if (!address) return false;
+    auto saved = backend.Capture();
+    if (!saved) return false;
+    const u64 sp = stack_top - 0x100;
+    ApplyTarget target{true, false, 0, 0, *address, sentinel, sp};
+    target.stores = {{sp, 0}, {sp + 8, 0}, {sp + 16, 0}, {sp + 24, 0}};
+    if (!prepare(target) || !backend.Redirect(target)) return false;
+    saved_context = std::move(saved);
+    call_stack = sp;
+    return true;
+}
+
+// Layout relative to the bottom of the existing private 64 KiB stack, not game offsets.
+inline constexpr u64 ScratchSize = 0x2000, RequestLimit = 0x1C00;
+inline constexpr u64 BancText = RequestLimit, StartText = BancText + 0x80;
+inline constexpr u64 BancCell = StartText + 0x80, StartCell = BancCell + 8, PositionData = StartCell + 8;
+template <typename Memory, typename Backend>
+bool IssueCross(Memory& memory, Backend& backend, const OotGameDataTrace::Profile& profile,
+                u64 base, u64 stack_top, u64 sentinel, CrossStep step, size_t event,
+                const Packet& destination, std::optional<typename Backend::Context>& saved_context,
+                u64& call_stack) {
+    if (!profile.teleport || !profile.teleport->cross || saved_context || stack_top < 0x10000) return false;
+    const auto& k = *profile.teleport->cross;
+    const u64 scratch = stack_top - 0x10000;
+    if (!k.enabled || !memory.IsValidVirtualAddressRange(scratch, ScratchSize)) return false;
+    if (event >= k.events.size()) return false;
+    const auto* entry = &k.enumeration;
+    if (step == CrossStep::Banc || step == CrossStep::Start) entry = &k.string64;
+    if (step == CrossStep::Position) entry = &k.vector3;
+    if (step == CrossStep::Constructor) entry = &k.request_ctor;
+    if (step == CrossStep::Event) entry = &k.request_event;
+    return IssueCall(backend, *entry, stack_top, sentinel, saved_context, call_stack, [&](ApplyTarget& t) {
+        using Player::Detail::Read;
+        const auto manager = Read(memory, base, profile.manager_cell, 8);
+        const auto cell = Read(memory, base, profile.event_got, 8);
+        const auto events = cell ? Read(memory, *cell, 0, 8) : std::nullopt;
+        if (!manager || !*manager || !events || !*events) return false;
+        auto text = [&](u64 at, std::string_view value) {
+            for (size_t i = 0; i < value.size(); ++i) memory.Write8(at + i, static_cast<u8>(value[i]));
+            memory.Write8(at + value.size(), 0);
+        };
+        t.arguments = {*manager, 0, 0};
+        switch (step) {
+        case CrossStep::Banc:
+            if (destination.banc.size() >= 64) return false;
+            text(scratch + BancText, destination.banc);
+            memory.Write64(scratch + BancCell, scratch + BancText);
+            t.arguments[1] = scratch + BancCell; t.arguments[2] = k.reserved_banc;
+            break;
+        case CrossStep::Start: {
+            const auto it = k.start_pos.find(destination.banc);
+            if (!k.explicit_position && it == k.start_pos.end()) return false;
+            const std::string name = k.explicit_position ? "" : it->second;
+            if (name.size() >= 64) return false;
+            text(scratch + StartText, name);
+            memory.Write64(scratch + StartCell, scratch + StartText);
+            t.arguments[1] = scratch + StartCell; t.arguments[2] = k.reserved_start;
+            break;
+        }
+        case CrossStep::Position:
+            if (!k.explicit_position) return false;
+            for (size_t i = 0; i < 3; ++i) memory.Write32(scratch + PositionData + i * 4, std::bit_cast<u32>(destination.pos[i]));
+            t.arguments[1] = scratch + PositionData; t.arguments[2] = k.reserved_position;
+            break;
+        case CrossStep::Fade:
+            t.arguments[1] = k.fade_value; t.arguments[2] = k.fade_key;
+            break;
+        case CrossStep::Control: case CrossStep::Reassert:
+            t.arguments[1] = k.control_value; t.arguments[2] = k.control_key;
+            break;
+        case CrossStep::Constructor:
+            t.arguments = {scratch};
+            break;
+        case CrossStep::Event: {
+            const u64 pointer = memory.Read64(scratch + k.request_name_ptr);
+            const u32 capacity = memory.Read32(scratch + k.request_name_cap);
+            const auto& name = k.events[event];
+            if (pointer < scratch || pointer - scratch >= k.request_size ||
+                capacity < name.size() + 1 || capacity > k.request_size - (pointer - scratch)) return false;
+            // Do not allow a corrupt SafeString to overwrite its own descriptor.
+            const auto overlaps = [&](u64 at, u64 n) { return pointer < at + n && at < pointer + name.size() + 1; };
+            if (overlaps(scratch + k.request_name_ptr, 8) || overlaps(scratch + k.request_name_cap, 4)) return false;
+            text(pointer, name);
+            t.arguments = {*events, scratch};
+            break;
+        }
+        }
+        return true;
+    });
+}
+
 // The same private call applier as GhostPort, with a separate saved context owned by teleport.
 // No actor transform stores are made here. The optional u16 OR mirrors the native one-shot.
 template <typename Memory, typename Backend>
 bool Issue(Memory& memory, Backend& backend, const OotGameDataTrace::Profile& profile, u64 base,
            u64 stack_top, u64 sentinel, const Player::Resident& resident, const Packet& destination,
            std::optional<typename Backend::Context>& saved_context, u64& call_stack) {
-    const auto entry = backend.VerifiedEntry(profile.ghost.set_mtx);
-    if (!entry || saved_context || stack_top < 0x100 || !backend.CallReady()) return false;
-    auto saved = backend.Capture();
-    if (!saved) return false;
-    const u64 sp = stack_top - 0x100;
-    const auto target = MatrixCall(*entry, sentinel, sp, resident.actor, destination);
+    if (saved_context) return false;
     std::optional<std::pair<u64, u16>> fall;
-    if (const auto& f = profile.teleport->fall_origin) {
-        u64 component = resident.actor;
-        for (u64 offset : f->chain) {
-            const auto next = Player::Detail::Read(memory, component, offset, 8);
-            if (!next || !*next) return false;
-            component = *next;
-        }
-        if (Player::Detail::Read(memory, component, f->owner, 8) != resident.actor ||
-            component > std::numeric_limits<u64>::max() - f->field - 2 ||
-            !memory.IsValidVirtualAddressRange(component + f->field, 2)) return false;
-        fall = {{component + f->field, memory.Read16(component + f->field)}};
-    }
-    if (!Player::Validate(memory, base, resident, *profile.anim->player)) return false;
-    if (fall) memory.Write16(fall->first, fall->second | profile.teleport->fall_origin->bit);
-    if (!backend.Redirect(target)) {
-        if (fall) memory.Write16(fall->first, fall->second);
-        return false;
-    }
-    saved_context = std::move(saved);
-    call_stack = sp;
-    return true;
+    bool fall_written = false;
+    const bool issued = IssueCall(backend, profile.ghost.set_mtx, stack_top, sentinel, saved_context, call_stack,
+        [&](ApplyTarget& target) {
+            if (const auto& f = profile.teleport->fall_origin) {
+                u64 component = resident.actor;
+                for (u64 offset : f->chain) {
+                    const auto next = Player::Detail::Read(memory, component, offset, 8);
+                    if (!next || !*next) return false;
+                    component = *next;
+                }
+                if (Player::Detail::Read(memory, component, f->owner, 8) != resident.actor ||
+                    component > std::numeric_limits<u64>::max() - f->field - 2 ||
+                    !memory.IsValidVirtualAddressRange(component + f->field, 2)) return false;
+                fall = {{component + f->field, memory.Read16(component + f->field)}};
+            }
+            if (!Player::Validate(memory, base, resident, *profile.anim->player)) return false;
+            target = MatrixCall(target.entry, sentinel, target.stack, resident.actor, destination);
+            if (fall) {
+                memory.Write16(fall->first, fall->second | profile.teleport->fall_origin->bit);
+                fall_written = true;
+            }
+            return true;
+        });
+    if (!issued && fall_written) memory.Write16(fall->first, fall->second);
+    return issued;
 }
 
 struct Port {
@@ -140,6 +248,7 @@ struct Port {
     // Performs entry verification, full context capture, optional fall-origin OR and redirect.
     std::function<bool(const Player::Resident&, const Packet&)> call;
     Log log;
+    std::function<bool(CrossStep, size_t, const Packet&)> cross_call;
 };
 struct Peer { std::string id, name; };
 [[nodiscard]] std::optional<std::string> ResolveTrigger(std::string_view line, const std::vector<Peer>& peers);
@@ -165,11 +274,24 @@ public:
     void Returned(u64 result, const Log& log);
     void Invalidate(const Log& log, std::string_view why, bool disconnected = false);
     void PeerGone(std::string_view peer, const Log& log);
-    [[nodiscard]] bool Calling() const { return phase == Phase::Calling; }
+    [[nodiscard]] bool Calling() const { return phase == Phase::Calling || phase == Phase::CrossCalling; }
+    [[nodiscard]] bool CrossActive() const { return cross_active && Busy(); }
+    [[nodiscard]] bool TransitionWait() const { return phase == Phase::Load; }
+    // A table relocation with the same manager can be an expected load, not a save identity change.
+    bool Rebinding(const Sample& sample, u64 now, bool same_manager, const Log& log);
     [[nodiscard]] bool Busy() const { return phase != Phase::Idle; }
 private:
-    enum class Phase { Idle, Waiting, Destination, Calling, Verify };
+    enum class Phase { Idle, Waiting, Destination, Calling, Verify, Reserve, CrossCalling, Load };
     void Finish(const Log& log, std::string_view why);
+    bool CrossFrame(const Sample& sample, u64 now, bool can_call, Port& port);
+    bool CrossIssue(Port& port);
+    void CrossFail(const Log& log, std::string_view why);
+    bool cross_active{}, event_live{}, reasserted{}, loading_on{}, switched{}, loading_off{}, old_gone{};
+    CrossStep cross_step{CrossStep::Banc};
+    size_t event_index{};
+    u64 cross_started{};
+    u32 arrival_frames{};
+    std::optional<Player::Resident> new_resident;
     Keys keys;
     History history;
     Phase phase{Phase::Idle};

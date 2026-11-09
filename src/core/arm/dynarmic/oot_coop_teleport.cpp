@@ -54,7 +54,7 @@ std::string Details(const Sample& s) {
 
 std::optional<Keys> DecodeKeys(const Json& v) {
     try {
-        if (!v.is_object() || v.size() != 15 + v.contains("fall_origin")) return {};
+        if (!v.is_object() || v.size() != 15 + v.contains("fall_origin") + v.contains("cross")) return {};
         Keys k;
         if (!v.at("enabled").is_boolean()) return {};
         k.enabled = v.at("enabled").get<bool>();
@@ -112,6 +112,65 @@ std::optional<Keys> DecodeKeys(const Json& v) {
             if (!owner || (*owner & 7) || !field || (*field & 1) || !bit || !*bit || (*bit & (*bit - 1))) return {};
             o.owner = *owner; o.field = *field; o.bit = static_cast<u16>(*bit);
             k.fall_origin = o;
+        }
+        if (v.contains("cross")) {
+            const auto& c = v.at("cross");
+            if (!c.is_object() || !c.at("enabled").is_boolean() || !c.at("mode").is_string()) return {};
+            CrossKeys x;
+            x.enabled = c.at("enabled").get<bool>();
+            const auto mode = c.at("mode").get<std::string>();
+            if (mode != "startpos" && mode != "explicit") return {};
+            x.explicit_position = mode == "explicit";
+            if (c.size() != (x.explicit_position ? 21 : 19)) return {};
+            for (auto [name, member] : {std::pair{"string64", &CrossKeys::string64}, {"enum", &CrossKeys::enumeration},
+                    {"request_ctor", &CrossKeys::request_ctor}, {"request_event", &CrossKeys::request_event},
+                    {"vector3", &CrossKeys::vector3}}) {
+                if (member == &CrossKeys::vector3 && !x.explicit_position) continue;
+                const auto& e = c.at(name);
+                if (!e.is_object() || e.size() != 2 || !e.at("words").is_array() || e.at("words").size() != 4) return {};
+                const auto at = Number(e.at("at"), 0x10000000);
+                if (!at || !*at || (*at & 3)) return {};
+                (x.*member).offset = *at;
+                for (const auto& word : e.at("words")) {
+                    const auto n = Number(word, UINT32_MAX);
+                    if (!n) return {};
+                    (x.*member).words.push_back(static_cast<u32>(*n));
+                }
+            }
+            for (auto [name, member] : {std::pair{"request_size", &CrossKeys::request_size},
+                    {"request_name_ptr", &CrossKeys::request_name_ptr}, {"request_name_cap", &CrossKeys::request_name_cap},
+                    {"reserved_banc", &CrossKeys::reserved_banc}, {"reserved_start", &CrossKeys::reserved_start},
+                    {"reserved_position", &CrossKeys::reserved_position}, {"fade_key", &CrossKeys::fade_key},
+                    {"fade_value", &CrossKeys::fade_value}, {"control_key", &CrossKeys::control_key},
+                    {"control_value", &CrossKeys::control_value}, {"load_timeout_ms", &CrossKeys::load_timeout_ms},
+                    {"arrive_frames", &CrossKeys::arrive_frames}}) {
+                if (member == &CrossKeys::reserved_position && !x.explicit_position) continue;
+                const auto n = Number(c.at(name), UINT32_MAX);
+                if (!n || !*n) return {};
+                x.*member = static_cast<u32>(*n);
+            }
+            if (x.request_size > RequestLimit || x.request_size < 16 || (x.request_size & 15) ||
+                (x.request_name_ptr & 7) || x.request_name_ptr > x.request_size - 8 ||
+                (x.request_name_cap & 3) || x.request_name_cap > x.request_size - 4 ||
+                (x.request_name_ptr < x.request_name_cap + 4 && x.request_name_cap < x.request_name_ptr + 8) ||
+                x.load_timeout_ms < 1000 || x.load_timeout_ms > 120000 || x.arrive_frames > 600) return {};
+            const auto& events = c.at("events");
+            if (!events.is_array() || events.empty() || events.size() > 4) return {};
+            for (const auto& event : events) {
+                if (!event.is_string()) return {};
+                const auto name = event.get<std::string>();
+                if (!Id(name) || name.size() >= 64 || Contains(x.events, name)) return {};
+                x.events.push_back(name);
+            }
+            const auto& starts = c.at("start_pos");
+            if (!starts.is_object() || starts.size() > 128) return {};
+            for (const auto& [banc, start] : starts.items()) {
+                if (!Id(banc) || banc.size() >= 64 || !start.is_string()) return {};
+                const auto name = start.get<std::string>();
+                if (!Id(name) || name.size() >= 64) return {};
+                x.start_pos.emplace(banc, name);
+            }
+            k.cross = std::move(x);
         }
         return k;
     } catch (...) { return {}; }
@@ -269,6 +328,7 @@ bool Controller::Trigger(std::string target, u64 now, const Log& log) {
         return false;
     }
     checkpoint.reset();
+    cross_active = false;
     source = history.previous;
     destination = {}; destination.request = true; destination.id = next_id++; destination.peer = std::move(target);
     started = now; phase = Phase::Waiting;
@@ -289,6 +349,8 @@ void Controller::Receive(const Packet& p, u64 now, const Log& log) {
 }
 void Controller::Tick(u64 now, const Log& log) {
     if (phase == Phase::Waiting && now - started > keys.reply_timeout_ms) Finish(log, "reply timeout");
+    if (CrossActive() && now - cross_started > keys.cross->load_timeout_ms)
+        CrossFail(log, "load timeout");
 }
 bool Controller::Frame(const Sample& s, u64 now, bool can_call, Port& port) {
     ++frame;
@@ -312,6 +374,7 @@ bool Controller::Frame(const Sample& s, u64 now, bool can_call, Port& port) {
         port.log(fmt::format("OoT co-op: teleport settled id={} +{}s {} {}", c.dest.id, c.next ? 3 : 1, stable ? "stable" : "moved", Details(s)));
         if (checkpoint->next++) checkpoint.reset();
     }
+    if (phase == Phase::Reserve || phase == Phase::Load) return CrossFrame(s, now, can_call, port);
     if ((phase == Phase::Waiting || phase == Phase::Destination) && source &&
         (s.loading || source->banc != s.banc || source->child != s.child || source->resident != s.resident)) {
         Finish(port.log, "source scene/age/actor changed since request " + Details(s));
@@ -321,7 +384,12 @@ bool Controller::Frame(const Sample& s, u64 now, bool can_call, Port& port) {
         const auto refuse = [&](std::string why) { Finish(port.log, why + " " + Details(s)); };
         if (now - arrived_at > keys.apply_timeout_ms) { refuse("stale answer"); return false; }
         if (!destination.ok) { refuse(destination.reason); return false; }
-        if (destination.banc != s.banc) { refuse("scene (cross-scene unsupported) destination=" + destination.banc); return false; }
+        const bool cross = destination.banc != s.banc;
+        if (cross && (!keys.cross || !keys.cross->enabled || !Contains(keys.allow_bancs, destination.banc) ||
+            Contains(keys.deny_bancs, destination.banc) || destination.banc.size() >= 64 ||
+            (!keys.cross->explicit_position && !keys.cross->start_pos.contains(destination.banc)))) {
+            refuse("scene (cross-scene disabled or unreviewed destination)"); return false;
+        }
         if (destination.child != s.child) { refuse("age"); return false; }
         if (destination.room) { refuse("scene (rooms unsupported)"); return false; }
         const auto why = Ready(s, history, keys, false);
@@ -329,6 +397,12 @@ bool Controller::Frame(const Sample& s, u64 now, bool can_call, Port& port) {
         if (!can_call) return false;
         if (!s.resident || !port.validate(*s.resident)) { refuse("actor changed"); return false; }
         resident = s.resident; scene = s.banc; child = s.child;
+        if (cross) {
+            cross_active = true; cross_started = now; cross_step = CrossStep::Banc; event_index = 0;
+            event_live = reasserted = loading_on = switched = loading_off = old_gone = false;
+            arrival_frames = 0; new_resident.reset(); abandoned = false; phase = Phase::Reserve;
+            return CrossIssue(port);
+        }
         if (!port.call(*resident, destination)) { refuse("call unavailable or actor changed"); return false; }
         phase = Phase::Calling; abandoned = false; issued_frame = frame;
         port.log(fmt::format("OoT co-op: teleport warp issued id={} actor={:#x} generation={:#x} from=({},{},{}) to=({},{},{}) yaw={}",
@@ -343,7 +417,7 @@ bool Controller::Frame(const Sample& s, u64 now, bool can_call, Port& port) {
         const bool arrived = failure.empty() && s.actor_pos && Within(*s.actor_pos, destination.pos, keys.tolerance) && Within(s.info_pos, destination.pos, keys.tolerance);
         if (failure.empty() && !arrived && frame - verify_start >= keys.verify_frames) failure = "verification timeout";
         if (arrived || !failure.empty()) {
-            port.log(fmt::format("OoT co-op: teleport {} id={} frames={} error=({},{},{}) reason={} {}", arrived ? "arrived" : "failed", destination.id,
+            port.log(fmt::format("OoT co-op: teleport {}{} id={} frames={} error=({},{},{}) reason={} {}", cross_active ? "cross " : "", arrived ? "arrived" : "failed", destination.id,
                 frame - issued_frame, s.info_pos[0] - destination.pos[0], s.info_pos[1] - destination.pos[1], s.info_pos[2] - destination.pos[2], failure, Details(s)));
             if (arrived) checkpoint = Checkpoint{destination, *resident, frame, 0};
             phase = Phase::Idle; resident.reset(); history.Reset();
@@ -352,16 +426,124 @@ bool Controller::Frame(const Sample& s, u64 now, bool can_call, Port& port) {
     return false;
 }
 void Controller::Returned(u64 result, const Log& log) {
+    if (phase == Phase::CrossCalling) {
+        static constexpr std::array names{"reserve banc", "reserve start", "reserve position", "reserve fade",
+            "reserve control", "event ctor", "event request", "event live re-assertion"};
+        log(fmt::format("OoT co-op: teleport cross {} id={} w0={:#x} name={}", names[static_cast<size_t>(cross_step)],
+            destination.id, static_cast<u32>(result),
+            cross_step == CrossStep::Constructor || cross_step == CrossStep::Event ? keys.cross->events[event_index] : ""));
+        if (abandoned) { phase = Phase::Idle; resident.reset(); return; }
+        phase = Phase::Reserve;
+        switch (cross_step) {
+        case CrossStep::Banc: cross_step = CrossStep::Start; break;
+        case CrossStep::Start: cross_step = keys.cross->explicit_position ? CrossStep::Position : CrossStep::Fade; break;
+        case CrossStep::Position: cross_step = CrossStep::Fade; break;
+        case CrossStep::Fade: cross_step = CrossStep::Control; break;
+        case CrossStep::Control: cross_step = CrossStep::Constructor; break;
+        case CrossStep::Constructor: cross_step = CrossStep::Event; break;
+        case CrossStep::Event:
+            if (result & 1) {
+                log(fmt::format("OoT co-op: teleport cross event accepted id={} name={}", destination.id, keys.cross->events[event_index]));
+                phase = Phase::Load; history.Reset();
+            } else if (++event_index < keys.cross->events.size()) cross_step = CrossStep::Constructor;
+            else CrossFail(log, "event refused");
+            break;
+        case CrossStep::Reassert: phase = Phase::Load; break;
+        }
+        return;
+    }
+    if (phase != Phase::Calling) return;
     log(fmt::format("OoT co-op: teleport returned id={} w0={:#x}", destination.id, static_cast<u32>(result)));
     if (abandoned) { phase = Phase::Idle; resident.reset(); }
     else { phase = Phase::Verify; verify_start = frame; }
 }
 void Controller::Invalidate(const Log& log, std::string_view why, bool disconnected) {
-    if (Busy() && !abandoned) log(fmt::format("OoT co-op: teleport failed id={} reason={}", destination.id, why));
+    if (Busy() && !abandoned) log(fmt::format("OoT co-op: teleport {}failed id={} reason={}", cross_active ? "cross " : "", destination.id, why));
     if (Calling()) abandoned = true;
     else { phase = Phase::Idle; resident.reset(); }
     requests.clear(); output.clear(); history.Reset(); checkpoint.reset();
     if (disconnected) seen.clear();
+}
+void Controller::CrossFail(const Log& log, std::string_view why) {
+    if (!abandoned) log(fmt::format("OoT co-op: teleport cross failed id={} reason={}", destination.id, why));
+    if (Calling()) abandoned = true;
+    else { phase = Phase::Idle; resident.reset(); }
+    history.Reset(); arrival_frames = 0;
+}
+bool Controller::CrossIssue(Port& port) {
+    if (!port.cross_call || !port.cross_call(cross_step, event_index, destination)) {
+        CrossFail(port.log, "call unavailable / entry or scratch invalid"); return false;
+    }
+    phase = Phase::CrossCalling;
+    return true;
+}
+bool Controller::Rebinding(const Sample& s, u64 now, bool same_manager, const Log& log) {
+    if (!TransitionWait()) return false;
+    if (!same_manager || !event_live || !reasserted || s.banc.empty() ||
+        (s.banc != scene && s.banc != destination.banc) || s.child != child ||
+        (!s.loading && !loading_on) || now - cross_started > keys.cross->load_timeout_ms) {
+        CrossFail(log, "binding lost: save/title identity unproven"); return false;
+    }
+    // Keep only value snapshots; every subsequent call resolves the current manager afresh.
+    history.Reset(); arrival_frames = 0;
+    return true;
+}
+bool Controller::CrossFrame(const Sample& s, u64 now, bool can_call, Port& port) {
+    if (now - cross_started > keys.cross->load_timeout_ms) { CrossFail(port.log, "load timeout"); return false; }
+    if (s.child != child) { CrossFail(port.log, "age changed"); return false; }
+    if (s.banc != scene && s.banc != destination.banc) { CrossFail(port.log, "unexpected banc"); return false; }
+    if (phase == Phase::Reserve) {
+        if (s.banc != scene || s.loading || s.resident != resident || !resident || !port.validate(*resident) ||
+            !Ready(s, history, keys, false).empty()) {
+            CrossFail(port.log, "source changed during reservation"); return false;
+        }
+        return can_call && CrossIssue(port);
+    }
+    const auto receipt = [&](std::string_view message) {
+        port.log(fmt::format("OoT co-op: teleport cross {} id={} ms={}", message, destination.id, now - started));
+    };
+    if (!event_live && s.event_running && *s.event_running) { event_live = true; receipt("event live"); }
+    if (!loading_on && s.loading) { loading_on = true; receipt("loading on"); }
+    if (!switched && s.banc == destination.banc) { switched = true; receipt("banc switched"); }
+    if (switched && s.banc != destination.banc) { CrossFail(port.log, "banc reverted"); return false; }
+    if (!old_gone && resident && !port.validate(*resident)) { old_gone = true; receipt("old resident gone"); }
+    if (loading_on && !s.loading && !loading_off) { loading_off = true; receipt("loading off"); }
+    if (loading_off && s.loading) { CrossFail(port.log, "loading restarted"); return false; }
+    if (event_live && !reasserted) {
+        if (!can_call) return false;
+        cross_step = CrossStep::Reassert;
+        reasserted = true;
+        receipt("re-assertion issued");
+        return CrossIssue(port);
+    }
+    const bool fresh = s.resident && resident &&
+        (s.resident->actor != resident->actor || s.resident->generation != resident->generation);
+    if (!switched || !loading_on || !loading_off || !old_gone || !reasserted || !fresh ||
+        !Ready(s, history, keys, false).empty() || !port.validate(*s.resident)) {
+        arrival_frames = 0; return false;
+    }
+    if (new_resident && new_resident != s.resident) {
+        CrossFail(port.log, "arrival resident changed"); return false;
+    }
+    if (!new_resident) {
+        new_resident = s.resident; arrival_frames = 0;
+        port.log(fmt::format("OoT co-op: teleport cross new resident id={} actor={:#x} generation={:#x}",
+            destination.id, s.resident->actor, s.resident->generation));
+    }
+    if (arrival_frames < keys.cross->arrive_frames) ++arrival_frames;
+    if (arrival_frames < keys.cross->arrive_frames || !can_call) return false;
+    receipt(fmt::format("ready after {} frames", arrival_frames));
+    resident = s.resident; scene = destination.banc;
+    if (keys.cross->explicit_position && Within(s.info_pos, destination.pos, keys.tolerance) &&
+        Within(*s.actor_pos, destination.pos, keys.tolerance)) {
+        receipt("arrived (no correction)");
+        checkpoint = Checkpoint{destination, *resident, frame, 0};
+        phase = Phase::Idle; resident.reset(); history.Reset(); return false;
+    }
+    if (!port.call(*resident, destination)) { CrossFail(port.log, "correction unavailable or actor changed"); return false; }
+    phase = Phase::Calling; issued_frame = frame;
+    receipt("correction issued");
+    return true;
 }
 void Controller::PeerGone(std::string_view peer, const Log& log) {
     seen.erase(std::string{peer});
