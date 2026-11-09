@@ -950,8 +950,9 @@ OoT co-op: quest class off: relay does not support it
 OoT co-op: teleport off: relay does not support it (pre-c16 relay)
 ```
 
-`mod mismatch` is checked first and latches co-op off (never a fallback). Any other refusal of a
-quest hello keeps quest's own single retry without quest. Fallbacks last for the process.
+`mod mismatch` is checked first and latches co-op off (never a fallback). Any other refusal (held out,
+client id already connected, sender capacity, a relay restarting) just reconnects with the same hello:
+it never turns a C16 class off (C16 smoke B-1). Fallbacks last for the process.
 
 Frame order (one guest call per frame): cross-scene teleport (exclusive while active) ->
 grants -> world cleanup -> quest -> pose step (room window, name tags; teleport step; ghost

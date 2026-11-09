@@ -1193,6 +1193,9 @@ struct Session::Impl {
     std::atomic<bool> finished{};
     std::atomic<int> relay_state{}; // 0 offline, 1 connected, 2 reconnecting
     std::atomic<u64> relay_rtt{UINT64_MAX};
+    // Room window "mod" field: the kit's mod hash when one was computed (what the two players compare), else
+    // the policy id. Fixed at construction: hello.mod_hash itself is cleared by the network thread on fallback.
+    std::string mod_label;
     const Room::Config& RoomConfig() const {
         static const Room::Config empty;
         const auto* settings = ux.Settings();
@@ -1201,7 +1204,7 @@ struct Session::Impl {
     void RoomFrame(std::optional<Room::RoomPeer> local_pose, u64 now) {
         const auto rtt = relay_rtt.load();
         const int state = relay_state.load();
-        room_window.Frame({hello.room, hello.seed_hash, hello.policy_id,
+        room_window.Frame({hello.room, hello.seed_hash, mod_label,
             state == 1 ? "connected" : state == 2 ? "reconnecting" : "offline", hello.name,
             rtt == UINT64_MAX ? std::nullopt : std::optional{rtt}, std::move(local_pose)},
             presence, RoomConfig(), now);
@@ -1592,16 +1595,9 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                                 return self->Fail("retry legacy hello");
                             }
                         }
-                        // Quest's own rule for any other refusal of a quest hello: one retry without it.
-                        if (type == "error" && self->owner.hello.quest && !self->owner.quest_fallback) {
-                            self->owner.quest_fallback = true;
-                            {
-                                std::scoped_lock lock{self->owner.mutex};
-                                std::erase_if(self->owner.outgoing, [](const Change& c) { return c.kind == Kind::Quest; });
-                            }
-                            LOG_INFO(Core_ARM, "OoT co-op: quest class off: relay does not support it");
-                            return self->Fail("retrying legacy hello");
-                        }
+                        // C16 smoke B-1: quest's own any-error retry is gone. A refusal that is not about an unknown
+                        // field (held out, client id already connected, sender capacity, a relay restarting) used to
+                        // latch quest off for the whole process; such refusals now just reconnect with the same hello.
                         if (!MatchesHello(*packet, self->owner.hello)) {
                             LOG_WARNING(Core_ARM, "OoT co-op: handshake refused or mismatched");
                             return self->Fail(type == "error" && packet->contains("reason") &&
@@ -1993,6 +1989,7 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
                                    profile->wallet_hash, profile->world, profile->quest && profile->quest->enabled)} {
     impl->binding.base = base;
     impl->hello.quest = false;
+    impl->mod_label = impl->hello.mod_hash.empty() ? impl->hello.policy_id : impl->hello.mod_hash;
     if (profile->quest && profile->quest->enabled && impl->allowed_classes.contains(Kind::Quest)) {
         denied_quests.insert(impl->denied.begin(), impl->denied.end());
         impl->quest = std::make_unique<Quest::Controller>(profile->quest, std::move(denied_quests), base);
