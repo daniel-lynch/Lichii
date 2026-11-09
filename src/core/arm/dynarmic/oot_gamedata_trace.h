@@ -113,6 +113,14 @@ struct GhostOffsets {
     /// command each pose category plays. Empty play entry: statue (no animation calls).
     Entry anim_play;
     std::string anim_idle, anim_walk, anim_run;
+    /// Optional: the puppet created when the age's puppet cannot be (e.g. its mod is not
+    /// installed: the create is refused). Animation and alpha apply to the primary puppet only.
+    std::string actor_fallback;
+    /// Optional see-through ghost: model component = *(*(actor + chain[0]) + chain[1]); the
+    /// setter takes it in x0 and the alpha in s0 (percent / 100). Called once per puppet.
+    Entry alpha_set;
+    std::array<u64, 2> alpha_chain{};
+    u32 alpha_percent{};
     bool Valid() const {
         return playing_info_cell && pos && rot && actor_mgr_cell && scale_const && banc_hash &&
                child_hash && loading_hash && str64[0] && str64[1] && str64[2] && create && get &&

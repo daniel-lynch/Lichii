@@ -270,13 +270,14 @@ struct PeerView {
     std::optional<Pose> pose;
 };
 
-enum class GhostOp { None, Create, Get, Release, Move, Play };
+enum class GhostOp { None, Create, Get, Release, Move, Play, Alpha };
 
 /// Per-peer puppet state machine. One synthetic call at most per frame, and only when the grant
 /// drain has not started one. Port:
 ///   std::optional<u64> R64(u64); std::optional<u32> R32(u64); bool Write(u64, const void*, size_t);
 ///   std::optional<u64> Verified(const OotGameDataTrace::Entry&);
-///   bool Call(u64 entry, const std::array<u64, 8>& args);   // capture, redirect; sentinel return
+///   bool Call(u64 entry, const std::array<u64, 8>& args, std::optional<float> s0 = {});
+///                                                    // capture, redirect; sentinel return
 template <typename Port>
 class GhostDriver {
 public:
@@ -293,6 +294,8 @@ public:
         u64 retry_tick{}, pending_tick{};
         bool pending_logged{};
         bool adult_fallback{}; ///< Adult peer, child puppet (no adult puppet in the profile)
+        bool fallback{};       ///< The primary puppet's create failed: the fallback is in use
+        bool alpha_done{};
         std::string played;    ///< Pose category whose command was last played ("" = none yet)
         u32 played_seq{};
         bool play_logged{};
@@ -375,7 +378,10 @@ public:
                 if (state == 3 && ready && local.banc == slot.banc) {
                     if (Start(port, g.get, {at, 1, 0}, i, GhostOp::Get)) return true;
                 } else if (state == 3 || state == 4) {
-                    if (state == 4) Line(log, slot, "create failed (state 4)");
+                    if (state == 4) {
+                        Line(log, slot, "create failed (state 4)");
+                        Fallback(log, slot);
+                    }
                     if (Start(port, g.release, {at}, i, GhostOp::Release)) return true;
                 } else if (!slot.pending_logged && tick - slot.pending_tick > 600) {
                     Line(log, slot, fmt::format("create still pending (state {})", state));
@@ -385,7 +391,24 @@ public:
             }
             // Live
             std::array<float, 4> target;
-            if (visible && !slot.parked && g.anim_play) {
+            if (visible && !slot.parked && g.alpha_set && !slot.fallback && !slot.alpha_done) {
+                slot.alpha_done = true; // once per puppet, whatever the result
+                const auto holder = port.R64(slot.actor + g.alpha_chain[0]);
+                const auto model = holder && *holder ? port.R64(*holder + g.alpha_chain[1]) : std::nullopt;
+                if (model && *model) {
+                    if (const auto why = Dead(port, slot)) {
+                        Drop(log, slot, *why);
+                        continue;
+                    }
+                    if (Start(port, g.alpha_set, {*model}, i, GhostOp::Alpha,
+                              static_cast<float>(g.alpha_percent) / 100.0f))
+                        return true;
+                } else {
+                    Line(log, slot, "alpha skipped (no model component)");
+                }
+                continue;
+            }
+            if (visible && !slot.parked && g.anim_play && !slot.fallback) {
                 // Animation category path: play the category's command once per change (the
                 // play call restarts the clip; it is never re-issued per packet).
                 const auto& p = *peer->pose;
@@ -464,7 +487,7 @@ public:
             if (!(x0 & 1) || !handle || !*handle) {
                 Line(log, slot, fmt::format("create refused (w0={} handle={:#x})", x0 & 1, handle.value_or(0)));
                 slot.state = State::None;
-                slot.retry_tick = tick + CreateRetry;
+                slot.retry_tick = tick + (Fallback(log, slot) ? 30 : CreateRetry);
             } else {
                 Line(log, slot, fmt::format("create requested name={} banc={}{}", slot_name, slot.banc,
                                             slot.adult_fallback ? " (adult peer: the profile has no adult "
@@ -503,6 +526,7 @@ public:
             slot.parked = true; // the next visible frame moves it into place
             slot.played.clear();
             slot.play_logged = false;
+            slot.alpha_done = false;
             Line(log, slot, fmt::format("live actor={:#x} generation={:#x}", x0, *generation));
             break;
         }
@@ -510,6 +534,9 @@ public:
             slot.state = State::None;
             slot.retry_tick = tick + CreateRetry;
             Line(log, slot, "create released");
+            break;
+        case GhostOp::Alpha:
+            Line(log, slot, fmt::format("alpha {}%", g.alpha_percent));
             break;
         case GhostOp::Play:
             if (!(x0 & 1) || !slot.play_logged) {
@@ -548,6 +575,14 @@ private:
         }
         return std::nullopt;
     }
+    /// Switch this slot to the fallback puppet once; false when there is none or it is in use.
+    template <typename Log>
+    bool Fallback(Log log, Slot& slot) {
+        if (slot.fallback || g.actor_fallback.empty()) return false;
+        slot.fallback = true;
+        Line(log, slot, fmt::format("falling back to {}", g.actor_fallback));
+        return true;
+    }
     template <typename Log>
     void Drop(Log log, Slot& slot, std::string_view why) {
         Line(log, slot, fmt::format("dropped ({})", why));
@@ -555,9 +590,10 @@ private:
         slot.actor = 0;
         slot.retry_tick = tick + 60;
     }
-    bool Start(Port& port, const OotGameDataTrace::Entry& entry, std::array<u64, 8> args, size_t i, GhostOp what) {
+    bool Start(Port& port, const OotGameDataTrace::Entry& entry, std::array<u64, 8> args, size_t i, GhostOp what,
+               std::optional<float> s0 = std::nullopt) {
         const auto address = port.Verified(entry);
-        if (!address || !port.Call(*address, args)) return false;
+        if (!address || !port.Call(*address, args, s0)) return false;
         return Started(i, what);
     }
     bool Started(size_t i, GhostOp what) {
@@ -579,8 +615,9 @@ private:
         if (!manager || !*manager || !entry) return false;
         // No adult puppet in the profile: an adult peer is drawn with the child one (logged once
         // per create, with the create line).
-        const std::string& name = peer.child || g.actor_adult.empty() ? g.actor_child : g.actor_adult;
-        slot.adult_fallback = !peer.child && g.actor_adult.empty();
+        const std::string& name = slot.fallback ? g.actor_fallback
+                                  : peer.child || g.actor_adult.empty() ? g.actor_child : g.actor_adult;
+        slot.adult_fallback = !slot.fallback && !peer.child && g.actor_adult.empty();
         // Slot layout: +0 handle, +8 name pointer, +0x10 matrix (0x30), +0x40 create argument
         // (0xA0), +0xE0 empty instance name, +0x100 actor name (64 bytes).
         std::array<u8, 0x140> b{};

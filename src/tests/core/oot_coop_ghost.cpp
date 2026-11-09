@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -95,9 +96,11 @@ struct Port {
         return true;
     }
     std::optional<u64> Verified(const Trace::Entry& e) { return 0x10000000 + e.offset; }
-    bool Call(u64 entry, const std::array<u64, 8>& args) {
+    std::vector<std::optional<float>> s0s;
+    bool Call(u64 entry, const std::array<u64, 8>& args, std::optional<float> s0 = std::nullopt) {
         if (refuse) return false;
         calls.push_back({entry, args});
+        s0s.push_back(s0);
         return true;
     }
 };
@@ -631,4 +634,78 @@ TEST_CASE("OoT co-op ghost animation path plays a category's command once per ch
     bad = ghost_json;
     bad["anim"]["frame"] = "x";
     REQUIRE_FALSE(load(bad));
+}
+
+TEST_CASE("OoT co-op ghost falls back when its puppet cannot be created and sets alpha once", "[core][oot_coop]") {
+    auto g = Offsets();
+    g.actor_fallback = "Puppet_Fallback";
+    g.alpha_set = {0x405000, {0xD503237F}};
+    g.alpha_chain = {0x70, 0x260};
+    g.alpha_percent = 50;
+    Bytes m;
+    Port port{m};
+    m.P64(Base + g.actor_mgr_cell, 0x60000000);
+    for (u64 i = 0; i < 3; ++i) m.PF(Base + g.scale_const + i * 4, 1.0f);
+    Coop::GhostDriver<Port> ghost{g, Base};
+    std::vector<std::string> lines;
+    const auto log = [&](std::string_view line) { lines.emplace_back(line); };
+    const auto name_at = [&] {
+        std::string name;
+        for (u64 i = 0; m.b.at(Block + 0x100 + i); ++i) name.push_back(static_cast<char>(m.b.at(Block + 0x100 + i)));
+        return name;
+    };
+    const Pose local = At("Forest_A", 0, 0);
+    std::vector<Coop::PeerView> peers{{"peer-b", At("Forest_A", 3, 4)}};
+    // The primary puppet's create is refused (its pack is not installed): fallback after a short wait.
+    REQUIRE(ghost.Frame(port, Block, local, peers, log));
+    REQUIRE(name_at() == "Puppet_Child");
+    m.P64(Block, 0);
+    ghost.Returned(port, Block, 0, log);
+    REQUIRE(std::any_of(lines.begin(), lines.end(),
+                        [](const std::string& l) { return l.find("falling back to Puppet_Fallback") != std::string::npos; }));
+    int frames = 0;
+    while (!ghost.Calling() && frames < 100) {
+        ghost.Frame(port, Block, local, peers, log);
+        ++frames;
+    }
+    REQUIRE(ghost.Calling());
+    REQUIRE(frames < 60);
+    REQUIRE(name_at() == "Puppet_Fallback");
+    // The fallback puppet gets no alpha (and no animation): take, move, then nothing.
+    m.P64(Block, 0x61000000);
+    m.P32(0x61000000, 3);
+    ghost.Returned(port, Block, 1, log);
+    REQUIRE(ghost.Frame(port, Block, local, peers, log)); // take
+    const u64 actor = 0x62000000, record = 0x63000000, holder = 0x64000000, model = 0x65000000;
+    m.P64(actor, 0xABC0);
+    m.P64(actor + 0x40, 0x1);
+    m.P64(actor + 0x48, 0x2);
+    m.P64(actor + 0x50, record);
+    m.P32(actor + 0x18, 0x35c);
+    m.P64(actor + 0x70, holder);
+    m.P64(holder + 0x260, model);
+    m.P64(record + 0x40, actor);
+    m.P32(record + 0x48, 0x35c);
+    ghost.Returned(port, Block, actor, log);
+    REQUIRE(ghost.Frame(port, Block, local, peers, log));
+    REQUIRE(port.calls.back().entry == Base + g.set_mtx.offset);
+    ghost.Returned(port, Block, 0, log);
+    REQUIRE_FALSE(ghost.Frame(port, Block, local, peers, log));
+
+    // A primary puppet: alpha once, with the model component in x0 and 0.5 in s0.
+    Coop::GhostDriver<Port> second{g, Base};
+    REQUIRE(second.Frame(port, Block, local, peers, log));
+    REQUIRE(name_at() == "Puppet_Child");
+    m.P64(Block, 0x61000000);
+    second.Returned(port, Block, 1, log);
+    REQUIRE(second.Frame(port, Block, local, peers, log)); // take
+    second.Returned(port, Block, actor, log);
+    REQUIRE(second.Frame(port, Block, local, peers, log)); // shown
+    second.Returned(port, Block, 0, log);
+    REQUIRE(second.Frame(port, Block, local, peers, log));
+    REQUIRE(port.calls.back().entry == Base + g.alpha_set.offset);
+    REQUIRE(port.calls.back().args[0] == model);
+    REQUIRE(port.s0s.back() == 0.5f);
+    second.Returned(port, Block, 0, log);
+    REQUIRE_FALSE(second.Frame(port, Block, local, peers, log)); // once
 }

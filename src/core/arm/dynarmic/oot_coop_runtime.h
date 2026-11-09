@@ -305,6 +305,11 @@ public:
         jit.ClearExclusiveState();
         clear_exclusive();
         for (size_t i = 0; i < target.arguments.size(); ++i) jit.SetRegister(i, target.arguments[i]);
+        if (target.s0_bits) {
+            auto v = jit.GetVectors();
+            v[0] = {u64{*target.s0_bits}, 0};
+            jit.SetVectors(v);
+        }
         jit.SetRegister(30, target.sentinel);
         jit.SetSP(target.stack);
         jit.SetPC(target.entry);

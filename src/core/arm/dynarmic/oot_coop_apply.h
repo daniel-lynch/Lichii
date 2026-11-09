@@ -4,6 +4,7 @@
 #pragma once
 
 #include <deque>
+#include <optional>
 
 #include "core/arm/dynarmic/oot_coop_sync.h"
 
@@ -48,6 +49,8 @@ struct ApplyTarget {
     /// 64-bit stores into the private stack region that Redirect makes before the call (an
     /// argument block the callee reads); empty for the flag setters and the wallet entry.
     std::vector<std::pair<u64, u64>> stores;
+    /// The float argument in s0 (bits), for the ghost's alpha and frame setters; unset: v0 as is.
+    std::optional<u32> s0_bits;
 };
 
 enum class ApplyPhase { Idle, Calling, AwaitingCommit, Quarantined };

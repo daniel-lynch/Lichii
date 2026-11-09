@@ -318,7 +318,8 @@ serves this head and later only:
           "lifecycle": ["<field>", "<lo>", "<hi>"],
           "anim": {"play": {"at": "<offset>", "words": [...]}, "idle": "<command>", "walk": "<command>",
                    "run": "<command>"},
-          "actor_child": "<actor>", "actor_adult": "<actor>"}
+          "alpha": {"set": {"at": "<offset>", "words": [...]}, "chain": ["<field>", "<field>"], "percent": 50},
+          "actor_child": "<actor>", "actor_adult": "<actor>", "actor_fallback": "<actor>"}
 ```
 
 - **Sender (pure reads at the frame hook).** Position and rotation from the player-info object,
@@ -356,7 +357,15 @@ serves this head and later only:
   with the category's command; a category without a command plays nothing. The call restarts the
   clip, so it is never re-issued per packet, and a rate change inside one category is not applied
   (the play call ignores it without a restart). Phase (`phase`) is not applied: the frame setter
-  takes its frame in s0, and the synthetic call path passes x0..x7 only.
+  takes its frame in s0; the synthetic call path can pass s0 since the alpha change, but phase
+  sync is not wired.
+- **Fallback puppet (optional `actor_fallback`).** When the age's puppet cannot be created (a
+  dedicated ghost pack that is not installed: the create call refuses at once, field C9), the slot
+  switches to the fallback once and retries within half a second. Animation and alpha apply to
+  the primary puppet only.
+- **Alpha (optional `alpha`).** Once per primary puppet, after it is first shown: the model
+  component is read through `chain` from the actor and the setter is called with it in x0 and
+  `percent`/100 in s0.
 - **Age.** `actor_adult` is optional. Without it an adult peer is drawn with the child puppet, and
   the create line says so.
 - Field status: `RESULT` of C8 (private).

@@ -5,6 +5,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -517,6 +518,32 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                             if (!number || !*number || (*number & 7)) return std::nullopt;
                             ghost.actor_fields.push_back(*number);
                         }
+                    } else if (name == "actor_fallback") {
+                        if (!item.is_string() || !ItemName(item.get<std::string>())) return std::nullopt;
+                        ghost.actor_fallback = item.get<std::string>();
+                    } else if (name == "alpha") {
+                        if (!item.is_object()) return std::nullopt;
+                        for (const auto& [key, part] : item.items()) {
+                            if (key == "set") {
+                                const auto decoded = entry(part);
+                                if (!decoded) return std::nullopt;
+                                ghost.alpha_set = *decoded;
+                            } else if (key == "chain") {
+                                if (!part.is_array() || part.size() != 2) return std::nullopt;
+                                for (size_t i = 0; i < 2; ++i) {
+                                    const auto number = Number(part[i], 0xFFFF);
+                                    if (!number || !*number || (*number & 7)) return std::nullopt;
+                                    ghost.alpha_chain[i] = *number;
+                                }
+                            } else if (key == "percent") {
+                                const auto number = Number(part, 100);
+                                if (!number || !*number) return std::nullopt;
+                                ghost.alpha_percent = static_cast<u32>(*number);
+                            } else {
+                                return std::nullopt;
+                            }
+                        }
+                        if (!ghost.alpha_set || !ghost.alpha_chain[0] || !ghost.alpha_percent) return std::nullopt;
                     } else if (name == "anim") {
                         if (!item.is_object()) return std::nullopt;
                         for (const auto& [key, part] : item.items()) {
@@ -1089,13 +1116,18 @@ struct Session::Impl::GhostPort {
     std::optional<u64> Verified(const OotGameDataTrace::Entry& entry) { return backend.VerifiedEntry(entry); }
     /// The grant path's call: full context captured, private stack, sentinel return. Up to three
     /// stack arguments read as zero.
-    bool Call(u64 entry, const std::array<u64, 8>& args) {
+    bool Call(u64 entry, const std::array<u64, 8>& args, std::optional<float> s0 = std::nullopt) {
         if (!backend.CallReady()) return false;
         auto saved = backend.Capture();
         if (!saved) return false;
         const u64 sp = impl.binding.stack - ItemFrame;
         ApplyTarget target{true, false, 0, 0, entry, impl.binding.sentinel, sp, args};
         target.stores = {{sp, 0}, {sp + 8, 0}, {sp + 0x10, 0}, {sp + 0x18, 0}};
+        if (s0) {
+            u32 bits;
+            std::memcpy(&bits, &*s0, 4);
+            target.s0_bits = bits;
+        }
         if (!backend.Redirect(target)) return false;
         impl.ghost_saved = std::move(saved);
         impl.ghost_stack = sp;
