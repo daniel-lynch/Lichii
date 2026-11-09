@@ -45,7 +45,7 @@ struct Resolver {
     std::array<u64, 2> death_chain{};                 ///< death component = *(*(actor + c0) + c1)
     u64 death_actor{}, death_state{}, death_flags{};
     u32 death_disabled{}, reason{};
-    u32 max_blocks{64}, max_records{4096}, max_total{65536}, max_list{2048};
+    u32 max_blocks{64}, max_records{32768}, max_total{65536}, max_list{2048};
     explicit operator bool() const { return root_cell != 0; }
 };
 bool DecodeResolver(const nlohmann::json& value, Resolver& resolver);
@@ -203,9 +203,13 @@ Walk Find(Memory& memory, u64 base, const Resolver& r, u64 key) {
             const auto capacity = r32(block + r.block_capacity), used = r32(block + r.block_used);
             const auto records = r64(block + r.block_records);
             ++walk.blocks;
-            if (!capacity || !used || !records || !*records || *used > *capacity ||
-                *capacity > r.max_records) { walk.bounded |= !used || !capacity || *used > *capacity ||
-                                              *capacity > r.max_records; continue; }
+            // capacity is a reservation (field: 110500 with 4197 used): bound what is walked, `used`.
+            if (!capacity || !used || !records || *used > *capacity || *used > r.max_records) {
+                walk.bounded |= !capacity || !used || !records || *used > *capacity || *used > r.max_records;
+                continue;
+            }
+            if (!*used) continue;
+            if (!*records) { walk.bounded = true; continue; }
             for (u64 i = 0; i < *used; ++i) {
                 if (++walk.records > r.max_total) return walk.bounded = true, walk;
                 match(*records + i * r.record_stride);
