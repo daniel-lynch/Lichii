@@ -1088,6 +1088,8 @@ struct Session::Impl {
     std::atomic<u64> quest_connections{};
     u64 quest_connection_seen{};
     bool quest_fallback{}; // transport thread only; one legacy retry for the session
+    bool quest_save_loaded{true}; // frame thread: the save gate (logged on change)
+    u32 quest_gate_lines{};
     u32 cleanup_lines{};
     bool cleanup_walk_only{};
     std::optional<World::Wallet> wallet_probe;
@@ -2624,8 +2626,23 @@ bool Session::FrameQuest(Backend& backend, Memory::Memory& memory, Log log, bool
     };
     available = available && !impl->cleanup_saved && !impl->ghost_saved &&
         !(impl->ghost && impl->ghost->Calling()) && !(impl->equipment && impl->equipment->Calling());
+    // The title screen runs on a bound, stable GameData manager with default data and a live
+    // challenge manager (field, C16 s2: a late-join target applied there, then the save load
+    // restored over it). A save is loaded once the wallet capacity Int is non-zero (the world
+    // class's signal: 0 at boot and title, the bag size in game). No capacity key: no gate.
+    bool loaded = true;
+    if (profile->world.capacity_hash) {
+        const auto capacity = backend.ReadInt(profile->world.capacity_hash);
+        loaded = capacity && *capacity > 0;
+    }
+    if (loaded != impl->quest_save_loaded) {
+        impl->quest_save_loaded = loaded;
+        if (impl->quest_gate_lines++ < 16)
+            log(loaded ? "OoT co-op: quest save gate open (wallet capacity non-zero)"
+                       : "OoT co-op: quest save gate closed (no loaded save: title or boot)");
+    }
     return impl->quest->Frame(port, impl->tick, impl->rebinds,
-        impl->stable_frame && impl->runtime->BaselineReady(), impl->quest_negotiated, available);
+        impl->stable_frame && impl->runtime->BaselineReady() && loaded, impl->quest_negotiated, available);
 }
 
 void Session::QueueCleanup(u64 key) {
