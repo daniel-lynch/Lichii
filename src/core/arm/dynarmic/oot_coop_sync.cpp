@@ -238,7 +238,8 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
         const char* value_field = change.kind == Kind::Rupee || change.kind == Kind::Key ? "delta" : "value";
         if (WireKind(change.kind)) {
             for (const auto& [field, value] : packet.items()) {
-                if (field == "type" || field == key || field == value_field) continue;
+                if (field == "type" || field == key || (change.kind != Kind::Quest && field == value_field)) continue;
+                if (change.kind == Kind::Quest && (field == "step" || field == "index")) continue;
                 if (change.kind == Kind::Bit && World::OriginField(field)) continue;
                 if (!snapshot && (field == "origin" || field == "seq")) continue;
                 if (!snapshot && field == "rev" && Unsigned(value, MaxSequence) && value != 0) continue;
@@ -261,7 +262,7 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
             }
             change.value = packet.at("value").get<bool>() ? 1 : 0;
         } else if (change.kind == Kind::Quest) {
-            if (!Unsigned(packet.at("index"), 255) ||
+            if (!change.key || packet.at("step") == 0 || !Unsigned(packet.at("index"), 255) ||
                 !Unsigned(packet.at("step"), std::numeric_limits<u32>::max())) {
                 return std::nullopt;
             }
@@ -324,7 +325,7 @@ std::optional<Json> DecodeLine(std::string_view line) {
 
 bool WireKind(Kind kind) {
     return kind == Kind::Bool || kind == Kind::Bit || kind == Kind::Rupee || kind == Kind::Item ||
-           kind == Kind::Key;
+           kind == Kind::Key || kind == Kind::Quest;
 }
 
 std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text) {
@@ -338,6 +339,7 @@ std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text) {
         else if (name == "item") result.insert(Kind::Item);
         else if (name == "pose") result.insert(Kind::Pose);
         else if (name == "dungeon") result.insert(Kind::Key);
+        else if (name == "quest") result.insert(Kind::Quest);
         else return std::nullopt;
         if (comma == std::string_view::npos) break;
         text.remove_prefix(comma + 1);
@@ -448,6 +450,11 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                 const auto cell = Number(value, MaxModuleOffset);
                 if (!cell || !*cell || (*cell & 7)) return std::nullopt;
                 (field == "manager_cell" ? profile.manager_cell : profile.pouch_cell) = *cell;
+            } else if (field == "quest") {
+                profile.quest = Quest::DecodeKeys(value);
+                if (!profile.quest) return {};
+                for (const auto& observer : profile.quest->observers)
+                    profile.sites.push_back({Point::StepCommit, observer.entry.offset, observer.entry.words.front()});
             } else if (field == "anim") {
                 const auto decoded = Anim::DecodeKeys(value);
                 if (!decoded) return std::nullopt;
@@ -770,11 +777,13 @@ Json EncodeHello(const Hello& hello) {
         packet["animation"] = {{"av", 1}, {"table_sha256", hello.animation_hash}};
     if (hello.world_wallet) packet["world_wallet"] = World::EncodeWallet(*hello.world_wallet);
     if (hello.ghost_equipment_v2) packet["ghost_equipment_v2"] = true;
+    if (hello.quest) packet["quest"] = 1;
     return packet;
 }
 
 bool MatchesHello(const Json& packet, const Hello& hello) {
     try {
+        if (packet.contains("quest") && (!hello.quest || !Unsigned(packet.at("quest"), 1) || packet.at("quest") != 1)) return false;
         const u32 version = hello.animation_hash.empty() ? ProtocolVersion : 4;
         if (!hello.animation_hash.empty() &&
             (!packet.contains("animation") ||
@@ -831,11 +840,11 @@ std::optional<KeyExtras> DecodeKeyExtras(const Json& document) {
         const auto& deny = document.at("deny");
         if (!deny.is_object()) return std::nullopt;
         for (const auto& [name, list] : deny.items()) {
-            if (name != "bool" || !list.is_array() || list.size() > DenyLimit) return std::nullopt;
+            if ((name != "bool" && name != "quest") || !list.is_array() || list.size() > DenyLimit) return std::nullopt;
             for (const auto& value : list) {
-                const auto key = u32_key(value);
-                if (!key) return std::nullopt;
-                extras.deny.insert(*key);
+                const auto key = name == "quest" ? Number(value, 0xffffffff) : std::optional<u64>{u32_key(value)};
+                if (!key || !*key) return std::nullopt;
+                (name == "quest" ? extras.deny_quest : extras.deny).insert(*key);
             }
         }
     }
@@ -971,9 +980,10 @@ struct Session::Impl {
     struct Connection;
     struct GhostPort;
     Impl(Endpoint endpoint_, Hello hello_, std::set<u64> denied_, std::set<Kind> allowed_,
-         std::set<std::pair<Kind, u64>> keys, u64 wallet, const World::Config& world)
+         std::set<std::pair<Kind, u64>> keys, u64 wallet, const World::Config& world, bool quest_enabled)
         : endpoint{std::move(endpoint_)}, hello{std::move(hello_)}, denied{std::move(denied_)},
           local{denied}, remote{denied}, allowed_classes{std::move(allowed_)}, retry{io} {
+        if (!quest_enabled) allowed_classes.erase(Kind::Quest);
         ApplyPolicy policy{true, allowed_classes, {}, wallet};
         for (const auto& [kind, key] : keys) {
             if (!denied.contains(key) && (kind != Kind::Bit || world.families.empty() || world.AdmitsFlag(key)))
@@ -1071,6 +1081,13 @@ struct Session::Impl {
     };
     std::optional<CleanupCall> cleanup_call;
     u64 cleanup_stack{};
+    std::unique_ptr<Quest::Controller> quest;
+    std::optional<Backend::Context> quest_saved;
+    u64 quest_stack{};
+    std::atomic<bool> quest_negotiated{};
+    std::atomic<u64> quest_connections{};
+    u64 quest_connection_seen{};
+    bool quest_fallback{}; // transport thread only; one legacy retry for the session
     u32 cleanup_lines{};
     bool cleanup_walk_only{};
     std::optional<World::Wallet> wallet_probe;
@@ -1170,6 +1187,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                             std::scoped_lock lock{self->owner.mutex};
                             hello.world_wallet = self->owner.wallet;
                         }
+                        hello.quest = hello.quest && !self->owner.quest_fallback;
                         self->Send(EncodeHello(hello));
                         self->Read();
                     });
@@ -1188,6 +1206,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
             owner.animation_peers.clear();
             owner.pose_out.reset();
             owner.equipment_negotiated = false;
+            owner.quest_negotiated = false;
         }
         resolver.cancel();
         boost::system::error_code ignored;
@@ -1219,6 +1238,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                 {
                     std::scoped_lock lock{self->owner.mutex};
                     for (const auto& change : self->owner.outgoing) {
+                        if (change.kind == Kind::Quest && !self->owner.quest_negotiated) continue;
                         if (change.seq > self->sent_seq && changes.size() < 64) {
                             changes.push_back(change);
                         }
@@ -1310,6 +1330,15 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                     self->last_receive = Clock::now();
                     const auto type = packet->at("type").get<std::string>();
                     if (!self->handshaken) {
+                        if (type == "error" && self->owner.hello.quest && !self->owner.quest_fallback) {
+                            self->owner.quest_fallback = true;
+                            {
+                                std::scoped_lock lock{self->owner.mutex};
+                                std::erase_if(self->owner.outgoing, [](const Change& c) { return c.kind == Kind::Quest; });
+                            }
+                            LOG_INFO(Core_ARM, "OoT co-op: quest class off: relay does not support it");
+                            return self->Fail("retrying legacy hello");
+                        }
                         if (!MatchesHello(*packet, self->owner.hello)) {
                             LOG_WARNING(Core_ARM, "OoT co-op: handshake refused or mismatched");
                             return self->Fail(type == "error" && packet->contains("reason") &&
@@ -1319,6 +1348,13 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                         }
                         self->owner.equipment_negotiated = self->owner.hello.ghost_equipment_v2 &&
                             packet->contains("ghost_equipment_v2") && (*packet)["ghost_equipment_v2"] == true;
+                        self->owner.quest_negotiated = self->owner.hello.quest && !self->owner.quest_fallback &&
+                            packet->contains("quest") && Unsigned(packet->at("quest"), 1) && packet->at("quest") == 1;
+                        if (self->owner.quest_negotiated) ++self->owner.quest_connections;
+                        if (!self->owner.quest_negotiated) {
+                            std::scoped_lock lock{self->owner.mutex};
+                            std::erase_if(self->owner.outgoing, [](const Change& c) { return c.kind == Kind::Quest; });
+                        }
                         self->handshaken = true;
                     } else if (type == "heartbeat") {
                         self->Send({{"type", "heartbeat_ack"}});
@@ -1496,13 +1532,13 @@ bool Session::Impl::Receive(const Json& packet) {
                 (value.at("type") == "rupee_add" || value.at("type") == "item_give" ||
                  value.at("type") == "key_add")) continue;
             const auto change = DecodeChange(value, true);
-            if (!change || !WireKind(change->kind)) return false;
+            if (!change || !WireKind(change->kind) || change->kind == Kind::Quest) return false;
             checkpoint.Merge(*change, false);
         }
         u64 revision = packet.at("revision").get<u64>();
         for (const auto& value : packet.at("replay")) {
             const auto change = DecodeChange(value);
-            if (!change || !WireKind(change->kind) || !Unsigned(value.at("rev"), MaxSequence) ||
+            if (!change || !WireKind(change->kind) || change->kind == Kind::Quest || !Unsigned(value.at("rev"), MaxSequence) ||
                 value.at("rev").get<u64>() != ++revision) return false;
             if (!EventKind(change->kind)) checkpoint.Merge(*change);
             else if (ever_ready && change->kind == Kind::Item &&
@@ -1512,10 +1548,18 @@ bool Session::Impl::Receive(const Json& packet) {
         }
         changes = checkpoint.Snapshot();
         changes.insert(changes.end(), world_replay.begin(), world_replay.end());
+        if (packet.contains("quest")) {
+            if (!quest_negotiated) return false;
+            const auto quests = Quest::DecodeSnapshot(packet.at("quest"));
+            if (!quests) return false;
+            for (const auto& q : *quests) changes.push_back({Kind::Quest, {}, 0, q.challenge, q.index, q.step});
+        }
     } else {
         const auto change = DecodeChange(packet);
-        if (!change || !WireKind(change->kind) || !Unsigned(packet.at("rev"), MaxSequence) ||
-            packet.at("rev") == 0) return false;
+        if (!change || !WireKind(change->kind)) return false;
+        if (change->kind == Kind::Quest) {
+            if (!quest_negotiated || packet.contains("rev")) return false;
+        } else if (!Unsigned(packet.at("rev"), MaxSequence) || packet.at("rev") == 0) return false;
         changes.push_back(*change);
     }
     std::scoped_lock lock{mutex};
@@ -1615,12 +1659,18 @@ struct Session::Impl::GhostPort {
 Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_,
                  std::shared_ptr<const OotGameDataTrace::Profile> profile_, Endpoint endpoint, Hello hello,
                  std::set<u64> denied, std::set<Kind> allowed_classes,
-                 std::set<std::pair<Kind, u64>> allowed_keys)
+                 std::set<std::pair<Kind, u64>> allowed_keys, std::set<u64> denied_quests)
     : owner{owner_}, base{base_}, profile{std::move(profile_)},
       impl{std::make_unique<Impl>(std::move(endpoint), std::move(hello), std::move(denied),
                                    std::move(allowed_classes), std::move(allowed_keys),
-                                   profile->wallet_hash, profile->world)} {
+                                   profile->wallet_hash, profile->world, profile->quest && profile->quest->enabled)} {
     impl->binding.base = base;
+    impl->hello.quest = false;
+    if (profile->quest && profile->quest->enabled && impl->allowed_classes.contains(Kind::Quest)) {
+        denied_quests.insert(impl->denied.begin(), impl->denied.end());
+        impl->quest = std::make_unique<Quest::Controller>(profile->quest, std::move(denied_quests), base);
+        impl->hello.quest = true;
+    }
     impl->cleanup_walk_only = Env("EDEN_NX2_OOT_COOP_WORLD_CLEANUP") == "walk";
     if (profile->world.cleanup == World::Cleanup::Death)
         LOG_INFO(Core_ARM, "OoT co-op: world cleanup {}", !profile->world.resolver ? "flag_only (no resolver in the key file)"
@@ -1731,6 +1781,31 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
 Session::~Session() = default;
 void Session::Stop() { impl->Stop(); }
 
+bool Session::Traps(OotGameDataTrace::Point point) const {
+    return OotGameDataTrace::CoopPoint(point) ||
+           (point == OotGameDataTrace::Point::StepCommit && impl->quest != nullptr) ||
+           (profile->chest.interaction_pc && point == OotGameDataTrace::Point::StructBoolSet);
+}
+
+Quest::Port Session::QuestPort(Memory::Memory& memory) {
+    using namespace OotGameDataTrace::Detail;
+    Quest::Port port;
+    port.range = [&](u64 at, u64 size) { return at && size && at + size > at &&
+        memory.IsValidVirtualAddressRange(at, size); };
+    port.r8 = [&](u64 at) -> std::optional<u8> {
+        if (!at || !memory.IsValidVirtualAddressRange(at, 1)) return {};
+        return memory.Read8(at);
+    };
+    port.r16 = [&](u64 at) -> std::optional<u16> {
+        if (!at || at + 2 <= at || !memory.IsValidVirtualAddressRange(at, 2)) return {};
+        return memory.Read16(at);
+    };
+    port.r32 = [&](u64 at) { return at && at + 4 > at ? Read32(memory, at) : std::nullopt; };
+    port.r64 = [&](u64 at) { return at && at + 8 > at ? Read64(memory, at) : std::nullopt; };
+    port.log = [](std::string_view line) { LOG_INFO(Core_ARM, "{}", line); };
+    return port;
+}
+
 bool Session::Observe(Change change) {
     // Wallet deltas are observed only at the wallet entry's listed callers (ObserveRupee).
     if (impl->stopped || !WireKind(change.kind)) return false;
@@ -1743,7 +1818,9 @@ bool Session::Observe(Change change) {
         }
         return false;
     }
-    if (!impl->local.Merge(change, false)) return false;
+    if (change.kind == Kind::Quest) {
+        if (!impl->quest_negotiated || !impl->quest) return false;
+    } else if (!impl->local.Merge(change, false)) return false;
     change.origin = impl->hello.client_id;
     change.seq = impl->next_seq++;
     impl->outgoing.push_back(std::move(change));
@@ -1985,6 +2062,25 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     };
     const auto log = [](std::string_view line) { LOG_INFO(Core_ARM, "{}", line); };
     const DrainContext site{thread, 1, impl->tick, true};
+    if (binding.sentinel && pc == binding.sentinel && impl->quest_saved && impl->quest) {
+        auto port = QuestPort(memory);
+        const u64 result = jit.GetRegister(0);
+        if (thread != impl->frame_thread || jit.GetSP() != impl->quest_stack || !backend.Restore(*impl->quest_saved)) {
+            impl->quest->Log(port, "sentinel refused: thread or stack mismatch");
+            return false;
+        }
+        impl->quest_saved.reset();
+        impl->quest->Returned(port, result);
+        return true;
+    }
+    if (point == OotGameDataTrace::Point::StepCommit && impl->quest) {
+        auto port = QuestPort(memory);
+        for (const auto& observer : profile->quest->observers)
+            if (base + observer.entry.offset == pc)
+                impl->quest->Dirty(port, jit.GetRegister(observer.state_register), pc);
+        return false;
+    }
+    if (impl->quest_saved) return false;
     if (binding.sentinel && pc == binding.sentinel && impl->cleanup_saved && impl->cleanup_call) {
         const u64 result = jit.GetRegister(0);
         if (thread != impl->frame_thread || jit.GetSP() != impl->cleanup_stack ||
@@ -2218,6 +2314,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         if (impl->ghost) impl->ghost->DropAll(log, "save or title: GameData moved");
         if (runtime.Rebind(backend, log)) {
             impl->stable_frame = false;
+            if (impl->quest) impl->quest->Reset();
             impl->key_watch.clear(); // a new save epoch: re-baseline the key counts
             impl->pickups.Clear();
             impl->local_pickups.clear();
@@ -2238,13 +2335,14 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     }
     const bool bound = backend.BindFromCell();
     if (binding.invalid || (!bound && impl->stable_frame)) {
+        if (impl->quest) impl->quest->Reset();
         if (impl->equipment) impl->equipment->Invalidate();
         if (impl->ghost) impl->ghost->DropAll(log, "GameData binding lost");
         runtime.Invalidate();
         runtime.Frame(backend, {thread, 1, impl->tick, true}, [](Change, bool) {}, log);
         return false;
     }
-    if (!bound) return false;
+    if (!bound) { if (impl->quest) impl->quest->Reset(); return false; }
     if (!std::exchange(impl->stable_frame, true)) return false;
 
     std::deque<std::variant<Change, HighWater>> batch;
@@ -2260,6 +2358,12 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             if (!impl->remote.AdoptSeen(*seen)) runtime.Invalidate();
         } else {
             const auto& change = std::get<Change>(entry);
+            if (change.kind == Kind::Quest) {
+                if (!change.origin.empty() && !impl->remote.AdoptSeen({{change.origin, change.seq}})) continue;
+                if (impl->quest) impl->quest->Queue({static_cast<u32>(change.key), change.step,
+                                                    static_cast<u32>(change.value), change.origin});
+                continue;
+            }
             if (change.kind == Kind::Key) {
                 // One gain, two adds: the dungeon's total and its current count. The credit keeps
                 // our own watch from sending the gain back.
@@ -2487,9 +2591,41 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         }
     }
     const bool cleaning = !runtime.Calling() && FrameCleanup(backend, memory, log);
-    if (impl->pose_enabled) FramePose(backend, memory, log, runtime.Calling() || cleaning);
-    return runtime.Calling() || cleaning || (impl->ghost && impl->ghost->Calling()) ||
+    const bool quest_call = FrameQuest(backend, memory, log, !runtime.Calling() && !cleaning);
+    if (impl->pose_enabled) FramePose(backend, memory, log, runtime.Calling() || cleaning || quest_call);
+    return runtime.Calling() || cleaning || quest_call || (impl->ghost && impl->ghost->Calling()) ||
            (impl->equipment && impl->equipment->Calling());
+}
+
+template <typename Backend, typename Log>
+bool Session::FrameQuest(Backend& backend, Memory::Memory& memory, Log log, bool available) {
+    if (!impl->quest) return false;
+    auto port = QuestPort(memory);
+    const u64 connection = impl->quest_connections;
+    if (connection != impl->quest_connection_seen) {
+        impl->quest->Rebaseline();
+        impl->quest_connection_seen = connection;
+    }
+    port.log = log;
+    port.ready = [&] { return backend.CallReady() && backend.ItemReady(); };
+    port.send = [&](const Quest::Target& t) { return Observe({Kind::Quest, {}, 0, t.challenge, t.index, t.step}); };
+    port.call = [&](const Quest::Entry& entry, const std::array<u64, 8>& args) {
+        const auto verified = backend.VerifiedEntry({entry.offset, entry.words});
+        if (!verified || !port.ready()) return false;
+        auto saved = backend.Capture();
+        if (!saved) return false;
+        const u64 sp = impl->binding.stack - ItemFrame;
+        ApplyTarget call{true, false, 0, 0, *verified, impl->binding.sentinel, sp, args};
+        call.stores = {{sp, 0}, {sp + 8, 0}, {sp + 0x10, 0}, {sp + 0x18, 0}};
+        if (!backend.Redirect(call)) return false;
+        impl->quest_saved = std::move(saved);
+        impl->quest_stack = sp;
+        return true;
+    };
+    available = available && !impl->cleanup_saved && !impl->ghost_saved &&
+        !(impl->ghost && impl->ghost->Calling()) && !(impl->equipment && impl->equipment->Calling());
+    return impl->quest->Frame(port, impl->tick, impl->rebinds,
+        impl->stable_frame && impl->runtime->BaselineReady(), impl->quest_negotiated, available);
 }
 
 void Session::QueueCleanup(u64 key) {
@@ -2711,6 +2847,7 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
         if (!allowed) throw std::runtime_error{"invalid grant class allow-list"};
         std::set<std::pair<Kind, u64>> keys;
         std::vector<DungeonKeys> dungeon_keys;
+        std::set<u64> denied_quests;
         const auto keys_path = Env("EDEN_NX2_OOT_COOP_KEYS");
         if (!keys_path.empty()) {
             std::ifstream in{std::filesystem::path{keys_path}};
@@ -2725,6 +2862,7 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
             const auto extras = DecodeKeyExtras(parsed->at("keys"));
             if (!extras) throw std::runtime_error{"invalid key file deny/dungeon section"};
             denied.insert(extras->deny.begin(), extras->deny.end());
+            denied_quests = extras->deny_quest;
             if (allowed->contains(Kind::Key)) {
                 for (const u32 key : extras->dungeon_bools) keys.emplace(Kind::Bool, key);
                 for (const auto& pair : extras->dungeon_keys) {
@@ -2751,7 +2889,7 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
         hello.client_id = fmt::format("{:08x}{:08x}{:08x}{:08x}", random(), random(), random(), random());
         auto session = std::make_shared<Session>(kernel, owner, base, std::move(profile),
             *ParseEndpoint(endpoint_text),
-            std::move(hello), std::move(denied), *allowed, std::move(keys));
+            std::move(hello), std::move(denied), *allowed, std::move(keys), std::move(denied_quests));
         session->SetDungeonKeys(std::move(dungeon_keys));
         std::scoped_lock lock{sessions_mutex};
         current_session = std::move(session);

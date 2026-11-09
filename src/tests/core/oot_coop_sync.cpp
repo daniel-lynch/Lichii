@@ -231,7 +231,7 @@ TEST_CASE("OoT co-op v2 frames are bounded and policy matched", "[core][oot_coop
     REQUIRE_FALSE(Coop::MatchesHello(ack, hello));
     REQUIRE(Coop::WireKind(Kind::Bool));
     REQUIRE(Coop::WireKind(Kind::Bit));
-    REQUIRE_FALSE(Coop::WireKind(Kind::Quest));
+    REQUIRE(Coop::WireKind(Kind::Quest));
     REQUIRE_FALSE(Coop::WireKind(Kind::PouchAdd));
 }
 
@@ -439,7 +439,7 @@ TEST_CASE("OoT co-op grant classes default closed", "[core][oot_coop]") {
     REQUIRE(Coop::DecodeAllowClasses("bool,bit") == std::set{Kind::Bool, Kind::Bit});
     REQUIRE_FALSE(Coop::DecodeAllowClasses("pouch"));
     REQUIRE_FALSE(Coop::DecodeAllowClasses("bool,"));
-    REQUIRE_FALSE(Coop::DecodeAllowClasses("bool,quest"));
+    REQUIRE(Coop::DecodeAllowClasses("bool,quest")->contains(Kind::Quest));
 }
 
 TEST_CASE("OoT co-op receipts cannot cross a loaded-save generation", "[core][oot_coop]") {

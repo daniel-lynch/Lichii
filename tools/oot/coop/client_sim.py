@@ -54,10 +54,12 @@ def animation_descriptor(path):
 class ClientSim:
     def __init__(self, client_id=None, *, room="default", team="default", name="Player",
                  build_id=BUILD_ID, seed_hash="0", policy_id="or-v2", auto_heartbeat=True,
-                 on_pose=None, world_wallet=None, animation=None):
+                 on_pose=None, world_wallet=None, animation=None, quest=False):
         self.hello = {"type": "hello", "version": wire.VERSION if animation else wire.LEGACY_VERSION, "build_id": build_id,
                       "seed_hash": seed_hash, "room": room, "team": team,
                       "client_id": client_id or uuid.uuid4().hex, "name": name, "policy_id": policy_id}
+        if quest:
+            self.hello["quest"] = 1
         if world_wallet is not None:
             wire.validate_wallet(world_wallet)
             self.hello["world_wallet"] = dict(world_wallet)
@@ -90,6 +92,9 @@ class ClientSim:
                 self.ack.get("animation") != self.hello.get("animation")):
             await self.close()
             raise ValueError("animation handshake mismatch")
+        if self.hello.get("quest") == 1 and (type(self.ack.get("quest")) is not int or self.ack["quest"] != 1):
+            await self.close()
+            raise ValueError("quest capability refused")
         self.snapshot = await self.read()
         if self.snapshot["type"] != "team_state":
             await self.close()
@@ -215,7 +220,7 @@ async def run(args):
                        build_id=args.build_id, seed_hash=args.seed, policy_id=args.policy,
                        world_wallet=dict(zip(("balance", "capacity"), args.world_wallet))
                        if args.world_wallet else None,
-                       animation=animation_descriptor(args.anim_table),
+                       animation=animation_descriptor(args.anim_table), quest=args.quest,
                        on_pose=lambda packet: print(json.dumps(packet), flush=True) if args.show_poses else None)
     try:
         await client.connect(args.host, args.port)
@@ -223,7 +228,7 @@ async def run(args):
         print(json.dumps(client.snapshot), flush=True)
         for raw in args.send:
             packet = json.loads(raw)
-            if packet.get("type") in wire.CHANGE_TYPES:
+            if packet.get("type") in wire.CHANGE_TYPES | {"quest_step"}:
                 kind = packet.pop("type")
                 await client.change(kind, **packet)
             else:
@@ -260,6 +265,7 @@ def main():
     parser.add_argument("--policy", default="or-v2")
     parser.add_argument("--world-wallet", type=int, nargs=2, metavar=("BALANCE", "CAPACITY"))
     parser.add_argument("--anim-table", help="private coop-anim.json sidecar (exact-byte SHA256 negotiation)")
+    parser.add_argument("--quest", action="store_true", help="negotiate quest; --send accepts quest_step")
     parser.add_argument("--duration", type=float, default=30)
     parser.add_argument("--send", action="append", default=[], help="JSON packet; change origin/seq are automatic")
     parser.add_argument("--pose", action="append", default=[], help="'BANC CHILD X Y Z YAW [LOADING]' (v3 pose)")

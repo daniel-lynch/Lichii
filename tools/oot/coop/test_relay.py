@@ -75,6 +75,92 @@ def materialize(snapshot):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_quest_capability_and_legacy_isolation(self):
+        server = self.memory_server()
+        old = self.stalled(server, "old")
+        sender = self.stalled(server, "a", quest=True)
+        peer = self.stalled(server, "b", quest=True)
+        self.assertNotIn("quest", self.queued(old)[0])
+        self.assertEqual(self.queued(sender)[0]["quest"], 1)
+        for client in (old, sender, peer):
+            self.drain(client)
+        event = dict(type="quest_step", origin="a", seq=1, challenge=101, step=55, index=3)
+        server.receive(sender, event)
+        self.assertEqual(self.drain(sender), [dict(type="ack", seq=1)])
+        self.assertEqual(self.drain(peer), [event])
+        self.assertEqual(self.drain(old), [])
+        server.receive(sender, grant(2))
+        self.assertEqual(self.drain(old)[0]["rev"], 1)
+        server.receive(old, dict(type="team_state_request"))
+        snapshot = self.drain(old)[0]
+        self.assertNotIn("quest", snapshot)
+        materialize(snapshot)  # replay remains contiguous, with the shared seq highwater
+        late = self.stalled(server, "late", quest=True)
+        state = next(p for p in self.queued(late) if p["type"] == "team_state")
+        self.assertEqual(state["quest"], [dict(type="quest_step", challenge=101, step=55, index=3)])
+        self.assertEqual(state["seen"]["a"], 2)
+        self.assertEqual(state["replay"][0]["rev"], 1)
+        with self.assertRaises(relay.ProtocolError):
+            server.receive(old, dict(event, origin="old", seq=1))
+
+    def test_quest_folds_raw_index_forward_and_acks_every_valid_noop(self):
+        server = self.memory_server()
+        sender = self.stalled(server, "a", quest=True)
+        peer = self.stalled(server, "b", quest=True)
+        self.drain(sender); self.drain(peer)
+        for seq, index, step in ((1, 3, 55), (2, 2, 44), (3, 3, 99), (4, 4, 66)):
+            event = dict(type="quest_step", origin="a", seq=seq, challenge=101, step=step, index=index)
+            server.receive(sender, event)
+            self.assertEqual(self.drain(sender), [dict(type="ack", seq=seq)])
+            self.assertEqual(self.drain(peer), [event] if seq in (1, 4) else [])
+        server.receive(sender, event)  # identical sequence, acked but not sent again
+        self.assertEqual(self.drain(sender), [dict(type="ack", seq=4)])
+        self.assertEqual(self.drain(peer), [])
+        self.assertEqual(sender.team.quest[101]["step"], 66)
+        self.assertEqual(sender.team.revision, 0)
+        self.assertEqual(list(sender.team.replay), [])
+        self.assertEqual(sender.team.seen["a"], 4)
+
+    def test_quest_deny_and_capacity_are_separate_from_revisioned_state(self):
+        server = self.memory_server()
+        server.deny_list = frozenset({101})
+        sender = self.stalled(server, "a", quest=True)
+        self.drain(sender)
+        event = dict(type="quest_step", origin="a", seq=1, challenge=101, step=55, index=3)
+        server.receive(sender, event)
+        self.assertEqual(self.drain(sender), [dict(type="ack", seq=1)])
+        self.assertEqual(sender.team.quest, {})
+        self.assertEqual(sender.team.seen["a"], 1)
+        for i in range(256):
+            sender.team.accept_quest(dict(event, seq=i + 2, challenge=i + 1000), set())
+        with self.assertRaises(relay.ProtocolError):
+            sender.team.accept_quest(dict(event, seq=258, challenge=9999), set())
+        self.assertEqual(sender.team.revision, 0)
+
+    def test_quest_rejects_malformed_hello_and_packets(self):
+        hello = client_sim.ClientSim("a").hello
+        relay.validate_hello(hello)
+        relay.validate_hello(dict(hello, quest=1))
+        for value in (True, False, 0, 2, "1", 1.0, None):
+            with self.assertRaises(relay.ProtocolError):
+                relay.validate_hello(dict(hello, quest=value))
+        event = dict(type="quest_step", origin="a", seq=1, challenge=101, step=55, index=3)
+        relay.validate_quest(event, "a")
+        for field, values in (("challenge", (0, -1, 1 << 32, "101", True)),
+                              ("step", (0, -1, 1 << 32, "55", True)),
+                              ("index", (-1, 256, "3", True, 3.0)),
+                              ("seq", (0, relay.MAX_SEQ + 1)), ("origin", ("b",))):
+            for value in values:
+                with self.assertRaises(relay.ProtocolError):
+                    relay.validate_quest(dict(event, **{field: value}), "a")
+        for field in event:
+            bad = dict(event); del bad[field]
+            with self.assertRaises(relay.ProtocolError):
+                relay.validate_quest(bad, "a")
+        for field in ("rev", "value", "force"):
+            with self.assertRaises(relay.ProtocolError):
+                relay.validate_quest(dict(event, **{field: 1}), "a")
+
     def memory_server(self):
         self.now = 0.0
         clock = mock.patch.object(relay.asyncio, "get_running_loop",
@@ -1236,6 +1322,26 @@ class FakePeerTests(unittest.IsolatedAsyncioTestCase):
         for options in ("aid=1.5", "aid=7 ar=nan", "aid=7 af=inf", "af=3", "aid=7 aid=8"):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 await self.peer.command("pose Field_1 1 0 0 0 0 " + options)
+
+    async def test_quest_commands_and_snapshot(self):
+        with self.assertRaises(ValueError):
+            await self.peer.command("quest 65 37 3")
+        await self.emu.close()
+        await self.peer.close()
+        self.peer = fake_peer.FakePeer(port=0, quest=True)
+        self.port = await self.peer.start()
+        self.emu = client_sim.ClientSim("emu", quest=True)
+        await self.emu.connect("127.0.0.1", self.port)
+        sent = (await self.peer.command("quest 65 37 3"))["quest"]
+        self.assertEqual(await self.emu.receive("quest_step"), sent)
+        await self.emu.change("quest_step", challenge=101, step=66, index=4)
+        received = (await self.peer.command("expect-quest 65 2"))["packet"]
+        self.assertEqual((received["step"], received["index"]), (66, 4))
+        self.assertNotIn("rev", received)
+        self.assertIn(received, (await self.peer.command("received"))["received"])
+        state = (await self.peer.command("state"))["state"]
+        self.assertEqual(state["quest"][0]["step"], 66)
+        self.assertEqual(state["replay"], [])
 
     async def test_records_the_emulator_broadcast(self):
         await self.emu.change("bool_set", hash=0xC1, value=True)

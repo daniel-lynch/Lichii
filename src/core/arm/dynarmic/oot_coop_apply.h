@@ -30,7 +30,7 @@ struct ApplyPolicy {
             return enabled && classes.contains(Kind::Key) && KeyGain(change.value) &&
                    keys.contains({Kind::Key, change.key});
         }
-        return enabled && WireKind(change.kind) && change.value == 1 &&
+        return enabled && (change.kind == Kind::Bool || change.kind == Kind::Bit) && change.value == 1 &&
                classes.contains(change.kind) && keys.contains({change.kind, change.key});
     }
 };

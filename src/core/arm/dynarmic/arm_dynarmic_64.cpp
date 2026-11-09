@@ -85,7 +85,8 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
             m_gamedata_trace = OotGameDataTrace::sessions.Find(m_process);
             m_gamedata_trace_looked_up = true;
         }
-        if (m_gamedata_trace) {
+        if (m_gamedata_trace && OotGameDataTrace::Identify(*m_gamedata_trace->profile,
+                m_gamedata_trace->base, vaddr, instruction) != OotGameDataTrace::Point::StepCommit) {
             return OotGameDataTrace::InstructionFor(*m_gamedata_trace->profile, m_gamedata_trace->base,
                                                     vaddr, instruction);
         }
@@ -93,6 +94,14 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     if (m_oot_coop) {
         const auto point =
             OotGameDataTrace::Identify(*m_oot_coop->profile, m_oot_coop->base, vaddr, instruction);
+        if (point == OotGameDataTrace::Point::StepCommit && m_oot_coop->Traps(point)) {
+            for (const auto& observer : m_oot_coop->profile->quest->observers) {
+                if (m_oot_coop->base + observer.entry.offset != vaddr) continue;
+                for (size_t i = 0; i < observer.entry.words.size(); ++i)
+                    if (OotGameDataTrace::Detail::Read32(m_memory, vaddr + i * 4) != observer.entry.words[i])
+                        return instruction;
+            }
+        }
         return m_oot_coop->Traps(point) ? OotGameDataTrace::Breakpoint : instruction;
     }
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
@@ -194,7 +203,7 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
             // A give rejection returns before its prologue and intentionally bypasses Resume.
             if (before && m_oot_coop && coop_hook(point)) return;
             // Resume exactly once, whether tracing, co-op, or both registered the breakpoint.
-            if (m_gamedata_trace) {
+            if (m_gamedata_trace && point != OotGameDataTrace::Point::StepCommit) {
                 OotGameDataTrace::Handle(*m_gamedata_trace, pc, *m_parent.m_jit, m_memory);
             } else {
                 OotGameDataTrace::Resume(point, *m_parent.m_jit, m_memory, pc);
