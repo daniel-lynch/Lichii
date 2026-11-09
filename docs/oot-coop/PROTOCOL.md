@@ -164,11 +164,77 @@ different gives of the same item both add. The chest's opened Bool travels separ
 ordinary `bool_set`. The receiver replays it from the frame drain only when no event is running and
 the profile's guard pointers are live; until then it waits at the head of the queue.
 
-`quest_step`, `int_set`, `enum_set`, `pouch_add`, `pouch_total` are **rejected** (since v2).
-A quest index maximum is not an OR over flags and an observed setter request is not
-proof of successful progress. The existing trace can still observe it locally. Pouch
+`int_set`, `enum_set`, `pouch_add`, `pouch_total` are **rejected** (since v2). Pouch
 stock, health, ammo, small-key balances, progressive tiers and spending are not inferred
 from ownership bits and cannot be synchronized by scalar arrival order.
+
+### Quest class (optional, default OFF)
+
+`quest` in `EDEN_NX2_OOT_COOP_ALLOW` **and** `offsets.<build>.quest.enabled=true` in the
+private key file activate this class. Both are required. The shipped configuration remains off
+until the load/restoration, guest-thread and silent-apply field probes pass. An inactive class
+adds no hello fields, quest packets or guest traps. Existing classes keep their wire shapes.
+
+An active client adds `"quest":1` to `hello`; a supporting relay echoes `"quest":1` in
+`hello_ack`. The value must be the integer 1, not a Boolean. Quest sending/application requires
+that echo. If an older relay rejects the hello, the client logs
+`OoT co-op: quest class off: relay does not support it` and reconnects without the field for
+the rest of the session. Other classes continue. The deployed C15 relay needs an update to
+support quest; a relay update is unnecessary when this class stays off.
+
+A quest packet has exactly `type`, `origin`, `seq`, `challenge`, `step`, `index`:
+
+```text
+{"type":"quest_step","origin":"<session>","seq":<shared-sequence>,
+ "challenge":<nonzero-u32>,"step":<nonzero-u32>,"index":<0..255>}
+```
+
+Hashes are opaque build-specific values loaded privately; rank is the ordered index, never the
+numeric hash. The sender publishes the **committed raw step and its actual index**, including
+transient steps. The commit trap only records dirty attribution. The frame drain re-reads the
+manager and record, requires index/hash agreement, suppresses restoration and our replay, and
+forwards only forward transitions relative to the stable epoch snapshot. Backwards changes
+update that snapshot silently. A periodic 60-frame pure-read poll catches missed traps.
+No quest work happens before a save is loaded: the title screen runs a live challenge manager on
+default data, so the class waits for the world class's loaded-save signal (the private wallet
+capacity Int is non-zero) and logs `quest save gate open|closed`.
+Manager/table or save-binding changes reset observation, retain remote targets for revalidation,
+and start a private `settle_frames` window (default 300). Bulk changes re-enter that window.
+
+The relay keeps a separate, bounded (256-challenge) quest map, folding **raw indices** forward
+only. Every valid quest packet is acked, including equal/lower, duplicate and denied writes.
+Accepted packets carry origin/seq, **no `rev`**, and go only to other quest-capable clients in the
+team. Quest packets never enter the revisioned checkpoint/replay log. Their sequences share the
+sender's existing sequence space and advance `seen`; ordinary replay revisions remain contiguous.
+Only capable clients receive a `"quest":[...]` member in `team_state`; its entries have exactly
+`type`, `challenge`, `step`, `index` and contain the furthest raw step per challenge. Old clients
+receive neither live quest packets nor this member. Non-capable senders are rejected.
+
+Each receiver validates the raw step against its live record's ordered step table, rejects
+unknown hashes/index mismatches, and floors to the highest private SAFE step at or below the
+received index. It never relabels a transient as a later safe step. Absent mirror challenges and
+`deny.quest` challenges are ignored; the relay's numeric deny list also denies challenge hashes.
+The ordered per-challenge safe lists live in `quest.mirror`. A further team target replaces a
+nearer target; equal/backwards targets cannot cause a rollback. The snapshot follows the same
+flooring and readiness path as live packets.
+
+Immediately before a native call, the receiver re-resolves the manager through both private
+pointer chains, re-reads all three bounded tables and the record, requires a stable save,
+initialized/nonbusy/nonrestoring manager, no event (`ItemReady`), no other co-op call, no local
+pending request, and zero participants in both old and target steps. Minigame/boss targets are
+blocked. NotReady waits for natural readiness; Complete drops. The native setter uses private
+arguments `w3=1,w4=0,w5=0`: silent UI, no explicit subentry completion, **never force**. No enum
+or dependency flag is written directly. A returned call is only a request: later index/hash
+reads verify the target within `apply_timeout` (default 600 frames), with at most three attempts.
+Failure stops that challenge for the session, without quarantining other classes. A matching
+receipt logs `quest echo suppressed`.
+
+Once settled and negotiated, each epoch publishes one ordinary raw quest packet per mirrored
+challenge above its private Ready index. Reconnect republishes the local baseline. These
+baselines let a late join receive the team's furthest target. The default-off switch is required
+because participant guards and silent arguments alone cannot prove that downstream world
+consumers never start an event or change the world unexpectedly. Quest sync does not replay
+skipped items, dialogue, cutscenes or positional actions.
 
 Client presence is `{"type":"client_state","state":{...}}`. The relay forwards it as
 `{"type":"client_state","origin":"session-a","state":{...}}`, caches it for joins,
@@ -441,7 +507,8 @@ validation before claiming save synchronization:
 1. Use backed-up disposable saves, a new room name and identical build/seed/policy.
    Pause progression while each client enumerates the reviewed keys from its loaded save.
 2. Export each true allowlisted bool/actor key as an ordinary grant. Do not export false,
-   counts, quest indices or generic `IsGet` keys whose side effects are unknown. Feed in
+   counts or generic `IsGet` keys whose side effects are unknown. Quest baselines use the
+   separate default-off capability and safe-floor policy described above. Feed flags in
    bounded batches and await acknowledgements so a large baseline cannot fill an outbox.
 3. After its last ack, each client sends `{"type":"team_state_request"}`. FIFO processing
    gives a barrier for **that client's prior uploads only**. Wait for both participants

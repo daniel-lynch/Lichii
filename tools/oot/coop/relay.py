@@ -175,9 +175,11 @@ def mod_hash(value):
 
 def validate_hello(packet):
     fields(packet, ("type", "version", "build_id", "seed_hash", "room", "team", "client_id", "name", "policy_id"),
-           ("world_wallet", "animation", "ghost_equipment_v2", "mod_hash"))
+           ("world_wallet", "animation", "ghost_equipment_v2", "mod_hash", "quest"))
     if "mod_hash" in packet:
         mod_hash(packet["mod_hash"])
+    if "quest" in packet:
+        integer(packet["quest"], 1, 1)
     if "ghost_equipment_v2" in packet and type(packet["ghost_equipment_v2"]) is not bool:
         raise ProtocolError("expected equipment capability boolean")
     if packet["type"] != "hello" or type(packet["version"]) is not int or packet["version"] not in (LEGACY_VERSION, VERSION):
@@ -206,6 +208,17 @@ def validate_animation(value):
     integer(value["av"], 1, 1)
     if not isinstance(value["table_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["table_sha256"]):
         raise ProtocolError("invalid animation table hash")
+
+
+def validate_quest(packet, origin):
+    fields(packet, ("type", "origin", "seq", "challenge", "step", "index"))
+    if packet["type"] != "quest_step" or packet["origin"] != origin:
+        raise ProtocolError("quest origin/type mismatch")
+    identifier(origin)
+    integer(packet["seq"], 1, MAX_SEQ)
+    integer(packet["challenge"], 1, (1 << 32) - 1)
+    integer(packet["step"], 1, (1 << 32) - 1)
+    integer(packet["index"], 0, 255)
 
 
 def validate_change(packet, origin):
@@ -338,6 +351,7 @@ def fold(state, packet):
 @dataclass
 class Team:
     current: dict = field(default_factory=dict)
+    quest: dict = field(default_factory=dict)
     checkpoint: dict = field(default_factory=dict)
     seen: dict = field(default_factory=dict)
     benefit_receipts: set = field(default_factory=set)
@@ -423,12 +437,31 @@ class Team:
                 if not grants and remaining:
                     raise ProtocolError("catchup grant exceeds frame limit")
 
-    def snapshot(self):
+    def accept_quest(self, packet, deny):
+        validate_quest(packet, packet["origin"])
+        origin, seq, challenge = packet["origin"], packet["seq"], packet["challenge"]
+        if seq <= self.seen.get(origin, 0):
+            return None
+        if origin not in self.seen and len(self.seen) >= MAX_SENDERS:
+            raise ProtocolError("sender capacity reached")
+        old = self.quest.get(challenge)
+        accepted = challenge not in deny and (old is None or packet["index"] > old["index"])
+        if accepted and old is None and len(self.quest) >= 256:
+            raise ProtocolError("quest capacity reached")
+        self.seen[origin] = seq
+        if not accepted:
+            return None
+        self.quest[challenge] = {key: packet[key] for key in ("type", "challenge", "step", "index")}
+        return dict(packet)
+
+    def snapshot(self, quest=False):
         # seen is current, after replay and no-ops. Reconstruct checkpoint + replay first;
         # do not use these highwaters to discard the replay that accompanies this snapshot.
         packet = {"type": "team_state", "revision": self.checkpoint_revision,
                   "changes": list(self.checkpoint.values()), "seen": dict(self.seen),
                   "replay": list(self.replay)}
+        if quest:
+            packet["quest"] = list(self.quest.values())
         wallets = {client_id: dict(client.state["world_wallet"])
                    for client_id, client in self.clients.items() if "world_wallet" in client.state}
         if wallets:
@@ -463,6 +496,7 @@ class Client:
         self.pose_times = deque()
         self.room = self.team = None
         self.client_id = None
+        self.quest = False
         self.state = {}
         self.last_receive = asyncio.get_running_loop().time()
         self.last_heartbeat = self.last_receive
@@ -820,6 +854,7 @@ class Relay:
         team.seen.setdefault(client_id, 0)
         team.sender_active[client_id] = time.time()
         client.client_id, client.room, client.team = client_id, room, team
+        client.quest = packet.get("quest") == 1
         client.version = packet["version"]
         client.animation = packet.get("animation")
         client.ghost_equipment_v2 = packet.get("ghost_equipment_v2", False)
@@ -837,8 +872,10 @@ class Relay:
         if supplied_hash is not None:
             ack["ledger"] = {"v": 1, "epoch": room.epoch, "floor": team.ledger_floor}
             ack["mod_hash"] = room.mod_hash
+        if client.quest:
+            ack["quest"] = 1
         client.send(ack)
-        client.send(team.snapshot())
+        client.send(team.snapshot(client.quest))
         for peer in team.clients.values():
             if peer is not client:
                 self.send_presence(peer, client)
@@ -861,6 +898,20 @@ class Relay:
         kind = packet["type"]
         if kind == "pose":
             self.pose(client, packet, size)
+        elif kind == "quest_step":
+            if not client.quest:
+                raise ProtocolError("unsupported message type")  # preserve the legacy refusal without capability
+            validate_quest(packet, client.client_id)
+            previous = client.team.seen.get(client.client_id, 0)
+            event = client.team.accept_quest(packet, self.deny_list)
+            if client.team.seen.get(client.client_id, 0) != previous:  # C16 merge: the shared high-water persists
+                client.room.last_active = client.team.sender_active[client.client_id] = time.time()
+                self.dirty = True
+            client.send({"type": "ack", "seq": packet["seq"]})
+            if event is not None:
+                for peer in tuple(client.team.clients.values()):
+                    if peer is not client and peer.quest:
+                        peer.send(event)
         elif kind in CHANGE_TYPES:
             validate_change(packet, client.client_id)
             previous = client.team.seen.get(client.client_id, 0)
@@ -884,7 +935,7 @@ class Relay:
                 for peer in tuple(client.team.clients.values()):
                     if peer is not client:
                         self.send_presence(client, peer)
-            client.send(client.team.snapshot())
+            client.send(client.team.snapshot(client.quest))
         elif kind in ("heartbeat", "heartbeat_ack"):
             fields(packet, ("type",))
             if kind == "heartbeat":

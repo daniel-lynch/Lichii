@@ -136,6 +136,7 @@ struct Hello {
     std::string mod_hash;
     std::string animation_hash; // nonempty: protocol v4, animation revision 1
     bool ghost_equipment_v2{};
+    bool quest{};
 };
 [[nodiscard]] nlohmann::json EncodeHello(const Hello& hello);
 [[nodiscard]] bool MatchesHello(const nlohmann::json& packet, const Hello& hello);
@@ -151,6 +152,7 @@ struct Hello {
 ///     travel as bool_set) and each dungeon's small-key Int pair (class dungeon, key_add)
 struct KeyExtras {
     std::set<u64> deny;
+    std::set<u64> deny_quest;
     std::vector<u32> dungeon_bools;
     std::vector<DungeonKeys> dungeon_keys;
 };
@@ -214,7 +216,8 @@ public:
     Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_,
             std::shared_ptr<const OotGameDataTrace::Profile> profile_, Endpoint endpoint, Hello hello,
             std::set<u64> denied, std::set<Kind> allowed_classes = {},
-            std::set<std::pair<Kind, u64>> allowed_keys = {});
+            std::set<std::pair<Kind, u64>> allowed_keys = {},
+            std::set<u64> denied_quests = {});
     ~Session();
     void Stop();
     bool Observe(Change change);
@@ -222,10 +225,7 @@ public:
               Memory::Memory& memory, u64 thread, u64& tls, u64& tls_ro,
               std::function<void()> clear_exclusive);
     bool IsSentinel(u64 pc) const;
-    bool Traps(OotGameDataTrace::Point point) const {
-        return OotGameDataTrace::CoopPoint(point) ||
-               (profile->chest.interaction_pc && point == OotGameDataTrace::Point::StructBoolSet);
-    }
+    bool Traps(OotGameDataTrace::Point point) const;
     /// Class dungeon: the small-key Int pairs to watch and apply (from the key file).
     void SetDungeonKeys(std::vector<DungeonKeys> keys);
     Kernel::KProcess* const owner;
@@ -250,6 +250,9 @@ private:
     template <typename Backend, typename Log>
     bool FrameCleanup(Backend& backend, Memory::Memory& memory, Log log);
     void QueueCleanup(u64 key);
+    template <typename Backend, typename Log>
+    bool FrameQuest(Backend& backend, Memory::Memory& memory, Log log, bool available);
+    Quest::Port QuestPort(Memory::Memory& memory);
     std::unique_ptr<Impl> impl;
 };
 

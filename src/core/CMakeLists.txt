@@ -21,6 +21,8 @@ add_library(core STATIC
     arm/dynarmic/oot_coop_equip.h
     arm/dynarmic/oot_coop_room.cpp
     arm/dynarmic/oot_coop_room.h
+    arm/dynarmic/oot_coop_quest.cpp
+    arm/dynarmic/oot_coop_quest.h
     arm/dynarmic/oot_coop_ux.cpp
     arm/dynarmic/oot_coop_ledger.cpp
     arm/dynarmic/oot_coop_ledger.h

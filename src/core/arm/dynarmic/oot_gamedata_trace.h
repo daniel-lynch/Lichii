@@ -4,6 +4,7 @@
 #pragma once
 
 #include "core/arm/dynarmic/oot_coop_chest.h"
+#include "core/arm/dynarmic/oot_coop_quest.h"
 
 #include <algorithm>
 #include <array>
@@ -74,8 +75,9 @@ enum class Point : u8 {
     ChestInteraction,
     ChestConfirm,
     ChestReturn,
+    StepCommit,
 };
-inline constexpr size_t PointCount = 16;
+inline constexpr size_t PointCount = 17;
 
 struct Site {
     Point point;
@@ -201,6 +203,7 @@ struct Profile {
     std::shared_ptr<const OotCoop::Anim::Keys> anim;
     GhostOffsets ghost; ///< Empty unless the profile has a "ghost" object
     std::shared_ptr<const OotCoop::Equip::Keys> equip;
+    std::shared_ptr<const OotCoop::Quest::Keys> quest;
 
     u64 SiteOffset(Point point) const {
         for (const Site& site : sites) {
@@ -233,7 +236,8 @@ inline Point Identify(const Profile& profile, u64 base, u64 address, u32 instruc
 
 /// What the JIT translates at `address`: a breakpoint at a trace point, the original otherwise.
 inline u32 InstructionFor(const Profile& profile, u64 base, u64 address, u32 instruction) {
-    return Identify(profile, base, address, instruction) == Point::None ? instruction : Breakpoint;
+    const auto point = Identify(profile, base, address, instruction);
+    return point == Point::None || point == Point::StepCommit ? instruction : Breakpoint;
 }
 
 /// Does what the replaced instruction would have: the JIT has already moved the PC past it.
@@ -281,6 +285,7 @@ void Resume(Point point, Jit& jit, Memory& memory, u64 pc = 0) {
     case Point::ItemGive:
     case Point::Frame:
     case Point::StepApply:
+    case Point::StepCommit:
     case Point::PlayedEvent: // pacibsp: nothing
     case Point::None:
         break;
@@ -293,6 +298,7 @@ constexpr std::string_view Name(Point point) {
         return "step-set";
     case Point::StepApply:
         return "step-apply";
+    case Point::StepCommit: return "step-commit";
     case Point::PlayedEvent:
         return "played-event";
     case Point::StructBoolSet: return "struct-bool-set";
@@ -393,8 +399,22 @@ inline std::string Index(std::optional<u32> value) {
 /// 0x160-byte records ({count, data} at +0x40/+0x48, +0x50/+0x58, +0x60/+0x68), name hash at +8,
 /// current step hash at +0x10 (the step setter's own search).
 template <typename Memory>
-std::optional<u32> CurrentStep(Memory& memory, u64 manager, u32 challenge) {
+std::optional<u32> CurrentStep(Memory& memory, u64 manager, u32 challenge,
+                               const OotCoop::Quest::Keys* quest = nullptr) {
     constexpr u32 MaxRecords = 4096;
+    if (quest) {
+        for (const auto& table : quest->tables) {
+            const auto count = Read32(memory, manager + table.count);
+            const auto data = Read64(memory, manager + table.data);
+            if (!count || !data || *count > 256) return {};
+            for (u32 i = 0; i < *count; ++i) {
+                const u64 record = *data + u64{i} * quest->M("record_stride");
+                if (Read32(memory, record + quest->L("record.challenge")) == challenge)
+                    return Read32(memory, record + quest->L("record.current_hash"));
+            }
+        }
+        return {};
+    }
     for (const u64 table : {u64{0x40}, u64{0x50}, u64{0x60}}) {
         const auto count = Read32(memory, manager + table);
         const auto data = Read64(memory, manager + table + 8);
@@ -415,8 +435,9 @@ std::optional<u32> CurrentStep(Memory& memory, u64 manager, u32 challenge) {
 /// The line for a hit, read from the registers and guest memory (reads only, each one checked
 /// first, so a wrong layout prints "?" instead of touching unmapped memory).
 template <typename Jit, typename Memory>
-std::string Describe(Point point, u64 base, Jit& jit, Memory& memory) {
+std::string Describe(Point point, u64 base, Jit& jit, Memory& memory, const Profile* profile = nullptr) {
     using namespace Detail;
+    const auto* quest = profile ? profile->quest.get() : nullptr;
     const u64 x0 = jit.GetRegister(0);
     const u64 lr = jit.GetRegister(30);
     const std::string caller = lr >= base ? fmt::format("main+{:#x}", lr - base)
@@ -429,12 +450,32 @@ std::string Describe(Point point, u64 base, Jit& jit, Memory& memory) {
                            "force={} mgr={:#x} lr={}",
                            Common::Nx2EventTrace::DescribeHash(challenge),
                            Common::Nx2EventTrace::DescribeHash(step),
-                           Hash(CurrentStep(memory, x0, challenge)),
+                           Hash(CurrentStep(memory, x0, challenge, quest)),
                            static_cast<u32>(jit.GetRegister(3)),
                            static_cast<u32>(jit.GetRegister(4)),
                            static_cast<u32>(jit.GetRegister(5)), x0, caller);
     }
     case Point::StepApply: {
+        if (quest) {
+            if (x0 < quest->L("record.state_embedded")) return "gamedata step-apply unreadable state";
+            const u64 record = x0 - quest->L("record.state_embedded");
+            const auto challenge = Read32(memory, record + quest->L("record.challenge"));
+            const auto current = Read32(memory, record + quest->L("record.current_hash"));
+            const auto pending = Read32(memory, x0 + quest->L("state.pending_hash"));
+            const auto from = Read32(memory, x0 + quest->L("state.current_index"));
+            const auto count = Read32(memory, x0 + quest->L("state.step_count"));
+            const auto steps = Read64(memory, x0 + quest->L("state.step_array"));
+            std::optional<u32> to;
+            if (pending && count && steps && *count <= 256) {
+                for (u32 i = 0; i < *count; ++i)
+                    if (Read32(memory, *steps + u64{i} * quest->L("step.stride") + quest->L("step.hash")) == pending)
+                        to = i;
+            }
+            const char* direction = !from || !to ? "?" : *to < *from ? "backwards" : *to > *from ? "forwards" : "same";
+            return fmt::format("gamedata step-apply challenge={} from={} #{} to={} #{} of {} {} w1={} lr={}",
+                Hash(challenge), Hash(current), Index(from), Hash(pending), Index(to), Index(count),
+                direction, static_cast<u32>(jit.GetRegister(1)), caller);
+        }
         // x0 = challenge record + 0x18: name hash at -0x10, current step hash at -8, current
         // index at +0x64, step count at +0x68, steps at +0x70 (0x90 bytes each, hash at +0x78),
         // pending step hash at +0x8c.
@@ -522,6 +563,7 @@ std::string Describe(Point point, u64 base, Jit& jit, Memory& memory) {
     case Point::Pickup:
     case Point::PickupReturn:
         return fmt::format("gamedata {} lr={}", Name(point), caller);
+    case Point::StepCommit:
     case Point::None:
         break;
     }
@@ -540,7 +582,7 @@ bool Handle(Session& session, u64 pc, Jit& jit, Memory& memory, std::string* out
     }
     bool last = false;
     if (session.Take(point, last)) {
-        auto line = Describe(point, session.base, jit, memory);
+        auto line = Describe(point, session.base, jit, memory, session.profile.get());
         if (last) {
             line += fmt::format(" (the last {} line this session)", Name(point));
         }

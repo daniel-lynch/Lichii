@@ -18,6 +18,8 @@ Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CT
   bit HEX ... origin=token:HEX:PARTNER_HEX   flags belonging to the same collectible transaction
   wallet BALANCE CAPACITY   publish wallet baseline and request the team's wallet baselines
   key HEX DELTA             key_add: a small-key gain of DELTA for the dungeon whose total key is HEX
+  quest CHALLENGE STEP INDEX  send a raw committed quest step (hex hashes; requires --quest)
+  expect-quest CHALLENGE SECS wait for an emulator quest commit; result includes packet
   expect-type TYPE SECS     wait for the emulator's next change of TYPE (rupee_add, key_add, ...)
   dup SEQ                   re-deliver this peer's accepted event SEQ to the other clients (a duplicate)
   expect-item NAME SECS     wait for the emulator's item_give of NAME
@@ -89,7 +91,7 @@ class FakePeer:
     """Relay + one scripted client in one event loop. `port=0` picks an ephemeral port."""
 
     def __init__(self, *, port=43390, room="default", team="default", policy="or-v2", seed="0",
-                 name="FakePeer", build_id=client_sim.BUILD_ID, record=None, wallet=0, anim_table=None, mod_hash=None, state_file=None):
+                 name="FakePeer", build_id=client_sim.BUILD_ID, record=None, wallet=0, anim_table=None, mod_hash=None, state_file=None, quest=False):
         self.relay = relay_mod.Relay(state_file=state_file)
         self.holdout_until = 0.0
         self.badmod_count = 0
@@ -102,7 +104,8 @@ class FakePeer:
         self.port = port
         self.client = client_sim.ClientSim(room=room, team=team, name=name, build_id=build_id,
                                            seed_hash=seed, policy_id=policy,
-                                           animation=client_sim.animation_descriptor(anim_table), mod_hash=mod_hash)
+                                           animation=client_sim.animation_descriptor(anim_table), mod_hash=mod_hash,
+                                           quest=quest)
         self.client.hello["ghost_equipment_v2"] = True
         self.equipment_seq = 0
         self.equipment_known = {}
@@ -244,7 +247,7 @@ class FakePeer:
                 continue
             self.log(packet)
             self.seen.append(packet)
-            if packet.get("type") in relay_mod.CHANGE_TYPES:
+            if packet.get("type") in relay_mod.CHANGE_TYPES | {"quest_step"}:
                 self.received.append(packet)
             for match, future in tuple(self.waiters):
                 if not future.done() and match(packet):
@@ -385,6 +388,27 @@ class FakePeer:
             await self.client.send(packet)
             await self.wait(lambda p: p.get("type") == "ack" and p.get("seq") == packet["seq"], 5, since)
             return {"sent": packet["seq"], "item": packet}
+        if verb == "quest":
+            if len(words) != 4 or self.client.ack.get("quest") != 1:
+                raise ValueError("quest CHALLENGE STEP INDEX requires --quest")
+            packet = {"type": "quest_step", "origin": self.client.hello["client_id"],
+                      "seq": self.client.seq + 1, "challenge": int(words[1], 16),
+                      "step": int(words[2], 16), "index": int(words[3], 0)}
+            relay_mod.validate_quest(packet, self.client.hello["client_id"])
+            self.client.seq += 1
+            since = len(self.seen)
+            await self.client.send(packet)
+            await self.wait(lambda p: p.get("type") == "ack" and p.get("seq") == packet["seq"], 5, since)
+            return {"sent": packet["seq"], "quest": packet}
+        if verb == "expect-quest":
+            if len(words) != 3:
+                raise ValueError("expect-quest CHALLENGE SECS")
+            challenge = int(words[1], 16)
+            try:
+                return {"packet": await self.wait(lambda p: p.get("type") == "quest_step" and
+                                                  p.get("challenge") == challenge, float(words[2]))}
+            except TimeoutError:
+                return {"timeout": True}
         if verb == "key":
             if len(words) != 3:
                 raise ValueError("key HEX DELTA")
@@ -564,7 +588,8 @@ async def serve(args):
     commands.touch()
     peer = FakePeer(port=args.port, room=args.room, team=args.team, policy=args.policy, seed=args.seed,
                     name=args.name, build_id=args.build_id, record=ctl / "received.jsonl",
-                    wallet=args.wallet, anim_table=args.anim_table, mod_hash=args.mod_hash, state_file=args.state_file)
+                    wallet=args.wallet, anim_table=args.anim_table, mod_hash=args.mod_hash, state_file=args.state_file,
+                    quest=args.quest)
     port = await peer.start()
     print(f"fake peer ready on 127.0.0.1:{port} room={args.room} team={args.team}", flush=True)
     done = len(commands.read_text().splitlines())
@@ -602,6 +627,7 @@ def main():
     parser.add_argument("--name", default="FakePeer")
     parser.add_argument("--build-id", default=client_sim.BUILD_ID)
     parser.add_argument("--anim-table", help="private coop-anim.json sidecar; enables v4 animation negotiation")
+    parser.add_argument("--quest", action="store_true", help="enable quest commands and reception")
     parser.add_argument("--wallet", type=lambda text: int(text, 0), default=0,
                         help="wallet GameData key for rupee_add (from the private profile)")
     parser.add_argument("--mod-hash", type=relay_mod.mod_hash)
