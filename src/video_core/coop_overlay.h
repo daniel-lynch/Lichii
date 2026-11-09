@@ -18,6 +18,7 @@ namespace VideoCore::CoopOverlay {
 
 struct Rect {
     s32 left{}, top{}, right{}, bottom{};
+    bool operator==(const Rect&) const = default;
 };
 
 /// One opaque box: RGBA8 (R, G, B, A in memory), row-major, already clipped to the frame.
@@ -25,6 +26,18 @@ struct Box {
     s32 x{}, y{};
     u32 width{}, height{};
     std::vector<u8> rgba;
+    u64 cache_id{}; // nonzero only for an immutable rasterised panel
+};
+
+class PanelCache {
+public:
+    std::shared_ptr<const Box> Get(const Core::OotCoop::Ux::Panel& panel, u32 scale,
+                                   Rect screen, u32 width, u32 height);
+private:
+    std::shared_ptr<const Box> box;
+    u64 generation{};
+    u32 last_scale{}, last_width{}, last_height{};
+    Rect last_screen;
 };
 
 /// The integer text scale for a game rectangle this tall (1 below 2160 px, 2 from 2160, ...).

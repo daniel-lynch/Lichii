@@ -28,6 +28,9 @@ private:
         vk::Buffer buffer;
         u64 tick{};
         bool used{};
+        VkDeviceSize capacity{};
+        u64 panel_cache_id{};
+        VkFormat panel_format{};
     };
     static constexpr VkDeviceSize SlotSize = 4u << 20;
     MemoryAllocator& allocator;

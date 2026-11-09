@@ -51,6 +51,10 @@ Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CT
   kick                      close the relay's connection to every other client (the emulator), as a
                             network drop would; the peer itself stays connected
   poses [N]                 the last N (default 20) poses received from other origins, and the total
+  leave                     close this peer only (relay announces offline); stops pose streams
+  join                      reconnect with the same client_id, name and completed state
+  finish                    announce finished=true in the full client state
+  presence                  repeat the full client state (no presence transition)
   quit
 Every packet the peer receives is also appended to CTL/received.jsonl with a wall-clock time,
 except poses: only every 15th received pose (the 1st, 16th, ...) is recorded there."""
@@ -59,6 +63,7 @@ import argparse
 import asyncio
 import importlib.util
 import collections
+import contextlib
 import json
 import math
 from pathlib import Path
@@ -103,6 +108,8 @@ class FakePeer:
         self.equipment_known = {}
         self.stream_eq32, self.stream_child = None, True  # poseequip: what the pose streams carry
         self.record = Path(record) if record else None
+        self.finished = False
+        self.world_wallet = None
         self.wallet = wallet  # the wallet key from the private profile (rupee_add)
         self.received = []
         self.seen = []
@@ -286,15 +293,57 @@ class FakePeer:
                                timeout)
 
     async def state(self, world_wallet=None):
+        if world_wallet is not None:
+            self.world_wallet = dict(world_wallet)
+            self.client.hello["world_wallet"] = dict(world_wallet)
         since = len(self.seen)
         await self.client.baseline(world_wallet)
         return await self.wait(lambda p: p.get("type") == "team_state", 5, since)
+
+    async def presence(self):
+        if self.client.writer is None:
+            raise ConnectionError("peer is offline; join first")
+        state = {"name": self.client.hello["name"]}
+        if self.finished:
+            state["finished"] = True
+        if self.world_wallet is not None:
+            state["world_wallet"] = dict(self.world_wallet)
+        await self.client.send({"type": "client_state", "state": state})
+        return {"state": state}
+
+    async def leave(self):
+        await self.stop_stream()
+        if self.task is not None:
+            self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, EOFError, ConnectionError):
+                await self.task
+            self.task = None
+        await self.client.close()
+        # Wait for the local relay's finally block before reusing this identity.
+        async with asyncio.timeout(5):
+            while any(getattr(c, "client_id", None) == self.client.hello["client_id"]
+                      for c in self.relay.clients):
+                await asyncio.sleep(0.01)
 
     async def command(self, line):
         words = line.split()
         if not words:
             raise ValueError("empty command")
         verb = words[0]
+        if verb in ("leave", "join", "finish", "presence"):
+            if len(words) != 1:
+                raise ValueError(verb + " takes no arguments")
+            if verb == "leave":
+                await self.leave()
+                return {"online": False}
+            if verb == "join":
+                if self.client.writer is None:
+                    await self.client.connect("127.0.0.1", self.port)
+                    self.task = asyncio.create_task(self.listen())
+                return {"online": True, **await self.presence()}
+            if verb == "finish":
+                self.finished = True
+            return await self.presence()
         source = {}
         options = [word for word in words[1:] if word.startswith("origin=")]
         if options:

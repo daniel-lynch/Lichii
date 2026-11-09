@@ -510,6 +510,36 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(relay.ProtocolError, "origin mismatch"):
             server.receive(b, grant())
 
+    def test_finish_presence_commands_without_sockets(self):
+        peer = fake_peer.FakePeer(name="Synthetic")
+        peer.client.writer = object()
+        peer.client.send = mock.AsyncMock()
+        peer.world_wallet = {"balance": 3, "capacity": 9}
+        for command, complete in (("presence", False), ("finish", True), ("presence", True)):
+            with self.assertRaises(StopIteration) as done:
+                peer.command(command).send(None)
+            state = done.exception.value["state"]
+            self.assertEqual(state["name"], "Synthetic")
+            self.assertEqual(state.get("finished", False), complete)
+            self.assertEqual(state["world_wallet"], peer.world_wallet)
+            peer.client.send.assert_awaited_with({"type": "client_state", "state": state})
+        peer.client.writer = None
+        with self.assertRaisesRegex(ConnectionError, "offline"):
+            peer.command("presence").send(None)
+
+    def test_finished_state_reaches_peer_and_late_joiner(self):
+        server = self.memory_server()
+        a, b = self.peer(server, "a"), self.peer(server, "b")
+        state = {"name": "Synthetic", "finished": True,
+                 "world_wallet": {"balance": 3, "capacity": 9}}
+        server.receive(a, {"type": "client_state", "state": state})
+        self.assertEqual(b.messages[-1], {"type": "client_state", "origin": "a", "state": state})
+        c = self.peer(server, "c")
+        announcement = next(p for p in c.messages if p["type"] == "client_state" and p["origin"] == "a")
+        self.assertEqual(announcement["state"], state)
+        server.receive(a, {"type": "team_state_request", "world_wallet": {"balance": 4, "capacity": 9}})
+        self.assertIs(b.messages[-1]["state"]["finished"], True)
+
     def test_dispatcher_presence_heartbeat_and_snapshot(self):
         server = self.memory_server()
         a, b = self.peer(server, "a"), self.peer(server, "b")
@@ -1236,6 +1266,27 @@ class FakePeerTests(unittest.IsolatedAsyncioTestCase):
         for options in ("aid=1.5", "aid=7 ar=nan", "aid=7 af=inf", "af=3", "aid=7 aid=8"):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 await self.peer.command("pose Field_1 1 0 0 0 0 " + options)
+
+    async def test_leave_join_finish_presence_commands(self):
+        origin = self.peer.client.hello["client_id"]
+        await self.peer.command("wallet 3 9")
+        self.assertTrue((await self.peer.command("finish"))["state"]["finished"])
+        async def presence_where(predicate):
+            while True:
+                packet = await self.emu.receive("client_state")
+                if packet["origin"] == origin and predicate(packet["state"]):
+                    return packet["state"]
+        finished = await presence_where(lambda state: state.get("finished") is True)
+        self.assertEqual(finished["world_wallet"], {"balance": 3, "capacity": 9})
+        await self.peer.command("presence")
+        self.assertEqual(await presence_where(lambda state: state.get("finished") is True), finished)
+        await self.peer.command("leave")
+        await presence_where(lambda state: state.get("online") is False)
+        await self.peer.command("join")
+        self.assertEqual(self.peer.client.hello["client_id"], origin)
+        self.assertEqual(await presence_where(lambda state: state.get("finished") is True), finished)
+        await self.peer.command("grant a1") # existing commands survive reconnect
+        self.assertEqual((await self.emu.receive("bool_set"))["hash"], 0xA1)
 
     async def test_records_the_emulator_broadcast(self):
         await self.emu.change("bool_set", hash=0xC1, value=True)

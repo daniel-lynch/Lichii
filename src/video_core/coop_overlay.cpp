@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <string_view>
 
 #include "video_core/coop_overlay.h"
@@ -34,8 +36,8 @@ u32 Coverage(char c, u32 x, u32 y) {
 }
 
 /// A text box: border, backing, the text anti-aliased over the backing.
-Box TextBox(std::string_view text, Rgb colour, u32 scale) {
-    if (text.size() > MaxChars) text = text.substr(0, MaxChars);
+Box TextBox(std::string_view text, Rgb colour, u32 scale, size_t limit = MaxChars) {
+    if (text.size() > limit) text = text.substr(0, limit);
     const u32 pad_x = 8 * scale, pad_y = 3 * scale;
     Box box;
     box.width = static_cast<u32>(text.size()) * Font::Width * scale + 2 * pad_x;
@@ -102,6 +104,39 @@ bool Clip(Box& box, Rect bounds) {
 }
 } // namespace
 
+std::shared_ptr<const Box> PanelCache::Get(const Core::OotCoop::Ux::Panel& panel, u32 scale,
+                                          Rect screen, u32 width, u32 height) {
+    if (box && generation == panel.generation && last_scale == scale && last_screen == screen &&
+        last_width == width && last_height == height) return box;
+    generation = panel.generation;
+    last_scale = scale; last_screen = screen; last_width = width; last_height = height;
+    box.reset();
+    if (panel.lines.empty() || !scale || scale > 16) return {};
+    size_t chars = 0;
+    for (const auto& line : panel.lines) chars = std::max(chars, std::min<size_t>(56, line.size()));
+    const size_t rows = std::min<size_t>(11, panel.lines.size());
+    Box result;
+    result.x = screen.left + static_cast<s32>(16 * scale);
+    result.y = screen.top + static_cast<s32>(16 * scale);
+    result.width = static_cast<u32>(chars) * Font::Width * scale + 16 * scale;
+    result.height = static_cast<u32>(rows) * (Font::Height + 6) * scale;
+    result.rgba.reserve(size_t{result.width} * result.height * 4);
+    for (size_t i = 0; i < rows; ++i) {
+        std::string text = panel.lines[i].substr(0, 56);
+        text.resize(chars, ' ');
+        const auto row = TextBox(text, ToastText, scale, 56);
+        result.rgba.insert(result.rgba.end(), row.rgba.begin(), row.rgba.end());
+    }
+    const Rect bounds{std::max(0, screen.left), std::max(0, screen.top),
+                      std::min(screen.right, static_cast<s32>(width)),
+                      std::min(screen.bottom, static_cast<s32>(height))};
+    if (!Clip(result, bounds)) return {};
+    static std::atomic<u64> next_id{};
+    result.cache_id = ++next_id;
+    box = std::make_shared<const Box>(std::move(result));
+    return box;
+}
+
 u32 Scale(u32 screen_height) {
     return std::max<u32>(1, screen_height / 1080);
 }
@@ -118,7 +153,28 @@ std::vector<Box> Layout(const OverlayFrame& frame, Rect screen, u32 width, u32 h
     const auto place = [&](Box box) {
         if (Clip(box, bounds)) boxes.push_back(std::move(box));
     };
-    // Name tags first, so a toast covers a tag and never the other way round.
+    // Panel first: fixed upload offset also lets each Vulkan slot reuse its packed bytes.
+    if (frame.panel) {
+        thread_local PanelCache cache;
+        if (const auto panel = cache.Get(*frame.panel, scale, screen, width, height)) boxes.push_back(*panel);
+    }
+    constexpr std::array<Rgb, 4> colours{{{100, 220, 255}, {255, 190, 80}, {180, 255, 120}, {240, 130, 230}}};
+    for (const auto& marker : frame.markers) {
+        if (!std::isfinite(marker.at.x) || !std::isfinite(marker.at.y) ||
+            marker.at.x < 0 || marker.at.x > 1 || marker.at.y < 0 || marker.at.y > 1) continue;
+        auto letter = TextBox(std::string(1, marker.label), colours[marker.colour % colours.size()], scale);
+        // Centre the glyph in a square, with an opaque border.
+        const u32 side = std::max(letter.width, letter.height);
+        auto square = Solid(0, 0, side, side, Border);
+        const u32 ox = (side - letter.width) / 2, oy = (side - letter.height) / 2;
+        for (u32 row = 0; row < letter.height; ++row)
+            std::copy_n(letter.rgba.begin() + size_t{row} * letter.width * 4, size_t{letter.width} * 4,
+                        square.rgba.begin() + (size_t{row + oy} * side + ox) * 4);
+        square.x = screen.left + static_cast<s32>(marker.at.x * sw) - static_cast<s32>(side / 2);
+        square.y = screen.top + static_cast<s32>(marker.at.y * sh) - static_cast<s32>(side / 2);
+        place(std::move(square));
+    }
+    // Name tags before toasts, so a toast covers a tag.
     for (const auto& tag : frame.tags) {
         const s32 px = screen.left + static_cast<s32>(tag.at.x * static_cast<float>(sw));
         const s32 py = screen.top + static_cast<s32>(tag.at.y * static_cast<float>(sh));

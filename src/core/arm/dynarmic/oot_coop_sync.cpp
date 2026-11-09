@@ -27,6 +27,7 @@
 #include "core/arm/dynarmic/oot_coop_ghost.h"
 #include "core/arm/dynarmic/oot_coop_runtime.h"
 #include "core/arm/dynarmic/oot_coop_ux.h"
+#include "core/arm/dynarmic/oot_coop_room.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
 #include "dynarmic/interface/A64/a64.h"
@@ -1015,6 +1016,8 @@ struct Session::Impl {
     std::set<Kind> allowed_classes;
     std::deque<Change> outgoing;
     std::deque<std::variant<Change, HighWater, Impl::CatchupEnd>> pending;
+    u64 pending_pushed{}, pending_drained{}; // transport under mutex / guest thread
+    Room::SyncTally sync_tally;
     u64 next_seq{1};
     std::mutex guest_mutex;
     GuestBinding binding;
@@ -1133,6 +1136,25 @@ struct Session::Impl {
     bool ever_ready{};
     std::chrono::seconds backoff{1};
     Ux::SessionUx ux; // toasts and name tags (host only)
+    Room::PresenceBook presence;
+    Room::FinishWatch finish_watch;
+    Room::Window room_window;
+    std::atomic<bool> finished{};
+    std::atomic<int> relay_state{}; // 0 offline, 1 connected, 2 reconnecting
+    std::atomic<u64> relay_rtt{UINT64_MAX};
+    const Room::Config& RoomConfig() const {
+        static const Room::Config empty;
+        const auto* settings = ux.Settings();
+        return settings && settings->room ? *settings->room : empty;
+    }
+    void RoomFrame(std::optional<Room::RoomPeer> local_pose, u64 now) {
+        const auto rtt = relay_rtt.load();
+        const int state = relay_state.load();
+        room_window.Frame({hello.room, hello.seed_hash, hello.policy_id,
+            state == 1 ? "connected" : state == 2 ? "reconnecting" : "offline", hello.name,
+            rtt == UINT64_MAX ? std::nullopt : std::optional{rtt}, std::move(local_pose)},
+            presence, RoomConfig(), now);
+    }
     void OnPose(std::string origin, Pose pose) {
         std::scoped_lock lock{mutex};
         if (!peers.contains(origin)) {
@@ -1157,6 +1179,7 @@ struct Session::Impl {
             const u32 delta = pose.t - track.samples.back().second.t;
             if (!delta || delta >= 0x80000000U) return;
         }
+        presence.Pose(origin, pose.banc, pose.child, pose.loading, Room::NowMs());
         track.Add(static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
                       Clock::now().time_since_epoch()).count()), std::move(pose));
         track.online = true;
@@ -1198,6 +1221,9 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
         if (std::exchange(failed, true)) return;
         owner.ledger_capable = false;
         if (catchup_active) owner.book.Abort(transaction);
+        if (!owner.stopped) Room::Dispatch(owner.presence.Lost(Room::NowMs()));
+        owner.relay_state = owner.stopped ? 0 : 2;
+        owner.relay_rtt = UINT64_MAX;
         size_t dropped = 0;
         {
             // No relay, no live peers: their ghosts park until poses arrive again.
@@ -1281,8 +1307,12 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
             for (auto change : page->grants) {
                 change.catchup_transaction = transaction;
                 owner.pending.emplace_back(std::move(change));
+                ++owner.pending_pushed; // C16 merge: ux2's drain tally counts every queued entry
             }
-            if (!page->more) owner.pending.emplace_back(Impl::CatchupEnd{transaction});
+            if (!page->more) {
+                owner.pending.emplace_back(Impl::CatchupEnd{transaction});
+                ++owner.pending_pushed;
+            }
         }
         catchup_count += page->grants.size();
         catchup_through = page->through;
@@ -1306,6 +1336,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
         timer.async_wait([self = shared_from_this()](auto error) {
             if (error || self->failed) return;
             const auto now = Clock::now();
+            Room::Dispatch(self->owner.presence.Tick(Room::NowMs()));
             if (now - self->last_receive > (self->ready ? 90s : 10s))
                 return self->Fail(self->ready ? "nothing received for 90 s" : "no handshake within 10 s");
             if (self->ready) {
@@ -1339,6 +1370,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                                         self->owner.save && self->owner.save->Bound());
                     }
                 }
+                if (self->owner.finished && !self->finished_sent) self->SendState();
                 std::vector<Change> changes;
                 {
                     std::scoped_lock lock{self->owner.mutex};
@@ -1384,13 +1416,29 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                     }
                     self->Send(request);
                 }
-                if (now - self->last_heartbeat >= 30s) {
-                    self->Send({{"type", "heartbeat"}});
-                    self->last_heartbeat = now;
+                if (now - self->last_heartbeat >= 30s) { // keepalive even if an ack is late
+                    self->Heartbeat();
                 }
             }
             self->Tick();
         });
+    }
+
+    void Heartbeat() {
+        last_heartbeat = Clock::now();
+        heartbeat_pending = true;
+        Send({{"type", "heartbeat"}});
+    }
+    void SendState() {
+        Json state{{"apply_enabled", !owner.allowed_classes.empty()}, {"name", owner.hello.name}};
+        finished_sent = owner.finished.load();
+        if (finished_sent) {
+            // The relay replaces its cached state with each client_state: keep our wallet in it.
+            state["finished"] = true;
+            std::scoped_lock lock{owner.mutex};
+            if (owner.wallet) state["world_wallet"] = World::EncodeWallet(*owner.wallet);
+        }
+        Send({{"type", "client_state"}, {"state", std::move(state)}});
     }
 
     void Send(const Json& packet) {
@@ -1513,6 +1561,11 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                                                    state.at("name").get<std::string>());
                         }
                         if (packet->contains("origin") && packet->at("origin").is_string() &&
+                            packet->at("origin") != self->owner.hello.client_id) {
+                            Room::Dispatch(self->owner.presence.Receive(*packet,
+                                self->owner.ux.Name(packet->at("origin").get<std::string>()), Room::NowMs()));
+                        }
+                        if (packet->contains("origin") && packet->at("origin").is_string() &&
                             state.is_object() && state.contains("online") &&
                             state.at("online") == false) {
                             const auto origin = packet->at("origin").get<std::string>();
@@ -1530,7 +1583,11 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                         if (self->deferred_live.size() >= QueueLimit) return self->Fail("catchup live queue full");
                         self->deferred_live.push_back(*packet);
                     } else if (type == "heartbeat_ack") {
-                        // Liveness only.
+                        if (self->heartbeat_pending) {
+                            self->owner.relay_rtt = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                Clock::now() - self->last_heartbeat).count());
+                            self->heartbeat_pending = false;
+                        }
                     } else if (type == "error") {
                         LOG_WARNING(Core_ARM, "OoT co-op: relay rejected a packet");
                         return self->Fail("relay error");
@@ -1547,9 +1604,10 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                         }
                         if (!self->ready) {
                             self->ready = true;
-                            self->Send({{"type", "client_state"},
-                                        {"state", {{"apply_enabled", !self->owner.allowed_classes.empty()},
-                                                   {"name", self->owner.hello.name}}}});
+                            self->owner.relay_state = 1;
+                            Room::Dispatch(self->owner.presence.Ready(Room::NowMs()));
+                            self->SendState();
+                            self->Heartbeat();
                             const bool again = std::exchange(self->owner.ever_ready, true);
                             if (again) ++self->owner.reconnects;
                             self->owner.attempts = 0;
@@ -1585,7 +1643,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
     bool failed{};
     bool handshaken{};
     bool baseline_requested{};
-    bool ready{};
+    bool ready{}, finished_sent{}, heartbeat_pending{};
     u64 sent_seq{};
     std::array<char, 4> header{};
     std::string input;
@@ -1693,8 +1751,12 @@ bool Session::Impl::Receive(const Json& packet) {
         return false;
     }
     if (type == "team_state") peer_wallets = std::move(wallets);
-    for (auto& change : changes) pending.emplace_back(std::move(change));
-    if (type == "team_state") pending.emplace_back(std::move(snapshot_seen));
+    const u64 first = pending_pushed + 1;
+    for (auto& change : changes) { pending.emplace_back(std::move(change)); ++pending_pushed; }
+    if (type == "team_state") {
+        pending.emplace_back(std::move(snapshot_seen));
+        sync_tally.Snapshot(first, ++pending_pushed);
+    }
     return true;
 }
 
@@ -2409,6 +2471,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         if (runtime.Rebind(backend, log)) {
             impl->stable_frame = false;
             impl->key_watch.clear(); // a new save epoch: re-baseline the key counts
+            impl->finish_watch.Rebaseline();
             impl->pickups.Clear();
             impl->local_pickups.clear();
             if (profile->chest.interaction_pc) {
@@ -2426,6 +2489,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             ++impl->rebinds;
         }
     }
+    Room::Dispatch(impl->presence.Tick(Room::NowMs()));
     const bool bound = backend.BindFromCell();
     if (binding.invalid || (!bound && impl->stable_frame)) {
         if (impl->equipment) impl->equipment->Invalidate();
@@ -2484,6 +2548,10 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         }
     }
     for (const auto& entry : batch) {
+        const auto* counted = std::get_if<Change>(&entry);
+        Room::DrainEntry tally_entry{impl->sync_tally, ++impl->pending_drained,
+            counted ? std::optional{counted->kind} : std::nullopt, runtime.Pending(),
+            [&] { return runtime.Pending(); }};
         if (const auto* seen = std::get_if<HighWater>(&entry)) {
             if (!impl->remote.AdoptSeen(*seen)) runtime.Invalidate();
         } else if (const auto* end = std::get_if<Impl::CatchupEnd>(&entry)) {
@@ -2671,6 +2739,17 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         if (std::ranges::any_of(impl->dungeon_keys, [&](const DungeonKeys& d) { return d.count == grant.key; }))
             impl->book.Applied(grant);
     }
+    for (const auto& result : impl->sync_tally.Settle(Room::NowMs(), !runtime.Calling() && runtime.Pending() == 0)) {
+        Ux::Notify(fmt::format("sync/{}", result.id), result.Text());
+        log(fmt::format("OoT co-op: team sync toast flags={} items={} (snapshot entries={})",
+                       result.flags, result.items, result.entries));
+    }
+    if (const auto key = impl->RoomConfig().finish; key && runtime.BaselineReady() && impl->tick % 30 == 0) {
+        if (impl->finish_watch.Sample(backend.ReadFlag(Change{Kind::Bool, {}, 0, *key, 1}))) {
+            impl->finished = true;
+            Ux::Notify("local-finish", "You finished the game");
+        }
+    }
     if (event == ApplyEvent::Started && runtime.LastGrant() && !runtime.LastGrant()->catchup &&
         runtime.LastGrant()->kind == Kind::Item &&
         runtime.LastGrant()->source.kind == World::OriginKind::Chest && profile->chest.interaction_pc)
@@ -2728,6 +2807,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     }
     const bool cleaning = !runtime.Calling() && FrameCleanup(backend, memory, log);
     if (impl->pose_enabled) FramePose(backend, memory, log, runtime.Calling() || cleaning);
+    else impl->RoomFrame(std::nullopt, Room::NowMs());
     return runtime.Calling() || cleaning || (impl->ghost && impl->ghost->Calling()) ||
            (impl->equipment && impl->equipment->Calling());
 }
@@ -2869,6 +2949,28 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
                                  peer.pose->pos}); // name: the origin, resolved by the session
         }
         impl->ux.Frame(memory, base, local.banc, local.loading, std::move(tag_peers), log);
+        {
+            std::scoped_lock lock{impl->mutex};
+            for (const auto& [origin, track] : impl->peers) {
+                if (track.samples.empty()) continue;
+                const auto& latest = track.samples.back().second;
+                impl->presence.Pose(origin, latest.banc, latest.child, latest.loading, track.last_ms);
+            }
+        }
+        impl->RoomFrame(Room::RoomPeer{{}, impl->hello.name, local.banc, true, true,
+                                      local.child, local.loading, now}, now);
+        std::vector<Ux::Marker> markers;
+        if (const auto& keys = impl->RoomConfig().minimap; keys && !local.loading) {
+            if (const auto map = Room::ReadMinimap(memory, base, *keys)) {
+                u8 colour = 0;
+                for (const auto& peer : peers) {
+                    if (!peer.pose || peer.pose->loading || peer.pose->banc != local.banc) continue;
+                    if (const auto at = Room::PlaceMarker(*map, local.pos, local.yaw, peer.pose->pos))
+                        markers.push_back({{at->x, at->y}, colour++, impl->ux.Name(peer.origin).front()});
+                }
+            }
+        }
+        Ux::PublishMarkers(std::move(markers));
     }
     // Grants keep priority: the one call slot of this frame is theirs when they used it.
     if (grant_calling) return;
