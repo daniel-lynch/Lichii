@@ -20,6 +20,8 @@
 #include "common/common_types.h"
 #include "common/nx2_event_trace.h"
 
+namespace Core::OotCoop::Equip { struct Keys; }
+
 namespace Kernel {
 class KProcess;
 }
@@ -182,6 +184,7 @@ struct Profile {
     /// {cell, field}: *(*(main + cell) + field) must be non-zero before a give is replayed.
     std::vector<std::pair<u64, u64>> item_guards;
     GhostOffsets ghost; ///< Empty unless the profile has a "ghost" object
+    std::shared_ptr<const OotCoop::Equip::Keys> equip;
 
     u64 SiteOffset(Point point) const {
         for (const Site& site : sites) {

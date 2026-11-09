@@ -22,6 +22,7 @@
 #include <nlohmann/json.hpp>
 
 #include "core/arm/dynarmic/oot_gamedata_trace.h"
+#include "core/arm/dynarmic/oot_coop_equip.h"
 
 namespace Core::OotCoop {
 
@@ -38,6 +39,7 @@ struct Pose {
     u32 anim_seq{};           ///< Bumped on every category change: a receiver restarts only then
     float rate{};             ///< Speed relative to the category's nominal speed, 0..10
     float phase{};            ///< Cycle position in [0, 1): distance (or time when idle) per stride
+    std::optional<Equip::Packet> equipment;
     bool operator==(const Pose&) const = default;
 };
 [[nodiscard]] bool AnimName(std::string_view name);
@@ -203,7 +205,7 @@ public:
         if (settling && !pose.banc.empty()) pose.loading = true;
         if (sent && now_ms - sent_ms < 66) return {};
         const bool changed = !sent || pose.banc != last.banc || pose.child != last.child ||
-                             pose.anim_seq != last.anim_seq ||
+                             pose.anim_seq != last.anim_seq || pose.equipment != last.equipment ||
                              pose.loading != last.loading || Far(pose.pos, last.pos, 0.01f) ||
                              std::fabs(pose.yaw - last.yaw) > 0.5f;
         if (!changed && now_ms - sent_ms < 1000) return {};
@@ -290,6 +292,8 @@ public:
         std::vector<u64> fields;
         std::string banc;
         bool parked{};
+        bool child{};
+        bool equipment_quarantined{};
         std::array<float, 4> drawn{}; ///< x, y, z, yaw last sent to set-transform
         u64 retry_tick{}, pending_tick{};
         bool pending_logged{};
@@ -321,6 +325,13 @@ public:
 
     bool Calling() const { return op != GhostOp::None; }
     const std::array<Slot, GhostSlots>& Slots() const { return slots; }
+    void RetireEquipment(u64 actor, bool recreate) {
+        for (auto& slot : slots) {
+            if (slot.actor != actor || slot.state != State::Live) continue;
+            if (!recreate || slot.abandons >= AbandonLimit) slot.equipment_quarantined = true;
+            else if (!slot.abandon) { slot.abandon = true; ++slot.abandons; }
+        }
+    }
 
     /// Forget every actor without a call (the game deletes them with the scene / save).
     template <typename Log>
@@ -366,7 +377,7 @@ public:
                 continue;
             }
             for (auto& slot : slots) {
-                if (slot.state == State::Live && slot.absent_since && tick - slot.absent_since >= OrphanAfter) {
+                if (slot.state == State::Live && !slot.equipment_quarantined && slot.absent_since && tick - slot.absent_since >= OrphanAfter) {
                     Line(log, slot, fmt::format("reassigned to peer {} (its peer is gone; actor kept)",
                                                 peer.origin.substr(0, 8)));
                     slot.origin = peer.origin;
@@ -400,7 +411,7 @@ public:
             const u64 at = block + i * SlotSize;
             const PeerView* peer = nullptr;
             for (const auto& p : peers) if (p.origin == slot.origin) peer = &p;
-            const bool visible = ready && peer && peer->pose && !peer->pose->loading &&
+            const bool visible = !slot.equipment_quarantined && ready && peer && peer->pose && !peer->pose->loading &&
                                  peer->pose->banc == local.banc;
             if (slot.state == State::None) {
                 if (!peer) { slot.origin.clear(); continue; } // gone and nothing to clean up
@@ -434,6 +445,10 @@ public:
                 continue;
             }
             // Live
+            if (visible && slot.child != peer->pose->child && !slot.abandon) {
+                if (slot.abandons >= AbandonLimit) slot.equipment_quarantined = true;
+                else { slot.abandon = true; ++slot.abandons; }
+            }
             std::array<float, 4> target;
             if (slot.abandon) {
                 // The watchdog gave up on this actor: park it out of sight once, then forget it.
@@ -851,6 +866,7 @@ private:
         // x0 manager, x1 &namePtr, x2 &argument, x3 &handle, w4 1; three zero stack arguments.
         if (!port.Call(*entry, {*manager, at + 8, at + 0x40, at, 1, 0, 0, 0})) return false;
         slot.banc = banc;
+        slot.child = peer.child;
         slot_name = name;
         (void)log;
         return true;

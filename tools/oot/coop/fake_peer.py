@@ -22,7 +22,8 @@ Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CT
   received                  every change packet received so far (from other origins)
   state                     the relay's team checkpoint as the peer sees it (team_state_request)
   mark TEXT                 a marker line in received.jsonl (for correlating with emulator logs)
-  pose BANC CHILD X Y Z YAW [LOADING]   send one v3 pose (CHILD/LOADING 0|1; BANC "-" = "")
+  pose BANC CHILD X Y Z YAW [LOADING] [eq32=WORD [eqseq=N]]
+                            send one v3 pose (CHILD/LOADING 0|1; BANC "-" = ""); WORD accepts 0x hex
   poseanim BANC X Y Z YAW ANIM RATE      one child pose with an explicit animation hint (idle|walk|run),
                             a new anim_seq each time (the receiver replays the category's command)
   posecircle BANC CX CY CZ R PERIOD_S HZ DURATION_S
@@ -76,6 +77,9 @@ class FakePeer:
         self.port = port
         self.client = client_sim.ClientSim(room=room, team=team, name=name, build_id=build_id,
                                            seed_hash=seed, policy_id=policy)
+        self.client.hello["ghost_equipment_v2"] = True
+        self.equipment_seq = 0
+        self.equipment_known = {}
         self.record = Path(record) if record else None
         self.wallet = wallet  # the wallet key from the private profile (rupee_add)
         self.received = []
@@ -105,8 +109,34 @@ class FakePeer:
         if self.pose_count % 15 == 1:
             self.log(dict(packet, pose_n=self.pose_count))
 
-    async def send_pose(self, banc, child, pos, yaw, loading=False, step=1, **anim):
-        return await self.client.pose(banc, child, pos, yaw, loading, t=self.client.pose_t + step, **anim)
+    async def send_pose(self, banc, child, pos, yaw, loading=False, step=1, eq32=None, eqseq=None, **anim):
+        packet = self.client.pose_packet(banc, child, pos, yaw, loading,
+                                         t=self.client.pose_t + step, **anim)
+        known = dict(self.equipment_known)
+        if eq32 is not None:
+            if self.client.ack.get("ghost_equipment_v2") is not True:
+                raise ValueError("equipment capability not negotiated")
+            relay_mod.validate_equipment(eq32, child)
+            unsettled = set()
+            for identity_shift, state_shift in ((0, 6), (3, 8)):
+                identity, state = (eq32 >> identity_shift) & 7, (eq32 >> state_shift) & 3
+                if not ((identity == 0 and state == 0) or (1 <= identity <= 3 and state in (1, 2))):
+                    unsettled.update((identity_shift, state_shift))
+            for shift, mask, unknown in ((0, 7, 7), (3, 7, 7), (6, 3, 3), (8, 3, 3),
+                                         (10, 3, 3), (12, 3, 3), (14, 15, 15), (18, 3, 3)):
+                value = (eq32 >> shift) & mask
+                if value != unknown and shift not in unsettled:
+                    known[shift] = value
+            if eqseq is None:
+                eqseq = (self.equipment_seq + (known != self.equipment_known)) & 0xFFFF
+            packet.update(eq32=eq32, eqseq=eqseq)
+        elif eqseq is not None:
+            raise ValueError("eqseq requires eq32")
+        relay_mod.validate_pose(packet)
+        await self.client.send(packet)
+        if eq32 is not None:
+            self.equipment_known, self.equipment_seq = known, eqseq
+        return packet
 
     async def circle(self, banc, centre, radius, period, hz, duration):
         loop = asyncio.get_running_loop()
@@ -311,11 +341,23 @@ class FakePeer:
         if verb == "state":
             return {"state": await self.state()}
         if verb == "pose":
-            if len(words) not in (7, 8):
-                raise ValueError("pose BANC CHILD X Y Z YAW [LOADING]")
+            options = {}
+            positional = words[:7]
+            for word in words[7:]:
+                if "=" in word:
+                    key, value = word.split("=", 1)
+                    if key not in ("eq32", "eqseq") or key in options:
+                        raise ValueError("unknown or repeated pose option")
+                    options[key] = int(value, 0)
+                else:
+                    positional.append(word)
+            words = positional
+            if (len(words) not in (7, 8) or words[2] not in ("0", "1") or
+                    (len(words) == 8 and words[7] not in ("0", "1"))):
+                raise ValueError("pose BANC CHILD X Y Z YAW [LOADING] [eq32=WORD [eqseq=N]]")
             packet = await self.send_pose("" if words[1] == "-" else words[1], words[2] == "1",
                                           [float(w) for w in words[3:6]], float(words[6]),
-                                          len(words) == 8 and words[7] == "1")
+                                          len(words) == 8 and words[7] == "1", **options)
             return {"sent": packet}
         if verb == "poseanim":
             if len(words) != 8 or words[6] not in ("idle", "walk", "run"):

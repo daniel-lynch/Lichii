@@ -78,6 +78,8 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
             m_oot_coop_looked_up = true;
         }
     }
+    if (m_oot_coop && m_oot_coop->EquipmentGuardSite(vaddr, instruction))
+        return OotGameDataTrace::Breakpoint;
     if (OotGameDataTrace::Enabled() && m_process->GetProgramId() == OotGameDataTrace::ProgramId) {
         // The loader registered the session (or none, for another build) before any guest code
         // ran, so one lookup per JIT is enough.
@@ -174,6 +176,10 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
                     m_parent.m_exclusive_monitor.ClearExclusive(m_parent.m_core_index);
                 });
         };
+        if (m_oot_coop && m_oot_coop->EquipmentGuardSite(pc, m_memory.Read32(pc))) {
+            coop_hook(OotGameDataTrace::Point::None);
+            return;
+        }
         if (m_oot_coop && m_oot_coop->IsSentinel(pc)) {
             if (coop_hook(OotGameDataTrace::Point::None)) return;
             ReturnException(pc, InstructionBreakpoint);

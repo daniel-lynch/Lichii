@@ -30,8 +30,10 @@ RUPEE_LIMIT = 999
 KEY_GAIN_LIMIT = 32
 ITEM_COUNT_LIMIT = 999
 POSE_FIELDS = ("type", "t", "banc", "child", "loading", "pos", "yaw", "anim", "anim_seq", "rate", "phase")
+EQUIPMENT_FIELDS = ("eq32", "eqseq")
 POSE_ANIMS = ("idle", "walk", "run")  # an animation hint inferred from speed; receivers may ignore it
 MAX_POSE_FRAME = 256  # JSON payload as the client sent it
+MAX_EQUIPMENT_POSE_FRAME = 384  # negotiated full equipment snapshot
 MAX_POSE_COORD = 100000
 MAX_POSE_QUEUE = 64  # a receiver whose outbox holds more frames than this gets no new pose
 POSE_RATE = 30  # poses per sender per second (sliding 1 s window); the excess is dropped
@@ -121,7 +123,10 @@ def fields(packet, required, optional=()):
 
 
 def validate_hello(packet):
-    fields(packet, ("type", "version", "build_id", "seed_hash", "room", "team", "client_id", "name", "policy_id"))
+    fields(packet, ("type", "version", "build_id", "seed_hash", "room", "team", "client_id", "name", "policy_id"),
+           ("ghost_equipment_v2",))
+    if "ghost_equipment_v2" in packet and type(packet["ghost_equipment_v2"]) is not bool:
+        raise ProtocolError("expected equipment capability boolean")
     if packet["type"] != "hello" or type(packet["version"]) is not int or packet["version"] != VERSION:
         raise ProtocolError("protocol version mismatch")
     if not isinstance(packet["build_id"], str) or not re.fullmatch(r"[0-9A-F]{40}", packet["build_id"]):
@@ -188,9 +193,22 @@ def finite(value, limit):
     return value
 
 
+def validate_equipment(word, child):
+    integer(word, 0, (1 << 32) - 1)
+    if word >> 28 != 1 or word & 0x0FE00000:
+        raise ProtocolError("equipment version/reserved bits")
+    if (word & 7) not in (0, 1, 2, 3, 7) or ((word >> 3) & 7) not in (0, 1, 2, 3, 7):
+        raise ProtocolError("invalid equipment identity")
+    if ((word >> 14) & 15) not in (*range(11), 15):
+        raise ProtocolError("invalid equipment mask")
+    age = (word >> 18) & 3
+    if age == 2 or (age != 3 and age != (0 if child else 1)):
+        raise ProtocolError("invalid equipment age")
+
+
 def validate_pose(packet, size=None):
     """A live position for drawing a ghost; never a grant. Malformed poses are protocol errors."""
-    fields(packet, POSE_FIELDS)
+    fields(packet, POSE_FIELDS, EQUIPMENT_FIELDS)
     integer(packet["t"], 0, (1 << 32) - 1)
     banc = packet["banc"]
     if not isinstance(banc, str) or not re.fullmatch(r"(?:[A-Za-z0-9_]{1,63})?", banc):
@@ -208,7 +226,13 @@ def validate_pose(packet, size=None):
     integer(packet["anim_seq"], 0, (1 << 32) - 1)
     if finite(packet["rate"], 10) < 0 or not 0 <= finite(packet["phase"], 1) < 1:
         raise ProtocolError("pose rate/phase out of range")
-    if (len(encode(packet)) - 4 if size is None else size) > MAX_POSE_FRAME:
+    if ("eq32" in packet) != ("eqseq" in packet):
+        raise ProtocolError("equipment fields must be paired")
+    if "eq32" in packet:
+        validate_equipment(packet["eq32"], packet["child"])
+        integer(packet["eqseq"], 0, (1 << 16) - 1)
+    limit = MAX_EQUIPMENT_POSE_FRAME if "eq32" in packet else MAX_POSE_FRAME
+    if (len(encode(packet)) - 4 if size is None else size) > limit:
         raise ProtocolError("pose too large")
 
 
@@ -422,11 +446,15 @@ class Relay:
             raise ProtocolError("sender capacity reached")
         team.seen.setdefault(client_id, 0)
         client.client_id, client.room, client.team = client_id, room, team
+        client.ghost_equipment_v2 = packet.get("ghost_equipment_v2", False)
         client.state = {"name": packet["name"]}
         room.empty_since = None
         team.clients[client_id] = client
-        client.send({"type": "hello_ack", "version": VERSION, "build_id": room.build_id,
-                     "seed_hash": room.seed_hash, "policy_id": room.policy_id, "client_id": client_id})
+        ack = {"type": "hello_ack", "version": VERSION, "build_id": room.build_id,
+               "seed_hash": room.seed_hash, "policy_id": room.policy_id, "client_id": client_id}
+        if "ghost_equipment_v2" in packet:
+            ack["ghost_equipment_v2"] = client.ghost_equipment_v2
+        client.send(ack)
         client.send(team.snapshot())
         for peer in team.clients.values():
             if peer is not client:
@@ -469,6 +497,8 @@ class Relay:
     @staticmethod
     def pose(client, packet, size=None):
         validate_pose(packet, size)
+        if "eq32" in packet and not client.ghost_equipment_v2:
+            raise ProtocolError("equipment capability not negotiated")
         now = asyncio.get_running_loop().time()
         times = client.pose_times
         while times and now - times[0] >= 1:
@@ -481,7 +511,10 @@ class Relay:
                      **{key: packet[key] for key in POSE_FIELDS[1:]}}
         for peer in tuple(client.team.clients.values()):
             if peer is not client:
-                peer.send_pose(forwarded)
+                outgoing = forwarded
+                if peer.ghost_equipment_v2 and "eq32" in packet:
+                    outgoing = dict(forwarded, **{key: packet[key] for key in EQUIPMENT_FIELDS})
+                peer.send_pose(outgoing)
 
     async def handle(self, client):
         sending = asyncio.create_task(client.write_loop())

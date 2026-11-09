@@ -41,12 +41,17 @@ bool AnimName(std::string_view name) {
 Json EncodePose(const Pose& pose) {
     // Two decimals of a metre / degree is plenty for a statue and keeps the frame small.
     const auto round = [](float v) { return std::round(static_cast<double>(v) * 100.0) / 100.0; };
-    return {{"type", "pose"},           {"t", pose.t},
+    Json result{{"type", "pose"},           {"t", pose.t},
             {"banc", pose.banc},        {"child", pose.child},
             {"loading", pose.loading},  {"pos", Json::array({round(pose.pos[0]), round(pose.pos[1]), round(pose.pos[2])})},
             {"yaw", round(pose.yaw)},   {"anim", pose.anim},
             {"anim_seq", pose.anim_seq}, {"rate", round(pose.rate)},
             {"phase", std::min(0.99, round(pose.phase))}};
+    if (pose.equipment) {
+        result["eq32"] = pose.equipment->word;
+        result["eqseq"] = pose.equipment->sequence;
+    }
+    return result;
 }
 
 std::optional<Pose> DecodePose(const Json& packet, std::string* origin) {
@@ -56,7 +61,7 @@ std::optional<Pose> DecodePose(const Json& packet, std::string* origin) {
         for (const auto& [field, value] : packet.items()) {
             if (field == "type" || field == "t" || field == "banc" || field == "child" ||
                 field == "loading" || field == "pos" || field == "yaw" || field == "anim" ||
-                field == "anim_seq" || field == "rate" || field == "phase")
+                field == "anim_seq" || field == "rate" || field == "phase" || field == "eq32" || field == "eqseq")
                 continue;
             if (forwarded && field == "origin") continue;
             return {};
@@ -77,6 +82,10 @@ std::optional<Pose> DecodePose(const Json& packet, std::string* origin) {
         if (!BancName(pose.banc)) return {};
         pose.child = packet.at("child").get<bool>();
         pose.loading = packet.at("loading").get<bool>();
+        if (packet.contains("eq32") || packet.contains("eqseq")) {
+            pose.equipment = Equip::DecodePacket(packet, pose.child);
+            if (!pose.equipment) return {};
+        }
         const auto& pos = packet.at("pos");
         if (!pos.is_array() || pos.size() != 3) return {};
         for (size_t i = 0; i < 3; ++i) {

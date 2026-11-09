@@ -129,6 +129,7 @@ struct Hello {
     std::string team{"default"};
     std::string client_id;
     std::string name{"Player"};
+    bool ghost_equipment_v2{};
 };
 [[nodiscard]] nlohmann::json EncodeHello(const Hello& hello);
 [[nodiscard]] bool MatchesHello(const nlohmann::json& packet, const Hello& hello);
@@ -271,6 +272,7 @@ public:
               Memory::Memory& memory, u64 thread, u64& tls, u64& tls_ro,
               std::function<void()> clear_exclusive);
     bool IsSentinel(u64 pc) const;
+    bool EquipmentGuardSite(u64 pc, u32 instruction) const;
     /// The points this session traps: the co-op set, plus the actor flag setter when the profile
     /// maps chest members (the same-chest race guard).
     bool Traps(OotGameDataTrace::Point point) const {

@@ -1279,10 +1279,12 @@ Result KProcess::LoadFromMetadata(KernelCore& kernel, const FileSys::ProgramMeta
 }
 
 Result KProcess::AllocateDebugCallMemory(KernelCore& kernel, KProcessAddress* stack_top,
-                                         KProcessAddress* sentinel) {
+                                         KProcessAddress* sentinel, size_t persistent_bytes) {
     // Loader-only allocation: never acquire page-table locks inside a running JIT callback.
     constexpr size_t StackSize = 0x10000; // 64 KiB: the game's give-to-pouch call is deep
-    constexpr size_t TotalSize = StackSize + PageSize;
+    R_UNLESS(persistent_bytes >= PageSize && persistent_bytes <= 0x10000 &&
+                 persistent_bytes % PageSize == 0, ResultInvalidSize);
+    const size_t TotalSize = StackSize + persistent_bytes;
     R_UNLESS((m_state == State::Created || m_state == State::CreatedAttached) &&
                  m_debug_call_memory_size == 0, ResultInvalidState);
     R_UNLESS(m_code_size <= m_max_process_memory &&
@@ -1304,7 +1306,7 @@ Result KProcess::AllocateDebugCallMemory(KernelCore& kernel, KProcessAddress* st
     // reprotected to RX. The page therefore stays RW: Dynarmic fetches code through
     // MemoryReadCode, which checks only that the address is mapped. The rest of the page past
     // +0x400 is the co-op ghost's persistent block (class "pose"); only its own requests point there.
-    R_TRY(m_page_table.MapPages(&code, 1, KMemoryState::Stack, KMemoryPermission::UserReadWrite));
+    R_TRY(m_page_table.MapPages(&code, persistent_bytes / PageSize, KMemoryState::Stack, KMemoryPermission::UserReadWrite));
     this->GetMemory().Write32(GetInteger(code), 0xD4200000); // A64 brk #0 sentinel.
     m_debug_call_memory_size = TotalSize;
     *stack_top = stack + StackSize;

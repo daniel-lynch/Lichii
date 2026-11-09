@@ -544,7 +544,7 @@ public:
     Result LoadFromMetadata(KernelCore& kernel, const FileSys::ProgramMetadata& metadata, std::size_t code_size, KProcessAddress aslr_space_start, size_t aslr_space_offset);
 
     Result AllocateDebugCallMemory(KernelCore& kernel, KProcessAddress* stack_top,
-                                   KProcessAddress* sentinel);
+                                   KProcessAddress* sentinel, size_t persistent_bytes = 0x1000);
 
     void LoadModule(KernelCore& kernel, CodeSet code_set, KProcessAddress base_addr);
 
