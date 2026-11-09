@@ -43,6 +43,13 @@ add_executable(tests
     core/gpu_dirty_memory.cpp
     core/memory_acquire.cpp
     core/oot_coop_call_memory.cpp
+    core/oot_coop_anim.cpp
+    core/oot_coop_anim_backend.cpp
+    core/oot_coop_player.cpp
+    core/oot_coop_keyfile.cpp
+    core/oot_coop_ux.cpp
+    core/oot_coop_chest.cpp
+    core/oot_coop_world.cpp
     core/builtin_patches.cpp
     core/system_test_context.h
     video_core/ampere_branch_modifiers.cpp
@@ -195,7 +202,7 @@ target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain
 
 if (TARGET dynarmic::dynarmic)
     target_sources(tests PRIVATE core/window_trace.cpp core/oot_gamedata_trace.cpp
-                                 core/oot_coop_sync.cpp core/oot_coop_ghost.cpp)
+                                 core/oot_coop_sync.cpp core/oot_coop_ghost.cpp core/oot_coop_equip.cpp)
     # dynarmic_tso.cpp allocates guest memory with mmap (POSIX only).
     if (ARCHITECTURE_x86_64 AND NOT WIN32)
         target_sources(tests PRIVATE core/dynarmic_tso.cpp)

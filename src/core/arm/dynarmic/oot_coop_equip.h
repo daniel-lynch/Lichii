@@ -1,0 +1,237 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+
+#include <array>
+#include <algorithm>
+#include <functional>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+#include <nlohmann/json.hpp>
+#include "core/arm/dynarmic/oot_coop_player.h"
+#include "core/arm/dynarmic/oot_gamedata_trace.h"
+
+namespace Core::OotCoop::Equip {
+struct Appearance {
+    u8 sword{7}, shield{7}, sword_state{3}, shield_state{3}, tunic{3}, boots{3}, mask{15}, age{3}, guard{};
+    bool operator==(const Appearance&) const = default;
+};
+std::optional<u32> Pack(const Appearance& value);
+std::optional<Appearance> Unpack(u64 word, std::optional<bool> child = {});
+bool Settled(u8 id, u8 state);
+bool Newer(u16 value, u16 previous);
+class Sequence {
+public:
+    u16 Sample(const Appearance& value);
+    void Reset() { *this = {}; }
+private:
+    Appearance known;
+    u16 sequence{};
+};
+struct Packet {
+    u32 word{};
+    u16 sequence{};
+    bool operator==(const Packet&) const = default;
+};
+std::optional<Packet> DecodePacket(const nlohmann::json& value, bool child);
+
+enum class Slot : size_t { Sword, Shield, Tunic, Boots, Head, Sheath, Count };
+inline constexpr size_t SlotCount = static_cast<size_t>(Slot::Count);
+struct SlotKeys { u64 link{}, handle{}; u32 create{}, dynamic{}, request_mask{}; };
+struct Keys {
+    std::map<std::string, u64, std::less<>> fields;
+    std::array<SlotKeys, SlotCount> slots;
+    OotGameDataTrace::Entry dynamic, statik, draw, sheathe, state;
+    bool enabled{}, recreate_none{};
+    std::array<u64, 5> dynamic_arguments{}, static_arguments{};
+    u64 Get(std::string_view field) const { return fields.at(std::string{field}); }
+};
+std::shared_ptr<const Keys> DecodeKeys(const nlohmann::json& value);
+struct Name {
+    Slot slot{};
+    u8 id{}, age{3};
+    std::string source, target, sheath;
+};
+struct Names {
+    std::vector<std::string> players; ///< accepted resident player actor names
+    std::vector<Name> rows;
+    const Name* Find(Slot slot, u8 id, u8 age) const;
+    u8 Identify(Slot slot, std::string_view name, u8 age) const;
+};
+std::optional<Names> DecodeNames(const nlohmann::json& document);
+std::optional<Names> LoadNames(std::string_view build);
+
+// All memory access stays on the existing guest frame lane; Call uses its full-context applier.
+struct Port {
+    std::function<std::optional<u8>(u64)> r8;
+    std::function<std::optional<u32>(u64)> r32;
+    std::function<std::optional<u64>(u64)> r64;
+    std::function<bool(u64, const void*, size_t)> write;
+    std::function<std::optional<u64>(const OotGameDataTrace::Entry&)> verified;
+    std::function<bool(u64, const std::array<u64, 8>&, std::optional<float>)> call;
+    std::function<void(std::string_view)> log;
+};
+struct ActorName {
+    std::array<char, 64> bytes{};
+    size_t length{};
+    ActorName() = default;
+    ActorName(std::string_view text) : length{std::min(text.size(), bytes.size() - 1)} {
+        std::copy_n(text.data(), length, bytes.data());
+    }
+    ActorName(const char* text) : ActorName{std::string_view{text}} {}
+    ActorName(const std::string& text) : ActorName{std::string_view{text}} {}
+    operator std::string_view() const { return {bytes.data(), length}; }
+    bool operator==(const ActorName&) const = default;
+    bool operator==(std::string_view text) const { return std::string_view{*this} == text; }
+    bool operator==(const char* text) const { return std::string_view{*this} == text; }
+    bool operator==(const std::string& text) const { return std::string_view{*this} == text; }
+};
+struct Child {
+    u64 link{}, record{}, actor{}, name_pointer{};
+    u32 generation{};
+    ActorName name;
+    bool operator==(const Child&) const = default;
+};
+std::optional<Child> ReadLink(const Port& port, const Keys& keys, u64 link, const Child* cached = nullptr);
+bool Related(const Port& port, const Keys& keys, u64 base, u64 owner, u64 child);
+struct Token {
+    std::string peer, scene;
+    u64 epoch{}, actor{}, record{}, equipment{};
+    u32 generation{};
+    u8 age{};
+    bool operator==(const Token&) const = default;
+};
+struct Root {
+    Token token;
+    bool eligible{};
+    std::optional<Packet> desired;
+};
+struct Observation {
+    std::optional<Child> child;
+    u64 handle{};
+    u32 phase{}, detail{}, bits{}, errors{};
+    bool readable{}, idle{};
+    u8 actual{3};
+};
+enum class Action { None, Create, Query, Draw, Sheathe, Quarantine, Recreate };
+struct Work { Action action{}; Slot slot{}; u8 id{}; };
+class Reconciler {
+public:
+    bool Desired(Packet packet, u8 age);
+    Work Step(const std::array<Observation, SlotCount>& observations, const Names& names,
+              u8 age, bool eligible, bool recreate_none);
+    void Issued(Work work, const Observation& previous);
+    void Quarantine() { quarantined = true; }
+    bool Quarantined() const { return quarantined; }
+    const Appearance& Desired() const { return desired; }
+    bool WantsNone() const;
+    /// A static slot (tunic/head) holds another child: replacing it is unproved (field C15: the
+    /// request is accepted and never applied), so it is deferred rather than issued.
+    bool Deferred(Slot slot) const { return deferred[static_cast<size_t>(slot)]; }
+private:
+    struct Request { bool pending{}; u8 id{}; u32 old_generation{0xffffffffU}; u32 updates{}; Action action{}; };
+    Appearance desired;
+    std::optional<u16> sequence;
+    std::array<Request, SlotCount> requests{};
+    std::array<bool, SlotCount> deferred{};
+    bool quarantined{};
+};
+std::array<u64, 8> Arguments(const Keys& keys, Work work, u64 equipment, u64 cell);
+
+// Owned guest memory for the native name arguments: each allowlisted target is written once as
+// an aligned 8-byte cell holding the guest address of its NUL-terminated string (x2 points at the
+// cell), plus one constant park matrix. Nothing is rewritten or reused for the process lifetime, so
+// a native request that still holds either pointer after its owner was retired can never read
+// another name; no per-generation scratch or reclamation is needed.
+class NameTable {
+public:
+    NameTable(u64 at_, u64 size_) : at{at_}, size{size_} {}
+    std::optional<u64> Cell(Port& port, std::string_view name);
+    std::optional<u64> Park(Port& port);
+private:
+    u64 at{}, size{}, used{}, park{};
+    std::vector<std::pair<std::string, u64>> cells;
+    bool full_logged{};
+};
+
+inline constexpr size_t MaxTrees = 8;        ///< Live plus recently retired owners (4 ghost slots)
+inline constexpr u64 RetireWindow = 600;     ///< Eligible updates a retired owner's children are parked
+inline constexpr size_t MaxChildren = 16;    ///< Validated children remembered per owner
+inline constexpr u64 SampleEvery = 8;        ///< Updates between local appearance samples
+class Controller {
+public:
+    Controller(std::shared_ptr<const Keys> keys, Names names, OotGameDataTrace::GhostOffsets ghost,
+               u64 base, u64 table, u64 table_bytes);
+    bool Calling() const;
+    /// One update. `eligible`: the local scene is ready. `send`: the relay negotiated the
+    /// capability (the local player is sampled only then). True when a call was started.
+    bool Frame(Port& port, const std::vector<Root>& roots, std::string_view scene, bool eligible,
+               bool send = true, std::optional<bool> child = {});
+    void Returned(Port& port, u64 result);
+    void CheckContext(const std::vector<Root>& roots, std::string_view scene, bool eligible);
+    std::optional<Packet> Local(bool child) const;
+    /// The owner was quarantined (timeout/refusal) or asked for an empty re-creation.
+    bool Blocked(u64 actor, u32 generation) const;
+    bool Recreate(u64 actor, u32 generation) const;
+    void Invalidate();
+private:
+    struct Tree {
+        u64 id{};
+        Token token;
+        Reconciler reconcile;
+        std::array<Observation, SlotCount> observed{};
+        std::array<std::optional<Child>, SlotCount> queried{};
+        std::array<u64, SlotCount> query_ticks{};
+        std::array<std::optional<std::pair<Child, u8>>, SlotCount> receipts{}; ///< last logged state
+        std::vector<Child> children; ///< every validated child, parked once on retirement
+        size_t parked{};
+        bool retired{}, recreate{}, none_logged{}, boots_logged{}, deferred_logged{};
+        u64 retired_tick{};
+    };
+    enum class Call { None, LocalState, Work, Park };
+    struct Pending {
+        Call call{};
+        u64 tree{};
+        size_t slot{};
+        Token token;
+        Work work;
+        std::optional<Child> child;
+        bool accept{true};
+    } pending;
+    std::shared_ptr<const Keys> keys;
+    Names names;
+    Player::Keys player_keys; ///< the shared resident-player resolver's view of `keys` + `names`
+    OotGameDataTrace::GhostOffsets ghost;
+    NameTable table;
+    u64 base{}, epoch{1}, tick{}, local_tick{}, next_tree{1};
+    std::optional<bool> local_child;
+    std::string scene;
+    std::vector<Tree> trees;
+    bool budget_logged{};
+    std::optional<Child> player;
+    u64 player_equipment{};
+    Appearance local;
+    Sequence sequence;
+    std::optional<Packet> local_packet;
+    size_t local_stage{};
+    std::array<std::optional<Child>, SlotCount> local_children{};
+    std::array<u32, SlotCount> absent_samples{};
+    size_t active_cursor{}, retire_cursor{};
+    Tree* find(u64 id);
+    bool valid(const Port& port, const Token& token) const;
+    std::optional<u64> equipment(const Port& port, u64 actor, bool private_owner) const;
+    Observation observe(const Port& port, const Token& token, Slot slot, const Child* cached = nullptr) const;
+    bool start(Port& port, const OotGameDataTrace::Entry& entry, std::array<u64, 8> args,
+               Pending call, std::optional<float> alpha = {});
+    void retire(Port& port, Tree& tree, bool recreate, std::string_view reason);
+    void remember(Tree& tree, const Child& child);
+    bool park(Port& port);
+    std::optional<Child> resident(const Port& port) const;
+    bool sender(Port& port);
+    void snapshot(Port& port);
+    void dump(Port& port, const Tree& tree, std::string_view reason) const;
+};
+} // namespace Core::OotCoop::Equip

@@ -190,13 +190,19 @@ TEST_CASE("OoT co-op ghost interpolation, matrix and staleness", "[core][oot_coo
     REQUIRE(m[11] == 3.0f);
     REQUIRE(std::fabs(std::atan2(m[2], m[10]) * 180.0 / 3.141592653589793 - 90.0) < 1e-3);
     Coop::PeerTrack track;
-    track.Add(1000, At("S", 0, 0));
-    track.Add(1100, At("S", 10, 0));
+    auto first = At("S", 0, 0), second = At("S", 10, 0);
+    first.t = 1;
+    second.t = 2;
+    track.Add(1000, first);
+    track.Add(1100, second);
     REQUIRE(std::fabs(track.At(1150)->pos[0] - 5.0f) < 1e-4f); // drawn 100 ms behind
     REQUIRE(track.At(1300)->pos[0] == 10.0f);                    // never extrapolated
     REQUIRE_FALSE(track.At(1100 + 5001));                        // stale
-    track.Add(1200, At("T", 50, 0));
-    REQUIRE(track.At(1250)->banc == "T"); // a scene change is never blended
+    auto third = At("T", 50, 0);
+    third.t = 3;
+    track.Add(1200, third);
+    REQUIRE(track.At(1250)->banc == "S"); // scene switch waits for its render timestamp
+    REQUIRE(track.At(1300)->banc == "T");
     track.online = false;
     REQUIRE_FALSE(track.At(1250));
 }
@@ -988,4 +994,121 @@ TEST_CASE("OoT co-op ghost look and watch fields load from the private profile",
     bad = ghost;
     bad["alpha"]["percent"] = 101;
     REQUIRE_FALSE(load(bad));
+}
+
+TEST_CASE("OoT co-op animation packets retain their discrete render timestamp", "[core][oot_coop]") {
+    Pose a = At("SyntheticScene", 0, 0), b = At("SyntheticScene", 10, 0);
+    a.t = 1;
+    b.t = 2;
+    a.animation = Coop::Anim::State{1, 20, 2.125f, 0.0f};
+    b.animation = Coop::Anim::State{2, 21, {}, 1.0f};
+    REQUIRE(Coop::DecodePose(Coop::EncodePose(a))->animation == a.animation);
+    REQUIRE(Coop::DecodePose(Coop::EncodePose(b))->animation == b.animation);
+    Coop::PeerTrack track;
+    track.Add(1000, a);
+    track.Add(1100, b);
+    REQUIRE(track.At(1150)->animation == a.animation);
+    REQUIRE(track.At(1200)->animation == b.animation);
+    track.Add(1200, a); // stale sender tick cannot overwrite the selected transition
+    REQUIRE(track.At(1300)->animation == b.animation);
+    b.t = 3;
+    b.child = false;
+    track.Add(1300, b);
+    REQUIRE(track.At(1350)->child);
+    REQUIRE_FALSE(track.At(1400)->child);
+}
+
+TEST_CASE("OoT co-op animation changes send while stationary", "[core][oot_coop]") {
+    Coop::PoseSender sender;
+    auto pose = At("SyntheticScene", 0, 0);
+    const auto sample = [&](u64 now, u32 sequence, float rate) {
+        return sender.Sample(pose, now, [&](Pose& p) {
+            p.animation = Coop::Anim::State{1, sequence, {}, rate};
+        });
+    };
+    REQUIRE(sample(1000, 1, 1));
+    REQUIRE_FALSE(sample(1030, 2, 1));
+    REQUIRE(sample(1070, 2, 1));
+    REQUIRE_FALSE(sample(1140, 2, 1));
+    REQUIRE(sample(1210, 2, 0));
+}
+
+TEST_CASE("OoT co-op animation native calls are ordered and lifetime checked", "[core][oot_coop]") {
+    auto g = Offsets();
+    auto keys = std::make_shared<Coop::Anim::Keys>();
+    keys->receiver_enabled = true;
+    keys->play_wrapper = {0x404000, {0xD503237F}};
+    keys->frame_setter = {0x405000, {0xD503237F}};
+    keys->rate_setter = {0x406000, {0xD503237F}};
+    const auto table = Coop::Anim::Table::Parse(R"({"schema":1,"unknown_id":0,"entries":[
+        {"id":1,"age":"Child","command_index":0,"command":"SyntheticCommand",
+         "clip":"SyntheticClip","slot":0,"frames":20,"loop":false,"root_zero_verified":true,
+         "end_policy":"hold_until_sender_transition"}]})");
+    REQUIRE(table);
+    Bytes m;
+    Port port{m};
+    m.P64(Base + g.actor_mgr_cell, 0x60000000);
+    for (u64 i = 0; i < 3; ++i) m.PF(Base + g.scale_const + i * 4, 1.0f);
+    Coop::GhostDriver<Port> ghost{g, Base, keys, table};
+    Pose local = At("SyntheticScene", 0, 0);
+    std::vector<Coop::PeerView> peers{{"peer-b", At("SyntheticScene", 3, 4), 1}};
+    peers[0].pose->t = 1;
+    peers[0].pose->animation = Coop::Anim::State{1, 1, 5.0f, 0.5f};
+    const auto frame = [&] { return ghost.Frame(port, Block, local, peers, NoLog); };
+    const auto returned = [&](u64 result) {
+        ghost.Returned(port, Block, result, NoLog, &local, &peers);
+    };
+    REQUIRE(frame());
+    m.P64(Block, 0x61000000);
+    m.P32(0x61000000, 3);
+    returned(1);
+    REQUIRE(frame());
+    const u64 actor = 0x62000000, record = 0x63000000;
+    m.P64(actor, 0xABC0);
+    m.P64(actor + 0x40, 1);
+    m.P64(actor + 0x48, 2);
+    m.P64(actor + 0x50, record);
+    m.P32(actor + 0x18, 100);
+    m.P64(record + 0x40, actor);
+    m.P32(record + 0x48, 100);
+    returned(actor);
+    REQUIRE(frame()); // initial placement
+    returned(0);
+    REQUIRE(frame());
+    REQUIRE(port.calls.back().entry == Base + keys->play_wrapper.offset);
+    REQUIRE(m.Read64(Block + 0x140) == actor);
+    REQUIRE(m.Read64(Block + 0x148) == Block + 0x180);
+    REQUIRE(m.F(Block + 0x154) == 0.0f);
+    REQUIRE_FALSE(ghost.Slots()[0].animation.Committed());
+    returned(1);
+    REQUIRE(frame());
+    REQUIRE(port.calls.back().entry == Base + keys->frame_setter.offset);
+    REQUIRE(port.calls.back().args[0] == actor);
+    REQUIRE(port.calls.back().args[1] == 0);
+    REQUIRE(port.calls.back().args[2] == 0);
+    REQUIRE(port.s0s.back() == 5.0f);
+    returned(0); // void, not a Boolean result
+    REQUIRE(frame());
+    REQUIRE(port.calls.back().entry == Base + keys->rate_setter.offset);
+    REQUIRE(port.s0s.back() == 0.5f);
+    returned(0);
+    REQUIRE(ghost.Slots()[0].animation.Committed()->aseq == 1);
+    REQUIRE(frame());
+    REQUIRE(port.calls.back().entry == Base + g.set_mtx.offset);
+    returned(0);
+    REQUIRE_FALSE(frame());
+    peers[0].pose->t = 2;
+    peers[0].pose->animation->ar = 0.0f;
+    REQUIRE(frame());
+    REQUIRE(port.calls.back().entry == Base + keys->rate_setter.offset);
+    REQUIRE(port.s0s.back() == 0.0f);
+    ++peers[0].session; // a completion from the previous peer session cannot commit
+    returned(0);
+    REQUIRE_FALSE(ghost.Slots()[0].animation.Committed());
+    REQUIRE(frame()); // replacement peer starts with play
+    REQUIRE(port.calls.back().entry == Base + keys->play_wrapper.offset);
+    m.P32(record + 0x48, 101); // generation changed in flight
+    returned(1);
+    REQUIRE_FALSE(ghost.Slots()[0].animation.Committed());
+    REQUIRE_FALSE(frame());
 }

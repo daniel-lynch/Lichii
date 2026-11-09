@@ -13,10 +13,12 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-VERSION = 3
+VERSION = 4
+LEGACY_VERSION = 3
 MAX_FRAME = 1024 * 1024  # JSON payload only; the 4-byte length is additional.
 MAX_SEQ = (1 << 53) - 1
 MAX_KEYS = 2048
+MAX_ORIGIN_RECEIPTS = 4096
 MAX_SENDERS = 256
 MAX_CLIENTS = 128
 MAX_ROOMS = 32
@@ -24,13 +26,16 @@ MAX_TEAMS = 16
 MAX_REPLAY = 512
 MAX_OUTBOX = 256
 MAX_OUTBOX_BYTES = 2 * MAX_FRAME
-CHANGE_TYPES = {"bool_set", "bit_set", "rupee_add", "item_give"}
-EVENT_TYPES = {"rupee_add", "item_give"}  # additive events: replay window only, never team state
+CHANGE_TYPES = {"bool_set", "bit_set", "rupee_add", "item_give", "key_add"}
+EVENT_TYPES = {"rupee_add", "item_give", "key_add"}  # additive events: replay window only, never team state
 RUPEE_LIMIT = 999
+KEY_GAIN_LIMIT = 32
 ITEM_COUNT_LIMIT = 999
 POSE_FIELDS = ("type", "t", "banc", "child", "loading", "pos", "yaw", "anim", "anim_seq", "rate", "phase")
+EQUIPMENT_FIELDS = ("eq32", "eqseq")
 POSE_ANIMS = ("idle", "walk", "run")  # an animation hint inferred from speed; receivers may ignore it
-MAX_POSE_FRAME = 256  # JSON payload as the client sent it
+ANIM_POSE_FIELDS = ("av", "aid", "af", "ar", "aseq")
+MAX_POSE_FRAME = 512  # JSON payload, including origin when forwarded (animation and equipment fields included)
 MAX_POSE_COORD = 100000
 MAX_POSE_QUEUE = 64  # a receiver whose outbox holds more frames than this gets no new pose
 POSE_RATE = 30  # poses per sender per second (sliding 1 s window); the excess is dropped
@@ -119,10 +124,51 @@ def fields(packet, required, optional=()):
         raise ProtocolError("missing or unknown fields")
 
 
+def validate_wallet(wallet):
+    if type(wallet) is not dict:
+        raise ProtocolError("invalid world wallet")
+    fields(wallet, ("balance", "capacity"))
+    capacity = integer(wallet["capacity"], 0, (1 << 31) - 1)
+    integer(wallet["balance"], 0, capacity)
+
+
+ORIGIN_FIELDS = ("origin_kind", "origin_key", "origin_key64", "origin_partner")
+
+
+def collectible_origin(packet):
+    """Validate the tagged union; legacy chest packets keep their u32 origin_key."""
+    kind = packet.get("origin_kind", "chest" if "origin_key" in packet else "none")
+    keys = set(packet) & set(ORIGIN_FIELDS[1:])
+    if not isinstance(kind, str) or kind not in ("none", "chest", "bit", "token"):
+        raise ProtocolError("invalid origin kind")
+    expected = {"none": set(), "chest": {"origin_key"}, "bit": {"origin_key64"},
+                "token": {"origin_key64", "origin_partner"}}[kind]
+    if keys != expected:
+        raise ProtocolError("invalid origin fields")
+    if kind == "none":
+        return None
+    if kind == "chest":
+        return kind, integer(packet["origin_key"], 1, (1 << 32) - 1)
+    key = integer(packet["origin_key64"], 1, (1 << 64) - 1)
+    if kind == "bit":
+        return kind, key
+    partner = integer(packet["origin_partner"], 1, (1 << 64) - 1)
+    if partner == key:
+        raise ProtocolError("invalid token partner")
+    return kind, key, partner
+
+
 def validate_hello(packet):
-    fields(packet, ("type", "version", "build_id", "seed_hash", "room", "team", "client_id", "name", "policy_id"))
-    if packet["type"] != "hello" or type(packet["version"]) is not int or packet["version"] != VERSION:
+    fields(packet, ("type", "version", "build_id", "seed_hash", "room", "team", "client_id", "name", "policy_id"),
+           ("world_wallet", "animation", "ghost_equipment_v2"))
+    if "ghost_equipment_v2" in packet and type(packet["ghost_equipment_v2"]) is not bool:
+        raise ProtocolError("expected equipment capability boolean")
+    if packet["type"] != "hello" or type(packet["version"]) is not int or packet["version"] not in (LEGACY_VERSION, VERSION):
         raise ProtocolError("protocol version mismatch")
+    if "animation" in packet:
+        if packet["version"] != VERSION:
+            raise ProtocolError("animation needs protocol v4")
+        validate_animation(packet["animation"])
     if not isinstance(packet["build_id"], str) or not re.fullmatch(r"[0-9A-F]{40}", packet["build_id"]):
         raise ProtocolError("invalid build id")
     if not isinstance(packet["seed_hash"], str) or not re.fullmatch(r"[0-9A-Fa-f]{1,128}", packet["seed_hash"]):
@@ -132,6 +178,17 @@ def validate_hello(packet):
     name = packet["name"]
     if not isinstance(name, str) or not 1 <= len(name.encode("utf-8")) <= 96 or any(ord(c) < 32 for c in name):
         raise ProtocolError("invalid name")
+    if "world_wallet" in packet:
+        validate_wallet(packet["world_wallet"])
+
+
+def validate_animation(value):
+    if type(value) is not dict:
+        raise ProtocolError("invalid animation negotiation")
+    fields(value, ("av", "table_sha256"))
+    integer(value["av"], 1, 1)
+    if not isinstance(value["table_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["table_sha256"]):
+        raise ProtocolError("invalid animation table hash")
 
 
 def validate_change(packet, origin):
@@ -140,8 +197,20 @@ def validate_change(packet, origin):
     if kind not in CHANGE_TYPES:
         raise ProtocolError("unsupported grant class")
     extra = {"bool_set": ("hash", "value"), "bit_set": ("actor", "value"), "rupee_add": ("hash", "delta"),
-             "item_give": ("name", "category", "count", "get", "flags")}[kind]
-    fields(packet, common + extra)
+             "item_give": ("name", "category", "count", "get", "flags"), "key_add": ("hash", "delta")}[kind]
+    chest_fields = ("chest_transaction", "chest_part", "chest_final")
+    optional = ORIGIN_FIELDS if kind in ("item_give", "bit_set") else ()
+    if kind == "item_give":
+        optional += chest_fields
+    fields(packet, common + extra, optional)
+    source = collectible_origin(packet)
+    if any(field in packet for field in chest_fields):
+        if source is None or source[0] != "chest" or not all(field in packet for field in chest_fields):
+            raise ProtocolError("chest receipt requires a chest and all transaction fields")
+        integer(packet["chest_transaction"], 1, MAX_SEQ)
+        integer(packet["chest_part"], 0, 63)
+        if type(packet["chest_final"]) is not bool:
+            raise ProtocolError("chest completion must be boolean")
     if packet["origin"] != origin:
         raise ProtocolError("origin mismatch")
     integer(packet["seq"], 1, MAX_SEQ)
@@ -153,12 +222,20 @@ def validate_change(packet, origin):
             raise ProtocolError("expected boolean")
     if kind == "bit_set":
         integer(packet["actor"], 0, (1 << 64) - 1)
+        if source is not None and (source[0] not in ("bit", "token") or
+                                   packet["actor"] not in source[1:]):
+            raise ProtocolError("bit flag does not belong to origin")
     if kind == "rupee_add":
         # The wallet key is game-derived: each receiver admits only its private profile's wallet.
         if packet["hash"] == 0:
             raise ProtocolError("rupee_add needs a wallet key")
         if integer(packet["delta"], -RUPEE_LIMIT, RUPEE_LIMIT) == 0:
             raise ProtocolError("zero rupee delta")
+    if kind == "key_add":
+        # A dungeon's small-key gain (C13): the hash names the dungeon's total-keys key (private).
+        if packet["hash"] == 0:
+            raise ProtocolError("key_add needs a dungeon key")
+        integer(packet["delta"], 1, KEY_GAIN_LIMIT)
     if kind == "item_give":
         # The game's own give call, as the opener made it: an event, applied by each receiver.
         if not isinstance(packet["name"], str) or not re.fullmatch(r"[A-Za-z0-9_]{1,63}", packet["name"]):
@@ -174,14 +251,27 @@ def validate_change(packet, origin):
 
 
 def finite(value, limit):
-    if type(value) not in (int, float) or not math.isfinite(value) or abs(value) > limit:
+    if type(value) not in (int, float) or abs(value) > limit or not math.isfinite(value):
         raise ProtocolError("invalid pose number")
     return value
 
 
+def validate_equipment(word, child):
+    integer(word, 0, (1 << 32) - 1)
+    if word >> 28 != 1 or word & 0x0FE00000:
+        raise ProtocolError("equipment version/reserved bits")
+    if (word & 7) not in (0, 1, 2, 3, 7) or ((word >> 3) & 7) not in (0, 1, 2, 3, 7):
+        raise ProtocolError("invalid equipment identity")
+    if ((word >> 14) & 15) not in (*range(11), 15):
+        raise ProtocolError("invalid equipment mask")
+    age = (word >> 18) & 3
+    if age == 2 or (age != 3 and age != (0 if child else 1)):
+        raise ProtocolError("invalid equipment age")
+
+
 def validate_pose(packet, size=None):
     """A live position for drawing a ghost; never a grant. Malformed poses are protocol errors."""
-    fields(packet, POSE_FIELDS)
+    fields(packet, POSE_FIELDS, ANIM_POSE_FIELDS + EQUIPMENT_FIELDS)
     integer(packet["t"], 0, (1 << 32) - 1)
     banc = packet["banc"]
     if not isinstance(banc, str) or not re.fullmatch(r"(?:[A-Za-z0-9_]{1,63})?", banc):
@@ -199,6 +289,21 @@ def validate_pose(packet, size=None):
     integer(packet["anim_seq"], 0, (1 << 32) - 1)
     if finite(packet["rate"], 10) < 0 or not 0 <= finite(packet["phase"], 1) < 1:
         raise ProtocolError("pose rate/phase out of range")
+    if any(key in packet for key in ANIM_POSE_FIELDS):
+        if not all(key in packet for key in ANIM_POSE_FIELDS):
+            raise ProtocolError("incomplete animation pose")
+        integer(packet["av"], 1, 1)
+        integer(packet["aid"], 0, (1 << 32) - 1)
+        integer(packet["aseq"], 0, (1 << 32) - 1)
+        if packet["af"] is not None and finite(packet["af"], 1000000) < 0:
+            raise ProtocolError("animation frame out of range")
+        if finite(packet["ar"], 4) < 0:
+            raise ProtocolError("animation rate out of range")
+    if ("eq32" in packet) != ("eqseq" in packet):
+        raise ProtocolError("equipment fields must be paired")
+    if "eq32" in packet:
+        validate_equipment(packet["eq32"], packet["child"])
+        integer(packet["eqseq"], 0, (1 << 16) - 1)
     if (len(encode(packet)) - 4 if size is None else size) > MAX_POSE_FRAME:
         raise ProtocolError("pose too large")
 
@@ -218,6 +323,7 @@ class Team:
     current: dict = field(default_factory=dict)
     checkpoint: dict = field(default_factory=dict)
     seen: dict = field(default_factory=dict)
+    benefit_receipts: set = field(default_factory=set)
     replay: deque = field(default_factory=deque)
     clients: dict = field(default_factory=dict)
     revision: int = 0
@@ -232,6 +338,13 @@ class Team:
         old = self.current.get(key)
         kind = packet["type"]
         accepted = key[1] not in deny
+        source = collectible_origin(packet)
+        # Chest sources stay a client-side rule (C13 ChestClaims: one opener per chest, several gives).
+        benefit = source if kind == "item_give" and source and source[0] != "chest" else None
+        if source is not None:
+            accepted &= not any(value in deny for value in source[1:])
+        if benefit is not None:
+            accepted &= benefit not in self.benefit_receipts
         if kind in ("bool_set", "bit_set"):
             accepted &= packet["value"] and old is None
         if accepted:
@@ -239,9 +352,13 @@ class Team:
                 raise ProtocolError("team state capacity reached")
             if self.revision == MAX_SEQ:
                 raise ProtocolError("team revision exhausted")
+            if benefit is not None and len(self.benefit_receipts) >= MAX_ORIGIN_RECEIPTS:
+                raise ProtocolError("origin receipt capacity reached")
         self.seen[origin] = seq  # Also remember ignored false, denied and backward writes.
         if not accepted:
             return None
+        if benefit is not None:
+            self.benefit_receipts.add(benefit)
         self.revision += 1
         event = dict(packet, rev=self.revision)
         fold(self.current, event)
@@ -255,9 +372,14 @@ class Team:
     def snapshot(self):
         # seen is current, after replay and no-ops. Reconstruct checkpoint + replay first;
         # do not use these highwaters to discard the replay that accompanies this snapshot.
-        return {"type": "team_state", "revision": self.checkpoint_revision,
-                "changes": list(self.checkpoint.values()), "seen": dict(self.seen),
-                "replay": list(self.replay)}
+        packet = {"type": "team_state", "revision": self.checkpoint_revision,
+                  "changes": list(self.checkpoint.values()), "seen": dict(self.seen),
+                  "replay": list(self.replay)}
+        wallets = {client_id: dict(client.state["world_wallet"])
+                   for client_id, client in self.clients.items() if "world_wallet" in client.state}
+        if wallets:
+            packet["world_wallet"] = wallets
+        return packet
 
 
 @dataclass
@@ -413,16 +535,33 @@ class Relay:
             raise ProtocolError("sender capacity reached")
         team.seen.setdefault(client_id, 0)
         client.client_id, client.room, client.team = client_id, room, team
+        client.version = packet["version"]
+        client.animation = packet.get("animation")
+        client.ghost_equipment_v2 = packet.get("ghost_equipment_v2", False)
         client.state = {"name": packet["name"]}
+        if "world_wallet" in packet:
+            client.state["world_wallet"] = dict(packet["world_wallet"])
         room.empty_since = None
         team.clients[client_id] = client
-        client.send({"type": "hello_ack", "version": VERSION, "build_id": room.build_id,
-                     "seed_hash": room.seed_hash, "policy_id": room.policy_id, "client_id": client_id})
+        ack = {"type": "hello_ack", "version": client.version, "build_id": room.build_id,
+               "seed_hash": room.seed_hash, "policy_id": room.policy_id, "client_id": client_id}
+        if client.animation is not None:
+            ack["animation"] = client.animation
+        if "ghost_equipment_v2" in packet:
+            ack["ghost_equipment_v2"] = client.ghost_equipment_v2
+        client.send(ack)
         client.send(team.snapshot())
         for peer in team.clients.values():
             if peer is not client:
-                client.send({"type": "client_state", "origin": peer.client_id, "state": peer.state})
-        self.broadcast(client, {"type": "client_state", "origin": client_id, "state": client.state})
+                self.send_presence(peer, client)
+                self.send_presence(client, peer)
+
+    @staticmethod
+    def send_presence(source, recipient):
+        state = {key: value for key, value in source.state.items() if key != "animation"}
+        if recipient.version == VERSION and source.animation is not None:
+            state["animation"] = source.animation
+        recipient.send({"type": "client_state", "origin": source.client_id, "state": state})
 
     @staticmethod
     def broadcast(client, packet):
@@ -441,7 +580,12 @@ class Relay:
             if event is not None:
                 self.broadcast(client, event)
         elif kind == "team_state_request":
-            fields(packet, ("type",))
+            fields(packet, ("type",), ("world_wallet",))
+            if "world_wallet" in packet:
+                validate_wallet(packet["world_wallet"])
+                client.state["world_wallet"] = dict(packet["world_wallet"])
+                self.broadcast(client, {"type": "client_state", "origin": client.client_id,
+                                        "state": client.state})
             client.send(client.team.snapshot())
         elif kind in ("heartbeat", "heartbeat_ack"):
             fields(packet, ("type",))
@@ -452,14 +596,28 @@ class Relay:
             state = packet["state"]
             if not isinstance(state, dict) or len(encode(packet)) > 4096:
                 raise ProtocolError("invalid client state")
+            if "world_wallet" in state:
+                validate_wallet(state["world_wallet"])
             client.state = state
-            self.broadcast(client, {"type": "client_state", "origin": client.client_id, "state": state})
+            for peer in tuple(client.team.clients.values()):
+                if peer is not client:
+                    self.send_presence(client, peer)
         else:
             raise ProtocolError("unsupported message type")
 
     @staticmethod
     def pose(client, packet, size=None):
         validate_pose(packet, size)
+        if "av" in packet and client.animation is None:
+            raise ProtocolError("animation not negotiated")
+        if "eq32" in packet and not client.ghost_equipment_v2:
+            raise ProtocolError("equipment capability not negotiated")
+        forwarded = {"type": "pose", "origin": client.client_id,
+                     **{key: packet[key] for key in POSE_FIELDS[1:]}}
+        animation = {key: packet[key] for key in ANIM_POSE_FIELDS if key in packet}
+        equipment = {key: packet[key] for key in EQUIPMENT_FIELDS if key in packet}
+        if len(encode(dict(forwarded, **animation, **equipment))) - 4 > MAX_POSE_FRAME:
+            raise ProtocolError("pose too large after origin")
         now = asyncio.get_running_loop().time()
         times = client.pose_times
         while times and now - times[0] >= 1:
@@ -468,11 +626,14 @@ class Relay:
             client.poses_rate_dropped += 1
             return
         times.append(now)
-        forwarded = {"type": "pose", "origin": client.client_id,
-                     **{key: packet[key] for key in POSE_FIELDS[1:]}}
         for peer in tuple(client.team.clients.values()):
             if peer is not client:
-                peer.send_pose(forwarded)
+                outgoing = forwarded
+                if animation and client.animation is not None and peer.animation == client.animation:
+                    outgoing = dict(outgoing, **animation)
+                if equipment and peer.ghost_equipment_v2:
+                    outgoing = dict(outgoing, **equipment)
+                peer.send_pose(outgoing)
 
     async def handle(self, client):
         sending = asyncio.create_task(client.write_loop())

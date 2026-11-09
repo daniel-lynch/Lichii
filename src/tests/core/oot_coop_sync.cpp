@@ -739,3 +739,191 @@ TEST_CASE("OoT co-op item gives are named events, never state", "[core][oot_coop
     bad.value = 0;
     REQUIRE_FALSE(open.Queue(bad));
 }
+
+TEST_CASE("OoT co-op small-key gains are dungeon events, never state", "[core][oot_coop]") {
+    const Change gain{Kind::Key, "B", 3, 0x1234, 1};
+    const auto packet = Coop::EncodeChange(gain);
+    REQUIRE(packet == Json{{"type", "key_add"}, {"origin", "B"}, {"seq", 3}, {"hash", 0x1234}, {"delta", 1}});
+    REQUIRE(Coop::DecodeChange(packet) == gain);
+    REQUIRE(Coop::WireKind(Kind::Key));
+    REQUIRE(Coop::EventKind(Kind::Key));
+    for (const auto& [field, value] : std::vector<std::pair<std::string, Json>>{
+             {"delta", 0}, {"delta", -1}, {"delta", 33}, {"delta", true}, {"hash", 0},
+             {"hash", 0x100000000ULL}, {"extra", 1}}) {
+        auto bad = packet;
+        bad[field] = value;
+        REQUIRE_FALSE(Coop::DecodeChange(bad));
+    }
+    REQUIRE_FALSE(Coop::DecodeChange(packet, true)); // never snapshot state
+    REQUIRE(Coop::DecodeAllowClasses("bool,dungeon") == std::set{Kind::Bool, Kind::Key});
+    Coop::State state;
+    REQUIRE(state.Merge(gain));
+    REQUIRE_FALSE(state.Merge(gain)); // a duplicate delivery is not a second key
+    REQUIRE(state.Merge({Kind::Key, "C", 1, 0x1234, 1})); // two players, two keys
+    REQUIRE(state.Snapshot().empty());
+    REQUIRE(Coop::ShouldApply(gain, state));
+    Coop::ApplyPolicy policy{true, {Kind::Key}, {{Kind::Key, 0x1234}}};
+    REQUIRE(policy.Allows(gain));
+    REQUIRE_FALSE(policy.Allows({Kind::Key, "B", 4, 0x9999, 1}));
+    REQUIRE_FALSE(Coop::ApplyPolicy{true, {Kind::Bool}, {{Kind::Key, 0x1234}}}.Allows(gain));
+}
+
+TEST_CASE("OoT co-op key watch forwards gains, never spends or our own credit", "[core][oot_coop]") {
+    Coop::KeyWatch watch;
+    REQUIRE(watch.Step(2, 1) == 0);      // baseline
+    REQUIRE(watch.Step(3, 2) == 1);      // a key picked up: total and count rise
+    REQUIRE(watch.Step(3, 1) == 0);      // a key spent on a door: per-player, nothing sent
+    REQUIRE(watch.Step(4, 1) == 1);      // a gain seen only in the total (count unchanged frame)
+    REQUIRE(watch.Step(4, 2) == 1);      // a gain seen only in the count (total not maintained)
+    watch.Credit(2);                     // two received gains applied here
+    REQUIRE(watch.Step(5, 3) == 0);      // the first one shows up: explained by the credit
+    REQUIRE(watch.Step(7, 5) == 1);      // the second plus a real local pickup in the same frame
+    REQUIRE(watch.credit_total == 0);
+    REQUIRE(watch.credit_count == 0);
+    // C14 field: one received gain whose two adds commit in different frames is never sent back.
+    watch.Credit(1);
+    REQUIRE(watch.Step(8, 5) == 0);      // the total add lands first
+    REQUIRE(watch.Step(8, 6) == 0);      // the count add a frame later: still our own apply
+    REQUIRE(watch.Step(9, 7) == 1);      // a real pickup afterwards is forwarded
+    REQUIRE(watch.Step(std::nullopt, 5) == 0); // unreadable: reset, no forward
+    REQUIRE_FALSE(watch.total);
+    REQUIRE(watch.Step(9, 6) == 0);      // a fresh baseline after the reset
+}
+
+TEST_CASE("OoT co-op key file extras: per-player deny and the dungeon class", "[core][oot_coop]") {
+    const Json file{{"bool", {1, 2, 3}},
+                    {"deny", {{"bool", {2, 7}}}},
+                    {"dungeon", {{"bool", {11, 12}}, {"keys", {{21, 22}, {31, 32}}}}},
+                    {"offsets", Json::object()}};
+    const auto keys = Coop::DecodeKeyPolicy(file);
+    REQUIRE(keys);
+    REQUIRE(keys->size() == 3); // the extras are not allow-list entries by themselves
+    const auto extras = Coop::DecodeKeyExtras(file);
+    REQUIRE(extras);
+    REQUIRE(extras->deny == std::set<u64>{2, 7});
+    REQUIRE(extras->dungeon_bools == std::vector<u32>{11, 12});
+    REQUIRE(extras->dungeon_keys.size() == 2);
+    REQUIRE(extras->dungeon_keys[1].total == 31);
+    REQUIRE(extras->dungeon_keys[1].count == 32);
+    REQUIRE(Coop::DecodeKeyExtras(Json::array({1, 2}))->deny.empty()); // legacy bare array
+    for (const Json& bad : {Json{{"deny", {{"bit", {1}}}}}, Json{{"deny", {{"bool", {0}}}}},
+                            Json{{"deny", {{"bool", {0x100000000ULL}}}}},
+                            Json{{"dungeon", {{"keys", {{21, 21}}}}}}, Json{{"dungeon", {{"keys", {{21}}}}}},
+                            Json{{"dungeon", {{"other", Json::array()}}}}, Json{{"deny", 1}}}) {
+        REQUIRE_FALSE(Coop::DecodeKeyExtras(bad));
+    }
+    // The per-player Bools are dropped by protocol state too (the session's deny set).
+    Coop::State state{extras->deny};
+    REQUIRE_FALSE(state.Merge({Kind::Bool, "B", 1, 7, 1}));
+    REQUIRE(state.Merge({Kind::Bool, "B", 2, 1, 1}));
+}
+
+TEST_CASE("OoT co-op profile: wallet observation and the Int add entry", "[core][oot_coop]") {
+    const auto load = [](const Json& fields) {
+        Json offsets = fields;
+        offsets["manager_cell"] = "0x200000";
+        return Coop::DecodeProfile(Json{{"offsets", {{P::BuildId, offsets}}}}, P::BuildId);
+    };
+    const auto loaded = load({{"rupee_callers", {"0x160004"}},
+                              {"sites", {{"rupee_add", {"0x112000"}}}},
+                              {"entries", {{"int_add", {{"at", "0x114000"}, {"words", {"0xD503237F"}}}}}}});
+    REQUIRE(loaded);
+    REQUIRE(loaded->rupee_callers == std::vector<u64>{0x160004});
+    REQUIRE(loaded->int_add.offset == 0x114000);
+    REQUIRE(loaded->SiteOffset(Trace::Point::RupeeAdd) == 0x112000);
+    REQUIRE(loaded->sites.back().instruction == Trace::MovW8Pending);
+    REQUIRE_FALSE(load({{"rupee_callers", {"0x160005"}}}));
+    REQUIRE_FALSE(load({{"rupee_callers", "0x160004"}}));
+}
+
+TEST_CASE("OoT co-op same-chest race begins before the give, not at a flag", "[core][oot_coop]") {
+    Coop::Chest::Claims claims;
+    const Coop::Chest::Identity identity{{0x1000, 0x2000, 3, 1}, 99, 17, 0xC1};
+    const auto attempt = claims.LocalBegin(identity, 1, 1);
+    REQUIRE(attempt);
+    REQUIRE(claims.BindEvent(attempt, {0x3000, 1}));
+    claims.RemoteClaim(Coop::World::Origin::Chest(0xC1), "peer");
+    const auto gate = claims.Gate(attempt);
+    REQUIRE(gate.decision == Coop::Chest::Decision::Allow);
+    REQUIRE(claims.Returned(attempt, gate.part, true));
+    claims.EndEvent({0x3000, 1});
+    REQUIRE(claims.Owner(Coop::World::Origin::Chest(0xC1)) == "us");
+    REQUIRE(claims.Find(0xC1)->closed);
+}
+
+TEST_CASE("OoT co-op item give origin key: wire and queued-give removal", "[core][oot_coop]") {
+    Change give{Kind::Item, "A", 4, Coop::PackItem({6, 7, {0, 0, 1, 0}}), 1};
+    give.name = "Item_Test_Slingshot";
+    give.source = Coop::World::Origin::Chest(0xC1);
+    const auto packet = Coop::EncodeChange(give);
+    REQUIRE(packet.at("origin_key") == 0xC1);
+    REQUIRE(Coop::DecodeChange(packet) == give);
+    give.source = {};
+    REQUIRE_FALSE(Coop::EncodeChange(give).contains("origin_key"));
+    for (const Json& bad : {Json(0), Json(-1), Json(0x100000000ULL), Json("c1")}) {
+        auto p = packet;
+        p["origin_key"] = bad;
+        REQUIRE_FALSE(Coop::DecodeChange(p));
+    }
+    // DropPending removes queued gives of a chest, never another chest's or another class.
+    struct NoBackend { using Context = int; };
+    Coop::GrantApplier<NoBackend> applier{{true, {Kind::Item, Kind::Rupee}, {}, Wallet}};
+    Change mine = give, other = give;
+    mine.source = Coop::World::Origin::Chest(0xC1);
+    other.source = Coop::World::Origin::Chest(0xC2);
+    other.seq = 5;
+    REQUIRE(applier.Queue(mine));
+    REQUIRE(applier.Queue(other));
+    REQUIRE(applier.Queue({Kind::Rupee, "A", 6, Wallet, 5}));
+    REQUIRE(applier.DropPending([](const Change& c) { return c.kind == Kind::Item && c.source == Coop::World::Origin::Chest(0xC1); }) == 1);
+    REQUIRE(applier.Pending() == 2);
+    // Profile: the chest members map.
+    const auto load = [](const Json& members) {
+        return Coop::DecodeProfile(Json{{"offsets", {{P::BuildId, {{"manager_cell", "0x200000"},
+                                                                  {"chest_members", members}}}}}}, P::BuildId);
+    };
+    const auto loaded = load(Json::array({Json::array({"0x11", "0xC1"}), Json::array({0x12, 0xC2})}));
+    REQUIRE(loaded);
+    REQUIRE(loaded->chest_members.at(0x11) == 0xC1);
+    REQUIRE(loaded->chest_members.at(0x12) == 0xC2);
+    REQUIRE_FALSE(load(Json::array({Json::array({"0x11", "0xC1"}), Json::array({"0x11", "0xC3"})})));
+    REQUIRE_FALSE(load(Json::array({Json::array({0, 1})})));
+}
+
+TEST_CASE("OoT chest transaction codec preserves part receipts", "[core][oot_coop]") {
+    Change give{Kind::Item, "peer", 7, Coop::PackItem({2, 0, {0, 0, 0, 0}}), 1};
+    give.name = "Test_Reward";
+    give.source = Coop::World::Origin::Chest(101);
+    give.chest_transaction = 51;
+    give.chest_part = 1;
+    give.chest_final = true;
+    auto packet = Coop::EncodeChange(give);
+    REQUIRE(Coop::DecodeChange(packet) == give);
+    for (const auto* field : {"chest_transaction", "chest_part", "chest_final", "origin_key"}) {
+        auto bad = packet;
+        bad.erase(field);
+        REQUIRE_FALSE(Coop::DecodeChange(bad));
+    }
+    packet["chest_part"] = Coop::Chest::Claims::PartLimit;
+    REQUIRE_FALSE(Coop::DecodeChange(packet));
+    packet["chest_part"] = false;
+    REQUIRE_FALSE(Coop::DecodeChange(packet));
+}
+
+TEST_CASE("OoT co-op animation hello requires the exact table hash", "[core][oot_coop]") {
+    Coop::Hello hello;
+    hello.client_id = "synthetic";
+    hello.animation_hash = std::string(64, 'a');
+    auto packet = Coop::EncodeHello(hello);
+    REQUIRE(packet.at("version") == 4);
+    REQUIRE(packet.at("animation").at("av") == 1);
+    packet["type"] = "hello_ack";
+    REQUIRE(Coop::MatchesHello(packet, hello));
+    packet["animation"]["av"] = 1.0;
+    REQUIRE_FALSE(Coop::MatchesHello(packet, hello));
+    packet["animation"]["av"] = 1;
+    packet["animation"]["table_sha256"] = std::string(64, 'b');
+    REQUIRE_FALSE(Coop::MatchesHello(packet, hello));
+    packet.erase("animation");
+    REQUIRE_FALSE(Coop::MatchesHello(packet, hello));
+}

@@ -41,6 +41,11 @@ def grant(seq=1, *, origin="a", key=1, kind="bool_set", value=True):
             "hash" if kind == "bool_set" else "actor": key, "value": value}
 
 
+def item(seq=1, **changes):
+    return dict({"type": "item_give", "origin": "a", "seq": seq, "name": "Item_X",
+                 "category": 6, "count": 1, "get": 7, "flags": [0, 0, 0, 0]}, **changes)
+
+
 def pose(**changes):
     return dict({"type": "pose", "t": 1234, "banc": "Field_1", "child": True, "loading": False,
                  "pos": [-46.09, 118.46, 15.39], "yaw": 108.6, "anim": "walk", "anim_seq": 3,
@@ -79,12 +84,15 @@ class ProtocolTests(unittest.TestCase):
         return relay.Relay()
 
     @staticmethod
-    def stalled(server, client_id, **kwargs):
+    def stalled(server, client_id, equipment=None, **kwargs):
         """A real relay Client whose write loop never runs: its outbox only fills."""
         closed = []
         peer = relay.Client(None, SimpleNamespace(close=lambda: closed.append(True)))
         peer.closed = closed
-        server.join(peer, client_sim.ClientSim(client_id, **kwargs).hello)
+        hello = client_sim.ClientSim(client_id, **kwargs).hello
+        if equipment is not None:
+            hello["ghost_equipment_v2"] = equipment
+        server.join(peer, hello)
         return peer
 
     @staticmethod
@@ -231,6 +239,228 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(len(snapshot["replay"]), 512)
         self.assertEqual(materialize(snapshot), team.current)
 
+    def test_key_gains_are_events_not_state(self):
+        def key(seq, delta=1, **extra):
+            return dict({"type": "key_add", "origin": "b", "seq": seq, "hash": 0x1234, "delta": delta}, **extra)
+        for bad in (key(1, 0), key(1, -1), key(1, 33), key(1, True), key(1, hash=0), key(1, value=True)):
+            with self.subTest(bad=bad), self.assertRaises(relay.ProtocolError):
+                relay.validate_change(bad, "b")
+        team = relay.Team()
+        self.assertEqual(team.accept(key(1), set())["rev"], 1)
+        self.assertIsNone(team.accept(key(1), set()))  # duplicate: not a second key
+        self.assertEqual(team.accept(key(2, 2), set())["rev"], 2)
+        self.assertEqual(team.current, {})
+        self.assertEqual([p["delta"] for p in team.snapshot()["replay"]], [1, 2])
+
+    def test_item_give_may_carry_its_chest(self):
+        give = {"type": "item_give", "origin": "b", "seq": 1, "name": "Item_X", "category": 6, "count": 1,
+                "get": 7, "flags": [0, 0, 1, 0]}
+        relay.validate_change(dict(give, origin_key=0xC1), "b")
+        for bad in (0, -1, 1 << 32, "c1", True):
+            with self.subTest(bad=bad), self.assertRaises(relay.ProtocolError):
+                relay.validate_change(dict(give, origin_key=bad), "b")
+        with self.assertRaises(relay.ProtocolError):
+            relay.validate_change(dict({"type": "key_add", "origin": "b", "seq": 1, "hash": 5, "delta": 1},
+                                       origin_key=1), "b")
+
+    def test_world_origin_union_roundtrip_and_validation(self):
+        key = (1 << 64) - 1
+        sources = ({}, {"origin_kind": "none"}, {"origin_key": 17},
+                   {"origin_kind": "chest", "origin_key": 17},
+                   {"origin_kind": "bit", "origin_key64": key},
+                   {"origin_kind": "token", "origin_key64": key, "origin_partner": 37})
+        for source in sources:
+            with self.subTest(source=source):
+                packet = item(**source)
+                relay.validate_change(packet, "a")
+                self.assertEqual(relay.decode(relay.encode(packet)), packet)
+        bad_sources = (
+            {"origin_kind": []}, {"origin_kind": "other"}, {"origin_kind": "none", "origin_key": 1},
+            {"origin_kind": "chest"}, {"origin_kind": "chest", "origin_key": 1 << 32},
+            {"origin_key64": 7}, {"origin_kind": "bit"},
+            {"origin_kind": "bit", "origin_key": 1, "origin_key64": 7},
+            {"origin_kind": "bit", "origin_key64": 0}, {"origin_kind": "bit", "origin_key64": -1},
+            {"origin_kind": "bit", "origin_key64": 1 << 64},
+            {"origin_kind": "bit", "origin_key64": True},
+            {"origin_kind": "bit", "origin_key64": "18446744073709551615"},
+            {"origin_kind": "token", "origin_key64": 7},
+            {"origin_kind": "token", "origin_key64": 7, "origin_partner": 7},
+            {"origin_kind": "token", "origin_key64": 7, "origin_partner": 0},
+            {"origin_kind": "token", "origin_key64": 7, "origin_partner": 1 << 64},
+        )
+        for source in bad_sources:
+            with self.subTest(source=source), self.assertRaises(relay.ProtocolError):
+                relay.validate_change(item(**source), "a")
+
+    def test_world_benefit_dedupe_is_typed_and_survives_replay_eviction(self):
+        team = relay.Team()
+        key = (1 << 63) + 17
+        packet = item(origin_kind="bit", origin_key64=key)
+        self.assertIsNotNone(team.accept(packet, set()))
+        self.assertIsNone(team.accept(packet, set()))
+        self.assertIsNone(team.accept(dict(packet, seq=2), set()))
+        self.assertIsNone(team.accept(dict(packet, seq=1, origin="b"), set()))
+        self.assertEqual(team.seen, {"a": 2, "b": 1})
+        self.assertIsNotNone(team.accept(item(3, origin_kind="bit", origin_key64=17), set()))
+        self.assertIsNotNone(team.accept(item(4, origin_kind="chest", origin_key=17), set()))
+        self.assertIsNotNone(team.accept(item(5, origin_key=17), set()))
+        # Chest sources are not relay receipts: the clients' ChestClaims pick one opener (C13).
+        self.assertIsNotNone(team.accept(item(2, origin="b", origin_key=17), set()))
+        for seq in range(6, relay.MAX_REPLAY + 10):
+            self.assertIsNotNone(team.accept(item(seq), set()))
+        self.assertNotIn(packet["seq"], [p["seq"] for p in team.replay])
+        self.assertIsNone(team.accept(dict(packet, origin="c"), set()))
+        self.assertEqual(len(team.benefit_receipts), 2)
+
+    def test_world_chest_bundle_keeps_every_give(self):
+        team = relay.Team()
+        for seq in range(1, 4):
+            packet = item(seq, origin_key=17, name="Item_" + str(seq))
+            self.assertIsNotNone(team.accept(packet, set()))
+            self.assertIsNone(team.accept(packet, set()))
+        self.assertEqual(len(team.replay), 3)
+        self.assertEqual(team.benefit_receipts, set())
+
+    def test_chest_legacy_semantic_retry_reaches_client_receipts(self):
+        team = relay.Team()
+        packet = item(origin_key=17)
+        self.assertIsNotNone(team.accept(packet, set()))
+        self.assertIsNone(team.accept(packet, set()))
+        # A fresh wire seq is not a new benefit; the receiver's retained chest receipt decides.
+        retry = dict(packet, seq=2)
+        forwarded = team.accept(retry, set())
+        self.assertEqual(forwarded["origin_key"], 17)
+        self.assertEqual(team.benefit_receipts, set())
+        self.assertEqual(team.current, {})
+
+    def test_chest_transactions_preserve_parts_and_reject_bad_metadata(self):
+        team = relay.Team()
+        base = item(origin_key=17, chest_transaction=51, chest_part=0, chest_final=False)
+        first = team.accept(base, set())
+        last = team.accept(dict(base, seq=2, chest_part=1, chest_final=True), set())
+        self.assertEqual(first["chest_transaction"], last["chest_transaction"])
+        self.assertEqual([p["chest_part"] for p in team.replay], [0, 1])
+        self.assertEqual([p["chest_final"] for p in team.replay], [False, True])
+        self.assertIsNone(team.accept(base, set()))
+        self.assertEqual(team.benefit_receipts, set())
+        self.assertEqual(team.current, {})
+        for field, bad in (("chest_transaction", 0), ("chest_transaction", True),
+                           ("chest_transaction", relay.MAX_SEQ + 1), ("chest_part", -1),
+                           ("chest_part", 64), ("chest_part", True), ("chest_final", 1)):
+            with self.subTest(field=field, bad=bad), self.assertRaises(relay.ProtocolError):
+                relay.validate_change(dict(base, **{field: bad}), "a")
+        for field in ("chest_transaction", "chest_part", "chest_final", "origin_key"):
+            bad = dict(base)
+            del bad[field]
+            with self.subTest(missing=field), self.assertRaises(relay.ProtocolError):
+                relay.validate_change(bad, "a")
+
+    def test_world_token_flags_share_origin_but_not_benefit_receipt(self):
+        source = {"origin_kind": "token", "origin_key64": (1 << 63) + 9,
+                  "origin_partner": (1 << 63) + 11}
+        for flags_first in (False, True):
+            with self.subTest(flags_first=flags_first):
+                team = relay.Team()
+                packets = [dict(grant(kind="bit_set", key=source[key]), **source)
+                           for key in ("origin_key64", "origin_partner")]
+                packets.insert(2 if flags_first else 0, item(**source))
+                for seq, packet in enumerate(packets, 1):
+                    self.assertIsNotNone(team.accept(dict(packet, seq=seq), set()))
+                self.assertEqual(len(team.benefit_receipts), 1)
+                self.assertEqual(len(team.current), 2)
+                self.assertIsNone(team.accept(item(4, **source), set()))
+                self.assertIsNone(team.accept(item(1, origin="b", **source), set()))
+        for bad in (dict(grant(kind="bit_set", key=5), **source),
+                    dict(grant(kind="bit_set"), origin_kind="chest", origin_key=1)):
+            with self.assertRaises(relay.ProtocolError):
+                relay.validate_change(bad, "a")
+
+    def test_world_origin_receipt_limit_is_transactional(self):
+        team = relay.Team()
+        with mock.patch.object(relay, "MAX_ORIGIN_RECEIPTS", 1):
+            team.accept(item(origin_kind="bit", origin_key64=7), set())
+            before = relay.encode(team.snapshot())
+            with self.assertRaisesRegex(relay.ProtocolError, "receipt capacity"):
+                team.accept(item(2, origin_kind="bit", origin_key64=8), set())
+            self.assertEqual(relay.encode(team.snapshot()), before)
+            self.assertEqual(team.benefit_receipts, {("bit", 7)})
+            self.assertIsNone(team.accept(item(2, origin_kind="bit", origin_key64=7), set()))
+
+    def test_world_denied_origin_does_not_claim_benefit(self):
+        team = relay.Team()
+        packet = item(origin_kind="token", origin_key64=17, origin_partner=19)
+        self.assertIsNone(team.accept(packet, {19}))
+        self.assertEqual(team.benefit_receipts, set())
+        self.assertIsNotNone(team.accept(dict(packet, seq=2), set()))
+
+    def test_world_wallet_baseline_validation_and_passthrough(self):
+        server = self.memory_server()
+        wallet = {"balance": 23, "capacity": 99}
+        a = self.peer(server, "a", world_wallet=wallet)
+        b = self.peer(server, "b")
+        snapshot = next(p for p in b.messages if p["type"] == "team_state")
+        self.assertEqual(snapshot["world_wallet"], {"a": wallet})
+        presence = next(p for p in b.messages if p["type"] == "client_state")
+        self.assertEqual(presence["state"]["world_wallet"], wallet)
+        updated = {"balance": 40, "capacity": 99}
+        server.receive(b, {"type": "team_state_request", "world_wallet": updated})
+        self.assertEqual(b.messages[-1]["world_wallet"], {"a": wallet, "b": updated})
+        self.assertEqual(a.messages[-1]["state"]["world_wallet"], updated)
+        for bad in (None, [], {}, {"balance": 0}, {"balance": -1, "capacity": 99},
+                    {"balance": True, "capacity": 99}, {"balance": 100, "capacity": 99},
+                    {"balance": 0, "capacity": 1 << 31},
+                    {"balance": 0, "capacity": 99, "extra": 1}):
+            with self.subTest(wallet=bad):
+                hello = dict(client_sim.ClientSim("c").hello, world_wallet=bad)
+                with self.assertRaises(relay.ProtocolError):
+                    relay.validate_hello(hello)
+                before = dict(b.state)
+                with self.assertRaises(relay.ProtocolError):
+                    server.receive(b, {"type": "team_state_request", "world_wallet": bad})
+                with self.assertRaises(relay.ProtocolError):
+                    server.receive(b, {"type": "client_state", "state": {"world_wallet": bad}})
+                self.assertEqual(b.state, before)
+
+    def test_world_origin_controller_syntax(self):
+        self.assertEqual(client_sim.origin_fields("bit:ffffffffffffffff"),
+                         {"origin_kind": "bit", "origin_key64": (1 << 64) - 1})
+        self.assertEqual(client_sim.origin_fields("token:11:13"),
+                         {"origin_kind": "token", "origin_key64": 17, "origin_partner": 19})
+        self.assertEqual(client_sim.origin_fields("chest:11"),
+                         {"origin_kind": "chest", "origin_key": 17})
+        for value in ("token:11:11", "bit:10000000000000000", "chest:100000000", "none:1", "other"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                client_sim.origin_fields(value)
+
+    def test_world_controller_without_sockets(self):
+        peer = fake_peer.FakePeer(wallet=WALLET)
+        sent = []
+        peer.client.send = mock.AsyncMock(side_effect=sent.append)
+        peer.wait = mock.AsyncMock(return_value={"type": "team_state"})
+        peer.client.writer = SimpleNamespace(write=sent.append, drain=mock.AsyncMock())
+
+        def command(text):
+            with self.assertRaises(StopIteration) as done:
+                peer.command(text).send(None)
+            return done.exception.value
+
+        packet = command("item Item_X 6 1 origin=token:8000000000000011:8000000000000013")["item"]
+        self.assertEqual(packet["origin_key64"], (1 << 63) + 17)
+        self.assertEqual(packet["origin_partner"], (1 << 63) + 19)
+        command("bit 8000000000000011 origin=token:8000000000000011:8000000000000013")
+        flag = relay.decode(sent[-1])
+        self.assertEqual(flag["actor"], packet["origin_key64"])
+        self.assertEqual(flag["origin_partner"], packet["origin_partner"])
+        command("wallet 23 99")
+        self.assertEqual(sent[-1], {"type": "team_state_request",
+                                    "world_wallet": {"balance": 23, "capacity": 99}})
+        self.assertEqual(command("itemk 11 Item_X 6 1")["item"]["origin_key"], 17)
+        for text in ("item Item_X 6 1 origin=bit:10000000000000000",
+                     "item Item_X 6 1 origin=bit:11 origin=bit:13",
+                     "item Item_X 6 1 7 0 0 0", "wallet 100 99"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                peer.command(text).send(None)
+
     def test_noop_highwater_and_deny(self):
         team = relay.Team()
         self.assertIsNone(team.accept(grant(3, value=False), set()))
@@ -354,7 +584,133 @@ class ProtocolTests(unittest.TestCase):
         hello = dict(client_sim.ClientSim("a").hello, version=2)
         with self.assertRaisesRegex(relay.ProtocolError, "protocol version mismatch"):
             relay.validate_hello(hello)
-        self.assertEqual(relay.VERSION, 3)
+        self.assertEqual((relay.LEGACY_VERSION, relay.VERSION), (3, 4))
+
+    def test_animation_hello_validation(self):
+        packet = dict(client_sim.ClientSim("a").hello, version=4,
+                      animation={"av": 1, "table_sha256": "a" * 64})
+        relay.validate_hello(packet)
+        for animation in (None, [], {}, {"av": 2, "table_sha256": "a" * 64},
+                          {"av": True, "table_sha256": "a" * 64},
+                          {"av": 1, "table_sha256": "A" * 64},
+                          {"av": 1, "table_sha256": "a" * 63},
+                          {"av": 1, "table_sha256": "a" * 64, "extra": 1}):
+            with self.subTest(animation=animation), self.assertRaises(relay.ProtocolError):
+                relay.validate_hello(dict(packet, animation=animation))
+        with self.assertRaises(relay.ProtocolError):
+            relay.validate_hello(dict(packet, version=3))
+
+    def test_animation_pose_validation(self):
+        packet = pose(av=1, aid=1, af=3.125, ar=1.5, aseq=0xffffffff)
+        relay.validate_pose(packet)
+        relay.validate_pose(dict(packet, aid=0, af=None, ar=0, aseq=0))
+        for changes in ({"av": 2}, {"av": True}, {"av": 1.0}, {"aid": -1},
+                        {"aid": 1.0}, {"aid": True}, {"aid": 1 << 32}, {"aseq": 0.5},
+                        {"aseq": -1}, {"aseq": 1 << 32}, {"ar": -0.1}, {"ar": 4.01},
+                        {"ar": float("nan")}, {"ar": float("inf")}, {"af": float("nan")},
+                        {"af": float("inf")}, {"af": -1}, {"af": True}, {"af": 1000001}):
+            with self.subTest(changes=changes), self.assertRaises(relay.ProtocolError):
+                relay.validate_pose(dict(packet, **changes))
+        for key in relay.ANIM_POSE_FIELDS:
+            missing = dict(packet)
+            del missing[key]
+            with self.subTest(missing=key), self.assertRaises(relay.ProtocolError):
+                relay.validate_pose(missing)
+
+    def test_animation_negotiation_and_presence(self):
+        server = self.memory_server()
+        descriptor = {"av": 1, "table_sha256": "a" * 64}
+        a = self.stalled(server, "a", animation=descriptor)
+        b = self.stalled(server, "b", animation=descriptor)
+        mismatch = self.stalled(server, "m", animation={"av": 1, "table_sha256": "b" * 64})
+        legacy = self.stalled(server, "old")
+        self.assertEqual(self.queued(a)[0]["animation"], descriptor)
+        self.assertEqual(self.queued(a)[0]["version"], 4)
+        self.assertEqual(self.queued(legacy)[0]["version"], 3)
+        self.assertTrue(all("animation" not in p.get("state", {}) for p in self.queued(legacy)))
+        presence = [p for p in self.queued(b) if p["type"] == "client_state" and p["origin"] == "a"]
+        self.assertEqual(presence[0]["state"]["animation"], descriptor)
+        for peer in (a, b, mismatch, legacy):
+            self.drain(peer)
+        packet = pose(av=1, aid=7, af=None, ar=1, aseq=9)
+        server.receive(a, packet)
+        self.assertEqual(self.queued(b), [dict(packet, origin="a")])
+        for peer in (mismatch, legacy):
+            self.assertEqual(self.queued(peer), [dict(pose(), origin="a")])
+        with self.assertRaisesRegex(relay.ProtocolError, "not negotiated"):
+            server.receive(legacy, packet)
+        self.drain(b)
+        server.receive(a, {"type": "client_state", "state": {"animation": {"forged": True}}})
+        self.assertEqual(self.queued(b)[0]["state"]["animation"], descriptor)
+
+    def test_forwarded_animation_pose_size_includes_origin(self):
+        server = self.memory_server()
+        a = self.stalled(server, "a" * 64, animation={"av": 1, "table_sha256": "a" * 64})
+        packet = pose(av=1, aid=7, af=2.5, ar=1, aseq=1)
+        payload_size = len(relay.encode(packet)) - 4
+        with mock.patch.object(relay, "MAX_POSE_FRAME", payload_size + 1):
+            relay.validate_pose(packet)
+            with self.assertRaisesRegex(relay.ProtocolError, "after origin"):
+                server.receive(a, packet)
+
+    def test_animation_late_join_gets_negotiation_but_no_cached_pose(self):
+        server = self.memory_server()
+        descriptor = {"av": 1, "table_sha256": "d" * 64}
+        a = self.stalled(server, "a", animation=descriptor)
+        b = self.stalled(server, "b", animation=descriptor)
+        server.receive(a, pose(av=1, aid=7, af=3, ar=0, aseq=1))
+        late = self.stalled(server, "late", animation=descriptor)
+        mismatch = self.stalled(server, "mismatch", animation={"av": 1, "table_sha256": "e" * 64})
+        for peer in (late, mismatch):
+            packets = self.queued(peer)
+            self.assertFalse(any(p["type"] == "pose" for p in packets))
+            presence = next(p for p in packets if p["type"] == "client_state" and p["origin"] == "a")
+            self.assertEqual(presence["state"]["animation"], descriptor)
+            self.drain(peer)
+        server.receive(a, pose(av=1, aid=7, af=4, ar=0, aseq=1))
+        self.assertEqual(self.queued(late)[0]["af"], 4)
+        self.assertNotIn("aid", self.queued(mismatch)[0])
+        self.assertFalse(any("aid" in p for p in a.team.snapshot()["replay"]))
+
+    def test_animation_sidecar_hashes_exact_bytes_and_is_bounded(self):
+        import hashlib
+        data = b'{"synthetic": true}\n'
+        with mock.patch.object(client_sim.Path, "open", mock.mock_open(read_data=data)):
+            self.assertEqual(client_sim.animation_descriptor("synthetic.json"),
+                             {"av": 1, "table_sha256": hashlib.sha256(data).hexdigest()})
+        for invalid in (b"", b"x" * (16 * 1024 * 1024 + 1)):
+            with mock.patch.object(client_sim.Path, "open", mock.mock_open(read_data=invalid)), \
+                    self.assertRaises(ValueError):
+                client_sim.animation_descriptor("synthetic.json")
+
+    def test_animation_client_refuses_unmatched_peer(self):
+        client = client_sim.ClientSim("a", animation={"av": 1, "table_sha256": "a" * 64})
+        with self.assertRaisesRegex(ValueError, "matching"):
+            client.pose_packet("Field_1", True, [0, 0, 0], 0, aid=7)
+        client.peer_animations["b"] = {"av": 1, "table_sha256": "b" * 64}
+        with self.assertRaises(ValueError):
+            client.pose_packet("Field_1", True, [0, 0, 0], 0, aid=7)
+        client.peer_animations["b"] = client.hello["animation"]
+        packet = client.pose_packet("Field_1", True, [0, 0, 0], 0, aid=7, af=2.125, ar=0, aseq=3)
+        self.assertEqual((packet["aid"], packet["af"], packet["ar"], packet["aseq"]), (7, 2.125, 0, 3))
+
+    def test_animation_fake_peer_commands_without_transport(self):
+        async def commands():
+            peer = fake_peer.FakePeer()
+            descriptor = {"av": 1, "table_sha256": "f" * 64}
+            peer.client.hello.update(version=4, animation=descriptor)
+            peer.client.peer_animations["synthetic"] = descriptor
+            peer.client.send = mock.AsyncMock()
+            first = (await peer.command("pose Field_1 1 0 0 0 0 aid=7 af=0 ar=0"))["sent"]
+            second = (await peer.command("pose Field_1 1 0 0 0 0 aid=7 af=4.125 ar=1 aseq=1"))["sent"]
+            third = (await peer.command("pose Field_1 1 0 0 0 0 aid=7 af=null ar=1"))["sent"]
+            self.assertEqual((first["aseq"], second["aseq"], third["aseq"]), (1, 1, 2))
+            self.assertEqual((second["af"], third["af"]), (4.125, None))
+            for options in ("aid=1.5", "aid=7 ar=nan", "aid=7 af=inf", "af=3", "aid=7 aid=8"):
+                with self.subTest(options=options), self.assertRaises(ValueError):
+                    await peer.command("pose Field_1 1 0 0 0 0 " + options)
+            self.assertEqual(peer.client.send.await_count, 3)
+        asyncio.run(commands())
 
     def test_pose_validation(self):
         relay.validate_pose(pose())
@@ -371,6 +727,127 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(relay.ProtocolError, "too large"):
             relay.validate_pose(pose(), size=relay.MAX_POSE_FRAME + 1)
         relay.validate_pose(pose(), size=relay.MAX_POSE_FRAME)
+
+    def test_equipment_hello_capability(self):
+        hello = client_sim.ClientSim("a").hello
+        for flag in (True, False):
+            relay.validate_hello(dict(hello, ghost_equipment_v2=flag))
+        for flag in (0, 1, "true", None, []):
+            with self.subTest(flag=flag), self.assertRaises(relay.ProtocolError):
+                relay.validate_hello(dict(hello, ghost_equipment_v2=flag))
+        server = self.memory_server()
+        enabled = self.stalled(server, "enabled", equipment=True)
+        disabled = self.stalled(server, "disabled", equipment=False)
+        legacy = self.stalled(server, "legacy")
+        self.assertIs(self.queued(enabled)[0]["ghost_equipment_v2"], True)
+        self.assertIs(self.queued(disabled)[0]["ghost_equipment_v2"], False)
+        self.assertNotIn("ghost_equipment_v2", self.queued(legacy)[0])
+
+    def test_equipment_codec_fields_exhaustive(self):
+        base = 0x10000000
+        fields = ((0, 3, {0, 1, 2, 3, 7}), (3, 3, {0, 1, 2, 3, 7}),
+                  (6, 2, set(range(4))), (8, 2, set(range(4))),
+                  (10, 2, set(range(4))), (12, 2, set(range(4))),
+                  (14, 4, set(range(11)) | {15}), (18, 2, {0, 1, 3}), (20, 1, {0, 1}))
+        for shift, width, allowed in fields:
+            for value in range(1 << width):
+                packet = pose(eq32=base | (value << shift), eqseq=65535,
+                              child=not (shift == 18 and value == 1))
+                with self.subTest(shift=shift, value=value):
+                    if value in allowed:
+                        relay.validate_pose(packet)
+                    else:
+                        with self.assertRaises(relay.ProtocolError):
+                            relay.validate_pose(packet)
+        # Transitional ID/state combinations are valid snapshots, settled by the receiver.
+        relay.validate_pose(pose(eq32=base | (1 << 6), eqseq=0))
+        relay.validate_pose(pose(eq32=base | 1, eqseq=0))
+
+    def test_equipment_malformed_and_age_validation(self):
+        for word in (-1, 1 << 32, True, 0, 0x10200000, 0x10080000, 0x10000004,
+                     0x1002C000, 0x20000000, 1.0, "268435456", None):
+            with self.subTest(word=word), self.assertRaises(relay.ProtocolError):
+                relay.validate_pose(pose(eq32=word, eqseq=0))
+        for bit in range(21, 28):
+            with self.subTest(bit=bit), self.assertRaises(relay.ProtocolError):
+                relay.validate_pose(pose(eq32=0x10000000 | (1 << bit), eqseq=0))
+        for seq in (-1, 65536, True, 1.0, "1", None):
+            with self.subTest(seq=seq), self.assertRaises(relay.ProtocolError):
+                relay.validate_pose(pose(eq32=0x10000000, eqseq=seq))
+        for extra in ({"eq32": 0x10000000}, {"eqseq": 0}):
+            with self.subTest(extra=extra), self.assertRaises(relay.ProtocolError):
+                relay.validate_pose(pose(**extra))
+        for child in (False, True):
+            relay.validate_pose(pose(child=child, eq32=0x100C0000, eqseq=0))
+            with self.assertRaises(relay.ProtocolError):
+                relay.validate_pose(pose(child=child, eq32=0x10000000 | (int(child) << 18), eqseq=0))
+
+    def test_equipment_pose_has_a_bounded_extended_budget(self):
+        # One limit for every pose: the worst case with all animation and equipment fields
+        # and the relay-added origin still fits MAX_POSE_FRAME.
+        packet = pose(banc="x" * 63, t=(1 << 32) - 1, pos=[-100000, -100000, -100000],
+                      eq32=0x10000000, eqseq=65535, av=1, aid=(1 << 32) - 1, af=999999.9921875,
+                      ar=3.9999998, aseq=(1 << 32) - 1)
+        relay.validate_pose(packet)
+        forwarded = dict(packet, origin="f" * 64)
+        self.assertLessEqual(len(relay.encode(forwarded)) - 4, relay.MAX_POSE_FRAME)
+        relay.validate_pose(packet, size=relay.MAX_POSE_FRAME)
+        with self.assertRaisesRegex(relay.ProtocolError, "too large"):
+            relay.validate_pose(packet, size=relay.MAX_POSE_FRAME + 1)
+        with self.assertRaisesRegex(relay.ProtocolError, "too large"):
+            relay.validate_pose(pose(), size=relay.MAX_POSE_FRAME + 1)
+
+    def test_equipment_negotiation_forwarding_and_coalescing(self):
+        server = self.memory_server()
+        a = self.stalled(server, "a", equipment=True)
+        b = self.stalled(server, "b", equipment=True)
+        legacy = self.stalled(server, "legacy")
+        for peer in (a, b, legacy):
+            self.drain(peer)
+        server.receive(a, pose(eq32=0x10000001, eqseq=65535))
+        server.receive(a, pose(t=1235, eq32=0x10000002, eqseq=0))
+        self.assertEqual(len(b.outbox), 1)
+        self.assertEqual((self.queued(b)[0]["eq32"], self.queued(b)[0]["eqseq"]), (0x10000002, 0))
+        self.assertNotIn("eq32", self.queued(legacy)[0])
+        self.assertNotIn("eqseq", self.queued(legacy)[0])
+        self.assertEqual(a.team.snapshot()["changes"], [])
+        self.assertEqual(a.team.snapshot()["replay"], [])
+        with self.assertRaisesRegex(relay.ProtocolError, "not negotiated"):
+            server.receive(legacy, pose(eq32=0x10000000, eqseq=0))
+
+    def test_equipment_fake_peer_commands_without_sockets(self):
+        peer = fake_peer.FakePeer()
+        peer.client.ack = {"ghost_equipment_v2": True}
+        peer.client.send = mock.AsyncMock()
+        for options, expected in (("eq32=0x10000081", 1), ("eq32=0x10100081", 1),
+                                  ("eq32=0x100fffff", 1), ("eq32=0x10000081", 1),
+                                  ("eq32=0x10000002", 1),
+                                  ("eq32=0x10000082 eqseq=65535", 65535),
+                                  ("eq32=0x10000083", 0)):
+            with self.assertRaises(StopIteration) as done:
+                peer.command("pose Field_1 1 0 0 0 0 " + options).send(None)
+            self.assertEqual(done.exception.value["sent"]["eqseq"], expected)
+        self.assertEqual(peer.client.send.await_count, 7)
+        for options in ("eqseq=1", "eq32=0", "eq32=0x10000000 eqseq=65536",
+                        "eq32=0x10000000 eq32=0x10000000", "unknown=1"):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                peer.command("pose Field_1 1 0 0 0 0 " + options).send(None)
+        peer.client.ack = {}
+        with self.assertRaisesRegex(ValueError, "not negotiated"):
+            peer.command("pose Field_1 1 0 0 0 0 eq32=0x10000000").send(None)
+
+    def test_fake_peer_poseequip_sets_what_streams_carry(self):
+        peer = fake_peer.FakePeer()
+        with self.assertRaises(StopIteration) as done:
+            peer.command("poseequip 0x10040292 child=0").send(None)
+        self.assertEqual(done.exception.value, {"stream_eq32": 0x10040292, "stream_child": False})
+        self.assertEqual((peer.stream_eq32, peer.stream_child), (0x10040292, False))
+        for bad in ("poseequip 0x10000289 child=0", "poseequip", "poseequip 0x10000289 child=2"):
+            with self.subTest(bad=bad), self.assertRaises((ValueError, relay.ProtocolError)):
+                peer.command(bad).send(None)
+        with self.assertRaises(StopIteration) as done:
+            peer.command("poseequip off child=1").send(None)
+        self.assertEqual((peer.stream_eq32, peer.stream_child), (None, True))
 
     def test_pose_forwarded_to_team_only_with_origin_and_no_ack(self):
         server = self.memory_server()
@@ -710,11 +1187,33 @@ class FakePeerTests(unittest.IsolatedAsyncioTestCase):
         self.peer = fake_peer.FakePeer(port=0, room="r", team="t", policy="p", wallet=WALLET)
         self.port = await self.peer.start()
         self.emu = client_sim.ClientSim("emu", room="r", team="t", policy_id="p")
+        self.emu.hello["ghost_equipment_v2"] = True
         await self.emu.connect("127.0.0.1", self.port)
 
     async def asyncTearDown(self):
         await self.emu.close()
         await self.peer.close()
+
+    async def test_animation_pose_commands_and_same_sequence_steps(self):
+        await self.emu.close()
+        await self.peer.close()
+        descriptor = {"av": 1, "table_sha256": "c" * 64}
+        with mock.patch.object(fake_peer.client_sim, "animation_descriptor", return_value=descriptor):
+            self.peer = fake_peer.FakePeer(port=0, anim_table="synthetic.json")
+        self.port = await self.peer.start()
+        self.emu = client_sim.ClientSim("emu", animation=descriptor)
+        await self.emu.connect("127.0.0.1", self.port)
+        await self.peer.wait(lambda p: p.get("type") == "client_state" and p.get("origin") == "emu", 2)
+        first = (await self.peer.command("pose Field_1 1 0 0 0 90 aid=7 af=0 ar=0"))["sent"]
+        got = await self.emu.receive_pose(since=0)
+        self.assertEqual((got["aid"], got["af"], got["ar"], got["aseq"]), (7, 0, 0, 1))
+        second = (await self.peer.command("pose Field_1 1 0 0 0 90 aid=7 af=4.125 ar=1 aseq=1"))["sent"]
+        self.assertEqual((second["aseq"], second["af"]), (first["aseq"], 4.125))
+        third = (await self.peer.command("pose Field_1 1 0 0 0 90 aid=7 af=null ar=1"))["sent"]
+        self.assertEqual((third["aseq"], third["af"]), (2, None))
+        for options in ("aid=1.5", "aid=7 ar=nan", "aid=7 af=inf", "af=3", "aid=7 aid=8"):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                await self.peer.command("pose Field_1 1 0 0 0 0 " + options)
 
     async def test_records_the_emulator_broadcast(self):
         await self.emu.change("bool_set", hash=0xC1, value=True)
@@ -743,6 +1242,24 @@ class FakePeerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(materialize(state), {})
         with self.assertRaises(ValueError):
             await self.peer.command("rupee")
+
+    async def test_world_controller_transaction_and_wallet_baseline(self):
+        command = "item Item_X 6 1 origin=token:8000000000000011:8000000000000013"
+        await self.peer.command(command)
+        received = await self.emu.receive("item_give")
+        self.assertEqual(received["origin_key64"], (1 << 63) + 17)
+        self.assertEqual(received["origin_partner"], (1 << 63) + 19)
+        await self.peer.command(command)
+        with self.assertRaises(TimeoutError):
+            await self.emu.receive("item_give", timeout=0.05)
+        await self.peer.command("bit 8000000000000011 8000000000000013 "
+                                "origin=token:8000000000000011:8000000000000013")
+        flags = [await self.emu.receive("bit_set") for _ in range(2)]
+        self.assertEqual({flag["actor"] for flag in flags}, {(1 << 63) + 17, (1 << 63) + 19})
+        self.assertTrue(all(flag["origin_kind"] == "token" for flag in flags))
+        snapshot = await self.peer.command("wallet 23 99")
+        self.assertEqual(snapshot["world_wallet"][self.peer.client.hello["client_id"]],
+                         {"balance": 23, "capacity": 99})
 
     async def test_snapshot_replays_grants_made_before_the_emulator_joined(self):
         late = client_sim.ClientSim("late", room="r", team="t", policy_id="p")
@@ -781,6 +1298,23 @@ class FakePeerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):  # refused locally, so the peer's session survives
             await self.peer.command("pose bad-banc 1 0 0 0 0")
         self.assertIn("state", await self.peer.command("state"))
+
+    async def test_equipment_pose_command_and_sequence(self):
+        count = 0
+        for options, expected in (("eq32=0x10000081", 1), ("eq32=0x10100081", 1),
+                                  ("eq32=0x100fffff", 1), ("eq32=0x10000081", 1),
+                                  ("eq32=0x10000002", 1),
+                                  ("eq32=0x10000082 eqseq=65535", 65535),
+                                  ("eq32=0x10000083", 0)):
+            sent = (await self.peer.command("pose Field_1 1 0 0 0 0 " + options))["sent"]
+            got = await self.emu.receive_pose(since=count)
+            count += 1
+            self.assertEqual(sent["eqseq"], expected)
+            self.assertEqual((got["eq32"], got["eqseq"]), (sent["eq32"], expected))
+        for options in ("eqseq=1", "eq32=0", "eq32=0x10000000 eqseq=65536",
+                        "eq32=0x10000000 eq32=0x10000000", "unknown=1"):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                await self.peer.command("pose Field_1 1 0 0 0 0 " + options)
 
     async def test_posecircle_stream_and_stop(self):
         result = await self.peer.command("posecircle Field_1 10 5 -20 100 4 20 0")

@@ -41,22 +41,31 @@ bool AnimName(std::string_view name) {
 Json EncodePose(const Pose& pose) {
     // Two decimals of a metre / degree is plenty for a statue and keeps the frame small.
     const auto round = [](float v) { return std::round(static_cast<double>(v) * 100.0) / 100.0; };
-    return {{"type", "pose"},           {"t", pose.t},
+    Json packet = {{"type", "pose"},           {"t", pose.t},
             {"banc", pose.banc},        {"child", pose.child},
             {"loading", pose.loading},  {"pos", Json::array({round(pose.pos[0]), round(pose.pos[1]), round(pose.pos[2])})},
             {"yaw", round(pose.yaw)},   {"anim", pose.anim},
             {"anim_seq", pose.anim_seq}, {"rate", round(pose.rate)},
             {"phase", std::min(0.99, round(pose.phase))}};
+    if (pose.animation) Anim::EncodeState(packet, *pose.animation);
+    if (pose.equipment) {
+        packet["eq32"] = pose.equipment->word;
+        packet["eqseq"] = pose.equipment->sequence;
+    }
+    return packet;
 }
 
 std::optional<Pose> DecodePose(const Json& packet, std::string* origin) {
     try {
-        if (!packet.is_object() || packet.at("type") != "pose") return {};
+        if (!packet.is_object() || packet.at("type") != "pose" ||
+            packet.dump().size() > PoseFrameLimit) return {};
         const bool forwarded = origin != nullptr;
         for (const auto& [field, value] : packet.items()) {
             if (field == "type" || field == "t" || field == "banc" || field == "child" ||
                 field == "loading" || field == "pos" || field == "yaw" || field == "anim" ||
-                field == "anim_seq" || field == "rate" || field == "phase")
+                field == "anim_seq" || field == "rate" || field == "phase" ||
+                field == "av" || field == "aid" || field == "af" || field == "ar" || field == "aseq" ||
+                field == "eq32" || field == "eqseq")
                 continue;
             if (forwarded && field == "origin") continue;
             return {};
@@ -77,6 +86,10 @@ std::optional<Pose> DecodePose(const Json& packet, std::string* origin) {
         if (!BancName(pose.banc)) return {};
         pose.child = packet.at("child").get<bool>();
         pose.loading = packet.at("loading").get<bool>();
+        if (packet.contains("eq32") || packet.contains("eqseq")) {
+            pose.equipment = Equip::DecodePacket(packet, pose.child);
+            if (!pose.equipment) return {};
+        }
         const auto& pos = packet.at("pos");
         if (!pos.is_array() || pos.size() != 3) return {};
         for (size_t i = 0; i < 3; ++i) {
@@ -99,6 +112,11 @@ std::optional<Pose> DecodePose(const Json& packet, std::string* origin) {
         if (!rate || *rate < 0 || !phase || *phase < 0 || *phase >= 1.0f) return {};
         pose.rate = *rate;
         pose.phase = *phase;
+        if (packet.contains("av") || packet.contains("aid") || packet.contains("af") ||
+            packet.contains("ar") || packet.contains("aseq")) {
+            pose.animation = Anim::DecodeState(packet);
+            if (!pose.animation) return {};
+        }
         return pose;
     } catch (const Json::exception&) {
         return {};
@@ -107,7 +125,7 @@ std::optional<Pose> DecodePose(const Json& packet, std::string* origin) {
 
 Pose Blend(const Pose& a, const Pose& b, float f) {
     f = std::clamp(f, 0.0f, 1.0f);
-    Pose out = b;
+    Pose out = f < 1.0f ? a : b;
     for (size_t i = 0; i < 3; ++i) out.pos[i] = a.pos[i] + (b.pos[i] - a.pos[i]) * f;
     float d = std::fmod(b.yaw - a.yaw, 360.0f);
     if (d > 180.0f) d -= 360.0f;

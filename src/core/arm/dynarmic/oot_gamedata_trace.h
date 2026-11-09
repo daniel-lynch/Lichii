@@ -3,9 +3,12 @@
 
 #pragma once
 
+#include "core/arm/dynarmic/oot_coop_chest.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -17,7 +20,13 @@
 #include <fmt/format.h>
 
 #include "common/common_types.h"
+#include "core/arm/dynarmic/oot_coop_world.h"
 #include "common/nx2_event_trace.h"
+
+namespace Core::OotCoop::Anim {
+struct Keys;
+}
+namespace Core::OotCoop::Equip { struct Keys; }
 
 namespace Kernel {
 class KProcess;
@@ -38,6 +47,8 @@ class KProcess;
 /// - StepApply / PlayedEvent / Frame / StructBoolSet / ActorFlagSet: a `pacibsp` (a no-op).
 /// - BitRead: `ldr w8, [x0, #0xc58]`; BitSet: `mov x8, x0`.
 /// - ItemGive: the `pacibsp` at the entry of the game's give-to-pouch call (co-op item class).
+/// - RupeeAdd: the first instruction of the wallet entry, `mov w8, #0x3bd4` (the pending field's
+///   offset); co-op observes a flow's positive wallet delta there (class rupee).
 namespace Core::OotGameDataTrace {
 
 inline constexpr u64 ProgramId = 0x0400486024DEC000ULL;
@@ -57,8 +68,14 @@ enum class Point : u8 {
     StructBoolSet,
     ActorFlagSet,
     ItemGive,
+    RupeeAdd,
+    Pickup,
+    PickupReturn,
+    ChestInteraction,
+    ChestConfirm,
+    ChestReturn,
 };
-inline constexpr size_t PointCount = 10;
+inline constexpr size_t PointCount = 16;
 
 struct Site {
     Point point;
@@ -71,6 +88,7 @@ inline constexpr u32 Pacibsp = 0xD503237F;  // pacibsp (a hint: dynarmic runs it
 inline constexpr u32 Breakpoint = 0xD4200000; // brk #0
 inline constexpr u32 LdrW8C58 = 0xB94C5808; // ldr w8, [x0, #0xc58]
 inline constexpr u32 MovX8X0 = 0xAA0003E8;  // mov x8, x0
+inline constexpr u32 MovW8Pending = 0x52877A88; // mov w8, #0x3bd4 (the wallet entry's first word)
 
 /// The only instruction Resume can stand in for at `point`.
 constexpr u32 ReplacedInstruction(Point point) {
@@ -78,6 +96,7 @@ constexpr u32 ReplacedInstruction(Point point) {
     case Point::StepSet: return MovW8One;
     case Point::BitRead: return LdrW8C58;
     case Point::BitSet: return MovX8X0;
+    case Point::RupeeAdd: return MovW8Pending;
     case Point::None: return 0;
     default: return Pacibsp;
     }
@@ -147,6 +166,10 @@ struct Profile {
     u64 pouch_cell{};   ///< Module offset of the pouch manager pointer
     u32 wallet_hash{};  ///< GameData key of the wallet (rupee deltas)
     Entry bool_setter, bit_setter, rupee_entry;
+    Entry int_add; ///< GameData Int add (x0 = manager, w1 = delta, w2 = key): class dungeon
+    OotCoop::World::Config world;
+    Entry pickup_entry, death_wrapper;
+    std::vector<Entry> pickup_returns;
     Entry item_entry;               ///< The give-to-pouch call (the ItemGive site's function)
     std::vector<u64> item_callers;  ///< Return addresses (module offsets) of gives to forward
     /// World pickups (class item, sub-class pickup): return addresses of the collect path's give
@@ -154,10 +177,30 @@ struct Profile {
     /// magic, ammo drops) is per-player and only logged.
     std::vector<u64> pickup_callers;
     std::vector<std::string> pickup_names;
+    /// Generic gives (C13, optional "give" object): with it, a give from ANY caller is forwarded
+    /// except our replays, nested gives (return address inside [give_body[0], give_body[1])), the
+    /// per-player callers (sequence/initialisation gives, put-away, bottles, museum), the
+    /// per-player names from a pickup caller (refill drops: hearts, ammo) and the names never
+    /// forwarded from any caller (dungeon items the dungeon class owns). The pickup name allow
+    /// list is then not consulted.
+    bool give_all{};
+    std::array<u64, 2> give_body{};
+    std::vector<u64> give_deny_callers;
+    std::vector<std::string> give_per_player; ///< from the pickup callers only
+    std::vector<std::string> give_never;      ///< from every caller
+    /// Wallet observation: reviewed gameplay return addresses for signed deltas.
+    /// The optional world profile also admits its shop caller; replay calls are suppressed.
+    std::vector<u64> rupee_callers;
+    /// The chest-opened struct's member hash -> its backing Bool. Interaction identity resolves
+    /// the member before a give; the local struct setter is a completion receipt.
+    std::map<u32, u32> chest_members;
+    OotCoop::Chest::Config chest;
     u64 event_got{};                ///< Module offset of the GOT slot of the event manager's cell
     /// {cell, field}: *(*(main + cell) + field) must be non-zero before a give is replayed.
     std::vector<std::pair<u64, u64>> item_guards;
+    std::shared_ptr<const OotCoop::Anim::Keys> anim;
     GhostOffsets ghost; ///< Empty unless the profile has a "ghost" object
+    std::shared_ptr<const OotCoop::Equip::Keys> equip;
 
     u64 SiteOffset(Point point) const {
         for (const Site& site : sites) {
@@ -167,11 +210,12 @@ struct Profile {
     }
 };
 
-/// Co-op alone hooks only the frame boundary: it binds GameData from the manager cell there, and
-/// its handler ignores every other point. The Bool64 accessors are hot (the actor reader copy
-/// runs per actor per frame), so hooking them without tracing would cost a trap each.
+/// Co-op observation points. Hot Bool64 accessors remain trace-only; chest completion is
+/// additionally enabled by Session::Traps when the private chest configuration is present.
 constexpr bool CoopPoint(Point point) {
-    return point == Point::Frame || point == Point::ItemGive;
+    return point == Point::Frame || point == Point::ItemGive || point == Point::RupeeAdd ||
+           point == Point::Pickup || point == Point::PickupReturn ||
+           point == Point::ChestInteraction || point == Point::ChestConfirm || point == Point::ChestReturn;
 }
 
 /// The trace point at `address` whose original instruction is `instruction`, or None.
@@ -194,7 +238,7 @@ inline u32 InstructionFor(const Profile& profile, u64 base, u64 address, u32 ins
 
 /// Does what the replaced instruction would have: the JIT has already moved the PC past it.
 template <typename Jit, typename Memory>
-void Resume(Point point, Jit& jit, Memory& memory) {
+void Resume(Point point, Jit& jit, Memory& memory, u64 pc = 0) {
     switch (point) {
     case Point::StepSet:
         jit.SetRegister(8, 1); // mov w8, #1 (a W write clears the upper half)
@@ -205,6 +249,33 @@ void Resume(Point point, Jit& jit, Memory& memory) {
     case Point::BitSet:
         jit.SetRegister(8, jit.GetRegister(0));
         break;
+    case Point::RupeeAdd:
+        jit.SetRegister(8, 0x3BD4); // mov w8, #0x3bd4
+        break;
+    case Point::ChestInteraction: {
+        // The decoder admits only LDRB W1,[X0,#imm12].
+        const u32 word = memory.Read32(pc);
+        jit.SetRegister(1, memory.Read8(jit.GetRegister(0) + ((word >> 10) & 0xFFF)));
+        break;
+    }
+    case Point::ChestConfirm: {
+        // BL has no flag effects; preserve all registers except its architectural LR write.
+        const u32 word = memory.Read32(pc);
+        const s64 displacement = static_cast<s64>(u64{word & 0x03FFFFFF} << 38) >> 36;
+        jit.SetRegister(30, pc + 4);
+        jit.SetPC(pc + static_cast<u64>(displacement));
+        break;
+    }
+    case Point::ChestReturn:
+    case Point::PickupReturn: {
+        // Only an ADRP x8 site is admitted by the private profile decoder.
+        const u32 word = memory.Read32(pc);
+        const u64 imm = ((u64{word >> 5} & 0x7FFFF) << 2) | ((word >> 29) & 3);
+        const s64 displacement = static_cast<s64>(imm << 43) >> 31;
+        jit.SetRegister(8, (pc & ~u64{0xFFF}) + static_cast<u64>(displacement));
+        break;
+    }
+    case Point::Pickup:
     case Point::StructBoolSet:
     case Point::ActorFlagSet:
     case Point::ItemGive:
@@ -227,6 +298,12 @@ constexpr std::string_view Name(Point point) {
     case Point::StructBoolSet: return "struct-bool-set";
     case Point::ActorFlagSet: return "actor-flag-set";
     case Point::ItemGive: return "item-give";
+    case Point::RupeeAdd: return "rupee-add";
+    case Point::ChestInteraction: return "chest-interaction";
+    case Point::ChestConfirm: return "chest-confirm";
+    case Point::ChestReturn: return "chest-return";
+    case Point::Pickup: return "pickup";
+    case Point::PickupReturn: return "pickup-return";
     case Point::Frame: return "frame";
     case Point::BitRead: return "bit-read";
     case Point::BitSet: return "bit-set";
@@ -427,6 +504,10 @@ std::string Describe(Point point, u64 base, Jit& jit, Memory& memory) {
                            static_cast<u32>(jit.GetRegister(1)), x0, caller);
     case Point::Frame:
         return fmt::format("gamedata frame lr={}", caller);
+    case Point::RupeeAdd:
+        return fmt::format("gamedata rupee-add delta={} reason={} lr={}",
+                           static_cast<s32>(jit.GetRegister(1)), static_cast<u32>(jit.GetRegister(2)),
+                           caller);
     case Point::ItemGive:
         return fmt::format("gamedata item-give category={} count={} get={} lr={}",
                            static_cast<u32>(jit.GetRegister(2)), static_cast<u32>(jit.GetRegister(3)),
@@ -435,6 +516,12 @@ std::string Describe(Point point, u64 base, Jit& jit, Memory& memory) {
     case Point::BitSet:
         return fmt::format("gamedata {} mgr={:#x} key={:016x}", Name(point), x0,
                            jit.GetRegister(2));
+    case Point::ChestInteraction:
+    case Point::ChestConfirm:
+    case Point::ChestReturn:
+    case Point::Pickup:
+    case Point::PickupReturn:
+        return fmt::format("gamedata {} lr={}", Name(point), caller);
     case Point::None:
         break;
     }
@@ -463,7 +550,7 @@ bool Handle(Session& session, u64 pc, Jit& jit, Memory& memory, std::string* out
             Common::Nx2EventTrace::Write(Common::Nx2EventTrace::GameDataTarget(), line);
         }
     }
-    Resume(point, jit, memory);
+    Resume(point, jit, memory, pc);
     return true;
 }
 

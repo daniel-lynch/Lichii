@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <deque>
 #include <optional>
 
@@ -24,6 +25,10 @@ struct ApplyPolicy {
         }
         if (change.kind == Kind::Item) {
             return enabled && classes.contains(Kind::Item) && ValidItem(change);
+        }
+        if (change.kind == Kind::Key) {
+            return enabled && classes.contains(Kind::Key) && KeyGain(change.value) &&
+                   keys.contains({Kind::Key, change.key});
         }
         return enabled && WireKind(change.kind) && change.value == 1 &&
                classes.contains(change.kind) && keys.contains({change.kind, change.key});
@@ -85,6 +90,15 @@ public:
 
     ApplyPhase Phase() const { return phase; }
     size_t Pending() const { return pending.size(); }
+    /// Remove queued (not started) changes matching `drop`; the change in flight stays.
+    template <typename Pred>
+    size_t DropPending(Pred drop) {
+        const auto first = pending.begin() + (phase == ApplyPhase::Idle || pending.empty() ? 0 : 1);
+        const auto keep = std::remove_if(first, pending.end(), drop);
+        const size_t n = static_cast<size_t>(pending.end() - keep);
+        pending.erase(keep, pending.end());
+        return n;
+    }
     const std::optional<Change>& LastGrant() const { return last_grant; }
     std::string_view LastPath() const { return last_path; }
     void Invalidate() { Quarantine(); }

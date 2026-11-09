@@ -13,13 +13,23 @@ Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CT
   bit HEX [HEX...]          bit_set (actor u64) the same way
   rupee DELTA [DELTA...]    rupee_add (wallet hash) with each signed delta, all in ONE socket write
   item NAME CAT COUNT [GET [F0 F1 F2 F3]]  item_give: one give call (get type default 7, flags 0)
+  itemk HEX NAME CAT COUNT [GET [F0 F1 F2 F3]]  item_give tagged with origin_key HEX (the chest Bool)
+  item ... origin=bit:HEX   give with a collectible origin (also chest:HEX or token:HEX:PARTNER_HEX)
+  bit HEX ... origin=token:HEX:PARTNER_HEX   flags belonging to the same collectible transaction
+  wallet BALANCE CAPACITY   publish wallet baseline and request the team's wallet baselines
+  key HEX DELTA             key_add: a small-key gain of DELTA for the dungeon whose total key is HEX
+  expect-type TYPE SECS     wait for the emulator's next change of TYPE (rupee_add, key_add, ...)
   dup SEQ                   re-deliver this peer's accepted event SEQ to the other clients (a duplicate)
   expect-item NAME SECS     wait for the emulator's item_give of NAME
   expect HEX SECS           wait for the emulator's bool_set of HEX (any rev); result has the packet
   received                  every change packet received so far (from other origins)
   state                     the relay's team checkpoint as the peer sees it (team_state_request)
   mark TEXT                 a marker line in received.jsonl (for correlating with emulator logs)
-  pose BANC CHILD X Y Z YAW [LOADING]   send one v3 pose (CHILD/LOADING 0|1; BANC "-" = "")
+  pose BANC CHILD X Y Z YAW [LOADING] [aid=N af=F|null ar=R aseq=N] [eq32=WORD [eqseq=N]]
+                            one pose (CHILD/LOADING 0|1; BANC "-" = ""); animation options need --anim-table
+                            and a matching peer. Omitted aseq advances on each command (including frozen
+                            frame steps). Reuse an explicit aseq for rate-only updates; frame changes need a
+                            new sequence. WORD accepts 0x hex (needs the equipment capability).
   poseanim BANC X Y Z YAW ANIM RATE      one child pose with an explicit animation hint (idle|walk|run),
                             a new anim_seq each time (the receiver replays the category's command)
   posecircle BANC CX CY CZ R PERIOD_S HZ DURATION_S
@@ -31,6 +41,9 @@ Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CT
                             start (returns at once) a pose stream walking the waypoints in order at
                             SPEED m/s, HZ poses/s, then holding the last one (1 Hz keepalive) until
                             posestop. Replaces any stream.
+  poseequip WORD|off [child=0|1]
+                            what later pose streams (posecircle, posepath) carry: an eq32 word (eqseq
+                            tracks known changes) and the age; off = no equipment fields
   posestop                  stop the stream; result has how many poses it sent
   kick                      close the relay's connection to every other client (the emulator), as a
                             network drop would; the peer itself stays connected
@@ -68,11 +81,16 @@ class FakePeer:
     """Relay + one scripted client in one event loop. `port=0` picks an ephemeral port."""
 
     def __init__(self, *, port=43390, room="default", team="default", policy="or-v2", seed="0",
-                 name="FakePeer", build_id=client_sim.BUILD_ID, record=None, wallet=0):
+                 name="FakePeer", build_id=client_sim.BUILD_ID, record=None, wallet=0, anim_table=None):
         self.relay = relay_mod.Relay()
         self.port = port
         self.client = client_sim.ClientSim(room=room, team=team, name=name, build_id=build_id,
-                                           seed_hash=seed, policy_id=policy)
+                                           seed_hash=seed, policy_id=policy,
+                                           animation=client_sim.animation_descriptor(anim_table))
+        self.client.hello["ghost_equipment_v2"] = True
+        self.equipment_seq = 0
+        self.equipment_known = {}
+        self.stream_eq32, self.stream_child = None, True  # poseequip: what the pose streams carry
         self.record = Path(record) if record else None
         self.wallet = wallet  # the wallet key from the private profile (rupee_add)
         self.received = []
@@ -102,8 +120,34 @@ class FakePeer:
         if self.pose_count % 15 == 1:
             self.log(dict(packet, pose_n=self.pose_count))
 
-    async def send_pose(self, banc, child, pos, yaw, loading=False, step=1, **anim):
-        return await self.client.pose(banc, child, pos, yaw, loading, t=self.client.pose_t + step, **anim)
+    async def send_pose(self, banc, child, pos, yaw, loading=False, step=1, eq32=None, eqseq=None, **anim):
+        packet = self.client.pose_packet(banc, child, pos, yaw, loading,
+                                         t=self.client.pose_t + step, **anim)
+        known = dict(self.equipment_known)
+        if eq32 is not None:
+            if self.client.ack.get("ghost_equipment_v2") is not True:
+                raise ValueError("equipment capability not negotiated")
+            relay_mod.validate_equipment(eq32, child)
+            unsettled = set()
+            for identity_shift, state_shift in ((0, 6), (3, 8)):
+                identity, state = (eq32 >> identity_shift) & 7, (eq32 >> state_shift) & 3
+                if not ((identity == 0 and state == 0) or (1 <= identity <= 3 and state in (1, 2))):
+                    unsettled.update((identity_shift, state_shift))
+            for shift, mask, unknown in ((0, 7, 7), (3, 7, 7), (6, 3, 3), (8, 3, 3),
+                                         (10, 3, 3), (12, 3, 3), (14, 15, 15), (18, 3, 3)):
+                value = (eq32 >> shift) & mask
+                if value != unknown and shift not in unsettled:
+                    known[shift] = value
+            if eqseq is None:
+                eqseq = (self.equipment_seq + (known != self.equipment_known)) & 0xFFFF
+            packet.update(eq32=eq32, eqseq=eqseq)
+        elif eqseq is not None:
+            raise ValueError("eqseq requires eq32")
+        relay_mod.validate_pose(packet)
+        await self.client.send(packet)
+        if eq32 is not None:
+            self.equipment_known, self.equipment_seq = known, eqseq
+        return packet
 
     async def circle(self, banc, centre, radius, period, hz, duration):
         loop = asyncio.get_running_loop()
@@ -125,7 +169,7 @@ class FakePeer:
             dx, dz = -math.sin(angle), math.cos(angle)  # direction of travel (counter-clockwise in X/Z)
             yaw = round(math.degrees(math.atan2(dx, dz)), 3)
             phase = 0.0 if anim == "idle" else (speed * n / hz / stride) % 1.0
-            await self.send_pose(banc, True, pos, yaw, False, step, anim=anim, anim_seq=self.anim_seq,
+            await self.send_pose(banc, self.stream_child, pos, yaw, False, step, eq32=self.stream_eq32, anim=anim, anim_seq=self.anim_seq,
                                  rate=round(min(10.0, 1.0 if anim == "idle" else speed / nominal), 2),
                                  phase=min(0.99, round(phase, 2)))
             self.stream_sent += 1
@@ -148,14 +192,14 @@ class FakePeer:
                 move = min(dist, speed / hz)
                 pos = [round(pos[i] + (target[i] - pos[i]) * move / dist, 3) for i in range(3)]
                 travelled += move
-                await self.send_pose(banc, True, pos, yaw, False, step, anim=anim, anim_seq=self.anim_seq,
+                await self.send_pose(banc, self.stream_child, pos, yaw, False, step, eq32=self.stream_eq32, anim=anim, anim_seq=self.anim_seq,
                                      rate=round(min(10.0, speed / nominal), 2),
                                      phase=min(0.99, round((travelled / stride) % 1.0, 2)))
                 self.stream_sent += 1
                 await asyncio.sleep(1 / hz)
         self.anim_seq += 1
         while True:  # hold: idle keepalive
-            await self.send_pose(banc, True, pos, yaw, False, step, anim="idle", anim_seq=self.anim_seq,
+            await self.send_pose(banc, self.stream_child, pos, yaw, False, step, eq32=self.stream_eq32, anim="idle", anim_seq=self.anim_seq,
                                  rate=1.0, phase=0.0)
             self.stream_sent += 1
             await asyncio.sleep(1.0)
@@ -200,7 +244,7 @@ class FakePeer:
         finally:
             self.waiters.remove(waiter)
 
-    async def burst(self, kind, keys):
+    async def burst(self, kind, keys, source=None):
         """All changes in one write, so the relay forwards them back to back. For rupee_add the
         'keys' are the signed deltas."""
         field = "hash" if kind == "bool_set" else "actor"
@@ -213,6 +257,9 @@ class FakePeer:
             if kind == "rupee_add":
                 packet = {"type": kind, "origin": self.client.hello["client_id"],
                           "seq": self.client.seq, "hash": self.wallet, "delta": key}
+            if source:
+                packet.update(source)
+            relay_mod.validate_change(packet, self.client.hello["client_id"])
             packets.append(packet)
             data += relay_mod.encode(packet)
         since = len(self.seen)
@@ -227,37 +274,72 @@ class FakePeer:
         return await self.wait(lambda p: p.get("type") in relay_mod.CHANGE_TYPES and p.get(field) == key,
                                timeout)
 
-    async def state(self):
+    async def state(self, world_wallet=None):
         since = len(self.seen)
-        await self.client.send({"type": "team_state_request"})
+        await self.client.baseline(world_wallet)
         return await self.wait(lambda p: p.get("type") == "team_state", 5, since)
 
     async def command(self, line):
         words = line.split()
+        if not words:
+            raise ValueError("empty command")
         verb = words[0]
+        source = {}
+        options = [word for word in words[1:] if word.startswith("origin=")]
+        if options:
+            if len(options) != 1 or verb not in ("item", "bit"):
+                raise ValueError("one origin option is allowed on item or bit")
+            source = client_sim.origin_fields(options[0].split("=", 1)[1])
+            words.remove(options[0])
         if verb in ("grant", "bit"):
             keys = [int(word, 16) for word in words[1:]]
             if not keys:
                 raise ValueError("no keys")
-            return await self.burst("bool_set" if verb == "grant" else "bit_set", keys)
+            return await self.burst("bool_set" if verb == "grant" else "bit_set", keys, source)
+        if verb == "wallet":
+            if len(words) != 3:
+                raise ValueError("wallet BALANCE CAPACITY")
+            return await self.state({"balance": int(words[1], 0), "capacity": int(words[2], 0)})
         if verb == "rupee":
             deltas = [int(word) for word in words[1:]]
             if not deltas:
                 raise ValueError("no deltas")
             return await self.burst("rupee_add", deltas)
+        if verb == "itemk":
+            if len(words) < 5:
+                raise ValueError("itemk HEX NAME CATEGORY COUNT [GET [F0 F1 F2 F3]]")
+            source, words = {"origin_key": int(words[1], 16)}, ["item"] + words[2:]
+            verb = "item"
         if verb == "item":
             # item NAME CATEGORY COUNT [GET [F0 F1 F2 F3]]: one give call, as an opener would send it
-            if len(words) < 4:
+            if len(words) not in (4, 5, 9):
                 raise ValueError("item NAME CATEGORY COUNT [GET [F0 F1 F2 F3]]")
             flags = [int(word, 0) for word in words[5:9]] or [0, 0, 0, 0]
             self.client.seq += 1
             packet = {"type": "item_give", "origin": self.client.hello["client_id"], "seq": self.client.seq,
                       "name": words[1], "category": int(words[2], 0), "count": int(words[3], 0),
                       "get": int(words[4], 0) if len(words) > 4 else 7, "flags": flags}
+            packet.update(source)
+            relay_mod.validate_change(packet, self.client.hello["client_id"])
             since = len(self.seen)
             await self.client.send(packet)
             await self.wait(lambda p: p.get("type") == "ack" and p.get("seq") == packet["seq"], 5, since)
             return {"sent": packet["seq"], "item": packet}
+        if verb == "key":
+            if len(words) != 3:
+                raise ValueError("key HEX DELTA")
+            self.client.seq += 1
+            packet = {"type": "key_add", "origin": self.client.hello["client_id"], "seq": self.client.seq,
+                      "hash": int(words[1], 16), "delta": int(words[2], 0)}
+            since = len(self.seen)
+            await self.client.send(packet)
+            await self.wait(lambda p: p.get("type") == "ack" and p.get("seq") == packet["seq"], 5, since)
+            return {"sent": packet["seq"], "key": packet}
+        if verb == "expect-type":
+            try:
+                return {"packet": await self.wait(lambda p: p.get("type") == words[1], float(words[2]))}
+            except TimeoutError:
+                return {"timeout": True}
         if verb == "dup":
             # dup SEQ: deliver this peer's accepted event SEQ (same origin/seq/rev) once more to every
             # other client of the team, as a duplicate delivery would (the relay itself never repeats)
@@ -287,12 +369,43 @@ class FakePeer:
         if verb == "state":
             return {"state": await self.state()}
         if verb == "pose":
-            if len(words) not in (7, 8):
-                raise ValueError("pose BANC CHILD X Y Z YAW [LOADING]")
+            if len(words) < 7:
+                raise ValueError("pose BANC CHILD X Y Z YAW [LOADING] [aid=N af=F|null ar=R aseq=N] [eq32=WORD [eqseq=N]]")
+            tail, loading, animation, equipment = words[7:], False, {}, {}
+            if tail and "=" not in tail[0]:
+                if tail[0] not in ("0", "1"):
+                    raise ValueError("LOADING must be 0 or 1")
+                loading, tail = tail[0] == "1", tail[1:]
+            for option in tail:
+                key, separator, value = option.partition("=")
+                if key in ("eq32", "eqseq") and separator and key not in equipment:
+                    equipment[key] = int(value, 0)
+                    continue
+                if not separator or key not in ("aid", "af", "ar", "aseq") or key in animation:
+                    raise ValueError("invalid animation pose option")
+                animation[key] = (int(value, 0) if key in ("aid", "aseq") else
+                                  None if key == "af" and value == "null" else float(value))
+            if animation:
+                if "aid" not in animation:
+                    raise ValueError("animation pose needs aid")
+                animation.setdefault("aseq", (getattr(self, "aseq", 0) + 1) & 0xffffffff)
+            if words[2] not in ("0", "1"):
+                raise ValueError("CHILD must be 0 or 1")
             packet = await self.send_pose("" if words[1] == "-" else words[1], words[2] == "1",
                                           [float(w) for w in words[3:6]], float(words[6]),
-                                          len(words) == 8 and words[7] == "1")
+                                          loading, **equipment, **animation)
+            if animation:
+                self.aseq = animation["aseq"]
             return {"sent": packet}
+        if verb == "poseequip":
+            if len(words) not in (2, 3) or (len(words) == 3 and words[2] not in ("child=0", "child=1")):
+                raise ValueError("poseequip WORD|off [child=0|1]")
+            child = self.stream_child if len(words) == 2 else words[2] == "child=1"
+            word = None if words[1] == "off" else int(words[1], 0)
+            if word is not None:
+                relay_mod.validate_equipment(word, child)
+            self.stream_eq32, self.stream_child = word, child
+            return {"stream_eq32": word, "stream_child": child}
         if verb == "poseanim":
             if len(words) != 8 or words[6] not in ("idle", "walk", "run"):
                 raise ValueError("poseanim BANC X Y Z YAW idle|walk|run RATE")
@@ -360,7 +473,7 @@ async def serve(args):
     commands.touch()
     peer = FakePeer(port=args.port, room=args.room, team=args.team, policy=args.policy, seed=args.seed,
                     name=args.name, build_id=args.build_id, record=ctl / "received.jsonl",
-                    wallet=args.wallet)
+                    wallet=args.wallet, anim_table=args.anim_table)
     port = await peer.start()
     print(f"fake peer ready on 127.0.0.1:{port} room={args.room} team={args.team}", flush=True)
     done = len(commands.read_text().splitlines())
@@ -397,6 +510,7 @@ def main():
     parser.add_argument("--seed", default="0")
     parser.add_argument("--name", default="FakePeer")
     parser.add_argument("--build-id", default=client_sim.BUILD_ID)
+    parser.add_argument("--anim-table", help="private coop-anim.json sidecar; enables v4 animation negotiation")
     parser.add_argument("--wallet", type=lambda text: int(text, 0), default=0,
                         help="wallet GameData key for rupee_add (from the private profile)")
     args = parser.parse_args()
