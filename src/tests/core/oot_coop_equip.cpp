@@ -203,17 +203,20 @@ struct ControllerFixture {
         memory.Write(child + 0x120, text, 8);
         memory.Write(child + 0x130, 6, 4);
         memory.Text(text, name);
+        // Each child appends one (owner, child) pair to the owner's ring.
+        const u32 n = related++;
         memory.Write(Base + 64, manager, 8);
         memory.Write(Actor + 80, indices, 8);
-        memory.Write(Actor + 88, 1, 4);
+        memory.Write(Actor + 88, 8, 4);
         memory.Write(Actor + 92, 0, 4);
-        memory.Write(Actor + 96, 1, 4);
+        memory.Write(Actor + 96, n + 1, 4);
         memory.Write(manager + 16, pairs, 8);
-        memory.Write(manager + 24, 1, 4);
-        memory.Write(indices, 0, 4);
-        memory.Write(pairs, Actor, 8);
-        memory.Write(pairs + 16, child, 8);
+        memory.Write(manager + 24, n + 1, 4);
+        memory.Write(indices + 4 * n, n, 4);
+        memory.Write(pairs + 32 * n, Actor, 8);
+        memory.Write(pairs + 32 * n + 16, child, 8);
     }
+    u32 related{};
     bool Frame(bool eligible = true) {
         root.eligible = eligible;
         return controller->Frame(port, {root}, root.token.scene, true);
