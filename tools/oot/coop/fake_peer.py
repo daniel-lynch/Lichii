@@ -20,12 +20,20 @@ Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CT
   state                     the relay's team checkpoint as the peer sees it (team_state_request)
   mark TEXT                 a marker line in received.jsonl (for correlating with emulator logs)
   pose BANC CHILD X Y Z YAW [LOADING]   send one v3 pose (CHILD/LOADING 0|1; BANC "-" = "")
+  poseanim BANC X Y Z YAW ANIM RATE      one child pose with an explicit animation hint (idle|walk|run),
+                            a new anim_seq each time (the receiver replays the category's command)
   posecircle BANC CX CY CZ R PERIOD_S HZ DURATION_S
                             start (returns at once) a pose stream walking a circle of radius R
                             around (CX,CY,CZ) in the X/Z plane, one lap per PERIOD_S, HZ poses/s,
                             for DURATION_S (0 = until posestop); yaw = atan2(dx, dz) of travel,
                             child, not loading, t += round(60/HZ) per pose. Replaces any stream.
+  posepath BANC HZ SPEED X,Y,Z [X,Y,Z...]
+                            start (returns at once) a pose stream walking the waypoints in order at
+                            SPEED m/s, HZ poses/s, then holding the last one (1 Hz keepalive) until
+                            posestop. Replaces any stream.
   posestop                  stop the stream; result has how many poses it sent
+  kick                      close the relay's connection to every other client (the emulator), as a
+                            network drop would; the peer itself stays connected
   poses [N]                 the last N (default 20) poses received from other origins, and the total
   quit
 Every packet the peer receives is also appended to CTL/received.jsonl with a wall-clock time,
@@ -122,6 +130,35 @@ class FakePeer:
                                  phase=min(0.99, round(phase, 2)))
             self.stream_sent += 1
             n += 1
+
+    async def path(self, banc, points, hz, speed):
+        loop = asyncio.get_running_loop()
+        step = max(1, round(60 / hz))
+        self.anim_seq = getattr(self, "anim_seq", 0) + 1
+        anim = "idle" if speed < 0.3 else "walk" if speed < 2.6 else "run"
+        nominal, stride = (1.5, 1.2) if anim == "walk" else (4.5, 2.4)
+        pos, yaw, travelled = list(points[0]), 0.0, 0.0
+        for target in points[1:]:
+            while True:
+                dx, dy, dz = (target[i] - pos[i] for i in range(3))
+                dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+                if dist < 1e-6:
+                    break
+                yaw = round(math.degrees(math.atan2(dx, dz)), 3) if dx or dz else yaw
+                move = min(dist, speed / hz)
+                pos = [round(pos[i] + (target[i] - pos[i]) * move / dist, 3) for i in range(3)]
+                travelled += move
+                await self.send_pose(banc, True, pos, yaw, False, step, anim=anim, anim_seq=self.anim_seq,
+                                     rate=round(min(10.0, speed / nominal), 2),
+                                     phase=min(0.99, round((travelled / stride) % 1.0, 2)))
+                self.stream_sent += 1
+                await asyncio.sleep(1 / hz)
+        self.anim_seq += 1
+        while True:  # hold: idle keepalive
+            await self.send_pose(banc, True, pos, yaw, False, step, anim="idle", anim_seq=self.anim_seq,
+                                 rate=1.0, phase=0.0)
+            self.stream_sent += 1
+            await asyncio.sleep(1.0)
 
     async def stop_stream(self):
         stopped = self.stream is not None and not self.stream.done()
@@ -256,6 +293,14 @@ class FakePeer:
                                           [float(w) for w in words[3:6]], float(words[6]),
                                           len(words) == 8 and words[7] == "1")
             return {"sent": packet}
+        if verb == "poseanim":
+            if len(words) != 8 or words[6] not in ("idle", "walk", "run"):
+                raise ValueError("poseanim BANC X Y Z YAW idle|walk|run RATE")
+            self.anim_seq = getattr(self, "anim_seq", 0) + 1
+            packet = await self.send_pose("" if words[1] == "-" else words[1], True,
+                                          [float(w) for w in words[2:5]], float(words[5]), False,
+                                          anim=words[6], anim_seq=self.anim_seq, rate=float(words[7]), phase=0.0)
+            return {"sent": packet}
         if verb == "posecircle":
             if len(words) != 9:
                 raise ValueError("posecircle BANC CX CY CZ R PERIOD_S HZ DURATION_S")
@@ -268,6 +313,27 @@ class FakePeer:
             self.stream = asyncio.create_task(self.circle(banc, (cx, cy, cz), radius, period, hz, duration))
             return {"started": {"banc": banc, "centre": [cx, cy, cz], "r": radius, "period": period,
                                 "hz": hz, "duration": duration}}
+        if verb == "posepath":
+            if len(words) < 5:
+                raise ValueError("posepath BANC HZ SPEED X,Y,Z [X,Y,Z...]")
+            banc = "" if words[1] == "-" else words[1]
+            hz, speed = float(words[2]), float(words[3])
+            points = [[float(v) for v in w.split(",")] for w in words[4:]]
+            if not 0 < hz <= 60 or speed <= 0 or any(len(p) != 3 for p in points):
+                raise ValueError("need 0 < HZ <= 60, SPEED > 0, points X,Y,Z")
+            if len(points) == 1:
+                points.append(points[0])
+            await self.stop_stream()
+            self.stream_sent = 0
+            self.stream = asyncio.create_task(self.path(banc, points, hz, speed))
+            return {"started": {"banc": banc, "points": points, "hz": hz, "speed": speed}}
+        if verb == "kick":
+            me, kicked = self.client.hello["client_id"], []
+            for client in list(self.relay.clients):
+                if getattr(client, "client_id", None) not in (None, me):
+                    kicked.append(client.client_id)
+                    client.writer.close()
+            return {"kicked": kicked}
         if verb == "posestop":
             stopped = await self.stop_stream()
             return {"stopped": stopped, "sent": self.stream_sent}

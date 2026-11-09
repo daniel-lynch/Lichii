@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -708,4 +709,283 @@ TEST_CASE("OoT co-op ghost falls back when its puppet cannot be created and sets
     REQUIRE(port.s0s.back() == 0.5f);
     second.Returned(port, Block, 0, log);
     REQUIRE_FALSE(second.Frame(port, Block, local, peers, log)); // once
+}
+
+namespace {
+/// A driver brought to a live, placed ghost for peer "peer-b" (actor 0x62000000, model
+/// component at 0x65000000 through chain {0x70, 0x260}).
+struct LiveGhost {
+    Trace::GhostOffsets g;
+    Bytes m;
+    Port port{m};
+    std::unique_ptr<Coop::GhostDriver<Port>> ghost;
+    std::vector<std::string> lines;
+    static constexpr u64 Actor = 0x62000000, Record = 0x63000000, Holder = 0x64000000, Model = 0x65000000;
+
+    explicit LiveGhost(Trace::GhostOffsets offsets) : g{std::move(offsets)} {
+        m.P64(Base + g.actor_mgr_cell, 0x60000000);
+        for (u64 i = 0; i < 3; ++i) m.PF(Base + g.scale_const + i * 4, 1.0f);
+        ghost = std::make_unique<Coop::GhostDriver<Port>>(g, Base);
+    }
+    auto Log() {
+        return [this](std::string_view line) { lines.emplace_back(line); };
+    }
+    bool Logged(std::string_view what) const {
+        return std::any_of(lines.begin(), lines.end(),
+                           [&](const std::string& l) { return l.find(what) != std::string::npos; });
+    }
+    void Actor_(u32 generation = 0x35c) {
+        m.P64(Actor, 0xABC0);
+        m.P64(Actor + 0x40, 0x1);
+        m.P64(Actor + 0x48, 0x2);
+        m.P64(Actor + 0x50, Record);
+        m.P32(Actor + 0x18, generation);
+        m.P64(Actor + 0x70, Holder);
+        m.P64(Holder + 0x260, Model);
+        m.P32(Model + 0xE4, 0);
+        m.P64(Record + 0x40, Actor);
+        m.P32(Record + 0x48, generation);
+    }
+    /// Create, take and place the ghost; returns with nothing in flight.
+    void BringUp(const Pose& local, const std::vector<Coop::PeerView>& peers) {
+        REQUIRE(ghost->Frame(port, Block, local, peers, Log())); // create
+        m.P64(Block, 0x61000000);
+        m.P32(0x61000000, 3);
+        ghost->Returned(port, Block, 1, Log());
+        REQUIRE(ghost->Frame(port, Block, local, peers, Log())); // take
+        Actor_();
+        ghost->Returned(port, Block, Actor, Log());
+        REQUIRE(ghost->Frame(port, Block, local, peers, Log())); // placed
+        REQUIRE(port.calls.back().entry == Base + g.set_mtx.offset);
+        ghost->Returned(port, Block, 0, Log());
+    }
+    /// Run frames until a call starts (returned at once with `x0`); the calls' entries.
+    std::vector<u64> Run(const Pose& local, const std::vector<Coop::PeerView>& peers, int frames, u64 x0 = 0) {
+        std::vector<u64> entries;
+        for (int f = 0; f < frames; ++f) {
+            if (ghost->Frame(port, Block, local, peers, Log())) {
+                entries.push_back(port.calls.back().entry);
+                ghost->Returned(port, Block, x0, Log());
+            }
+        }
+        return entries;
+    }
+};
+} // namespace
+
+TEST_CASE("OoT co-op ghost parks on the PEER's scene change and logs every transition", "[core][oot_coop]") {
+    LiveGhost t{Offsets()};
+    const Pose local = At("KokiriForest_Child", 0, 0);
+    std::vector<Coop::PeerView> peers{{"peer-b", At("KokiriForest_Child", 3, 4, 45)}};
+    t.BringUp(local, peers);
+    // We never change scene; the peer does: parked, with both scenes named.
+    peers[0].pose->banc = "Shop_Child";
+    REQUIRE(t.ghost->Frame(t.port, Block, local, peers, t.Log()));
+    REQUIRE(t.m.F(Block + 0x10 + 7 * 4) == Coop::GhostDriver<Port>::ParkY);
+    t.ghost->Returned(t.port, Block, 0, t.Log());
+    REQUIRE(t.Logged("parked (peer elsewhere: peer in Shop_Child, we are in KokiriForest_Child)"));
+    // While it is elsewhere, its moves never reach the actor.
+    peers[0].pose->pos[0] = 50;
+    REQUIRE(t.Run(local, peers, 10).empty());
+    // Back in our scene: shown at its new position.
+    peers[0].pose->banc = "KokiriForest_Child";
+    REQUIRE(t.ghost->Frame(t.port, Block, local, peers, t.Log()));
+    REQUIRE(t.m.F(Block + 0x10 + 3 * 4) == 50.0f);
+    t.ghost->Returned(t.port, Block, 0, t.Log());
+    REQUIRE(t.Logged("shown (peer in KokiriForest_Child at (50.00, 10.00, 4.00))"));
+    // Loading, stale (no pose) and gone are distinct park reasons.
+    peers[0].pose->loading = true;
+    t.Run(local, peers, 1);
+    REQUIRE(t.Logged("parked (peer loading KokiriForest_Child)"));
+    peers[0].pose->loading = false;
+    t.Run(local, peers, 1);
+    peers[0].pose.reset();
+    t.Run(local, peers, 1);
+    REQUIRE(t.Logged("parked (peer stale)"));
+    peers.clear();
+    peers.push_back({"peer-b", At("KokiriForest_Child", 3, 4)});
+    t.Run(local, peers, 1);
+    t.Run(local, {}, 1);
+    REQUIRE(t.Logged("parked (peer gone)"));
+}
+
+TEST_CASE("OoT co-op ghost watchdog re-creates an actor that stops following or is hidden",
+          "[core][oot_coop]") {
+    auto g = Offsets();
+    g.alpha_set = {0x405000, {0xD503237F}};
+    g.alpha_chain = {0x70, 0x260};
+    g.watch_pos = 0x31C;
+    g.watch_hide = 0xE4;
+    LiveGhost t{g};
+    const Pose local = At("KokiriForest_Child", 0, 0);
+    std::vector<Coop::PeerView> peers{{"peer-b", At("KokiriForest_Child", 3, 4, 45)}};
+    t.BringUp(local, peers);
+    REQUIRE(t.Run(local, peers, 2).empty());
+    REQUIRE(t.Logged("alpha 100% (opaque, no call)")); // the default: no alpha call at all
+    REQUIRE(std::none_of(t.port.calls.begin(), t.port.calls.end(),
+                         [&](const auto& c) { return c.entry == Base + g.alpha_set.offset; }));
+    // The actor follows: its own position matches what was drawn; nothing happens.
+    t.m.PF(LiveGhost::Actor + 0x31C, 3.0f);
+    t.m.PF(LiveGhost::Actor + 0x320, 10.0f);
+    t.m.PF(LiveGhost::Actor + 0x324, 4.0f);
+    REQUIRE(t.Run(local, peers, 200).empty());
+    REQUIRE_FALSE(t.Logged("watchdog"));
+    // It stops following (the game moved or froze it elsewhere): three strikes, park, re-create.
+    t.m.PF(LiveGhost::Actor + 0x31C, 40.0f);
+    std::vector<u64> calls;
+    for (int f = 0; f < 200; ++f) {
+        if (!t.ghost->Frame(t.port, Block, local, peers, t.Log())) continue;
+        if (calls.empty()) REQUIRE(t.m.F(Block + 0x10 + 7 * 4) == Coop::GhostDriver<Port>::ParkY);
+        calls.push_back(t.port.calls.back().entry);
+        t.ghost->Returned(t.port, Block, 1, t.Log());
+    }
+    REQUIRE(t.Logged("stopped following set-transform; parking it and re-creating (1 of 4)"));
+    REQUIRE(t.Logged("abandoned (parked); re-creating"));
+    REQUIRE(calls.size() >= 2);
+    REQUIRE(calls[0] == Base + g.set_mtx.offset); // the park
+    REQUIRE(calls[1] == Base + g.create.offset);  // the new puppet
+    // The game hides the (re-created) puppet while it should show: same path.
+    LiveGhost h{g};
+    h.BringUp(local, peers);
+    h.m.PF(LiveGhost::Actor + 0x31C, 3.0f);
+    h.m.PF(LiveGhost::Actor + 0x320, 10.0f);
+    h.m.PF(LiveGhost::Actor + 0x324, 4.0f);
+    h.m.P32(LiveGhost::Model + 0xE4, 0x04);
+    h.Run(local, peers, 200, 1);
+    REQUIRE(h.Logged("hide byte 0x00 -> 0x04"));
+    REQUIRE(h.Logged("the game hides it (hide byte 0x04) while it should show"));
+    REQUIRE(h.Logged("abandoned (parked); re-creating"));
+    // A parked ghost is never judged (it is meant to be out of sight).
+    LiveGhost p{g};
+    p.BringUp(local, peers);
+    peers[0].pose->banc = "Elsewhere";
+    p.Run(local, peers, 1);
+    p.m.PF(LiveGhost::Actor + 0x31C, 40.0f);
+    p.m.P32(LiveGhost::Model + 0xE4, 0x04);
+    p.Run(local, peers, 300);
+    REQUIRE_FALSE(p.Logged("watchdog"));
+}
+
+TEST_CASE("OoT co-op ghost watchdog gives up after a bounded number of re-creates", "[core][oot_coop]") {
+    auto g = Offsets();
+    g.watch_pos = 0x31C;
+    LiveGhost t{g};
+    const Pose local = At("KokiriForest_Child", 0, 0);
+    std::vector<Coop::PeerView> peers{{"peer-b", At("KokiriForest_Child", 3, 4, 45)}};
+    t.BringUp(local, peers);
+    t.m.PF(LiveGhost::Actor + 0x31C, 40.0f); // never follows
+    t.m.PF(LiveGhost::Actor + 0x320, 10.0f);
+    t.m.PF(LiveGhost::Actor + 0x324, 4.0f);
+    size_t creates = 0;
+    for (int f = 0; f < 20000; ++f) {
+        if (!t.ghost->Frame(t.port, Block, local, peers, t.Log())) continue;
+        const u64 e = t.port.calls.back().entry;
+        if (e == Base + g.create.offset) {
+            ++creates;
+            t.m.P64(Block, 0x61000000);
+            t.m.P32(0x61000000, 3);
+            t.ghost->Returned(t.port, Block, 1, t.Log());
+        } else if (e == Base + g.get.offset) {
+            t.ghost->Returned(t.port, Block, LiveGhost::Actor, t.Log());
+        } else {
+            t.ghost->Returned(t.port, Block, 0, t.Log());
+        }
+    }
+    REQUIRE(creates == Coop::GhostDriver<Port>::AbandonLimit);
+    REQUIRE(t.Logged("(4 of 4)"));
+}
+
+TEST_CASE("OoT co-op ghost tint per slot, status lines and orphan reuse", "[core][oot_coop]") {
+    auto g = Offsets();
+    g.alpha_set = {0x405000, {0xD503237F}};
+    g.alpha_chain = {0x70, 0x260};
+    g.alpha_percent = 100;
+    g.tint_set = {0x406000, {0xD503237F}};
+    g.tint_colors = {{0.0f, 0.6f, 1.0f, 0.25f}};
+    LiveGhost t{g};
+    const Pose local = At("KokiriForest_Child", 0, 0);
+    std::vector<Coop::PeerView> peers{{"peer-b", At("KokiriForest_Child", 3, 4, 45)}};
+    t.BringUp(local, peers);
+    const auto calls = t.Run(local, peers, 3);
+    REQUIRE(calls == std::vector<u64>{Base + g.tint_set.offset});
+    const auto& tint = t.port.calls.back();
+    REQUIRE(tint.args[0] == LiveGhost::Model);
+    REQUIRE(t.m.F(tint.args[1]) == 0.0f);
+    REQUIRE(t.m.F(tint.args[1] + 4) == 0.6f);
+    REQUIRE(t.m.F(tint.args[1] + 12) == 0.25f);
+    REQUIRE(tint.args[1] >= Block + 0x1C0);
+    REQUIRE(tint.args[1] + 16 <= Block + Coop::GhostDriver<Port>::SlotSize);
+    REQUIRE(t.Logged("tint (0.00, 0.60, 1.00, 0.25) set"));
+    REQUIRE(t.Run(local, peers, 5).empty()); // once per puppet
+    // A status line per ghost now and then: peer, local scene, state.
+    t.Run(local, peers, static_cast<int>(Coop::GhostDriver<Port>::StatusEvery));
+    REQUIRE(t.Logged("status peer=KokiriForest_Child (3.00, 10.00, 4.00) idle dist=5.0 local=KokiriForest_Child "
+                     "state=live drawn=(3.00, 10.00, 4.00)"));
+    // The peer vanishes (it closed its game) and comes back under a new identity: after a
+    // while the live ghost is handed to it, no second actor is created.
+    t.Run(local, {}, 1);
+    REQUIRE(t.Logged("parked (peer gone)"));
+    // Fill the other three slots so no free slot is left.
+    std::vector<Coop::PeerView> crowd{{"peer-c", At("Far", 0, 0)}, {"peer-d", At("Far", 0, 0)},
+                                      {"peer-e", At("Far", 0, 0)}};
+    t.Run(local, crowd, 1);
+    const size_t before = t.port.calls.size();
+    crowd.push_back({"peer-f", At("KokiriForest_Child", 7, 1)});
+    t.Run(local, crowd, static_cast<int>(Coop::GhostDriver<Port>::OrphanAfter) + 5);
+    REQUIRE(t.Logged("reassigned to peer peer-f (its peer is gone; actor kept)"));
+    REQUIRE(std::none_of(t.port.calls.begin() + static_cast<long>(before), t.port.calls.end(),
+                         [&](const auto& c) { return c.entry == Base + g.create.offset; }));
+    REQUIRE(t.Logged("shown (peer in KokiriForest_Child at (7.00, 10.00, 1.00))"));
+}
+
+TEST_CASE("OoT co-op ghost look and watch fields load from the private profile", "[core][oot_coop]") {
+    Json ghost{{"playing_info_cell", "0x300000"}, {"pos", "0x100"}, {"rot", "0x10C"},
+               {"actor_mgr_cell", "0x300008"}, {"scale_const", "0x300010"},
+               {"banc_hash", "0x1111"}, {"child_hash", "0x2222"}, {"loading_hash", "0x3333"},
+               {"str64", Json::array({"0x80", "0x20", "0x8"})},
+               {"create", {{"at", "0x400000"}, {"words", Json::array({"0xD503237F"})}}},
+               {"get", {{"at", "0x401000"}, {"words", Json::array({"0xD503237F"})}}},
+               {"release", {{"at", "0x402000"}, {"words", Json::array({"0xD503237F"})}}},
+               {"set_mtx", {{"at", "0x403000"}, {"words", Json::array({"0xD503237F"})}}},
+               {"actor_fields", Json::array({"0x40", "0x48"})},
+               {"link", Json::array({"0x50", "0x18", "0x40", "0x48"})},
+               {"actor_child", "Puppet_Child"},
+               {"alpha", {{"set", {{"at", "0x405000"}, {"words", Json::array({"0xD503237F"})}}},
+                          {"chain", Json::array({"0x70", "0x260"})}}},
+               {"tint", {{"set", {{"at", "0x406000"}, {"words", Json::array({"0xD503237F"})}}},
+                         {"colors", Json::array({Json::array({0, 0.6, 1, 0.25}), Json::array({1, 0, 0, 0.25})})}}},
+               {"watch", {{"pos", "0x31C"}, {"hide", "0xE4"}}}};
+    const auto load = [&](const Json& j) {
+        return Coop::DecodeProfile(Json{{"offsets", {{Build, {{"manager_cell", "0x200000"}, {"ghost", j}}}}}}, Build);
+    };
+    const auto profile = load(ghost);
+    REQUIRE(profile);
+    REQUIRE(profile->ghost.alpha_percent == 100); // opaque unless the key file says otherwise
+    REQUIRE(profile->ghost.tint_set.offset == 0x406000);
+    REQUIRE(profile->ghost.tint_colors.size() == 2);
+    REQUIRE(profile->ghost.tint_colors[1] == std::array<float, 4>{1, 0, 0, 0.25f});
+    REQUIRE(profile->ghost.watch_pos == 0x31C);
+    REQUIRE(profile->ghost.watch_hide == 0xE4);
+    auto bad = ghost;
+    bad["tint"]["colors"] = Json::array({Json::array({0, 0.6, 2, 0.25})});
+    REQUIRE_FALSE(load(bad));
+    bad = ghost;
+    bad["tint"]["colors"] = Json::array();
+    REQUIRE_FALSE(load(bad));
+    bad = ghost;
+    bad["watch"]["pos"] = "0x31D";
+    REQUIRE_FALSE(load(bad));
+    bad = ghost;
+    bad["watch"]["size"] = "0x4";
+    REQUIRE_FALSE(load(bad));
+    bad = ghost;
+    bad.erase("alpha"); // tint and hide need the model chain
+    REQUIRE_FALSE(load(bad));
+    bad["tint"].clear();
+    bad.erase("tint");
+    bad["watch"] = {{"pos", "0x31C"}};
+    REQUIRE(load(bad)); // the position watch does not
+    bad = ghost;
+    bad["alpha"]["percent"] = 101;
+    REQUIRE_FALSE(load(bad));
 }

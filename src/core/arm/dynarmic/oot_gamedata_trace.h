@@ -120,7 +120,17 @@ struct GhostOffsets {
     /// setter takes it in x0 and the alpha in s0 (percent / 100). Called once per puppet.
     Entry alpha_set;
     std::array<u64, 2> alpha_chain{};
-    u32 alpha_percent{};
+    u32 alpha_percent{100}; ///< 100 (the default): opaque, the setter is not called
+    /// Optional per-peer colour: the model component's extra-colour setter (x0 = component, x1 =
+    /// &RGBA 4 floats), one colour per ghost slot (slot index modulo the list). Needs the alpha
+    /// chain. In C10 this colour reached only the eyes, not the body (see HOOKS.md "Ghost look").
+    Entry tint_set;
+    std::vector<std::array<float, 4>> tint_colors;
+    /// Optional watchdog reads: the actor's own world position (3 floats at actor + watch_pos)
+    /// and the model component's hide-reason byte (component + watch_hide, component via the
+    /// alpha chain). A puppet whose position stops following set-transform, or that the game
+    /// keeps hiding while we show it, is abandoned (parked) and re-created. Offset 0: not read.
+    u64 watch_pos{}, watch_hide{};
     bool Valid() const {
         return playing_info_cell && pos && rot && actor_mgr_cell && scale_const && banc_hash &&
                child_hash && loading_hash && str64[0] && str64[1] && str64[2] && create && get &&
@@ -139,6 +149,11 @@ struct Profile {
     Entry bool_setter, bit_setter, rupee_entry;
     Entry item_entry;               ///< The give-to-pouch call (the ItemGive site's function)
     std::vector<u64> item_callers;  ///< Return addresses (module offsets) of gives to forward
+    /// World pickups (class item, sub-class pickup): return addresses of the collect path's give
+    /// and the exact item names forwarded from there. Anything else from that path (hearts,
+    /// magic, ammo drops) is per-player and only logged.
+    std::vector<u64> pickup_callers;
+    std::vector<std::string> pickup_names;
     u64 event_got{};                ///< Module offset of the GOT slot of the event manager's cell
     /// {cell, field}: *(*(main + cell) + field) must be non-zero before a give is replayed.
     std::vector<std::pair<u64, u64>> item_guards;

@@ -234,9 +234,21 @@ or `"0x..."` strings; unknown fields reject the file.
    "entries": {"bool_setter": {"at": "<offset>", "words": ["<word>", ...]},
                "bit_setter": {...}, "rupee_entry": {...}, "item_entry": {...}},
    "item_callers": ["<offset>"], "event_got": "<offset>",
-   "item_guards": [["<cell>", "<field>"], ...]}}}
+   "item_guards": [["<cell>", "<field>"], ...],
+   "pickup": {"callers": ["<offset>", ...], "names": ["<item>", ...]}}}}
 ```
 
+- `pickup` (optional, class `item`, sub-class pickup): the return addresses of the world-pickup
+  path's give calls (the collect routine of a freestanding drop calls the same give-to-pouch entry
+  as a chest, count 1, get type 0) and the exact item names forwarded from there. A give from a
+  pickup caller whose name is not listed is logged `item-give seen (pickup, per-player)` and never
+  forwarded. Decision: rupees and permanent pickups (heart pieces, heart containers) are shared;
+  recovery hearts, magic jars and ammo drops (sticks, nuts, seeds, arrows, bombs) and fairies are
+  per-player: each player refills their own. Silver rupees are puzzle pieces of a room, not wallet
+  money, and are not listed. A forwarded pickup is an `item_give` event like a chest give (deduped
+  by origin/sequence on the receiver, never folded into state) and is replayed through the same
+  give call, which adds the rupees to the receiver's wallet the way the chest's own nested
+  rupee give does. The receiver does not get the pickup's HUD/notification call (next pass).
 - `item_give` is a site kind too (the give entry's `pacibsp`); co-op traps it whenever the profile
   names it, logging each give (`item-give observed|seen|replayed ...`, at most 256 lines).
 - `event_got` is the GOT slot of the event manager's cell; a give waits while
@@ -318,7 +330,9 @@ serves this head and later only:
           "lifecycle": ["<field>", "<lo>", "<hi>"],
           "anim": {"play": {"at": "<offset>", "words": [...]}, "idle": "<command>", "walk": "<command>",
                    "run": "<command>"},
-          "alpha": {"set": {"at": "<offset>", "words": [...]}, "chain": ["<field>", "<field>"], "percent": 50},
+          "alpha": {"set": {"at": "<offset>", "words": [...]}, "chain": ["<field>", "<field>"], "percent": 100},
+          "tint": {"set": {"at": "<offset>", "words": [...]}, "colors": [[r, g, b, a], ...]},
+          "watch": {"pos": "<actor field>", "hide": "<model component byte>"},
           "actor_child": "<actor>", "actor_adult": "<actor>", "actor_fallback": "<actor>"}
 ```
 
@@ -365,8 +379,37 @@ serves this head and later only:
   the primary puppet only.
 - **Alpha (optional `alpha`).** Once per primary puppet, after it is first shown: the model
   component is read through `chain` from the actor and the setter is called with it in x0 and
-  `percent`/100 in s0.
+  `percent`/100 in s0. `percent` defaults to 100 (opaque), and at 100 the setter is not called at
+  all (the puppet's own alpha is 1); the line `alpha 100% (opaque, no call)` says so.
+- **Colour (optional `tint`, needs `alpha`'s chain).** Once per primary puppet, after the alpha
+  step: the model component's extra-colour setter (x0 = component, x1 = 16 bytes of RGBA floats in
+  the slot at +0x1E0), one colour per ghost slot (slot index modulo the list, 1-4 colours, each
+  component 0..1). Field C10: this colour reaches only the eyes, not body or clothes. A whole-body
+  colour needs the material blend colour (`p_model_blend_color`), whose compositing is not
+  decoded; not wired.
+- **Watchdog (optional `watch`).** Pure reads every 30 frames on a validated live, placed, shown
+  puppet: the actor's own world position (`pos`: three floats at actor + field) against what was
+  last drawn, and the model component's hide-reason byte (`hide`, through `alpha`'s chain). Three
+  bad reads in a row (more than 2 m apart, or a non-zero hide byte while we show it) abandon the
+  puppet: it is parked once (set-transform to y -10000) and forgotten, and a new one is created.
+  At most four abandons per slot per local scene. Hide-byte changes are logged.
+- **Status and transitions.** Every transition is one line: `assigned`, `create requested`,
+  `live`, `shown (peer in <banc> at (x, y, z))`, `parked (peer gone | peer stale | peer loading
+  <banc> | peer elsewhere: peer in <banc>, we are in <banc> | local scene <banc> not ready)`,
+  `dropped (...)`, `watchdog: ...`, `abandoned`, `reassigned`. Every 1800 frames (about 30 s)
+  each ghost logs a `status` line: the peer's pose (scene, position, category, distance from us),
+  our scene, the slot state, the drawn position, the read-back actor position, hide byte and
+  lifecycle. Transition lines are capped at 4096 per session, status lines at 2000.
+- **Peers that come back.** A peer missing from the list (relay gone, `client_state` offline) parks
+  its ghost (`parked (peer gone)`); the same identity coming back is shown again. A new identity
+  with no free slot takes over a live ghost whose peer has been gone for 600 frames (`reassigned to
+  peer <id> (its peer is gone; actor kept)`), so a restarted peer does not leak a fifth actor.
 - **Age.** `actor_adult` is optional. Without it an adult peer is drawn with the child puppet, and
   the create line says so.
-- Field status: `RESULT` of C8 (private).
+- **Receiver timing.** Poses are drawn about 100 ms behind the newest arrival, blended linearly
+  between the two samples around that time; past the newest sample the newest is held (never
+  extrapolated). A forward "slide then snap" of the body while walking or running is the run and
+  walk clips' own root translation (field C10), not prediction; the in-place animation banks of
+  the ghost mod (C11) remove it.
+- Field status: `RESULT` of C8-C11 (private).
 
