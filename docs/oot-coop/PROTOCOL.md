@@ -511,3 +511,16 @@ rejection, malformed JSON/length, split/coalesced frames, deny-list enforcement,
 pose routing without ack, malformed and oversized poses, the pose rate cap, and the fake peer's
 pose commands. Pose coalescing and the stalled-receiver drop are pure tests.
 A pure-test pass is not evidence that these real-socket tests passed.
+
+### Additive completion presence (C16)
+
+`client_state.state` may contain `"finished": true`. This is a session completion signal, not a
+GameData change or grant. A receiver shows `<name> finished the game` once per origin per session;
+missing/false values do not retract completion. The local private sidecar optionally identifies
+the completion Bool (`"finish": {"bool": "0x<8 hex>"}`); its value/hash is never sent in this state.
+
+A sender keeps `finished: true` on every later client state, including after reconnect, together
+with `name`, `apply_enabled`, and its own `world_wallet` when known. The relay replaces its cached
+state on each `client_state`; omitting the wallet would discard that baseline. The deployed relay
+already forwards this field to peers and late joiners under its existing 4096-byte state limit.
+No relay update or protocol-version bump is required. Older clients ignore the additive field.

@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "common/logging.h"
@@ -89,16 +91,31 @@ void CoopOverlay::Draw(VkImage image, VkFormat format, u32 width, u32 height,
         }
     }
     if (!slot) return; // every buffer still in flight: skip this frame's overlay
-    if (!slot->buffer) slot->buffer = CreateWrappedBuffer(allocator, SlotSize, MemoryUsage::Upload);
+    VkDeviceSize needed = 0;
+    for (const auto& box : boxes)
+        needed += (VkDeviceSize{box.width} * box.height * 4 + 15) & ~VkDeviceSize{15};
+    needed = std::clamp((needed + SlotSize - 1) & ~(SlotSize - 1), SlotSize, VkDeviceSize{64u << 20});
+    if (!slot->buffer || slot->capacity < needed) {
+        slot->buffer = CreateWrappedBuffer(allocator, needed, MemoryUsage::Upload);
+        slot->capacity = needed;
+        slot->panel_cache_id = 0;
+    }
     auto mapped = slot->buffer.Mapped();
     std::vector<VkBufferImageCopy> copies;
     VkDeviceSize offset = 0;
+    const u64 previous_panel = std::exchange(slot->panel_cache_id, 0);
     for (const auto& box : boxes) {
         const VkDeviceSize bytes = VkDeviceSize{box.width} * box.height * 4;
-        if (offset + bytes > SlotSize || mapped.size() < offset + bytes) break;
+        if (offset + bytes > slot->capacity || mapped.size() < offset + bytes) break;
         u8* out = mapped.data() + offset;
-        for (size_t i = 0; i < size_t{box.width} * box.height; ++i) {
-            Pack(packing, &box.rgba[i * 4], out + i * 4);
+        const bool panel = offset == 0 && box.cache_id;
+        if (!panel || previous_panel != box.cache_id || slot->panel_format != format) {
+            for (size_t i = 0; i < size_t{box.width} * box.height; ++i)
+                Pack(packing, &box.rgba[i * 4], out + i * 4);
+        }
+        if (panel) {
+            slot->panel_cache_id = box.cache_id;
+            slot->panel_format = format;
         }
         copies.push_back({.bufferOffset = offset,
                           .bufferRowLength = 0,

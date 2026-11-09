@@ -39,6 +39,8 @@
 
 #include "common/common_types.h"
 
+namespace Core::OotCoop::Room { struct Config; }
+
 namespace Core::OotCoop::Ux {
 
 /// EDEN_NX2_OOT_COOP_<name>: true unless set to 0, off, false or no (or, with `fallback` false,
@@ -263,6 +265,7 @@ struct Tag {
 
 struct Config {
     ItemNames names;
+    std::shared_ptr<const Room::Config> room;
     std::optional<CameraKeys> camera; // for the running build
 };
 /// The sidecar for `build_id` (40 hex digits). A missing file gives an empty config and `why`.
@@ -273,10 +276,22 @@ struct Config {
 
 // ---- Process-wide overlay state: the co-op session writes, the presenter reads. ----
 
+struct Panel {
+    std::vector<std::string> lines;
+    u64 generation{};
+};
+struct Marker {
+    Point2 at;
+    u8 colour{};
+    char label{'?'};
+};
+
 struct OverlayFrame {
     std::vector<std::string> toasts;
     std::vector<Tag> tags;
-    [[nodiscard]] bool Empty() const { return toasts.empty() && tags.empty(); }
+    std::shared_ptr<const Panel> panel;
+    std::vector<Marker> markers;
+    [[nodiscard]] bool Empty() const { return toasts.empty() && tags.empty() && !panel && markers.empty(); }
 };
 
 /// Queue a toast (no-op when EDEN_NX2_OOT_COOP_TOAST is off). False when `id` was seen.
@@ -284,6 +299,9 @@ bool Notify(std::string id, std::string text);
 /// The name tags for this game frame; the presenter drops them after TagLifetimeMs.
 inline constexpr u64 TagLifetimeMs = 250;
 void PublishTags(std::vector<Tag> tags);
+void PublishMarkers(std::vector<Marker> markers);
+/// Immutable panel, published only on text changes; generation never reused across resets.
+void PublishPanel(std::vector<std::string> lines);
 /// Session reset: toasts, ids and tags cleared.
 void Reset();
 /// What to draw now. Cheap when nothing is queued.

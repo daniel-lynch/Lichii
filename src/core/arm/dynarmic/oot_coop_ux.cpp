@@ -11,6 +11,7 @@
 #include <fmt/format.h>
 
 #include "core/arm/dynarmic/oot_coop_ux.h"
+#include "core/arm/dynarmic/oot_coop_room.h"
 
 namespace Core::OotCoop::Ux {
 namespace {
@@ -74,7 +75,9 @@ struct Global {
     std::mutex mutex;
     ToastQueue toasts;
     std::vector<Tag> tags;
-    u64 tags_ms{};
+    u64 tags_ms{}, markers_ms{}, panel_generation{};
+    std::vector<Marker> markers;
+    std::shared_ptr<const Panel> panel;
 };
 Global& State() {
     static Global global;
@@ -302,6 +305,8 @@ Config DecodeConfig(const Json& document, std::string_view build_id, std::string
         return config;
     }
     config.names.Load(document);
+    config.room = std::make_shared<const Room::Config>(
+        Room::DecodeConfig(document, build_id, Switch("MINIMAP", false)));
     std::string note = fmt::format("{} item names", config.names.Size());
     try {
         const auto builds = document.find("builds");
@@ -397,12 +402,30 @@ void PublishTags(std::vector<Tag> tags) {
     g.tags_ms = NowMs();
 }
 
+void PublishMarkers(std::vector<Marker> markers) {
+    auto& g = State();
+    std::scoped_lock lock{g.mutex};
+    g.markers = std::move(markers);
+    g.markers_ms = NowMs();
+}
+
+void PublishPanel(std::vector<std::string> lines) {
+    auto& g = State();
+    std::scoped_lock lock{g.mutex};
+    if (lines.empty()) { g.panel.reset(); return; }
+    if (g.panel && g.panel->lines == lines) return;
+    g.panel = std::make_shared<const Panel>(Panel{std::move(lines), ++g.panel_generation});
+}
+
 void Reset() {
     auto& g = State();
     std::scoped_lock lock{g.mutex};
     g.toasts.Clear();
     g.tags.clear();
     g.tags_ms = 0;
+    g.markers.clear();
+    g.markers_ms = 0;
+    g.panel.reset();
 }
 
 OverlayFrame Current() {
@@ -412,6 +435,8 @@ OverlayFrame Current() {
     OverlayFrame frame;
     if (!g.toasts.Empty()) frame.toasts = g.toasts.Visible(now);
     if (!g.tags.empty() && now - g.tags_ms <= TagLifetimeMs) frame.tags = g.tags;
+    frame.panel = g.panel;
+    if (!g.markers.empty() && now - g.markers_ms <= TagLifetimeMs) frame.markers = g.markers;
     return frame;
 }
 
