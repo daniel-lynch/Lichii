@@ -32,9 +32,10 @@ RUPEE_LIMIT = 999
 KEY_GAIN_LIMIT = 32
 ITEM_COUNT_LIMIT = 999
 POSE_FIELDS = ("type", "t", "banc", "child", "loading", "pos", "yaw", "anim", "anim_seq", "rate", "phase")
+EQUIPMENT_FIELDS = ("eq32", "eqseq")
 POSE_ANIMS = ("idle", "walk", "run")  # an animation hint inferred from speed; receivers may ignore it
 ANIM_POSE_FIELDS = ("av", "aid", "af", "ar", "aseq")
-MAX_POSE_FRAME = 512  # JSON payload, including origin when forwarded
+MAX_POSE_FRAME = 512  # JSON payload, including origin when forwarded (animation and equipment fields included)
 MAX_POSE_COORD = 100000
 MAX_POSE_QUEUE = 64  # a receiver whose outbox holds more frames than this gets no new pose
 POSE_RATE = 30  # poses per sender per second (sliding 1 s window); the excess is dropped
@@ -159,7 +160,9 @@ def collectible_origin(packet):
 
 def validate_hello(packet):
     fields(packet, ("type", "version", "build_id", "seed_hash", "room", "team", "client_id", "name", "policy_id"),
-           ("world_wallet", "animation"))
+           ("world_wallet", "animation", "ghost_equipment_v2"))
+    if "ghost_equipment_v2" in packet and type(packet["ghost_equipment_v2"]) is not bool:
+        raise ProtocolError("expected equipment capability boolean")
     if packet["type"] != "hello" or type(packet["version"]) is not int or packet["version"] not in (LEGACY_VERSION, VERSION):
         raise ProtocolError("protocol version mismatch")
     if "animation" in packet:
@@ -253,9 +256,22 @@ def finite(value, limit):
     return value
 
 
+def validate_equipment(word, child):
+    integer(word, 0, (1 << 32) - 1)
+    if word >> 28 != 1 or word & 0x0FE00000:
+        raise ProtocolError("equipment version/reserved bits")
+    if (word & 7) not in (0, 1, 2, 3, 7) or ((word >> 3) & 7) not in (0, 1, 2, 3, 7):
+        raise ProtocolError("invalid equipment identity")
+    if ((word >> 14) & 15) not in (*range(11), 15):
+        raise ProtocolError("invalid equipment mask")
+    age = (word >> 18) & 3
+    if age == 2 or (age != 3 and age != (0 if child else 1)):
+        raise ProtocolError("invalid equipment age")
+
+
 def validate_pose(packet, size=None):
     """A live position for drawing a ghost; never a grant. Malformed poses are protocol errors."""
-    fields(packet, POSE_FIELDS, ANIM_POSE_FIELDS)
+    fields(packet, POSE_FIELDS, ANIM_POSE_FIELDS + EQUIPMENT_FIELDS)
     integer(packet["t"], 0, (1 << 32) - 1)
     banc = packet["banc"]
     if not isinstance(banc, str) or not re.fullmatch(r"(?:[A-Za-z0-9_]{1,63})?", banc):
@@ -283,6 +299,11 @@ def validate_pose(packet, size=None):
             raise ProtocolError("animation frame out of range")
         if finite(packet["ar"], 4) < 0:
             raise ProtocolError("animation rate out of range")
+    if ("eq32" in packet) != ("eqseq" in packet):
+        raise ProtocolError("equipment fields must be paired")
+    if "eq32" in packet:
+        validate_equipment(packet["eq32"], packet["child"])
+        integer(packet["eqseq"], 0, (1 << 16) - 1)
     if (len(encode(packet)) - 4 if size is None else size) > MAX_POSE_FRAME:
         raise ProtocolError("pose too large")
 
@@ -516,6 +537,7 @@ class Relay:
         client.client_id, client.room, client.team = client_id, room, team
         client.version = packet["version"]
         client.animation = packet.get("animation")
+        client.ghost_equipment_v2 = packet.get("ghost_equipment_v2", False)
         client.state = {"name": packet["name"]}
         if "world_wallet" in packet:
             client.state["world_wallet"] = dict(packet["world_wallet"])
@@ -525,6 +547,8 @@ class Relay:
                "seed_hash": room.seed_hash, "policy_id": room.policy_id, "client_id": client_id}
         if client.animation is not None:
             ack["animation"] = client.animation
+        if "ghost_equipment_v2" in packet:
+            ack["ghost_equipment_v2"] = client.ghost_equipment_v2
         client.send(ack)
         client.send(team.snapshot())
         for peer in team.clients.values():
@@ -586,10 +610,13 @@ class Relay:
         validate_pose(packet, size)
         if "av" in packet and client.animation is None:
             raise ProtocolError("animation not negotiated")
+        if "eq32" in packet and not client.ghost_equipment_v2:
+            raise ProtocolError("equipment capability not negotiated")
         forwarded = {"type": "pose", "origin": client.client_id,
                      **{key: packet[key] for key in POSE_FIELDS[1:]}}
-        extended = dict(forwarded, **{key: packet[key] for key in ANIM_POSE_FIELDS if key in packet})
-        if len(encode(extended)) - 4 > MAX_POSE_FRAME:
+        animation = {key: packet[key] for key in ANIM_POSE_FIELDS if key in packet}
+        equipment = {key: packet[key] for key in EQUIPMENT_FIELDS if key in packet}
+        if len(encode(dict(forwarded, **animation, **equipment))) - 4 > MAX_POSE_FRAME:
             raise ProtocolError("pose too large after origin")
         now = asyncio.get_running_loop().time()
         times = client.pose_times
@@ -601,8 +628,12 @@ class Relay:
         times.append(now)
         for peer in tuple(client.team.clients.values()):
             if peer is not client:
-                matching = client.animation is not None and peer.animation == client.animation
-                peer.send_pose(extended if matching else forwarded)
+                outgoing = forwarded
+                if animation and client.animation is not None and peer.animation == client.animation:
+                    outgoing = dict(outgoing, **animation)
+                if equipment and peer.ghost_equipment_v2:
+                    outgoing = dict(outgoing, **equipment)
+                peer.send_pose(outgoing)
 
     async def handle(self, client):
         sending = asyncio.create_task(client.write_loop())

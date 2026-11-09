@@ -564,6 +564,9 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                     if (!cell || !*cell || (*cell & 7) || !member || (*member & 7)) return std::nullopt;
                     profile.item_guards.emplace_back(*cell, *member);
                 }
+            } else if (field == "equip") {
+                profile.equip = Equip::DecodeKeys(value);
+                if (!profile.equip) return std::nullopt;
             } else if (field == "ghost") {
                 if (!value.is_object()) return std::nullopt;
                 auto& ghost = profile.ghost;
@@ -766,6 +769,7 @@ Json EncodeHello(const Hello& hello) {
     if (!hello.animation_hash.empty())
         packet["animation"] = {{"av", 1}, {"table_sha256", hello.animation_hash}};
     if (hello.world_wallet) packet["world_wallet"] = World::EncodeWallet(*hello.world_wallet);
+    if (hello.ghost_equipment_v2) packet["ghost_equipment_v2"] = true;
     return packet;
 }
 
@@ -1088,6 +1092,8 @@ struct Session::Impl {
     std::atomic<bool> stopped{};
     // Class "pose" (v3): own pose out, peers' poses in, puppets drawn by the frame drain.
     bool pose_enabled{};
+    std::atomic<bool> equipment_negotiated{};
+    std::unique_ptr<Equip::Controller> equipment;
     PoseSender sender;
     Anim::Sender anim_sender;
     Anim::CommandWatch command_watch; // guest thread: per-frame player command transitions
@@ -1130,9 +1136,13 @@ struct Session::Impl {
         }
         auto& track = peers[origin];
         if (!track.session) track.session = ++peer_session;
-        track.online = true;
+        if (track.online && !track.samples.empty()) {
+            const u32 delta = pose.t - track.samples.back().second.t;
+            if (!delta || delta >= 0x80000000U) return;
+        }
         track.Add(static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
                       Clock::now().time_since_epoch()).count()), std::move(pose));
+        track.online = true;
         ++poses_in;
     }
     boost::asio::io_context io;
@@ -1177,6 +1187,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
             owner.peer_wallets.clear();
             owner.animation_peers.clear();
             owner.pose_out.reset();
+            owner.equipment_negotiated = false;
         }
         resolver.cancel();
         boost::system::error_code ignored;
@@ -1306,6 +1317,8 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                                                   ? "handshake: " + packet->at("reason").get<std::string>().substr(0, 80)
                                                   : std::string{"handshake mismatch"});
                         }
+                        self->owner.equipment_negotiated = self->owner.hello.ghost_equipment_v2 &&
+                            packet->contains("ghost_equipment_v2") && (*packet)["ghost_equipment_v2"] == true;
                         self->handshaken = true;
                     } else if (type == "heartbeat") {
                         self->Send({{"type", "heartbeat_ack"}});
@@ -1315,6 +1328,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                         auto pose = self->input.size() <= PoseFrameLimit
                                         ? DecodePose(*packet, &origin) : std::nullopt;
                         if (pose && self->owner.pose_enabled) {
+                            if (!self->owner.equipment_negotiated) pose->equipment.reset();
                             self->owner.OnPose(std::move(origin), std::move(*pose));
                         } else if (!pose && !self->owner.logged_bad_pose) {
                             self->owner.logged_bad_pose = true;
@@ -1523,6 +1537,9 @@ inline constexpr u64 GhostBlock = 0x400;
 inline constexpr u64 AnimSourceLines = 512; ///< Source-slot blackboard lines per session
 inline constexpr u64 CommandLines = 2048;   ///< Player command transition lines per session
 static_assert(GhostBlock + GhostSlots * GhostDriver<int>::SlotSize <= 0x1000);
+// The equipment name table: the free tail of the same page (write-once cells and strings).
+inline constexpr u64 EquipBlock = GhostBlock + GhostSlots * GhostDriver<int>::SlotSize;
+static_assert(EquipBlock + 0x200 <= 0x1000);
 
 struct Session::Impl::GhostPort {
     Backend& backend;
@@ -1541,6 +1558,39 @@ struct Session::Impl::GhostPort {
         return memory.WriteBlock(address, data, size);
     }
     std::optional<u64> Verified(const OotGameDataTrace::Entry& entry) { return backend.VerifiedEntry(entry); }
+    void CheckEquipmentContext(const OotGameDataTrace::GhostOffsets& offsets) {
+        if (!impl.equipment || !impl.equipment->Calling()) return;
+        const auto local = ReadLocalPose(memory, impl.binding.base, impl.binding.manager, offsets,
+                                         static_cast<u32>(impl.tick));
+        const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now().time_since_epoch()).count());
+        std::vector<Equip::Root> roots;
+        {
+            std::scoped_lock lock{impl.mutex};
+            for (const auto& slot : impl.ghost->Slots()) {
+                if (slot.state != GhostDriver<GhostPort>::State::Live) continue;
+                const auto peer = impl.peers.find(slot.origin);
+                const auto pose = peer != impl.peers.end() ? peer->second.At(now) : std::nullopt;
+                const bool eligible = impl.equipment_negotiated && !slot.abandon && pose && !pose->loading &&
+                    pose->banc == local.banc && pose->child == slot.child;
+                roots.push_back({{slot.origin, slot.banc, 0, slot.actor, slot.record, 0, slot.generation,
+                                   static_cast<u8>(slot.child ? 0 : 1)}, eligible});
+            }
+        }
+        impl.equipment->CheckContext(roots, local.banc, !local.loading && !local.banc.empty());
+    }
+    Equip::Port EquipmentPort() {
+        return {
+            [this](u64 a) -> std::optional<u8> {
+                if (!a || !memory.IsValidVirtualAddressRange(a, 1)) return {};
+                return memory.Read8(a);
+            },
+            [this](u64 a) { return R32(a); }, [this](u64 a) { return R64(a); },
+            [this](u64 a, const void* b, size_t n) { return Write(a, b, n); },
+            [this](const OotGameDataTrace::Entry& e) { return Verified(e); },
+            [this](u64 a, const std::array<u64, 8>& args, std::optional<float> f) { return Call(a, args, f); },
+            [](std::string_view line) { LOG_INFO(Core_ARM, "{}", line); }};
+    }
     /// The grant path's call: full context captured, private stack, sentinel return. Up to three
     /// stack arguments read as zero.
     bool Call(u64 entry, const std::array<u64, 8>& args, std::optional<float> s0 = std::nullopt) {
@@ -1667,6 +1717,14 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
         std::string why;
         impl->ux.Configure(Ux::LoadConfig(profile->build_id, &why));
         LOG_INFO(Core_ARM, "OoT co-op: UX {}", why);
+    }
+    if (impl->pose_enabled && impl->ghost && profile->equip && profile->equip->enabled) {
+        if (auto names = Equip::LoadNames(profile->build_id)) {
+            impl->equipment = std::make_unique<Equip::Controller>(profile->equip, std::move(*names),
+                profile->ghost, base, impl->binding.sentinel + EquipBlock, 0x1000 - EquipBlock);
+            impl->hello.ghost_equipment_v2 = true;
+            LOG_INFO(Core_ARM, "OoT co-op: equipment v2 enabled (sword, shield, tunic, mask; boots deferred)");
+        } else LOG_WARNING(Core_ARM, "OoT co-op: equipment disabled: missing or invalid coop-equip.json");
     }
     impl->Start();
 }
@@ -1941,7 +1999,8 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                         impl->cleanup_call->key, impl->cleanup_call->actor));
         return true;
     }
-    if (binding.sentinel && pc == binding.sentinel && impl->ghost && impl->ghost->Calling()) {
+    if (binding.sentinel && pc == binding.sentinel &&
+        ((impl->ghost && impl->ghost->Calling()) || (impl->equipment && impl->equipment->Calling()))) {
         const u64 result = jit.GetRegister(0);
         if (thread != impl->frame_thread || jit.GetSP() != impl->ghost_stack || !impl->ghost_saved ||
             !backend.Restore(*impl->ghost_saved)) {
@@ -1950,6 +2009,12 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         }
         impl->ghost_saved.reset();
         Impl::GhostPort port{backend, memory, *impl};
+        if (impl->equipment && impl->equipment->Calling()) {
+            auto equipment_port = port.EquipmentPort();
+            port.CheckEquipmentContext(profile->ghost);
+            impl->equipment->Returned(equipment_port, result);
+            return true;
+        }
         const auto local = ReadLocalPose(memory, base, binding.manager, profile->ghost,
                                          static_cast<u32>(impl->tick));
         const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1963,6 +2028,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         impl->ghost->Returned(port, binding.sentinel + GhostBlock, result, log, &local, &peers);
         return true;
     }
+    if (impl->equipment && impl->equipment->Calling()) return false;
     if (binding.sentinel && pc == binding.sentinel) {
         const u64 result = jit.GetRegister(0); // the call's return value, before the restore
         const auto event = runtime.Sentinel(backend, site, pc, log);
@@ -2148,6 +2214,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         const u64 old = binding.manager;
         const auto now =
             OotGameDataTrace::Detail::Read64(memory, binding.base + profile->manager_cell);
+        if (impl->equipment) impl->equipment->Invalidate();
         if (impl->ghost) impl->ghost->DropAll(log, "save or title: GameData moved");
         if (runtime.Rebind(backend, log)) {
             impl->stable_frame = false;
@@ -2171,6 +2238,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     }
     const bool bound = backend.BindFromCell();
     if (binding.invalid || (!bound && impl->stable_frame)) {
+        if (impl->equipment) impl->equipment->Invalidate();
         if (impl->ghost) impl->ghost->DropAll(log, "GameData binding lost");
         runtime.Invalidate();
         runtime.Frame(backend, {thread, 1, impl->tick, true}, [](Change, bool) {}, log);
@@ -2420,7 +2488,8 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     }
     const bool cleaning = !runtime.Calling() && FrameCleanup(backend, memory, log);
     if (impl->pose_enabled) FramePose(backend, memory, log, runtime.Calling() || cleaning);
-    return runtime.Calling() || cleaning || (impl->ghost && impl->ghost->Calling());
+    return runtime.Calling() || cleaning || (impl->ghost && impl->ghost->Calling()) ||
+           (impl->equipment && impl->equipment->Calling());
 }
 
 void Session::QueueCleanup(u64 key) {
@@ -2431,7 +2500,9 @@ void Session::QueueCleanup(u64 key) {
 template <typename Backend, typename Log>
 bool Session::FrameCleanup(Backend& backend, Memory::Memory& memory, Log log) {
     const auto& resolver = profile->world.resolver;
-    if (!resolver || impl->cleanup_saved || (impl->ghost && impl->ghost->Calling())) return false;
+    if (!resolver || impl->cleanup_saved || (impl->ghost && impl->ghost->Calling()) ||
+        (impl->equipment && impl->equipment->Calling()))
+        return false;
     const auto line = [&](std::string text) {
         if (impl->cleanup_lines < 256) {
             ++impl->cleanup_lines;
@@ -2505,7 +2576,7 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
     // Own pose: pure reads, paced by the sender; the network thread sends the newest one.
     const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now().time_since_epoch()).count());
-    const auto local = ReadLocalPose(memory, base, impl->binding.manager, profile->ghost,
+    auto local = ReadLocalPose(memory, base, impl->binding.manager, profile->ghost,
                                      static_cast<u32>(impl->tick));
     // One snapshot per frame feeds the command watch (and through it the sender); it is read
     // only while something consumes it.
@@ -2525,6 +2596,8 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
             if (!sending) animation_snapshot.reset();
         }
     }
+    if (impl->equipment && impl->equipment_negotiated && !local.loading && !local.banc.empty())
+        local.equipment = impl->equipment->Local(local.child);
     std::vector<PeerView> peers;
     {
         std::scoped_lock lock{impl->mutex};
@@ -2560,7 +2633,39 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
     // Grants keep priority: the one call slot of this frame is theirs when they used it.
     if (grant_calling) return;
     Impl::GhostPort port{backend, memory, *impl};
-    impl->ghost->Frame(port, impl->binding.sentinel + GhostBlock, local, peers, log, now);
+    if (!impl->equipment) {
+        impl->ghost->Frame(port, impl->binding.sentinel + GhostBlock, local, peers, log, now);
+        return;
+    }
+    // One guest call per frame between them. The ghost driver (movement, animation) goes first;
+    // equipment takes the frames it leaves idle, and every fourth frame first, so neither starves.
+    const auto equipment = [&] {
+        if (impl->ghost->Calling()) return false;
+        std::vector<Equip::Root> roots;
+        for (const auto& slot : impl->ghost->Slots()) {
+            if (slot.state != GhostDriver<Impl::GhostPort>::State::Live) continue;
+            const auto peer = std::find_if(peers.begin(), peers.end(), [&](const PeerView& p) { return p.origin == slot.origin; });
+            const bool eligible = impl->equipment_negotiated && !slot.abandon && !local.loading && !local.banc.empty() &&
+                slot.banc == local.banc && peer != peers.end() && peer->pose && !peer->pose->loading &&
+                peer->pose->banc == local.banc && peer->pose->child == slot.child;
+            roots.push_back({{slot.origin, slot.banc, 0, slot.actor, slot.record, 0, slot.generation,
+                              static_cast<u8>(slot.child ? 0 : 1)}, eligible,
+                             peer != peers.end() && peer->pose ? peer->pose->equipment : std::nullopt});
+        }
+        auto equipment_port = port.EquipmentPort();
+        const bool called = impl->equipment->Frame(equipment_port, roots, local.banc,
+            !local.loading && !local.banc.empty(), impl->equipment_negotiated,
+            local.banc.empty() ? std::nullopt : std::optional<bool>{local.child});
+        for (const auto& slot : impl->ghost->Slots()) {
+            if (slot.actor && impl->equipment->Blocked(slot.actor, slot.generation))
+                impl->ghost->RetireEquipment(slot.actor, impl->equipment->Recreate(slot.actor, slot.generation));
+        }
+        return called;
+    };
+    const bool equipment_first = impl->tick % 4 == 0;
+    if (equipment_first && equipment()) return;
+    if (impl->ghost->Frame(port, impl->binding.sentinel + GhostBlock, local, peers, log, now)) return;
+    if (!equipment_first) equipment();
 }
 
 void BeginSession() {

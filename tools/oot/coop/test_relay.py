@@ -84,12 +84,15 @@ class ProtocolTests(unittest.TestCase):
         return relay.Relay()
 
     @staticmethod
-    def stalled(server, client_id, **kwargs):
+    def stalled(server, client_id, equipment=None, **kwargs):
         """A real relay Client whose write loop never runs: its outbox only fills."""
         closed = []
         peer = relay.Client(None, SimpleNamespace(close=lambda: closed.append(True)))
         peer.closed = closed
-        server.join(peer, client_sim.ClientSim(client_id, **kwargs).hello)
+        hello = client_sim.ClientSim(client_id, **kwargs).hello
+        if equipment is not None:
+            hello["ghost_equipment_v2"] = equipment
+        server.join(peer, hello)
         return peer
 
     @staticmethod
@@ -725,6 +728,127 @@ class ProtocolTests(unittest.TestCase):
             relay.validate_pose(pose(), size=relay.MAX_POSE_FRAME + 1)
         relay.validate_pose(pose(), size=relay.MAX_POSE_FRAME)
 
+    def test_equipment_hello_capability(self):
+        hello = client_sim.ClientSim("a").hello
+        for flag in (True, False):
+            relay.validate_hello(dict(hello, ghost_equipment_v2=flag))
+        for flag in (0, 1, "true", None, []):
+            with self.subTest(flag=flag), self.assertRaises(relay.ProtocolError):
+                relay.validate_hello(dict(hello, ghost_equipment_v2=flag))
+        server = self.memory_server()
+        enabled = self.stalled(server, "enabled", equipment=True)
+        disabled = self.stalled(server, "disabled", equipment=False)
+        legacy = self.stalled(server, "legacy")
+        self.assertIs(self.queued(enabled)[0]["ghost_equipment_v2"], True)
+        self.assertIs(self.queued(disabled)[0]["ghost_equipment_v2"], False)
+        self.assertNotIn("ghost_equipment_v2", self.queued(legacy)[0])
+
+    def test_equipment_codec_fields_exhaustive(self):
+        base = 0x10000000
+        fields = ((0, 3, {0, 1, 2, 3, 7}), (3, 3, {0, 1, 2, 3, 7}),
+                  (6, 2, set(range(4))), (8, 2, set(range(4))),
+                  (10, 2, set(range(4))), (12, 2, set(range(4))),
+                  (14, 4, set(range(11)) | {15}), (18, 2, {0, 1, 3}), (20, 1, {0, 1}))
+        for shift, width, allowed in fields:
+            for value in range(1 << width):
+                packet = pose(eq32=base | (value << shift), eqseq=65535,
+                              child=not (shift == 18 and value == 1))
+                with self.subTest(shift=shift, value=value):
+                    if value in allowed:
+                        relay.validate_pose(packet)
+                    else:
+                        with self.assertRaises(relay.ProtocolError):
+                            relay.validate_pose(packet)
+        # Transitional ID/state combinations are valid snapshots, settled by the receiver.
+        relay.validate_pose(pose(eq32=base | (1 << 6), eqseq=0))
+        relay.validate_pose(pose(eq32=base | 1, eqseq=0))
+
+    def test_equipment_malformed_and_age_validation(self):
+        for word in (-1, 1 << 32, True, 0, 0x10200000, 0x10080000, 0x10000004,
+                     0x1002C000, 0x20000000, 1.0, "268435456", None):
+            with self.subTest(word=word), self.assertRaises(relay.ProtocolError):
+                relay.validate_pose(pose(eq32=word, eqseq=0))
+        for bit in range(21, 28):
+            with self.subTest(bit=bit), self.assertRaises(relay.ProtocolError):
+                relay.validate_pose(pose(eq32=0x10000000 | (1 << bit), eqseq=0))
+        for seq in (-1, 65536, True, 1.0, "1", None):
+            with self.subTest(seq=seq), self.assertRaises(relay.ProtocolError):
+                relay.validate_pose(pose(eq32=0x10000000, eqseq=seq))
+        for extra in ({"eq32": 0x10000000}, {"eqseq": 0}):
+            with self.subTest(extra=extra), self.assertRaises(relay.ProtocolError):
+                relay.validate_pose(pose(**extra))
+        for child in (False, True):
+            relay.validate_pose(pose(child=child, eq32=0x100C0000, eqseq=0))
+            with self.assertRaises(relay.ProtocolError):
+                relay.validate_pose(pose(child=child, eq32=0x10000000 | (int(child) << 18), eqseq=0))
+
+    def test_equipment_pose_has_a_bounded_extended_budget(self):
+        # One limit for every pose: the worst case with all animation and equipment fields
+        # and the relay-added origin still fits MAX_POSE_FRAME.
+        packet = pose(banc="x" * 63, t=(1 << 32) - 1, pos=[-100000, -100000, -100000],
+                      eq32=0x10000000, eqseq=65535, av=1, aid=(1 << 32) - 1, af=999999.9921875,
+                      ar=3.9999998, aseq=(1 << 32) - 1)
+        relay.validate_pose(packet)
+        forwarded = dict(packet, origin="f" * 64)
+        self.assertLessEqual(len(relay.encode(forwarded)) - 4, relay.MAX_POSE_FRAME)
+        relay.validate_pose(packet, size=relay.MAX_POSE_FRAME)
+        with self.assertRaisesRegex(relay.ProtocolError, "too large"):
+            relay.validate_pose(packet, size=relay.MAX_POSE_FRAME + 1)
+        with self.assertRaisesRegex(relay.ProtocolError, "too large"):
+            relay.validate_pose(pose(), size=relay.MAX_POSE_FRAME + 1)
+
+    def test_equipment_negotiation_forwarding_and_coalescing(self):
+        server = self.memory_server()
+        a = self.stalled(server, "a", equipment=True)
+        b = self.stalled(server, "b", equipment=True)
+        legacy = self.stalled(server, "legacy")
+        for peer in (a, b, legacy):
+            self.drain(peer)
+        server.receive(a, pose(eq32=0x10000001, eqseq=65535))
+        server.receive(a, pose(t=1235, eq32=0x10000002, eqseq=0))
+        self.assertEqual(len(b.outbox), 1)
+        self.assertEqual((self.queued(b)[0]["eq32"], self.queued(b)[0]["eqseq"]), (0x10000002, 0))
+        self.assertNotIn("eq32", self.queued(legacy)[0])
+        self.assertNotIn("eqseq", self.queued(legacy)[0])
+        self.assertEqual(a.team.snapshot()["changes"], [])
+        self.assertEqual(a.team.snapshot()["replay"], [])
+        with self.assertRaisesRegex(relay.ProtocolError, "not negotiated"):
+            server.receive(legacy, pose(eq32=0x10000000, eqseq=0))
+
+    def test_equipment_fake_peer_commands_without_sockets(self):
+        peer = fake_peer.FakePeer()
+        peer.client.ack = {"ghost_equipment_v2": True}
+        peer.client.send = mock.AsyncMock()
+        for options, expected in (("eq32=0x10000081", 1), ("eq32=0x10100081", 1),
+                                  ("eq32=0x100fffff", 1), ("eq32=0x10000081", 1),
+                                  ("eq32=0x10000002", 1),
+                                  ("eq32=0x10000082 eqseq=65535", 65535),
+                                  ("eq32=0x10000083", 0)):
+            with self.assertRaises(StopIteration) as done:
+                peer.command("pose Field_1 1 0 0 0 0 " + options).send(None)
+            self.assertEqual(done.exception.value["sent"]["eqseq"], expected)
+        self.assertEqual(peer.client.send.await_count, 7)
+        for options in ("eqseq=1", "eq32=0", "eq32=0x10000000 eqseq=65536",
+                        "eq32=0x10000000 eq32=0x10000000", "unknown=1"):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                peer.command("pose Field_1 1 0 0 0 0 " + options).send(None)
+        peer.client.ack = {}
+        with self.assertRaisesRegex(ValueError, "not negotiated"):
+            peer.command("pose Field_1 1 0 0 0 0 eq32=0x10000000").send(None)
+
+    def test_fake_peer_poseequip_sets_what_streams_carry(self):
+        peer = fake_peer.FakePeer()
+        with self.assertRaises(StopIteration) as done:
+            peer.command("poseequip 0x10040292 child=0").send(None)
+        self.assertEqual(done.exception.value, {"stream_eq32": 0x10040292, "stream_child": False})
+        self.assertEqual((peer.stream_eq32, peer.stream_child), (0x10040292, False))
+        for bad in ("poseequip 0x10000289 child=0", "poseequip", "poseequip 0x10000289 child=2"):
+            with self.subTest(bad=bad), self.assertRaises((ValueError, relay.ProtocolError)):
+                peer.command(bad).send(None)
+        with self.assertRaises(StopIteration) as done:
+            peer.command("poseequip off child=1").send(None)
+        self.assertEqual((peer.stream_eq32, peer.stream_child), (None, True))
+
     def test_pose_forwarded_to_team_only_with_origin_and_no_ack(self):
         server = self.memory_server()
         a, b, c = (self.stalled(server, name) for name in ("a", "b", "c"))
@@ -1063,6 +1187,7 @@ class FakePeerTests(unittest.IsolatedAsyncioTestCase):
         self.peer = fake_peer.FakePeer(port=0, room="r", team="t", policy="p", wallet=WALLET)
         self.port = await self.peer.start()
         self.emu = client_sim.ClientSim("emu", room="r", team="t", policy_id="p")
+        self.emu.hello["ghost_equipment_v2"] = True
         await self.emu.connect("127.0.0.1", self.port)
 
     async def asyncTearDown(self):
@@ -1173,6 +1298,23 @@ class FakePeerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):  # refused locally, so the peer's session survives
             await self.peer.command("pose bad-banc 1 0 0 0 0")
         self.assertIn("state", await self.peer.command("state"))
+
+    async def test_equipment_pose_command_and_sequence(self):
+        count = 0
+        for options, expected in (("eq32=0x10000081", 1), ("eq32=0x10100081", 1),
+                                  ("eq32=0x100fffff", 1), ("eq32=0x10000081", 1),
+                                  ("eq32=0x10000002", 1),
+                                  ("eq32=0x10000082 eqseq=65535", 65535),
+                                  ("eq32=0x10000083", 0)):
+            sent = (await self.peer.command("pose Field_1 1 0 0 0 0 " + options))["sent"]
+            got = await self.emu.receive_pose(since=count)
+            count += 1
+            self.assertEqual(sent["eqseq"], expected)
+            self.assertEqual((got["eq32"], got["eqseq"]), (sent["eq32"], expected))
+        for options in ("eqseq=1", "eq32=0", "eq32=0x10000000 eqseq=65536",
+                        "eq32=0x10000000 eq32=0x10000000", "unknown=1"):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                await self.peer.command("pose Field_1 1 0 0 0 0 " + options)
 
     async def test_posecircle_stream_and_stop(self):
         result = await self.peer.command("posecircle Field_1 10 5 -20 100 4 20 0")

@@ -48,6 +48,10 @@ Json EncodePose(const Pose& pose) {
             {"anim_seq", pose.anim_seq}, {"rate", round(pose.rate)},
             {"phase", std::min(0.99, round(pose.phase))}};
     if (pose.animation) Anim::EncodeState(packet, *pose.animation);
+    if (pose.equipment) {
+        packet["eq32"] = pose.equipment->word;
+        packet["eqseq"] = pose.equipment->sequence;
+    }
     return packet;
 }
 
@@ -60,7 +64,8 @@ std::optional<Pose> DecodePose(const Json& packet, std::string* origin) {
             if (field == "type" || field == "t" || field == "banc" || field == "child" ||
                 field == "loading" || field == "pos" || field == "yaw" || field == "anim" ||
                 field == "anim_seq" || field == "rate" || field == "phase" ||
-                field == "av" || field == "aid" || field == "af" || field == "ar" || field == "aseq")
+                field == "av" || field == "aid" || field == "af" || field == "ar" || field == "aseq" ||
+                field == "eq32" || field == "eqseq")
                 continue;
             if (forwarded && field == "origin") continue;
             return {};
@@ -81,6 +86,10 @@ std::optional<Pose> DecodePose(const Json& packet, std::string* origin) {
         if (!BancName(pose.banc)) return {};
         pose.child = packet.at("child").get<bool>();
         pose.loading = packet.at("loading").get<bool>();
+        if (packet.contains("eq32") || packet.contains("eqseq")) {
+            pose.equipment = Equip::DecodePacket(packet, pose.child);
+            if (!pose.equipment) return {};
+        }
         const auto& pos = packet.at("pos");
         if (!pos.is_array() || pos.size() != 3) return {};
         for (size_t i = 0; i < 3; ++i) {

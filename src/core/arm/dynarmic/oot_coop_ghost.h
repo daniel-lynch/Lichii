@@ -22,6 +22,7 @@
 
 #include "core/arm/dynarmic/oot_gamedata_trace.h"
 #include "core/arm/dynarmic/oot_coop_anim.h"
+#include "core/arm/dynarmic/oot_coop_equip.h"
 
 namespace Core::OotCoop {
 
@@ -39,6 +40,7 @@ struct Pose {
     float rate{};             ///< Speed relative to the category's nominal speed, 0..10
     float phase{};            ///< Cycle position in [0, 1): distance (or time when idle) per stride
     std::optional<Anim::State> animation;
+    std::optional<Equip::Packet> equipment;
     bool operator==(const Pose&) const = default;
 };
 [[nodiscard]] bool AnimName(std::string_view name);
@@ -210,6 +212,7 @@ public:
         if (sent && now_ms - sent_ms < 66) return {};
         const bool changed = !sent || pose.banc != last.banc || pose.child != last.child ||
                              pose.anim_seq != last.anim_seq || pose.animation != last.animation ||
+                             pose.equipment != last.equipment ||
                              pose.loading != last.loading || Far(pose.pos, last.pos, 0.01f) ||
                              std::fabs(pose.yaw - last.yaw) > 0.5f;
         if (!changed && now_ms - sent_ms < 1000) return {};
@@ -301,6 +304,8 @@ public:
         std::vector<u64> fields;
         std::string banc;
         bool parked{};
+        bool child{};
+        bool equipment_quarantined{};
         std::array<float, 4> drawn{}; ///< x, y, z, yaw last sent to set-transform
         u64 retry_tick{}, pending_tick{};
         bool pending_logged{};
@@ -317,7 +322,6 @@ public:
         std::string played;    ///< Pose category whose command was last played ("" = none yet)
         u32 played_seq{};
         bool play_logged{};
-        bool child{};
         u64 session{};
         Anim::Receiver animation;
         std::optional<Anim::Operation> animation_call;
@@ -340,6 +344,13 @@ public:
 
     bool Calling() const { return op != GhostOp::None; }
     const std::array<Slot, GhostSlots>& Slots() const { return slots; }
+    void RetireEquipment(u64 actor, bool recreate) {
+        for (auto& slot : slots) {
+            if (slot.actor != actor || slot.state != State::Live) continue;
+            if (!recreate || slot.abandons >= AbandonLimit) slot.equipment_quarantined = true;
+            else if (!slot.abandon) { slot.abandon = true; ++slot.abandons; }
+        }
+    }
 
     /// Forget every actor without a call (the game deletes them with the scene / save).
     template <typename Log>
@@ -394,7 +405,7 @@ public:
                 continue;
             }
             for (auto& slot : slots) {
-                if (slot.state == State::Live && slot.absent_since && tick - slot.absent_since >= OrphanAfter) {
+                if (slot.state == State::Live && !slot.equipment_quarantined && slot.absent_since && tick - slot.absent_since >= OrphanAfter) {
                     Line(log, slot, fmt::format("reassigned to peer {} (its peer is gone; actor kept)",
                                                 peer.origin.substr(0, 8)));
                     slot.origin = peer.origin;
@@ -429,7 +440,7 @@ public:
             const u64 at = block + i * SlotSize;
             const PeerView* peer = nullptr;
             for (const auto& p : peers) if (p.origin == slot.origin) peer = &p;
-            const bool visible = ready && peer && peer->pose && !peer->pose->loading &&
+            const bool visible = !slot.equipment_quarantined && ready && peer && peer->pose && !peer->pose->loading &&
                                  peer->pose->banc == local.banc;
             if (slot.state == State::None) {
                 if (!peer) { slot.origin.clear(); continue; } // gone and nothing to clean up
@@ -469,9 +480,13 @@ public:
                 slot.played.clear();
             }
             if (!visible) slot.animation.Reset();
-            if (visible && slot.child != (peer->pose->child || g.actor_adult.empty())) {
+            // Age change: park the old pack before creating the new age (bounded per scene; past
+            // the bound the slot is quarantined like an equipment failure). An adult peer with no
+            // adult actor configured keeps the child fallback, so that is not an age change.
+            if (visible && slot.child != (peer->pose->child || g.actor_adult.empty()) && !slot.abandon) {
                 slot.animation.Reset();
-                slot.abandon = true; // park the old pack before creating the new age
+                if (slot.abandons >= AbandonLimit) slot.equipment_quarantined = true;
+                else { slot.abandon = true; ++slot.abandons; }
             }
             std::array<float, 4> target;
             if (slot.abandon) {

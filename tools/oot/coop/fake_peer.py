@@ -25,10 +25,11 @@ Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CT
   received                  every change packet received so far (from other origins)
   state                     the relay's team checkpoint as the peer sees it (team_state_request)
   mark TEXT                 a marker line in received.jsonl (for correlating with emulator logs)
-  pose BANC CHILD X Y Z YAW [LOADING] [aid=N af=F|null ar=R aseq=N]
-                            one pose; animation options need --anim-table and a matching peer.
-                            Omitted aseq advances on each command (including frozen frame steps).
-                            Reuse an explicit aseq for rate-only updates; frame changes need a new sequence.
+  pose BANC CHILD X Y Z YAW [LOADING] [aid=N af=F|null ar=R aseq=N] [eq32=WORD [eqseq=N]]
+                            one pose (CHILD/LOADING 0|1; BANC "-" = ""); animation options need --anim-table
+                            and a matching peer. Omitted aseq advances on each command (including frozen
+                            frame steps). Reuse an explicit aseq for rate-only updates; frame changes need a
+                            new sequence. WORD accepts 0x hex (needs the equipment capability).
   poseanim BANC X Y Z YAW ANIM RATE      one child pose with an explicit animation hint (idle|walk|run),
                             a new anim_seq each time (the receiver replays the category's command)
   posecircle BANC CX CY CZ R PERIOD_S HZ DURATION_S
@@ -40,6 +41,9 @@ Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CT
                             start (returns at once) a pose stream walking the waypoints in order at
                             SPEED m/s, HZ poses/s, then holding the last one (1 Hz keepalive) until
                             posestop. Replaces any stream.
+  poseequip WORD|off [child=0|1]
+                            what later pose streams (posecircle, posepath) carry: an eq32 word (eqseq
+                            tracks known changes) and the age; off = no equipment fields
   posestop                  stop the stream; result has how many poses it sent
   kick                      close the relay's connection to every other client (the emulator), as a
                             network drop would; the peer itself stays connected
@@ -83,6 +87,10 @@ class FakePeer:
         self.client = client_sim.ClientSim(room=room, team=team, name=name, build_id=build_id,
                                            seed_hash=seed, policy_id=policy,
                                            animation=client_sim.animation_descriptor(anim_table))
+        self.client.hello["ghost_equipment_v2"] = True
+        self.equipment_seq = 0
+        self.equipment_known = {}
+        self.stream_eq32, self.stream_child = None, True  # poseequip: what the pose streams carry
         self.record = Path(record) if record else None
         self.wallet = wallet  # the wallet key from the private profile (rupee_add)
         self.received = []
@@ -112,8 +120,34 @@ class FakePeer:
         if self.pose_count % 15 == 1:
             self.log(dict(packet, pose_n=self.pose_count))
 
-    async def send_pose(self, banc, child, pos, yaw, loading=False, step=1, **anim):
-        return await self.client.pose(banc, child, pos, yaw, loading, t=self.client.pose_t + step, **anim)
+    async def send_pose(self, banc, child, pos, yaw, loading=False, step=1, eq32=None, eqseq=None, **anim):
+        packet = self.client.pose_packet(banc, child, pos, yaw, loading,
+                                         t=self.client.pose_t + step, **anim)
+        known = dict(self.equipment_known)
+        if eq32 is not None:
+            if self.client.ack.get("ghost_equipment_v2") is not True:
+                raise ValueError("equipment capability not negotiated")
+            relay_mod.validate_equipment(eq32, child)
+            unsettled = set()
+            for identity_shift, state_shift in ((0, 6), (3, 8)):
+                identity, state = (eq32 >> identity_shift) & 7, (eq32 >> state_shift) & 3
+                if not ((identity == 0 and state == 0) or (1 <= identity <= 3 and state in (1, 2))):
+                    unsettled.update((identity_shift, state_shift))
+            for shift, mask, unknown in ((0, 7, 7), (3, 7, 7), (6, 3, 3), (8, 3, 3),
+                                         (10, 3, 3), (12, 3, 3), (14, 15, 15), (18, 3, 3)):
+                value = (eq32 >> shift) & mask
+                if value != unknown and shift not in unsettled:
+                    known[shift] = value
+            if eqseq is None:
+                eqseq = (self.equipment_seq + (known != self.equipment_known)) & 0xFFFF
+            packet.update(eq32=eq32, eqseq=eqseq)
+        elif eqseq is not None:
+            raise ValueError("eqseq requires eq32")
+        relay_mod.validate_pose(packet)
+        await self.client.send(packet)
+        if eq32 is not None:
+            self.equipment_known, self.equipment_seq = known, eqseq
+        return packet
 
     async def circle(self, banc, centre, radius, period, hz, duration):
         loop = asyncio.get_running_loop()
@@ -135,7 +169,7 @@ class FakePeer:
             dx, dz = -math.sin(angle), math.cos(angle)  # direction of travel (counter-clockwise in X/Z)
             yaw = round(math.degrees(math.atan2(dx, dz)), 3)
             phase = 0.0 if anim == "idle" else (speed * n / hz / stride) % 1.0
-            await self.send_pose(banc, True, pos, yaw, False, step, anim=anim, anim_seq=self.anim_seq,
+            await self.send_pose(banc, self.stream_child, pos, yaw, False, step, eq32=self.stream_eq32, anim=anim, anim_seq=self.anim_seq,
                                  rate=round(min(10.0, 1.0 if anim == "idle" else speed / nominal), 2),
                                  phase=min(0.99, round(phase, 2)))
             self.stream_sent += 1
@@ -158,14 +192,14 @@ class FakePeer:
                 move = min(dist, speed / hz)
                 pos = [round(pos[i] + (target[i] - pos[i]) * move / dist, 3) for i in range(3)]
                 travelled += move
-                await self.send_pose(banc, True, pos, yaw, False, step, anim=anim, anim_seq=self.anim_seq,
+                await self.send_pose(banc, self.stream_child, pos, yaw, False, step, eq32=self.stream_eq32, anim=anim, anim_seq=self.anim_seq,
                                      rate=round(min(10.0, speed / nominal), 2),
                                      phase=min(0.99, round((travelled / stride) % 1.0, 2)))
                 self.stream_sent += 1
                 await asyncio.sleep(1 / hz)
         self.anim_seq += 1
         while True:  # hold: idle keepalive
-            await self.send_pose(banc, True, pos, yaw, False, step, anim="idle", anim_seq=self.anim_seq,
+            await self.send_pose(banc, self.stream_child, pos, yaw, False, step, eq32=self.stream_eq32, anim="idle", anim_seq=self.anim_seq,
                                  rate=1.0, phase=0.0)
             self.stream_sent += 1
             await asyncio.sleep(1.0)
@@ -336,14 +370,17 @@ class FakePeer:
             return {"state": await self.state()}
         if verb == "pose":
             if len(words) < 7:
-                raise ValueError("pose BANC CHILD X Y Z YAW [LOADING] [aid=N af=F|null ar=R aseq=N]")
-            tail, loading, animation = words[7:], False, {}
+                raise ValueError("pose BANC CHILD X Y Z YAW [LOADING] [aid=N af=F|null ar=R aseq=N] [eq32=WORD [eqseq=N]]")
+            tail, loading, animation, equipment = words[7:], False, {}, {}
             if tail and "=" not in tail[0]:
                 if tail[0] not in ("0", "1"):
                     raise ValueError("LOADING must be 0 or 1")
                 loading, tail = tail[0] == "1", tail[1:]
             for option in tail:
                 key, separator, value = option.partition("=")
+                if key in ("eq32", "eqseq") and separator and key not in equipment:
+                    equipment[key] = int(value, 0)
+                    continue
                 if not separator or key not in ("aid", "af", "ar", "aseq") or key in animation:
                     raise ValueError("invalid animation pose option")
                 animation[key] = (int(value, 0) if key in ("aid", "aseq") else
@@ -356,10 +393,19 @@ class FakePeer:
                 raise ValueError("CHILD must be 0 or 1")
             packet = await self.send_pose("" if words[1] == "-" else words[1], words[2] == "1",
                                           [float(w) for w in words[3:6]], float(words[6]),
-                                          loading, **animation)
+                                          loading, **equipment, **animation)
             if animation:
                 self.aseq = animation["aseq"]
             return {"sent": packet}
+        if verb == "poseequip":
+            if len(words) not in (2, 3) or (len(words) == 3 and words[2] not in ("child=0", "child=1")):
+                raise ValueError("poseequip WORD|off [child=0|1]")
+            child = self.stream_child if len(words) == 2 else words[2] == "child=1"
+            word = None if words[1] == "off" else int(words[1], 0)
+            if word is not None:
+                relay_mod.validate_equipment(word, child)
+            self.stream_eq32, self.stream_child = word, child
+            return {"stream_eq32": word, "stream_child": child}
         if verb == "poseanim":
             if len(words) != 8 or words[6] not in ("idle", "walk", "run"):
                 raise ValueError("poseanim BANC X Y Z YAW idle|walk|run RATE")

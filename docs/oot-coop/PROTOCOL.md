@@ -37,7 +37,7 @@ semantics from omitted capabilities:
 | `REQUEST_TEAM_STATE`, `UPDATE_TEAM_STATE` | `team_state_request`/`team_state`: authoritative relay union of flags plus checkpoint/replay, never a whole guest save. Clients cannot replace relay state. |
 | `UPDATE_CLIENT_STATE`, `ALL_CLIENT_STATE` | `client_state` to other team members and cached state on join. Retain online/name/save-loaded/scene/room presence concepts. Presence has no guest-write authority. |
 | `UPDATE_ROOM_STATE` | Drop mutable owner settings. Room build, seed and policy are fixed by first join. No mid-session team migration. |
-| `PLAYER_UPDATE` | `pose` (v3): position, facing, scene (`banc`), age and a loading bit only, best effort, forwarded to the team, never state. Joints, equipment and animation are dropped. Like `Ship/Packets/PlayerUpdate.cpp` it is drawn only for same-scene peers. |
+| `PLAYER_UPDATE` | `pose` (v3): position, facing, scene (`banc`), age, loading and animation hints, plus optional negotiated equipment; best effort, forwarded to the team, never state. Joints are dropped. Like `Ship/Packets/PlayerUpdate.cpp` it is drawn only for same-scene peers. |
 | Dummy player creation/update/destruction | No packet. With class `pose` allowed, each same-scene peer is a "statue" ghost: a Link-shaped puppet actor created through the game's own actor manager and moved only by the actor's own set-transform call (no joints, animation, collision or equipment). It is parked below the map, not destroyed, when the peer leaves the scene or disconnects. `Ship/Anchor.cpp:199` refreshes remote actors; `Ship/DummyPlayer.cpp:115` gates updates on scene, online and save-loaded state. |
 | `PLAYER_SFX`, `OCARINA_SFX`, `DAMAGE_PLAYER`, `REQUEST_TELEPORT`, `TELEPORT_TO` | Drop audio, PvP and teleportation. |
 | `HEARTBEAT` | `heartbeat`/`heartbeat_ack`, same liveness purpose, new schema. |
@@ -100,6 +100,11 @@ that peer's negotiation. Missing or mismatched tables retain legacy animation hi
 A client sends the v4 hello only when its private key file turns an animation sender or
 receiver on and the sidecar loads; with both off it keeps the v3 hello (and so still joins a
 relay that predates v4). Deploy the v4 relay before enabling either.
+
+Equipment-capable clients add the optional boolean `ghost_equipment_v2:true` to `hello`.
+The relay echoes the flag in `hello_ack` when supplied. Send equipment only after a true
+acknowledgement; omission or false disables it. Legacy clients retain the original handshake. The flag is independent of
+the protocol version: a v3 or v4 hello may carry it.
 
 ## Grants, receipts and presence
 
@@ -309,7 +314,7 @@ inline clipping and durable baseline revisions still require a later ordered-wal
 
 A pose is a peer's live position, sent so the others can draw a ghost of it. It is **not a
 grant**: no `seq`, no ack, no `rev`, no replay window, never folded into team state, never in a
-`team_state` snapshot and never sent on join. A client sends exactly these fields:
+`team_state` snapshot and never sent on join. A client sends these required fields:
 
 ```json
 {"type":"pose","t":123456,"banc":"<banc>","child":true,"loading":false,"pos":[-46.09,118.46,15.39],"yaw":108.6,"anim":"walk","anim_seq":3,"rate":1.0,"phase":0.25}
@@ -322,12 +327,49 @@ because the game's command table shares a locomotion command for walking and run
 then and never per packet. `rate` (0..10) is the speed relative to the category's nominal speed;
 `phase` (0 <= phase < 1) is the cycle position (distance per stride, or time while idle).
 
+Negotiated equipment adds the optional pair `eq32` and `eqseq`; both must be present or absent.
+`eq32` is an unsigned 32-bit JSON integer and `eqseq` an unsigned 16-bit JSON integer (booleans
+and floats are rejected). The relay forwards the pair only to receivers that negotiated
+`ghost_equipment_v2`; it strips both fields for legacy receivers. Unnegotiated senders cannot
+send either field. Equipment fields count toward the same 512-byte pose payload limit as the
+animation fields; the existing cadence, coalescing and rate limits apply.
+
+| `eq32` bits | Mod-defined value |
+|---|---|
+| 0–2, 3–5 | Sword/shield identity: 0 none, 1–3 allowlisted IDs, 7 unknown; 4–6 invalid |
+| 6–7, 8–9 | Actual sword/shield state: 0 absent, 1 drawn, 2 sheathed, 3 unknown |
+| 10–11, 12–13 | Tunic/boots: 0–2 allowlisted IDs, 3 unknown |
+| 14–17 | Mask: 0 default head, 1–10 allowlisted IDs, 15 unknown; 11–14 invalid |
+| 18–19 | Age: 0 child, 1 adult, 3 unknown; 2 invalid |
+| 20 | Guard-front boolean |
+| 21–27 | Reserved, must be zero |
+| 28–31 | Equipment schema version, exactly 1 (independent of protocol version) |
+
+A known equipment age must agree with outer `child`. Unknown age cannot create or re-age a
+ghost. Unknown fields retain the last confirmed desired value only within the current peer
+freshness, scene epoch and actor generation. None plus a nonzero state, or an equipped identity
+plus state zero, is an unsettled snapshot: accept its encoding, but defer native changes until
+it settles. IDs index the private allowlist sidecar; names, guest pointers and native addresses
+never travel in these fields. Runtime entries such as `main+0x????` come from the private profile.
+
+`eqseq` changes only when a known ID, actual state or age changes; unknown observations and the
+guard bit do not increment it; it wraps at 65536 and is not an action count. Receivers apply
+equipment snapshots in arrival order (one ordered stream, every packet a full snapshot) and do not
+reject by `eqseq`, since a restarted client restarts its sequence; outer pose `t`, freshness and
+scene identity still reject stale poses. Send the latest full snapshot at the existing cadence and
+coalesce before issuing any guest calls. Boots identities travel on the wire, but the receiver
+defers them: no guarded native boots path exists yet.
+
+The kit controller's `peer pose <banc> 1 <x> <y> <z> <yaw> eq32=<word> [eqseq=<u16>]`
+accepts decimal or `0x` equipment words. Omitted `eqseq` tracks known changes and wraps at 65536;
+an explicit value supports stale/wrap probes. Use the private probe report for actual pack IDs.
+
 `t` is the sender's frame counter (unsigned 32-bit, wraps). `banc` is the sender's current scene
 name, 1..63 of `[A-Za-z0-9_]`, or `""` when there is no save, the title screen is up or the scene
 cannot be read. `child` and `loading` are JSON booleans. `pos` is exactly three finite numbers
 (integer or float, never a boolean), each with magnitude at most 100000. `yaw` is a finite number
 of degrees in [-360, 360]. The JSON payload is at most 512 bytes, including the relay-added
-`origin` on forwarded packets. `origin` and `seq`
+`origin` on forwarded packets and any negotiated animation and equipment fields. `origin` and `seq`
 are not accepted from the client and unknown fields are rejected. A malformed pose is a protocol
 error like any other malformed packet (an `error` and disconnect); a well-formed one never
 causes a disconnect unless adding the required origin exceeds the payload limit.
