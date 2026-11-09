@@ -620,6 +620,8 @@ TEST_CASE("Equipment suspends, never retires, an owner that is only ineligible",
     // Back in view: the pending request resumes its timeout from where it stood, once.
     fixture.AddChild(Slot::Sword, 0x40000, 77, "PrivateA");
     fixture.AddChild(Slot::Sheath, 0x50000, 78, "PrivateCaseA");
+    // Field C15: the request bits stay set while the slots hold their children; that is settled.
+    fixture.memory.Write(ControllerFixture::Equipment + 0x700, 1U | (1U << 5), 4);
     for (unsigned i = 0; i < 32 && !fixture.controller->Calling(); ++i) fixture.Frame();
     REQUIRE(fixture.controller->Calling());
     REQUIRE(fixture.calls.back().entry == ControllerFixture::CreateEntry + 8); // actual-state query
@@ -719,4 +721,14 @@ TEST_CASE("Equipment sender finds the resident player by reads and reports settl
     memory.Text(Name, "SomeoneElse");
     for (unsigned i = 0; i < 100; ++i) frame(true);
     REQUIRE_FALSE(fixture.controller->Local(true));
+}
+
+TEST_CASE("Equipment treats a request bit without a child as in flight", "[core][oot_coop][equip]") {
+    ControllerFixture fixture;
+    fixture.memory.Write(ControllerFixture::Equipment + 0x700, 1, 4); // sword bit, no sword child
+    for (unsigned i = 0; i < 64; ++i) REQUIRE_FALSE(fixture.Frame());
+    REQUIRE(fixture.calls.empty());
+    fixture.memory.Write(ControllerFixture::Equipment + 0x700, 0, 4);
+    fixture.UntilCall();
+    REQUIRE(fixture.calls.back().entry == ControllerFixture::CreateEntry);
 }

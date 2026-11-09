@@ -440,9 +440,11 @@ Observation Controller::observe(const Port& p, const Token& t, Slot slot, const 
     o.readable = phase && detail && bits && errors && handle && id && (o.child || *id == 0xffffffff);
     o.phase = phase.value_or(0); o.detail = detail.value_or(0); o.bits = bits.value_or(0);
     o.errors = errors.value_or(0); o.handle = handle.value_or(0);
-    // An empty component-owned handle and cleared request bit are a conservative idle receipt.
-    // The two phase words remain telemetry: no undocumented phase is labelled ready.
-    o.idle = o.readable && !o.handle && !(o.bits & s.request_mask) && !(o.errors & k.Get("error_mask"));
+    // Idle: empty component-owned handle, no inspected error, and the slot's request bit either clear
+    // or backed by a validated child. Field C15: the bit stays set once the slot holds its child
+    // (0x9 with a live sword and sheath, both lifecycle 4, sword DE active/sheathed), so it marks an
+    // occupied slot; set with no child, it is a request in flight. Phase words remain telemetry.
+    o.idle = o.readable && !o.handle && (!(o.bits & s.request_mask) || o.child) && !(o.errors & k.Get("error_mask"));
     return o;
 }
 bool Controller::start(Port& p, const OotGameDataTrace::Entry& entry, std::array<u64, 8> args,
