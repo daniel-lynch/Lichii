@@ -131,7 +131,8 @@ struct ControllerFixture {
                              {"actor_record", 0x110}, {"actor_id", 0x118},
                              {"model", 0x18}, {"bookkeeping", 0x200}, {"bookkeeping_stride", 8},
                              {"request_bits", 0x700}, {"error_flags", 0x704}, {"error_mask", 1},
-                             {"user_cell", 0x800}, {"user_equipment", 0x8}});
+                             {"user_cell", 0x800}, {"user_equipment", 0x8},
+                             {"user", 0x38}, {"guard", 0}, {"guard_mask", 0x10}});
         keys->fields["actor_name"] = 0x120;
         keys->fields["lifecycle"] = 0x130;
         keys->dynamic.offset = CreateEntry;
