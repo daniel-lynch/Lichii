@@ -958,3 +958,10 @@ Frame order (one guest call per frame): cross-scene teleport (exclusive while ac
 grants -> world cleanup -> quest -> pose step (room window, name tags; teleport step; ghost
 driver; equipment). Quest and teleport also refuse to call while any other call is outstanding.
 
+
+Optional private `quest.bosses` bundles defer selected quest completions during local activity.
+They consume the same raw `quest_step` and snapshot `quest` records; the wire format and relay
+ordering are unchanged. Bundle steps and local-only Bools are verified in order, after an exit,
+teleport arrival, or configured death/respawn policy. Boss definitions and activity identifiers
+come only from the private key file. Existing profiles without these fields retain mirror-only
+behaviour; experimental in-place skips default off.

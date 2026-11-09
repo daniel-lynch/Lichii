@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "core/arm/dynarmic/oot_coop_quest.h"
+#include "core/arm/dynarmic/oot_coop_questdefer.h"
 #include <algorithm>
 #include <charconv>
 #include <limits>
@@ -61,8 +62,11 @@ std::shared_ptr<const Keys> DecodeKeys(const Json& j) {
     try {
         if (!Fields(j, {"manager", "entries", "commit_observation", "layout", "setter_arguments",
                         "mirror", "notready_hash", "complete_hash", "ready_hash"},
-                       {"enabled", "settle_frames", "apply_timeout"})) return {};
+                       {"enabled", "settle_frames", "apply_timeout", "defer_in_activity", "death_skips",
+                        "skip_in_place", "death_apply", "activity", "bosses"})) return {};
         auto k = std::make_shared<Keys>();
+        k->defer = QuestDefer::Decode(j);
+        if (!k->defer) return {};
         if (j.contains("enabled")) {
             if (!j.at("enabled").is_boolean()) return {};
             k->enabled = j.at("enabled").get<bool>();
@@ -251,7 +255,7 @@ std::optional<Record> ReadRecord(const Port& p, const Keys& k, const Manager& m,
 bool Restoring(const Keys& k, const Manager& m, const Record& r) {
     return m.restoring || (r.flags & k.L("record.restoration_mask"));
 }
-std::string_view ApplyBlock(const Keys& k, const Manager& m, const Record& r, const Target& t) {
+std::string_view ApplyBlock(const Keys& k, const Manager& m, const Record& r, const Target& t, const QuestDefer::Machine* defer) {
     if (!m.Ready()) return "manager not ready (uninitialized, busy or restoring)";
     if (m.gated) return "manager suppressed";
     if (Restoring(k, m, r)) return "record restoring";
@@ -262,7 +266,8 @@ std::string_view ApplyBlock(const Keys& k, const Manager& m, const Record& r, co
     if (r.current == k.complete_hash) return "Complete";
     if ((r.pending && r.pending != r.current) || (r.flags & k.L("record.pending_mask"))) return "own request pending";
     if (r.steps[r.index].participants || r.steps[t.index].participants) return "participants";
-    if (r.steps[t.index].minigame || r.steps[t.index].boss || r.steps[r.index].minigame || r.steps[r.index].boss)
+    if ((!defer || !defer->Authorizes(t)) &&
+        (r.steps[t.index].minigame || r.steps[t.index].boss || r.steps[r.index].minigame || r.steps[r.index].boss))
         return "minigame or boss step";
     return {};
 }
@@ -270,7 +275,7 @@ bool CanApply(const Keys& k, const Manager& m, const Record& r, const Target& t)
     return ApplyBlock(k, m, r, t).empty();
 }
 Book::Book(std::shared_ptr<const Keys> keys_, std::set<u64> denied_) : keys{std::move(keys_)}, denied{std::move(denied_)} {}
-bool Book::Mirrored(u32 c) const { return keys->mirror.contains(c) && !denied.contains(c); }
+bool Book::Mirrored(u32 c) const { return (keys->mirror.contains(c) || (keys->defer && keys->defer->Find(c))) && !denied.contains(c); }
 std::string Book::Remote(const Record& r, Target t) {
     if (!Mirrored(t.challenge) || r.challenge != t.challenge) return "not mirrored or denied";
     const auto index = r.Index(t.step);
@@ -287,6 +292,7 @@ std::string Book::Reconcile(const Record& r) {
     if (row.exhausted) return "gave up for session";
     if (!row.team) return "no remote target";
     if (r.Index(row.team->step) != row.team->index) return "unknown step or index mismatch";
+    if (keys->defer && keys->defer->Find(r.challenge)) return "bundle only";
     if (r.current == keys->complete_hash) return "Complete: dropped";
     std::optional<Target> floor;
     std::optional<u32> previous;
@@ -326,7 +332,9 @@ std::vector<Target> Book::Baseline(const std::vector<Record>& records) const {
     return result;
 }
 Controller::Controller(std::shared_ptr<const Keys> keys_, std::set<u64> denied, u64 base_)
-    : keys{std::move(keys_)}, book{keys, std::move(denied)}, base{base_} {}
+    : keys{std::move(keys_)}, book{keys, denied}, defer{std::make_unique<QuestDefer::Machine>(keys, std::move(denied))}, base{base_} {}
+Controller::~Controller() = default;
+bool Controller::Calling() const { return (flight && !flight->returned) || defer->Calling(); }
 void Controller::Log(const Port& p, std::string_view line) {
     if (lines < 511) { ++lines; p.log("OoT co-op: quest " + std::string{line}); }
     else ++suppressed;
@@ -337,7 +345,7 @@ void Controller::Queue(Target t) {
     if (old == incoming.end() || old->second.index < t.index) incoming[t.challenge] = std::move(t);
 }
 void Controller::NewEpoch() {
-    book.Epoch(); dirty.clear(); flight.reset(); baseline_sent.clear(); silent_logged.clear(); blocked.clear();
+    book.Epoch(); defer->Epoch(); dirty.clear(); flight.reset(); baseline_sent.clear(); silent_logged.clear(); blocked.clear();
     snapshotted = false; settle_until = tick + keys->settle_frames;
 }
 void Controller::Reset() { manager.reset(); NewEpoch(); }
@@ -355,7 +363,7 @@ void Controller::Dirty(const Port& p, u64 state, u64 pc) {
     a.restoration |= !flags || !m || !m->initialized || m->restoring || (*flags & keys->L("record.restoration_mask"));
     a.replay |= flight && flight->target.challenge == *hash;
 }
-bool Controller::Frame(Port& p, u64 frame, u64 bind_epoch, bool stable, bool negotiated, bool available) {
+bool Controller::Frame(Port& p, u64 frame, u64 bind_epoch, bool stable, bool negotiated, bool available, QuestDefer::Port* bundles) {
     tick = frame;
     if (tick % 3600 == 0 && suppressed != reported) {
         p.log(fmt::format("OoT co-op: quest suppressed lines={} frame={}", suppressed, tick)); reported = suppressed;
@@ -376,7 +384,10 @@ bool Controller::Frame(Port& p, u64 frame, u64 bind_epoch, bool stable, bool neg
     // Poll all mirrored records every 60 frames, plus dirty, pending, verification and initial snapshots.
     const bool poll = tick % 60 == 0 || !snapshotted;
     std::vector<Record> records;
-    for (const auto& [c, safe] : keys->mirror) {
+    std::set<u32> challenges;
+    for (const auto& [c, safe] : keys->mirror) challenges.insert(c);
+    if (keys->defer) for (const auto& b : keys->defer->bosses) if (book.Mirrored(b.challenge)) challenges.insert(b.challenge);
+    for (const auto c : challenges) {
         if (!book.Mirrored(c) || (!poll && !dirty.contains(c) && !incoming.contains(c) && !book.Pending(c) &&
             !(flight && flight->target.challenge == c) && (!negotiated || baseline_sent.contains(c)))) continue;
         const auto r = ReadRecord(p, *keys, *now, c);
@@ -404,7 +415,7 @@ bool Controller::Frame(Port& p, u64 frame, u64 bind_epoch, bool stable, bool neg
     size_t rises = 0;
     for (const auto& r : records) {
         const auto known = book.Known(r.challenge);
-        if (known && r.index > *known && !book.Echo(r)) ++rises;
+        if (known && r.index > *known && !book.Echo(r) && !defer->Echo(r)) ++rises;
     }
     const bool bulk = snapshotted && rises > 1;
     if (bulk && !settling) { NewEpoch(); Log(p, "bulk change: settling again, not forwarded"); }
@@ -413,7 +424,7 @@ bool Controller::Frame(Port& p, u64 frame, u64 bind_epoch, bool stable, bool neg
         const auto known = book.Known(r.challenge);
         const auto a = dirty.contains(r.challenge) ? dirty.at(r.challenge) : Attribution{};
         const bool restore = a.restoration || Restoring(*keys, *checked, r);
-        const bool echo = a.replay || book.Echo(r) || (flight && flight->target.challenge == r.challenge);
+        const bool echo = a.replay || book.Echo(r) || defer->Echo(r) || (flight && flight->target.challenge == r.challenge);
         const bool moved = known && *known != r.index;
         if (moved) {
             const bool forward = snapshotted && !quiet && !restore && !echo && negotiated && r.index > *known;
@@ -439,6 +450,7 @@ bool Controller::Frame(Port& p, u64 frame, u64 bind_epoch, bool stable, bool neg
         }
         if (const auto in = incoming.find(r.challenge); in != incoming.end()) {
             const auto reason = book.Remote(r, in->second);
+            if (r.Index(in->second.step) == in->second.index) defer->Queue(in->second);
             Log(p, fmt::format("remote challenge={:08x} step={:08x} index={} ({})", r.challenge,
                               in->second.step, in->second.index, reason));
             incoming.erase(in);
@@ -456,7 +468,7 @@ bool Controller::Frame(Port& p, u64 frame, u64 bind_epoch, bool stable, bool neg
     if (quiet) return false;
     if (!snapshotted) {
         size_t expected = 0;
-        for (const auto& [c, safe] : keys->mirror) if (book.Mirrored(c)) ++expected;
+        for (const auto c : challenges) if (book.Mirrored(c)) ++expected;
         if (records.size() != expected || std::any_of(records.begin(), records.end(),
             [&](const auto& r) { return Restoring(*keys, *checked, r); })) return false;
         snapshotted = true;
@@ -470,12 +482,32 @@ bool Controller::Frame(Port& p, u64 frame, u64 bind_epoch, bool stable, bool neg
         }
         for (const auto& t : book.Baseline(records)) {
             const auto r = std::find_if(records.begin(), records.end(), [&](const auto& v) { return v.challenge == t.challenge; });
-            if (baseline_sent.contains(t.challenge) || Restoring(*keys, *checked, *r)) continue;
+            if (baseline_sent.contains(t.challenge) || Restoring(*keys, *checked, *r) || defer->Echo(*r)) continue;
             if (p.send(t)) {
                 baseline_sent.insert(t.challenge);
                 Log(p, fmt::format("baseline challenge={:08x} step={:08x} index={}", t.challenge, t.step, t.index));
             }
         }
+    }
+    if (bundles) {
+        bundles->read = [&](u32 c) -> std::optional<Record> {
+            const auto m = ReadManager(p, *keys, base);
+            if (!m || !m->Same(*checked) || !m->Ready() || m->gated) return {};
+            const auto r = ReadRecord(p, *keys, *m, c);
+            const auto last = ReadManager(p, *keys, base);
+            if (!r || !last || !last->Same(*m) || !last->Ready() || Restoring(*keys, *last, *r)) return {};
+            return r;
+        };
+        bundles->step = [&](const Target& t, bool boss) {
+            const auto m = ReadManager(p, *keys, base);
+            if (!m || !m->Same(*checked)) return false;
+            const auto r = ReadRecord(p, *keys, *m, t.challenge);
+            const auto last = ReadManager(p, *keys, base);
+            if (!r || !last || !last->Same(*m) || !p.ready() ||
+                !ApplyBlock(*keys, *last, *r, t, boss ? defer.get() : nullptr).empty()) return false;
+            return p.call(keys->setter, {m->pointer, t.challenge, t.step, keys->arguments[0], keys->arguments[1], 0, 0, 0});
+        };
+        if (defer->Frame(*bundles, tick, negotiated && available && !flight && p.ready())) return true;
     }
     if (!negotiated || !available || flight || !p.ready()) {
         if (negotiated && !flight && tick - waiting_logged >= 600 &&
@@ -511,6 +543,7 @@ bool Controller::Frame(Port& p, u64 frame, u64 bind_epoch, bool stable, bool neg
     return false;
 }
 void Controller::Returned(Port& p, u64 result) {
+    if (defer->Calling()) { defer->Returned(); return; }
     if (!flight || flight->returned) return;
     flight->returned = true; flight->frame = tick;
     Log(p, fmt::format("apply challenge={:08x} step={:08x} index={} from={} origin={} w0={}",
