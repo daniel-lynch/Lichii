@@ -584,8 +584,11 @@ class Relay:
             if "world_wallet" in packet:
                 validate_wallet(packet["world_wallet"])
                 client.state["world_wallet"] = dict(packet["world_wallet"])
-                self.broadcast(client, {"type": "client_state", "origin": client.client_id,
-                                        "state": client.state})
+                # Per recipient, like every other presence: a client_state is a full state, so a raw
+                # client.state (no negotiated animation) would make v4 peers drop this client's animation.
+                for peer in tuple(client.team.clients.values()):
+                    if peer is not client:
+                        self.send_presence(client, peer)
             client.send(client.team.snapshot())
         elif kind in ("heartbeat", "heartbeat_ack"):
             fields(packet, ("type",))

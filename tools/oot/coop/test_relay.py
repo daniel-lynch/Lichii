@@ -643,6 +643,28 @@ class ProtocolTests(unittest.TestCase):
         server.receive(a, {"type": "client_state", "state": {"animation": {"forged": True}}})
         self.assertEqual(self.queued(b)[0]["state"]["animation"], descriptor)
 
+    def test_wallet_update_presence_keeps_negotiated_animation(self):
+        # Field C15: a team_state_request carrying world_wallet (a reconnect after the save loaded)
+        # re-broadcast the raw state without "animation"; clients treat client_state as a full
+        # state, so every v4 peer silently fell back to the legacy categories for that client.
+        server = self.memory_server()
+        descriptor = {"av": 1, "table_sha256": "a" * 64}
+        a = self.stalled(server, "a", animation=descriptor)
+        b = self.stalled(server, "b", animation=descriptor)
+        legacy = self.stalled(server, "old")
+        for peer in (a, b, legacy):
+            self.drain(peer)
+        wallet = {"balance": 5, "capacity": 99}
+        server.receive(a, {"type": "team_state_request", "world_wallet": wallet})
+        presence = [p for p in self.queued(b) if p["type"] == "client_state"]
+        self.assertEqual(presence, [{"type": "client_state", "origin": "a",
+                                     "state": dict(a.state, animation=descriptor)}])
+        old = [p for p in self.queued(legacy) if p["type"] == "client_state"]
+        self.assertEqual(len(old), 1)
+        self.assertEqual(old[0]["state"]["world_wallet"], wallet)
+        self.assertNotIn("animation", old[0]["state"])
+        self.assertNotIn("animation", a.state)
+
     def test_forwarded_animation_pose_size_includes_origin(self):
         server = self.memory_server()
         a = self.stalled(server, "a" * 64, animation={"av": 1, "table_sha256": "a" * 64})
