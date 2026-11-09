@@ -54,7 +54,9 @@ std::string Details(const Sample& s) {
 
 std::optional<Keys> DecodeKeys(const Json& v) {
     try {
-        if (!v.is_object() || v.size() != 15 + v.contains("fall_origin") + v.contains("cross")) return {};
+        if (!v.is_object() ||
+            v.size() != size_t{15} + (v.contains("fall_origin") ? 1U : 0U) + (v.contains("cross") ? 1U : 0U))
+            return {};
         Keys k;
         if (!v.at("enabled").is_boolean()) return {};
         k.enabled = v.at("enabled").get<bool>();
