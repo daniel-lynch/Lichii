@@ -190,7 +190,7 @@ TEST_CASE("questdefer decoder rejects wrong types limits duplicates and ambiguou
 
 TEST_CASE("questdefer defers once and requires sixty consecutive settled exit frames", "[oot_coop]") {
     Rig r; REQUIRE_FALSE(r.Tick()); REQUIRE(r.machine.Status(201) == D::State::Deferred);
-    REQUIRE(r.toasts == std::vector<std::string>{"Peer A beat Guardian A. Finish it, or teleport/die to skip"});
+    REQUIRE(r.toasts == std::vector<std::string>{"Peer A beat Guardian A. Teleport/die to skip"});
     REQUIRE(r.machine.ExemptBancs() == std::vector<std::string>{"Arena_A"});
     r.Frames(10); REQUIRE(r.toasts.size() == 1);
     r.observation.banc = "Outside_A"; r.Frames(59); REQUIRE(r.calls.empty());

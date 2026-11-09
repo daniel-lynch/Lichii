@@ -203,7 +203,7 @@ bool Machine::Frame(Port& p, u64 frame, bool available) {
                 r.state = State::Deferred;
                 if (!r.deferred_toast) {
                     Log(p, fmt::format("challenge={:08x} deferred", c));
-                    if (p.toast) p.toast(fmt::format("{} beat {}. Finish it, or teleport/die to skip", p.peer ? p.peer(r.team->origin) : r.team->origin, b.name));
+                    if (p.toast) p.toast(fmt::format("{} beat {}. Teleport/die to skip", p.peer ? p.peer(r.team->origin) : r.team->origin, b.name));
                     r.deferred_toast = true;
                 }
                 continue;
