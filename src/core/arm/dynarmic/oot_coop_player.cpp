@@ -16,6 +16,10 @@ std::optional<u64> Number(const nlohmann::json& value, u64 limit) {
     u64 n{};
     if (value.is_number_unsigned()) {
         n = value.get<u64>();
+    } else if (value.is_number_integer()) {
+        const auto v = value.get<s64>();
+        if (v < 0) return std::nullopt;
+        n = static_cast<u64>(v);
     } else if (value.is_string()) {
         const auto text = value.get<std::string>();
         const bool hex = text.starts_with("0x") || text.starts_with("0X");
