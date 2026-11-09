@@ -29,6 +29,7 @@
 #include "core/arm/dynarmic/oot_coop_runtime.h"
 #include "core/arm/dynarmic/oot_coop_ux.h"
 #include "core/arm/dynarmic/oot_coop_room.h"
+#include "core/arm/dynarmic/oot_coop_gui.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
 #include "dynarmic/interface/A64/a64.h"
@@ -1198,7 +1199,28 @@ struct Session::Impl {
         const auto* settings = ux.Settings();
         return settings && settings->room ? *settings->room : empty;
     }
+    // GUI panel status board (guest thread only): <= 2 Hz, immutable hello fields + atomics + PresenceBook.
+    std::string status_mod_hash; // copied before the io thread starts (the io thread may clear hello.mod_hash)
+    u64 status_ms{};
+    void PublishGuiStatus(const std::optional<Room::RoomPeer>& local, u64 now) {
+        if (status_ms && now - status_ms < 500) return;
+        status_ms = now;
+        Gui::Status s;
+        s.live = true;
+        const int state = relay_state.load();
+        s.relay_state = state == 1 ? "connected" : state == 2 ? "reconnecting" : "offline";
+        if (const auto rtt = relay_rtt.load(); rtt != UINT64_MAX) s.rtt_ms = rtt;
+        s.room = hello.room; s.team = hello.team; s.name = hello.name; s.seed = hello.seed_hash;
+        s.policy = hello.policy_id; s.mod_hash = status_mod_hash; s.teleport = teleport != nullptr;
+        if (local) { s.local_child = local->child; s.local_area = Room::AreaText(*local, RoomConfig()); }
+        for (const auto& p : presence.Peers())
+            s.peers.push_back({p.origin, p.name, Room::AreaText(p, RoomConfig()), p.online, p.has_pose,
+                               p.child, p.loading, p.seen});
+        s.published_ms = now;
+        Gui::PublishStatus(std::move(s));
+    }
     void RoomFrame(std::optional<Room::RoomPeer> local_pose, u64 now) {
+        PublishGuiStatus(local_pose, now);
         const auto rtt = relay_rtt.load();
         const int state = relay_state.load();
         room_window.Frame({hello.room, hello.seed_hash, hello.policy_id,
@@ -2125,6 +2147,7 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
         LOG_INFO(Core_ARM, "OoT co-op: teleport off: {}", !profile->teleport || !profile->teleport->enabled ? "key-file disabled" :
             !impl->pose_enabled ? "pose/ghost/private call memory unavailable" : "anim.player or event_got missing");
     }
+    impl->status_mod_hash = impl->hello.mod_hash;
     impl->Start();
 }
 Session::~Session() = default;
@@ -3337,6 +3360,7 @@ void BeginSession() {
     }
     if (old) old->Stop();
     Ux::Reset();
+    Gui::ClearStatus();
 }
 
 void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 program_id, u64 base,
