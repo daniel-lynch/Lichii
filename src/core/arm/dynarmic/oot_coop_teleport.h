@@ -292,6 +292,7 @@ private:
     u64 cross_started{};
     u32 arrival_frames{};
     std::optional<Player::Resident> new_resident;
+    Vec cross_from{}; ///< PlayingInfo position when the cross teleport started
     Keys keys;
     History history;
     Phase phase{Phase::Idle};

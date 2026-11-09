@@ -582,14 +582,15 @@ TEST_CASE("teleport cross event refusal is terminal", "[oot_coop]") {
     REQUIRE(r.steps.size() == count); REQUIRE(r.calls.empty());
 }
 
-TEST_CASE("teleport cross arrival needs new generation agreement and consecutive readiness", "[oot_coop]") {
+TEST_CASE("teleport cross arrival needs a moved agreed position and consecutive readiness", "[oot_coop]") {
     CrossRig r; r.Reserve(); r.Live(); r.Load();
     for (int i = 0; i < 10; ++i) r.Frame(); // stale PlayingInfo after loading fell
     REQUIRE(r.calls.empty()); REQUIRE(r.Logged("loading off"));
-    r.Agree();
-    r.sample.resident = Sample().resident; // identical old actor/generation cannot be the destination
+    // Field (C16 s2): the resident survives the banc change with the same actor and generation.
+    r.sample.resident = Sample().resident;
+    r.Agree(Sample().info_pos); // both views agree but still at the source point: not arrived
     for (int i = 0; i < 10; ++i) r.Frame(); REQUIRE(r.calls.empty());
-    ++r.sample.resident->generation;
+    r.Agree();
     for (int i = 0; i < 4; ++i) r.Frame(); REQUIRE(r.calls.empty());
     r.sample.block_bools_ok = false; r.Frame(); r.sample.block_bools_ok = true;
     for (int i = 0; i < 4; ++i) r.Frame(); REQUIRE(r.calls.empty());

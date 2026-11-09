@@ -401,6 +401,7 @@ bool Controller::Frame(const Sample& s, u64 now, bool can_call, Port& port) {
             cross_active = true; cross_started = now; cross_step = CrossStep::Banc; event_index = 0;
             event_live = reasserted = loading_on = switched = loading_off = old_gone = false;
             arrival_frames = 0; new_resident.reset(); abandoned = false; phase = Phase::Reserve;
+            cross_from = s.info_pos;
             return CrossIssue(port);
         }
         if (!port.call(*resident, destination)) { refuse("call unavailable or actor changed"); return false; }
@@ -516,9 +517,11 @@ bool Controller::CrossFrame(const Sample& s, u64 now, bool can_call, Port& port)
         receipt("re-assertion issued");
         return CrossIssue(port);
     }
-    const bool fresh = s.resident && resident &&
-        (s.resident->actor != resident->actor || s.resident->generation != resident->generation);
-    if (!switched || !loading_on || !loading_off || !old_gone || !reasserted || !fresh ||
+    // Field (C16 s2): the resident player actor survives a banc change (same actor and generation), so a
+    // new resident is not required. The stale-PlayingInfo guard is the actor/PlayingInfo agreement in Ready()
+    // plus a position that has left the source point.
+    const bool moved = !Within(s.info_pos, cross_from, keys.tolerance);
+    if (!switched || !loading_on || !loading_off || !reasserted || !s.resident || !moved ||
         !Ready(s, history, keys, false).empty() || !port.validate(*s.resident)) {
         arrival_frames = 0; return false;
     }
@@ -527,8 +530,9 @@ bool Controller::CrossFrame(const Sample& s, u64 now, bool can_call, Port& port)
     }
     if (!new_resident) {
         new_resident = s.resident; arrival_frames = 0;
-        port.log(fmt::format("OoT co-op: teleport cross new resident id={} actor={:#x} generation={:#x}",
-            destination.id, s.resident->actor, s.resident->generation));
+        port.log(fmt::format("OoT co-op: teleport cross arrival resident id={} actor={:#x} generation={:#x} ({})",
+            destination.id, s.resident->actor, s.resident->generation,
+            resident && *resident == *s.resident ? "kept across the load" : "new"));
     }
     if (arrival_frames < keys.cross->arrive_frames) ++arrival_frames;
     if (arrival_frames < keys.cross->arrive_frames || !can_call) return false;
