@@ -511,3 +511,276 @@ rejection, malformed JSON/length, split/coalesced frames, deny-list enforcement,
 pose routing without ack, malformed and oversized poses, the pose rate cap, and the fake peer's
 pose commands. Pose coalescing and the stalled-receiver drop are pure tests.
 A pure-test pass is not evidence that these real-socket tests passed.
+
+## Ledger, catch-up and the mod gate (C16)
+
+These are additive extensions to v3/v4; existing live grants, typed origins, chest
+multipart fields, animation/equipment presence and wallet baselines retain their
+wire formats. Catch-up never carries save bytes. A network ack still means relay
+acceptance only, not application or a durable guest save.
+
+### Handshake and compatibility
+
+Hello may add `"mod_hash":"<64 lowercase hex>"`. Any other representation is a
+protocol error. After build/seed/policy checks, the first hashing client fixes the
+room's hash for its lifetime. A legacy-created room initially has no hash. A
+hashing client with a different hash receives
+`{"type":"error","reason":"mod mismatch (room <first 12 hex>, client <first 12 hex>)"}`
+and disconnects. The relay prints:
+
+```text
+OoT co-op relay: handshake refused: mod mismatch room=<room> team=<team> client=<client_id> room_hash=<12> client_hash=<12>
+```
+
+A hello without `mod_hash` is admitted unchecked, even into a hashed room. It gets
+exactly the c15 hello_ack, with no added fields. Each such join prints:
+
+```text
+OoT co-op relay: client <id> joined room <room> without a mod hash (legacy client, unchecked)
+```
+
+Only a hello containing `mod_hash` gets these additional hello_ack fields:
+
+```json
+{"ledger":{"v":1,"epoch":"<room epoch>","floor":0},"mod_hash":"<room hash>"}
+```
+
+The relay creates a random 16-character lowercase hex epoch per room. Persistence
+preserves it; deletion/reset followed by recreation makes a new one. The client
+accepts capability revision 1, an epoch of 1..64 `[A-Za-z0-9_.-]` characters, and a
+floor in 0..2^53−1. Absence means no catch-up capability for that connection.
+
+| Client | Relay | Result |
+|---|---|---|
+| C16 hashing client | C16, same kit | Mod check; catch-up when locally enabled and save bound |
+| C16 hashing client | C16, different kit | Refused; client stops reconnecting until restart |
+| C16 hashing client | deployed c15 | First hello refused with exactly `missing or unknown fields`; client removes the hash for this process and reconnects with normal backoff |
+| c15 v3/v4 client | C16 | Unchecked legacy join; unchanged ack, live events and state; no unsolicited catch-up |
+| C16 client with hash sending disabled/failed | C16 | Unchecked legacy hello; no capability echo and no automatic catch-up |
+| c15 client | c15 | Unchanged |
+
+The fail-soft client logs once:
+
+```text
+OoT co-op: relay predates the ledger (c16): no mod check, no catch-up; playing on
+```
+
+A hash mismatch instead logs and latches co-op off:
+
+```text
+OoT co-op: handshake refused: mod mismatch (ours <12 hex>; <relay reason>); co-op stays off until restart with the room's kit
+```
+
+### Ledger and paging
+
+Each team retains at most 4096 accepted additive broadcast event dictionaries,
+including `rev`: `item_give`, `rupee_add`, and `key_add`. False/denied writes and
+sender sequence retries are not ledger entries. Flags remain in team_state.
+Evicting the oldest entry advances `ledger_floor` to its revision; the initial
+floor is zero. Live forwarding is unchanged.
+
+For a chest origin (including legacy `origin_key`), the first accepted give fixes
+`(origin, chest_transaction or null)` as that chest's ledger owner. All of that
+owner's multipart gives remain eligible. Gives from a different owner/transaction
+are still broadcast live but are omitted from catch-up. The owner table stops
+adding keys at MAX_KEYS; untracked keys still ledger normally. Bit/token item
+origins retain the existing team benefit-receipt uniqueness rule.
+
+Any joined client may request exactly:
+
+```json
+{"type":"catchup_request","after":0}
+```
+
+`after` is an integer in 0..2^53−1 (not a boolean). The response is exactly:
+
+```json
+{"type":"catchup","epoch":"<epoch>","floor":0,"through":123,"after":0,"grants":[],"more":false}
+```
+
+`through` is the team's revision when this page is built. `grants` contains all
+senders' ledger events with `after < rev <= through`, sorted by revision, at most
+256 per page. It includes the requester's own grants; per-save client IDs decide
+which to skip. The relay shrinks pages to fit the 1 MiB payload limit. `more` is
+true iff eligible ledger events remain beyond the page's last grant. Repeat with
+`after` equal to that last revision while `more` is true. An empty page never has
+`more:true`. A page is assembled synchronously; different pages can have different
+`through` values as the room advances. Requests change no state and never dirty the
+state file. There is no frozen multi-page snapshot or acknowledgment of page use.
+
+The client starts at zero on each connection after the ordinary baseline exchange
+and save bind. It allows one transaction per connection and at most 16384 grants
+per transaction. Each page must match the epoch and requested cursor, have valid
+u53 floor/through/revisions, strictly increasing positive grant revisions, and
+contain only decodable additive events. Invalid pages abandon the transaction
+with a diagnostic, without deliberately disconnecting. Local `catchup` metadata
+is never encoded as a grant field.
+
+Ordering is flags first (the preceding team_state drained in FIFO order), then
+catch-up gives in revision order through the existing one-call-per-frame apply
+queue, then live gives. Additive live packets received while awaiting initial
+catch-up or paging are held and released after the final page; flags continue to
+enter the FIFO. Queue limits still apply. A reconnect starts another transaction
+and retains this process's working save receipts.
+
+Once per second while connected, the client looks for `<user dir>/coop-resync`.
+It deletes the trigger, logs `OoT co-op: resync requested (coop-resync)`, requests
+team_state, and starts catch-up after that state arrives if capable, enabled and
+bound. A request during paging schedules another transaction after the current
+one; otherwise a diagnostic explains unavailable catch-up.
+
+### Exact mod-hash input
+
+Compute SHA256, lowercase hex, of UTF-8 text with lines joined by `\n` and a final
+`\n`. The canonical lines are exactly:
+
+```text
+oot-coop-mod-hash 1
+keys <size> <sha256>
+sidecar coop-ux.json <size> <sha256>
+sidecar coop-anim.json <size> <sha256>
+sidecar coop-equip.json <size> <sha256>
+sidecar coop-ledger.json <size> <sha256>
+mod <relpath> <size> <sha256>
+```
+
+For a missing sidecar its entire line is `sidecar <name> absent`. The four names
+always appear in that order, beside the exact key file loaded by the client,
+independently of feature switches. File sizes are decimal byte counts; file
+hashes cover exact bytes, without JSON normalization. Each regular file under
+`<load dir>/<program id as 16 uppercase hex>/<any mod dir>/romfs/**` or
+`.../exefs/**` contributes one `mod` line. `relpath` is the UTF-8 slash-separated
+path from the mod directory, such as `romfs/a/b.bin`. The mod directory's name is
+excluded. Retain duplicate records and sort bytewise by relpath, then file hash.
+Exclude `cheats/` and all other top-level trees. Follow symlinks; unreadable files,
+broken links in the traversed trees, and directory cycles fail hashing. Newlines
+in relative paths are rejected because they cannot be represented unambiguously
+in this line format.
+
+The hash is computed once at session start, independently of the ledger enable
+rule. `EDEN_NX2_OOT_COOP_MOD_HASH=0` disables sending it. A failure logs and sends
+no hash. Success logs:
+
+```text
+OoT co-op: mod hash <first 12 hex> (keys + 4 sidecars + <n> mod files, <MiB> MiB)
+```
+
+Operators can use `python3 -I tools/oot/coop/mod_hash.py --keys FILE --load DIR
+[--text]`. DIR can be the title's 16-hex load directory, or a load root containing
+one title. With multiple titles, use `--program-id HEX` to select one; it never
+hashes unrelated titles. `--text` prints the canonical text instead of its digest.
+This does not include local FPS cheats, folder names, or enabled/disabled mod
+selection; every file in the specified mod trees contributes.
+
+### Save binding and receipt sidecars
+
+The private configuration `coop-ledger.json`, beside the key file, is strictly
+`{"version":1,"save_file":"<ECMAScript regex>"}`. Unknown fields are rejected.
+The entire filesystem virtual path must match, with exactly one capture group
+naming the slot. Slot names must be safe identifiers (no slash, `.` or `..`).
+There are no game save names or offsets in the implementation. Catch-up requires
+this config, valid private pose offsets, the item class, and
+`EDEN_NX2_OOT_COOP_LEDGER` not equal to `0`. Startup logs either:
+
+```text
+OoT co-op: ledger on (save pattern loaded)
+OoT co-op: ledger off: <reason>
+```
+
+Successful read/write opens and renames notify the session. The first 64 matched
+operations log `OoT co-op: ledger save file op=<read|write|rename> slot=<slot>
+path=<virtual> host=<host>`. After 60 consecutive drain frames with nonempty local
+pose banc and no loading flag, bind the last read-open slot. No read means a new
+save, with an empty working set and slot unknown until its first write. Read-write
+opens before bind are logged but do not write receipts. Another slot read after
+bind disables catch-up until restart; one save per process remains the contract.
+
+Before binding, the frame drain holds the pending FIFO. The game can retain its
+manager across title and load: applying team flags before loading would lose those
+flags, and the observed true-to-false transition would quarantine the drain.
+After bind, first observe the loaded local flag baseline before queueing incoming
+flags, so local coverage cannot be inferred from team flags applied by co-op.
+
+The receipt sidecar lives at `<matched host file's parent>/coop-ledger.json`, so
+it travels with the slot directory. If the host path is empty or relative, or its
+parent directory does not exist, use `<user dir>/oot-coop-ledger/<slot>.json`.
+A rename has no host path: it reuses the sidecar path last seen for that slot with a host
+path (else the fallback). Back up/copy the applicable
+receipt file together with the slot. The receipt document (distinct from the
+private regex config despite the same basename) is:
+
+```json
+{"format":1,"slot":"slot_a","rooms":{"room/team":{"epoch":"0011223344556677","through":123,"used_ms":1000,"applied":[["sender",42]]}}}
+```
+
+Keep at most eight room/team entries, evicting least recently used, and at most
+8192 IDs per entry, evicting oldest inserted. A different epoch resets the selected
+entry's receipt state. `through` is the maximum page watermark seen, not proof that
+all grants succeeded. A matched write/rename after bind snapshots the working IDs
+under their mutex and posts an atomic sidecar replacement to the co-op I/O thread.
+It merges only the current room/team entry into the destination slot's document.
+File fsync is best effort. Corrupt/unreadable documents are treated as absent for
+reading, logged, and left untouched until a save-write; replacement first preserves
+a `.bad` copy. If that copy fails, the write fails rather than destroying evidence.
+
+Book admission uses exact `(sender, seq)` IDs, not quantities or sender high-water
+marks, for catch-up. It checks already-applied, then already-queued, then local
+source coverage (chest Bool, or every bit/token source flag), otherwise queues the
+give. Live admission additionally uses the existing sender high-water rule. Own
+outgoing additive IDs count as applied. Item/rupee IDs become applied on sentinel
+return regardless of w0; key IDs are recorded after both queued key adds commit.
+Catch-up chest gives bypass historical C13 chest claims; bit/token gives retain
+normal world reservation/application. Policy or full-queue drops are not applied
+receipts. Per-save ID bounds and source coverage are deliberately separate.
+
+The client emits bounded per-grant decisions and these transaction receipts:
+
+```text
+OoT co-op: ledger save bound slot=<slot|new> applied=<n> sidecar=<path|none>
+OoT co-op: ledger sidecar written slot=<slot> applied=<n> path=<path>
+OoT co-op: catchup grant sender=<8> seq=<n> class=<item|rupee|key> name=<name|-> decision=<queued|already-applied|covered|policy>
+OoT co-op: catchup received epoch=<e> floor=<f> through=<t> grants=<N> queued=<Q> already-applied=<a> covered=<c> in-flight=<q>
+OoT co-op: catchup: <N> grants, <M> applied, <K> already had
+OoT co-op: catchup warning: the relay ledger window starts after rev <floor>; older gives cannot be replayed
+```
+
+`K = already-applied + covered + in-flight`. If `M < Q`, the final line appends the
+number of queued grants not applied. The receive line means intake completed;
+the final line waits for the queued gives' returns or known drops. It is not a
+save-commit receipt. A save-open notification and asynchronously written sidecar
+are **not atomic with a guest save commit**; a crash or overlapping save/give can
+leave the two out of sync. This design offers bounded per-save dedupe in the normal
+workflow, not a proof of crash-safe exactly-once delivery.
+
+### Relay persistence and lifetime
+
+The library default is memory-only. CLI defaults to `relay-state.json` beside
+relay.py; `--state-file PATH` overrides it and `--no-state` disables persistence.
+The format is `{"format":1,"rooms":{...}}`: room build/seed/policy, epoch, mod hash,
+last-active wall time; team revision, folded current flags, sender high-waters,
+benefit receipts, ledger/floor and chest owners. Clients, sockets, presence, poses
+and wallets are not persisted. Load makes current flags a checkpoint at the saved
+revision with empty replay, preserving legacy team_state decoding.
+
+Dirty changes write the whole document at most once per second and on close,
+using a same-directory mode-0600 temporary file, flush/fsync, atomic replace and
+directory fsync. Missing state starts empty; corrupt, unreadable, inconsistent or
+larger-than-64-MiB state refuses startup. Runtime write errors log once per distinct
+error and retry while continuing in memory. Acknowledged grants can therefore be
+lost on a crash before persistence or during write failures.
+
+Memory-only empty rooms keep the 300-second TTL. Persistent empty rooms expire
+after `--room-ttl-days` (default 30) since last activity. At room capacity the least
+recently active empty room may be evicted; only an entirely connected set refuses
+a new room. Capacity eviction is logged with the idle timestamp. Room deletion
+loses that campaign's ledger; backup and room naming remain operator responsibilities.
+`--reset-room NAME` is an offline, synchronous command: load, remove only that room,
+atomically write, print, exit without opening a server or event loop. Missing room
+is an error. Startup reports the state path or `memory only` and loaded room count.
+
+Every client process is a new sender ID, so a persistent team would fill its 256
+sender high-water slots. At that capacity a join forgets the longest-idle OFFLINE
+sender idle for at least an hour (`OoT co-op relay: room R: idle sender X forgotten
+(sender capacity)`); its ledger entries stay. A process alive with an unacknowledged
+outbox reconnects within its 30 s backoff, long before that. Teams persist
+`sender_active` (sender -> wall time of its last join/change) for this.

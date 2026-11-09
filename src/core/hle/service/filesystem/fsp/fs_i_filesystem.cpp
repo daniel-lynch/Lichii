@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "core/arm/dynarmic/oot_coop_ledger.h"
 #include "common/string_util.h"
 #include "core/file_sys/fssrv/fssrv_sf_path.h"
 #include "core/hle/service/cmif_serialization.h"
@@ -85,7 +86,9 @@ Result IFileSystem::RenameFile(
     const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> new_path) {
     LOG_DEBUG(Service_FS, "called. file '{}' to file '{}'", old_path->str, new_path->str);
 
-    R_RETURN(backend->RenameFile(FileSys::Path(old_path->str), FileSys::Path(new_path->str)));
+    R_TRY(backend->RenameFile(FileSys::Path(old_path->str), FileSys::Path(new_path->str)));
+    Core::OotCoop::Ledger::NoteSaveFile(new_path->str, {}, true);
+    R_SUCCEED();
 }
 
 Result IFileSystem::RenameDirectory(
@@ -105,6 +108,9 @@ Result IFileSystem::OpenFile(OutInterface<IFile> out_interface,
     R_TRY(backend->OpenFile(&vfs_file, FileSys::Path(path->str),
                             static_cast<FileSys::OpenMode>(mode)));
 
+    if (Core::OotCoop::Ledger::Watching())
+        Core::OotCoop::Ledger::NoteSaveFile(path->str, vfs_file->GetFullPath(),
+            (mode & static_cast<u32>(FileSys::OpenMode::Write)) != 0);
     *out_interface = std::make_shared<IFile>(system, vfs_file);
     R_SUCCEED();
 }

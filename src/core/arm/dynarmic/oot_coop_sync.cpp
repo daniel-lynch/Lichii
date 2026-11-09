@@ -19,8 +19,10 @@
 
 #include <boost/asio.hpp>
 
+#include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/thread.h"
+#include "core/arm/dynarmic/oot_coop_ledger.h"
 #include "core/arm/dynarmic/oot_coop_sync.h"
 #include "core/arm/dynarmic/oot_coop_ghost.h"
 #include "core/arm/dynarmic/oot_coop_runtime.h"
@@ -768,6 +770,7 @@ Json EncodeHello(const Hello& hello) {
                    {"client_id", hello.client_id}, {"name", hello.name}};
     if (!hello.animation_hash.empty())
         packet["animation"] = {{"av", 1}, {"table_sha256", hello.animation_hash}};
+    if (!hello.mod_hash.empty()) packet["mod_hash"] = hello.mod_hash;
     if (hello.world_wallet) packet["world_wallet"] = World::EncodeWallet(*hello.world_wallet);
     if (hello.ghost_equipment_v2) packet["ghost_equipment_v2"] = true;
     return packet;
@@ -979,16 +982,30 @@ struct Session::Impl {
             if (!denied.contains(key) && (kind != Kind::Bit || world.families.empty() || world.AdmitsFlag(key)))
                 policy.keys.emplace(kind, key);
         }
-        for (const auto& [kind, key] : policy.keys)
+        for (const auto& [kind, key] : policy.keys) {
             if (kind == Kind::Bit) world_keys.insert(key);
+            if (kind == Kind::Key) ledger_key_targets.insert(key);
+        }
         runtime = std::make_unique<FrameDrain<Backend>>(std::move(policy));
     }
-    ~Impl() { Stop(); }
+    ~Impl() { if (save) Ledger::RemoveWatch(save.get()); Stop(); }
     void Start();
     void Stop();
     void Connect();
     bool Receive(const Json& packet);
 
+    struct CatchupEnd { u64 transaction; };
+    Ledger::Book book;
+    std::set<u64> ledger_key_targets;
+    std::unique_ptr<Ledger::Save> save;
+    std::atomic<bool> ledger_capable{};
+    u64 catchup_serial{}; // io thread only
+    bool LedgerOn() const { return save && save->Enabled(); }
+    bool AdmitEvent(const Change& change) {
+        const bool merged = change.catchup || remote.Merge(change, !change.origin.empty());
+        if (!LedgerOn()) return !change.catchup && merged;
+        return book.Admit(change, merged) == Ledger::Decision::Admit;
+    }
     Endpoint endpoint;
     Hello hello;
     std::set<u64> denied;
@@ -997,7 +1014,7 @@ struct Session::Impl {
     State remote;
     std::set<Kind> allowed_classes;
     std::deque<Change> outgoing;
-    std::deque<std::variant<Change, HighWater>> pending;
+    std::deque<std::variant<Change, HighWater, Impl::CatchupEnd>> pending;
     u64 next_seq{1};
     std::mutex guest_mutex;
     GuestBinding binding;
@@ -1014,7 +1031,7 @@ struct Session::Impl {
     bool chest_quarantined{};
     /// A chest-tagged benefit this receiver arbitrates (else it takes the ordinary give path).
     bool ChestGuarded(const Change& change) const {
-        return change.kind == Kind::Item && change.source.kind == World::OriginKind::Chest &&
+        return !change.catchup && change.kind == Kind::Item && change.source.kind == World::OriginKind::Chest &&
                !chest_quarantined && chest_bools.contains(static_cast<u32>(change.source.key));
     }
     struct LocalChestGive {
@@ -1038,7 +1055,7 @@ struct Session::Impl {
                 chest_bools.contains(static_cast<u32>(change->key)))
                 claims.RemoteClaim(World::Origin::Chest(static_cast<u32>(change->key)),
                                    change->origin, change->origin.empty());
-            else if (change->kind == Kind::Item && change->source.kind == World::OriginKind::Chest &&
+            else if (!change->catchup && change->kind == Kind::Item && change->source.kind == World::OriginKind::Chest &&
                      chest_bools.contains(static_cast<u32>(change->source.key)) &&
                      allowed_classes.contains(Kind::Item))
                 claims.AcceptRemote(*change);
@@ -1170,6 +1187,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                             std::scoped_lock lock{self->owner.mutex};
                             hello.world_wallet = self->owner.wallet;
                         }
+                        self->sent_mod_hash = !hello.mod_hash.empty();
                         self->Send(EncodeHello(hello));
                         self->Read();
                     });
@@ -1178,6 +1196,8 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
 
     void Fail(std::string_view why = "connection error") {
         if (std::exchange(failed, true)) return;
+        owner.ledger_capable = false;
+        if (catchup_active) owner.book.Abort(transaction);
         size_t dropped = 0;
         {
             // No relay, no live peers: their ghosts park until poses arrive again.
@@ -1207,6 +1227,80 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
         });
     }
 
+    bool CatchupReady() const {
+        return ready && baseline_exchanged && capable && owner.LedgerOn() && owner.save->Bound();
+    }
+    void StartCatchup() {
+        if (catchup_active || !CatchupReady()) return;
+        catchup_started = catchup_active = true;
+        transaction = ++owner.catchup_serial;
+        catchup_after = catchup_count = 0;
+        catchup_through = 0;
+        catchup_saved_through = owner.book.Snapshot().through;
+        warned_floor = false;
+        waiting_page = true;
+        Send({{"type", "catchup_request"}, {"after", 0}});
+    }
+    void FlushLive() {
+        for (const auto& packet : deferred_live)
+            if (!owner.Receive(packet)) { Fail("pending queue full after catchup"); break; }
+        deferred_live.clear();
+    }
+    void AbandonCatchup(std::string_view reason) {
+        LOG_WARNING(Core_ARM, "OoT co-op: catchup abandoned: {}", reason);
+        catchup_active = waiting_page = next_page = false;
+        owner.book.Abort(transaction);
+        FlushLive();
+    }
+    void Catchup(const Json& packet) {
+        if (!catchup_active || !waiting_page) {
+            LOG_WARNING(Core_ARM, "OoT co-op: ignored unsolicited catchup page");
+            return;
+        }
+        const auto page = Ledger::DecodePage(packet.dump(), epoch, catchup_after);
+        if (!page || page->through < catchup_through || page->floor < floor)
+            return AbandonCatchup("invalid page");
+        if (!owner.LedgerOn()) return AbandonCatchup("ledger disabled");
+        if (catchup_count + page->grants.size() > 16384) return AbandonCatchup("16384 grant limit");
+        {
+            std::scoped_lock lock{owner.mutex};
+            if (owner.pending.size() + page->grants.size() + 1 > QueueLimit) {
+                // No partially admitted page and no disconnect for a malformed/oversized transaction.
+                next_page = false;
+            } else next_page = true;
+        }
+        if (!next_page) return AbandonCatchup("pending queue full");
+        if (page->floor && catchup_saved_through < page->floor && !warned_floor) {
+            warned_floor = true;
+            LOG_WARNING(Core_ARM, "OoT co-op: catchup warning: the relay ledger window starts after rev {}; older gives cannot be replayed", page->floor);
+        }
+        owner.book.Begin(transaction, epoch, page->floor, page->through);
+        owner.book.Through(page->through);
+        {
+            std::scoped_lock lock{owner.mutex};
+            for (auto change : page->grants) {
+                change.catchup_transaction = transaction;
+                owner.pending.emplace_back(std::move(change));
+            }
+            if (!page->more) owner.pending.emplace_back(Impl::CatchupEnd{transaction});
+        }
+        catchup_count += page->grants.size();
+        catchup_through = page->through;
+        floor = page->floor;
+        if (!page->grants.empty()) catchup_after = packet.at("grants").back().at("rev").get<u64>();
+        waiting_page = false;
+        next_page = page->more;
+        if (!page->more) {
+            catchup_active = false;
+            FlushLive();
+            if (resync_pending) {
+                resync_pending = false;
+                baseline_exchanged = false;
+                catchup_started = false;
+                Send({{"type", "team_state_request"}});
+            }
+        }
+    }
     void Tick() {
         timer.expires_after(50ms);
         timer.async_wait([self = shared_from_this()](auto error) {
@@ -1215,6 +1309,36 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
             if (now - self->last_receive > (self->ready ? 90s : 10s))
                 return self->Fail(self->ready ? "nothing received for 90 s" : "no handshake within 10 s");
             if (self->ready) {
+                if (!self->owner.LedgerOn() && !self->deferred_live.empty()) self->FlushLive();
+                if (!self->catchup_started && self->CatchupReady()) self->StartCatchup();
+                if (self->catchup_active && self->next_page) {
+                    bool room;
+                    {
+                        std::scoped_lock lock{self->owner.mutex};
+                        room = self->owner.pending.size() + 257 <= QueueLimit;
+                    }
+                    if (room) {
+                        self->next_page = false;
+                        self->waiting_page = true;
+                        self->Send({{"type", "catchup_request"}, {"after", self->catchup_after}});
+                    }
+                }
+                if (now - self->last_resync >= 1s) {
+                    self->last_resync = now;
+                    std::error_code error;
+                    const auto path = Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) / "coop-resync";
+                    if (std::filesystem::remove(path, error)) {
+                        LOG_INFO(Core_ARM, "OoT co-op: resync requested (coop-resync)");
+                        self->Send({{"type", "team_state_request"}});
+                        if (self->catchup_active) self->resync_pending = true;
+                        else if (self->CatchupReady()) {
+                            self->baseline_exchanged = false;
+                            self->catchup_started = false;
+                        } else LOG_INFO(Core_ARM, "OoT co-op: resync catchup unavailable (capable={} on={} bound={})",
+                                        self->capable, self->owner.LedgerOn(),
+                                        self->owner.save && self->owner.save->Bound());
+                    }
+                }
                 std::vector<Change> changes;
                 {
                     std::scoped_lock lock{self->owner.mutex};
@@ -1310,12 +1434,36 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                     self->last_receive = Clock::now();
                     const auto type = packet->at("type").get<std::string>();
                     if (!self->handshaken) {
+                        if (type == "error" && packet->contains("reason") && packet->at("reason").is_string()) {
+                            const auto reason = packet->at("reason").get<std::string>();
+                            if (self->sent_mod_hash && reason == "missing or unknown fields") {
+                                self->owner.hello.mod_hash.clear();
+                                if (self->owner.save) self->owner.save->Disable();
+                                LOG_WARNING(Core_ARM, "OoT co-op: relay predates the ledger (c16): no mod check, no catch-up; playing on");
+                                return self->Fail("retry legacy hello");
+                            }
+                            if (reason.starts_with("mod mismatch")) {
+                                LOG_WARNING(Core_ARM, "OoT co-op: handshake refused: mod mismatch (ours {}; {}); co-op stays off until restart with the room's kit",
+                                            self->owner.hello.mod_hash.substr(0, 12), reason);
+                                self->owner.stopped = true;
+                                return self->Fail("mod mismatch");
+                            }
+                        }
                         if (!MatchesHello(*packet, self->owner.hello)) {
                             LOG_WARNING(Core_ARM, "OoT co-op: handshake refused or mismatched");
                             return self->Fail(type == "error" && packet->contains("reason") &&
                                                       packet->at("reason").is_string()
                                                   ? "handshake: " + packet->at("reason").get<std::string>().substr(0, 80)
                                                   : std::string{"handshake mismatch"});
+                        }
+                        if (packet->contains("ledger")) {
+                            auto capability = Ledger::DecodeCapability(packet->at("ledger").dump());
+                            if (!capability) return self->Fail("invalid ledger capability");
+                            self->epoch = capability->first;
+                            self->floor = capability->second;
+                            self->capable = true;
+                            self->owner.ledger_capable = true;
+                            if (self->owner.save) self->owner.save->Epoch(self->epoch);
                         }
                         self->owner.equipment_negotiated = self->owner.hello.ghost_equipment_v2 &&
                             packet->contains("ghost_equipment_v2") && (*packet)["ghost_equipment_v2"] == true;
@@ -1374,6 +1522,13 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                             if (self->owner.peers.erase(origin))
                                 LOG_INFO(Core_ARM, "OoT co-op: peer {} offline (relay)", origin.substr(0, 8));
                         }
+                    } else if (type == "catchup") {
+                        self->Catchup(*packet);
+                    } else if (self->capable && self->owner.LedgerOn() &&
+                               (self->catchup_active || !self->catchup_started) &&
+                               (type == "item_give" || type == "rupee_add" || type == "key_add")) {
+                        if (self->deferred_live.size() >= QueueLimit) return self->Fail("catchup live queue full");
+                        self->deferred_live.push_back(*packet);
                     } else if (type == "heartbeat_ack") {
                         // Liveness only.
                     } else if (type == "error") {
@@ -1384,6 +1539,11 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                         if (!self->owner.Receive(*packet)) return self->Fail("rejected " + type);
                         if (self->baseline_requested && type == "team_state") {
                             LOG_INFO(Core_ARM, "OoT co-op: baseline exchanged");
+                            self->baseline_exchanged = true;
+                            if (self->resync_pending && !self->catchup_active) {
+                                self->resync_pending = false;
+                                self->catchup_started = false;
+                            }
                         }
                         if (!self->ready) {
                             self->ready = true;
@@ -1416,6 +1576,12 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
     boost::asio::steady_timer timer;
     Clock::time_point last_receive{Clock::now()};
     Clock::time_point last_heartbeat{Clock::now()};
+    Clock::time_point last_resync{};
+    std::string epoch;
+    u64 floor{}, transaction{}, catchup_after{}, catchup_count{}, catchup_through{}, catchup_saved_through{};
+    bool capable{}, sent_mod_hash{}, baseline_exchanged{}, catchup_started{}, catchup_active{};
+    bool waiting_page{}, next_page{}, warned_floor{}, resync_pending{};
+    std::deque<Json> deferred_live;
     bool failed{};
     bool handshaken{};
     bool baseline_requested{};
@@ -1505,7 +1671,7 @@ bool Session::Impl::Receive(const Json& packet) {
             if (!change || !WireKind(change->kind) || !Unsigned(value.at("rev"), MaxSequence) ||
                 value.at("rev").get<u64>() != ++revision) return false;
             if (!EventKind(change->kind)) checkpoint.Merge(*change);
-            else if (ever_ready && change->kind == Kind::Item &&
+            else if (!(ledger_capable && LedgerOn()) && ever_ready && change->kind == Kind::Item &&
                      (change->source.kind == World::OriginKind::Bit || change->source.kind == World::OriginKind::Token ||
                       change->source.kind == World::OriginKind::Chest))
                 world_replay.push_back(*change);
@@ -1726,10 +1892,26 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
             LOG_INFO(Core_ARM, "OoT co-op: equipment v2 enabled (sword, shield, tunic, mask; boots deferred)");
         } else LOG_WARNING(Core_ARM, "OoT co-op: equipment disabled: missing or invalid coop-equip.json");
     }
+    std::string ledger_why;
+    auto pattern = Ledger::LoadConfig(Env("EDEN_NX2_OOT_COOP_KEYS"), ledger_why);
+    if (Env("EDEN_NX2_OOT_COOP_LEDGER") == "0") ledger_why = "disabled by environment";
+    else if (!profile->ghost.Valid()) ledger_why = "valid pose offsets required";
+    else if (!impl->allowed_classes.contains(Kind::Item)) ledger_why = "item class disabled";
+    else if (pattern) {
+        auto* self = impl.get();
+        impl->save = std::make_unique<Ledger::Save>(impl->book, std::move(*pattern),
+            Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir), impl->hello.room + "/" + impl->hello.team,
+            [self](std::function<void()> work) { boost::asio::post(self->io, std::move(work)); });
+    }
+    if (impl->save) LOG_INFO(Core_ARM, "OoT co-op: ledger on (save pattern loaded)");
+    else LOG_INFO(Core_ARM, "OoT co-op: ledger off: {}", ledger_why);
     impl->Start();
 }
 Session::~Session() = default;
-void Session::Stop() { impl->Stop(); }
+void Session::Stop() {
+    if (impl->save) Ledger::RemoveWatch(impl->save.get());
+    impl->Stop();
+}
 
 bool Session::Observe(Change change) {
     // Wallet deltas are observed only at the wallet entry's listed callers (ObserveRupee).
@@ -1746,6 +1928,7 @@ bool Session::Observe(Change change) {
     if (!impl->local.Merge(change, false)) return false;
     change.origin = impl->hello.client_id;
     change.seq = impl->next_seq++;
+    if (EventKind(change.kind)) impl->book.Applied(change);
     impl->outgoing.push_back(std::move(change));
     return true;
 }
@@ -1947,7 +2130,11 @@ void Session::ObserveChest(OotGameDataTrace::Point point, Dynarmic::A64::Jit& ji
                      identity->token.actor, jit.GetRegister(19), attempt, !previous);
     }
     if (profile->chest.enforce)
-        impl->runtime->DropPending([&](const Change& c) { return impl->ChestGuarded(c) && !impl->claims.CanApply(c); });
+        impl->runtime->DropPending([&](const Change& c) {
+            const bool drop = impl->ChestGuarded(c) && !impl->claims.CanApply(c);
+            if (drop) impl->book.Dropped(c);
+            return drop;
+        });
 }
 
 void Session::ObserveRupee(Dynarmic::A64::Jit& jit, u64 thread) {
@@ -2032,13 +2219,15 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     if (binding.sentinel && pc == binding.sentinel) {
         const u64 result = jit.GetRegister(0); // the call's return value, before the restore
         const auto event = runtime.Sentinel(backend, site, pc, log);
+        if (event == ApplyEvent::Quarantined) impl->book.Quarantined();
         if (event == ApplyEvent::Returned && runtime.LastGrant() &&
             runtime.LastGrant()->kind == Kind::Item) {
             log(fmt::format("OoT co-op: item give returned w0={} name={}", result & 1,
                             runtime.LastGrant()->name));
             const auto& grant = *runtime.LastGrant();
             if (result & 1) impl->ux.ItemReceived(grant.origin, grant.seq, grant.name, grant.value);
-            if (grant.source.kind == World::OriginKind::Chest && profile->chest.interaction_pc) {
+            impl->book.Applied(grant);
+            if (!grant.catchup && grant.source.kind == World::OriginKind::Chest && profile->chest.interaction_pc) {
                 // The give ran to its return: one processed attempt, whatever w0 says (like world).
                 impl->claims.RemoteReturned(grant, true);
                 if (impl->race_lines++ < 256)
@@ -2076,6 +2265,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             log(fmt::format("OoT co-op: rupee pending={} after the call (pouch {:#x})",
                             static_cast<s32>(pending.value_or(0)), pouch));
             const auto& grant = *runtime.LastGrant();
+            impl->book.Applied(grant);
             impl->ux.RupeeReceived(grant.origin, grant.seq, grant.value);
         }
         // An unowned/invalid sentinel must reach the normal breakpoint fault, never resume.
@@ -2242,12 +2432,50 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         if (impl->ghost) impl->ghost->DropAll(log, "GameData binding lost");
         runtime.Invalidate();
         runtime.Frame(backend, {thread, 1, impl->tick, true}, [](Change, bool) {}, log);
+        impl->book.Quarantined();
         return false;
     }
     if (!bound) return false;
     if (!std::exchange(impl->stable_frame, true)) return false;
 
-    std::deque<std::variant<Change, HighWater>> batch;
+    if (impl->LedgerOn()) {
+        const auto pose = ReadLocalPose(memory, base, binding.manager, profile->ghost,
+                                        static_cast<u32>(impl->tick));
+        impl->save->Frame(!pose.banc.empty() && !pose.loading);
+        // The game keeps one manager across title/save load. Applying flags before that load
+        // loses them and the drain sees true->false as rollback. Hold FIFO until the save is live.
+        if (!impl->save->Bound()) return false;
+    }
+    if (impl->save && !impl->LedgerOn()) {
+        runtime.DropPending([&](const Change& change) {
+            if (!change.catchup) return false;
+            impl->book.Dropped(change);
+            if (change.source.kind == World::OriginKind::Bit || change.source.kind == World::OriginKind::Token)
+                impl->world_claims.Cancel(change.source, change.origin);
+            return true;
+        });
+    }
+    const auto send = [&](Change change, bool baseline) {
+        impl->book.LocalFlag(change);
+        if (change.kind == Kind::Bit && !profile->world.families.empty()) {
+            if (impl->world_quarantined || !profile->world.AdmitsFlag(change.key)) return;
+            if (const auto source = impl->world_claims.GaveFlag(change.key)) change.source = *source;
+            else if (!baseline) {
+                const auto source = profile->world.Source(change.key);
+                if (source && impl->world_claims.Busy(*source)) return;
+            }
+            if (change.source && !impl->world_flags_sent.insert(change.key).second) return;
+        }
+        Observe(change);
+        log(fmt::format("OoT co-op: {} class={} key={:016x} value=1 path=observer",
+                        baseline ? "baseline" : "observed", ClassName(change.kind), change.key));
+    };
+    if (impl->LedgerOn() && !runtime.BaselineReady()) {
+        // Observe the loaded save before inbound flag receipts suppress the local baseline.
+        runtime.Frame(backend, {thread, 1, impl->tick, true}, send, log);
+        if (!runtime.BaselineReady()) return false;
+    }
+    std::deque<std::variant<Change, HighWater, Impl::CatchupEnd>> batch;
     {
         std::scoped_lock lock{impl->mutex};
         for (size_t count = 0; count < 64 && !impl->pending.empty(); ++count) {
@@ -2258,6 +2486,8 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     for (const auto& entry : batch) {
         if (const auto* seen = std::get_if<HighWater>(&entry)) {
             if (!impl->remote.AdoptSeen(*seen)) runtime.Invalidate();
+        } else if (const auto* end = std::get_if<Impl::CatchupEnd>(&entry)) {
+            impl->book.End(end->transaction);
         } else {
             const auto& change = std::get<Change>(entry);
             if (change.kind == Kind::Key) {
@@ -2265,10 +2495,15 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                 // our own watch from sending the gain back.
                 const auto pair = std::find_if(impl->dungeon_keys.begin(), impl->dungeon_keys.end(),
                                                [&](const DungeonKeys& d) { return d.total == change.key; });
-                if (!impl->remote.Merge(change, !change.origin.empty())) continue;
+                if (!impl->AdmitEvent(change)) continue;
                 Change count = change;
                 if (pair != impl->dungeon_keys.end()) count.key = pair->count;
-                if (pair == impl->dungeon_keys.end() || !runtime.Queue(change) || !runtime.Queue(count)) {
+                const bool pair_allowed = impl->allowed_classes.contains(Kind::Key) &&
+                    impl->ledger_key_targets.contains(change.key) && impl->ledger_key_targets.contains(count.key);
+                if (pair == impl->dungeon_keys.end() ||
+                    (impl->LedgerOn() && (!pair_allowed || runtime.Pending() + 2 > QueueLimit)) ||
+                    !runtime.Queue(change) || !runtime.Queue(count)) {
+                    impl->book.Dropped(change);
                     if (!impl->logged_class) {
                         log("OoT co-op: not applied: class/key policy disabled or queue full");
                         impl->logged_class = true;
@@ -2287,6 +2522,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                 if (!std::all_of(flags.begin(), flags.end(), [&](u64 key) { return impl->world_keys.contains(key); }) ||
                     impl->world_quarantined || !profile->world.Admits(change.source) ||
                     !impl->allowed_classes.contains(Kind::Bit)) {
+                    if (change.catchup && impl->AdmitEvent(change)) impl->book.Dropped(change);
                     // Not ours to apply (policy differs, world off): the sender keeps its benefit.
                     if (impl->world_lines++ < 64)
                         log(fmt::format("OoT co-op: world {} key={:016x} from {} not applied ({})", ClassName(change.kind),
@@ -2295,13 +2531,18 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                     continue;
                 }
                 if (change.kind == Kind::Item) {
-                    if (!impl->allowed_classes.contains(Kind::Item) ||
-                        !impl->remote.Merge(change, !change.origin.empty())) continue;
+                    if (!impl->allowed_classes.contains(Kind::Item)) {
+                        if (change.catchup && impl->AdmitEvent(change)) impl->book.Dropped(change);
+                        continue;
+                    }
+                    if (!impl->AdmitEvent(change)) continue;
                     if (!impl->world_claims.Reserve(change.source, change.origin)) {
+                        impl->book.Dropped(change);
                         log("OoT co-op: pickup race: peer give dropped (source reserved or applied)");
                         continue;
                     }
                     if (!runtime.Queue(change)) {
+                        impl->book.Dropped(change);
                         impl->world_claims.Cancel(change.source, change.origin);
                         impl->world_quarantined = true;
                         log("OoT co-op: world give queue full; world quarantined");
@@ -2320,17 +2561,19 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             if (profile->chest.interaction_pc && impl->ChestGuarded(change)) {
                 // Sender/sequence dedupe first; the chest receipts then reject semantic duplicates
                 // (a fresh sequence, a second transaction, another opener).
-                if (!impl->remote.Merge(change, !change.origin.empty())) continue;
+                if (!impl->AdmitEvent(change)) continue;
                 const bool accepted = impl->claims.AcceptRemote(change);
                 if (!accepted && profile->chest.enforce) {
+                    impl->book.Dropped(change);
                     if (impl->race_lines++ < 256)
                         log(fmt::format("OoT co-op: chest race: peer give dropped name={} chest={:08x} owner={} "
                                         "transaction={} part={}", change.name, change.source.key,
                                         impl->claims.Owner(change.source), change.chest_transaction, change.chest_part));
                     continue;
                 }
-                if (!runtime.Queue(change) && !impl->logged_class) {
-                    log("OoT co-op: not applied: class/key policy disabled or queue full");
+                if (!runtime.Queue(change)) {
+                    impl->book.Dropped(change);
+                    if (!impl->logged_class) log("OoT co-op: not applied: class/key policy disabled or queue full");
                     impl->logged_class = true;
                 }
                 continue;
@@ -2340,30 +2583,19 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                 impl->claims.RemoteClaim(World::Origin::Chest(static_cast<u32>(change.key)), change.origin,
                                          change.origin.empty());
             }
-            if (impl->remote.Merge(change, !change.origin.empty()) && !runtime.Queue(change) &&
-                !runtime.Suppress(change) && !impl->logged_class) {
-                log("OoT co-op: not applied: class/key policy disabled or queue full");
-                impl->logged_class = true;
+            if ((EventKind(change.kind) ? impl->AdmitEvent(change) :
+                 impl->remote.Merge(change, !change.origin.empty())) && !runtime.Queue(change)) {
+                if (EventKind(change.kind)) impl->book.Dropped(change);
+                if (!runtime.Suppress(change) && !impl->logged_class) {
+                    log("OoT co-op: not applied: class/key policy disabled or queue full");
+                    impl->logged_class = true;
+                }
             }
             // A live peer flag of a collectible (not a baseline): its loaded actor goes too.
             if (change.kind == Kind::Bit && !change.origin.empty() && !impl->world_quarantined)
                 QueueCleanup(change.key);
         }
     }
-    const auto send = [&](Change change, bool baseline) {
-        if (change.kind == Kind::Bit && !profile->world.families.empty()) {
-            if (impl->world_quarantined || !profile->world.AdmitsFlag(change.key)) return;
-            if (const auto source = impl->world_claims.GaveFlag(change.key)) change.source = *source;
-            else if (!baseline) {
-                const auto source = profile->world.Source(change.key);
-                if (source && impl->world_claims.Busy(*source)) return;
-            }
-            if (change.source && !impl->world_flags_sent.insert(change.key).second) return;
-        }
-        Observe(change);
-        log(fmt::format("OoT co-op: {} class={} key={:016x} value=1 path=observer",
-                        baseline ? "baseline" : "observed", ClassName(change.kind), change.key));
-    };
     if (profile->world.capacity_hash && impl->allowed_classes.contains(Kind::Rupee) &&
         !runtime.Calling() && !runtime.Pending() && impl->local_pickups.empty()) {
         using OotGameDataTrace::Detail::Read32;
@@ -2425,13 +2657,21 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     }
     if (profile->chest.enforce) {
         const auto dropped = runtime.DropPending([&](const Change& c) {
-            return impl->ChestGuarded(c) && !impl->claims.CanApply(c);
+            const bool drop = impl->ChestGuarded(c) && !impl->claims.CanApply(c);
+            if (drop) impl->book.Dropped(c);
+            return drop;
         });
         if (dropped && impl->race_lines++ < 256)
             log(fmt::format("OoT co-op: chest race: {} pending loser/duplicate parts dropped before apply", dropped));
     }
     const auto event = runtime.Frame(backend, {thread, 1, impl->tick, true}, send, log);
-    if (event == ApplyEvent::Started && runtime.LastGrant() &&
+    if (event == ApplyEvent::Quarantined) impl->book.Quarantined();
+    if (event == ApplyEvent::Committed && runtime.LastGrant() && runtime.LastGrant()->kind == Kind::Key) {
+        const auto& grant = *runtime.LastGrant();
+        if (std::ranges::any_of(impl->dungeon_keys, [&](const DungeonKeys& d) { return d.count == grant.key; }))
+            impl->book.Applied(grant);
+    }
+    if (event == ApplyEvent::Started && runtime.LastGrant() && !runtime.LastGrant()->catchup &&
         runtime.LastGrant()->kind == Kind::Item &&
         runtime.LastGrant()->source.kind == World::OriginKind::Chest && profile->chest.interaction_pc)
         impl->claims.StartRemote(*runtime.LastGrant());
@@ -2741,6 +2981,17 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
             }
         }
         Hello hello;
+        if (Env("EDEN_NX2_OOT_COOP_MOD_HASH") != "0") {
+            try {
+                const auto hash = Ledger::ModHash(keys_path,
+                    Common::FS::GetEdenPath(Common::FS::EdenPath::LoadDir) / fmt::format("{:016X}", program_id));
+                hello.mod_hash = hash.digest;
+                LOG_INFO(Core_ARM, "OoT co-op: mod hash {} (keys + 4 sidecars + {} mod files, {:.2f} MiB)",
+                         hash.digest.substr(0, 12), hash.files, static_cast<double>(hash.bytes) / (1024 * 1024));
+            } catch (const std::exception& error) {
+                LOG_WARNING(Core_ARM, "OoT co-op: mod hash failed: {} (sending no mod_hash)", error.what());
+            }
+        }
         hello.build_id = std::string{build_id};
         hello.seed_hash = Env("EDEN_NX2_OOT_COOP_SEED", "0");
         hello.policy_id = Env("EDEN_NX2_OOT_COOP_POLICY", "or-v2");

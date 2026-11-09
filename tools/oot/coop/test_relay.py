@@ -1374,5 +1374,365 @@ class FakePeerTests(unittest.IsolatedAsyncioTestCase):
             await self.peer.command("posecircle Field_1 0 0 0 1 0 15 0")
 
 
+class LedgerUnitTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = mock.patch.object(relay.asyncio, 'get_running_loop',
+                                      return_value=SimpleNamespace(time=lambda: 0.0))
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+
+    peer = staticmethod(ProtocolTests.peer)
+
+    def test_idle_offline_sender_forgotten_at_capacity(self):
+        # Every emulator process is a new sender: a persistent room must not fill MAX_SENDERS forever.
+        server = relay.Relay()
+        with mock.patch.object(relay, 'MAX_SENDERS', 3), \
+                mock.patch.object(relay.time, 'time', return_value=1000.0):
+            for name in ('a', 'b', 'c'):
+                self.peer(server, name)
+            team = server.rooms['default'].teams['default']
+            team.clients.pop('a'); team.clients.pop('b')
+            with self.assertRaises(relay.ProtocolError):  # offline but not idle long enough
+                self.peer(server, 'd')
+            team.sender_active['b'] = 1000.0 - relay.SENDER_IDLE_EVICT - 5
+            team.sender_active['a'] = 1000.0 - relay.SENDER_IDLE_EVICT - 1
+            self.peer(server, 'd')
+            self.assertEqual(sorted(team.seen), ['a', 'c', 'd'])  # the longest-idle offline sender went
+            team.sender_active['a'] = -1e6
+            team.sender_active['c'] = -1e6  # idle but still connected: never evicted
+            self.peer(server, 'e')
+            self.assertEqual(sorted(team.seen), ['c', 'd', 'e'])
+
+    def test_missing_gives_and_flags_are_separate(self):
+        team = relay.Team()
+        team.accept(grant(), ())
+        for n in range(2, 7):
+            team.accept(item(n), ())
+        self.assertEqual(list(materialize(team.snapshot())), [('bool_set', 1)])
+        page = team.catchup('a' * 16, 3)
+        self.assertEqual([p['rev'] for p in page['grants']], [4, 5, 6])
+        self.assertEqual(page['through'], 6)
+        self.assertEqual(page['after'], 3)
+        self.assertFalse(page['more'])
+
+    def test_pages_and_frame_budget(self):
+        team = relay.Team()
+        for n in range(1, 301):
+            team.accept(item(n), ())
+        first = team.catchup('e' * 16, 0)
+        self.assertEqual(len(first['grants']), 256)
+        self.assertTrue(first['more'])
+        last = team.catchup('e' * 16, first['grants'][-1]['rev'])
+        self.assertEqual(len(last['grants']), 44)
+        self.assertFalse(last['more'])
+        with mock.patch.object(relay, 'MAX_FRAME', 1024):
+            small = team.catchup('e' * 16, 0)
+            self.assertLessEqual(len(relay.encode(small)) - 4, 1024)
+            self.assertTrue(small['more'])
+            self.assertTrue(small['grants'])
+        with self.assertRaises(relay.ProtocolError):
+            team.catchup('e' * 16, True)
+
+    def test_reconnect_duplicates_and_own_grants(self):
+        server = relay.Relay()
+        a = self.peer(server, 'a', mod_hash='a' * 64)
+        server.receive(a, item())
+        a.team.clients.clear()
+        again = self.peer(server, 'a', mod_hash='a' * 64)
+        server.receive(again, item())
+        server.receive(again, {'type': 'catchup_request', 'after': 0})
+        self.assertEqual(len(again.team.ledger), 1)
+        self.assertEqual(again.messages[-1]['grants'][0]['origin'], 'a')
+        before = server.state_document()
+        server.dirty = False
+        server.receive(again, {'type': 'catchup_request', 'after': 1})
+        self.assertFalse(server.dirty)
+        self.assertEqual(before, server.state_document())
+
+    def test_chest_first_transaction_multipart_and_legacy(self):
+        team = relay.Team()
+        for p in [item(1, origin_key=7, chest_transaction=99, chest_part=0, chest_final=False),
+                  item(1, origin='b', origin_kind='chest', origin_key=7, chest_transaction=1, chest_part=0, chest_final=True),
+                  item(2, origin_key=7, chest_transaction=99, chest_part=1, chest_final=True),
+                  item(3, origin_key=7, chest_transaction=100, chest_part=0, chest_final=True),
+                  item(4, origin_key=8), item(5, origin_key=8), item(2, origin='b', origin_key=8)]:
+            self.assertIsNotNone(team.accept(p, ())) # live race broadcasts unchanged
+        self.assertEqual([p['rev'] for p in team.ledger], [1, 3, 5, 6])
+        self.assertEqual(team.chest_owner[7], ('a', 99))
+
+    def test_owner_capacity_still_ledgers(self):
+        with mock.patch.object(relay, 'MAX_KEYS', 1):
+            team = relay.Team()
+            for n in range(1, 4):
+                team.accept(item(n, origin_key=n), ())
+            self.assertEqual(len(team.chest_owner), 1)
+            self.assertEqual(len(team.ledger), 3)
+
+    def test_world_origins_are_unique(self):
+        team = relay.Team()
+        for source in [dict(origin_kind='bit', origin_key64=10),
+                       dict(origin_kind='token', origin_key64=20, origin_partner=21)]:
+            seq = len(team.ledger) + 1
+            self.assertIsNotNone(team.accept(item(seq, **source), ()))
+            self.assertIsNone(team.accept(item(seq, origin='b', **source), ()))
+        self.assertEqual(len(team.ledger), 2)
+
+    def test_key_rupee_bounds_and_denied_highwater(self):
+        team = relay.Team()
+        with mock.patch.object(relay, 'MAX_LEDGER', 2):
+            team.accept(item(1), ())
+            team.accept(dict(type='key_add', origin='a', seq=2, hash=7, delta=2), ())
+            team.accept(dict(type='rupee_add', origin='a', seq=3, hash=8, delta=-3), ())
+            self.assertEqual(team.ledger_floor, 1)
+            self.assertEqual([p['type'] for p in team.ledger], ['key_add', 'rupee_add'])
+            self.assertIsNone(team.accept(grant(4, key=77), (77,)))
+            self.assertEqual(team.seen['a'], 4)
+            self.assertEqual(team.revision, 3)
+
+    def populated(self, path):
+        server = relay.Relay(state_file=path)
+        a = self.peer(server, 'a', mod_hash='a' * 64)
+        server.receive(a, grant())
+        server.receive(a, item(2, origin_key=1, chest_transaction=99, chest_part=0, chest_final=True))
+        server.receive(a, item(3, origin_kind='token', origin_key64=2, origin_partner=3))
+        server.receive(a, grant(4, value=False))
+        server.persist(strict=True)
+        return server, a
+
+    def test_persist_reload_checkpoint_epoch_hash_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            server, a = self.populated(path)
+            before = a.team.catchup(a.room.epoch, 0)
+            restored = relay.Relay(state_file=path)
+            b = self.peer(restored, 'b', mod_hash='a' * 64)
+            self.assertEqual(b.room.epoch, a.room.epoch)
+            self.assertEqual(b.room.mod_hash, 'a' * 64)
+            self.assertEqual(b.team.catchup(b.room.epoch, 0), before)
+            self.assertEqual(b.messages[1]['replay'], [])
+            self.assertEqual(b.messages[1]['revision'], 3)
+            self.assertEqual(len(b.messages[1]['changes']), 1)
+            restored.receive(b, item(1, origin='b'))
+            self.assertEqual(b.team.revision, 4)
+            self.assertEqual(b.team.seen['a'], 4)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual([p.name for p in Path(directory).iterdir()], ['state.json'])
+
+    def test_corrupt_inconsistent_oversized_refuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            for text in ['{', '{"format":1,"format":1,"rooms":{}}', '{"format":true,"rooms":{}}']:
+                path.write_text(text)
+                with self.assertRaisesRegex(ValueError, 'cannot load relay state'):
+                    relay.Relay(state_file=path)
+            path.unlink()
+            server, _ = self.populated(path)
+            doc = server.state_document()
+            doc['rooms']['default']['last_active'] = 1e308
+            path.write_text(json.dumps(doc))
+            with self.assertRaisesRegex(ValueError, 'cannot load relay state'):
+                relay.Relay(state_file=path)
+            doc['rooms']['default']['last_active'] = 100
+            doc['rooms']['default']['teams']['default']['ledger'][0]['rev'] = 0
+            path.write_text(json.dumps(doc))
+            with self.assertRaises(ValueError):
+                relay.Relay(state_file=path)
+            with mock.patch.object(relay, 'MAX_STATE_BYTES', 4):
+                with self.assertRaisesRegex(ValueError, '64 MiB'):
+                    relay.Relay(state_file=path)
+
+    def test_runtime_write_failure_retries_and_preserves_old_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            server, a = self.populated(path)
+            old = path.read_bytes()
+            server.receive(a, item(5))
+            with mock.patch.object(relay.os, 'replace', side_effect=OSError('synthetic disk error')), mock.patch('builtins.print') as output:
+                server.persist()
+                server.persist()
+                self.assertEqual(output.call_count, 1)
+            self.assertTrue(server.dirty)
+            self.assertEqual(path.read_bytes(), old)
+            self.assertEqual(len(list(Path(directory).iterdir())), 1)
+            server.persist(strict=True)
+            self.assertFalse(server.dirty)
+            self.assertNotEqual(path.read_bytes(), old)
+
+    def test_close_flush_and_offline_reset_cli(self):
+        # No event-loop sockets: exercise the exact async bodies with immediate awaits.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            server, _ = self.populated(path)
+            self.peer(server, 'b', room='other')
+            with mock.patch.object(relay.asyncio, 'gather', new=mock.AsyncMock()):
+                coro = server.close()
+                with self.assertRaises(StopIteration): coro.send(None)
+            self.assertIn('other', relay.Relay(state_file=path).rooms)
+            args = SimpleNamespace(deny_list=None, no_state=False, state_file=path, room_ttl_days=30, reset_room='default')
+            with mock.patch.object(relay.Relay, 'start', side_effect=AssertionError('must not serve')):
+                coro = relay.run(args)
+                with self.assertRaises(StopIteration): coro.send(None)
+            loaded = relay.Relay(state_file=path)
+            self.assertEqual(set(loaded.rooms), {'other'})
+            with self.assertRaisesRegex(ValueError, 'does not exist'):
+                relay.run(args).send(None)
+
+    def test_reset_cli_uses_no_event_loop(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            self.populated(path)
+            command = [sys.executable, '-I', str(Path(relay.__file__)), '--state-file', str(path), '--reset-room', 'default']
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('room default reset', result.stdout)
+            self.assertEqual(relay.Relay(state_file=path).rooms, {})
+            missing = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn('does not exist', missing.stderr)
+
+    def test_persistent_and_memory_expiry(self):
+        for persistent in (False, True):
+            with tempfile.TemporaryDirectory() as directory:
+                server = relay.Relay(state_file=Path(directory) / 'state.json' if persistent else None)
+                peer = self.peer(server, 'a')
+                peer.team.clients.clear()
+                peer.room.empty_since = 0
+                peer.room.last_active = 100
+                loops = [0]
+                async def sleep_once(_):
+                    loops[0] += 1
+                    if loops[0] > 1:
+                        raise asyncio.CancelledError
+                loop = SimpleNamespace(time=lambda: 301)
+                with mock.patch.object(relay.asyncio, 'sleep', sleep_once), mock.patch.object(relay.asyncio, 'get_running_loop', return_value=loop), mock.patch.object(relay.time, 'time', return_value=401):
+                    with self.assertRaises(asyncio.CancelledError): server.maintain().send(None)
+                self.assertEqual(bool(server.rooms), persistent)
+                if persistent:
+                    loops[0] = 0
+                    with mock.patch.object(relay.asyncio, 'sleep', sleep_once), mock.patch.object(relay.time, 'time', return_value=100 + 31 * 86400):
+                        with self.assertRaises(asyncio.CancelledError): server.maintain().send(None)
+                    self.assertEqual(server.rooms, {})
+
+    def test_mod_gate_ack_legacy_and_new_room_hash(self):
+        server = relay.Relay()
+        a = self.peer(server, 'a')
+        expected = dict(type='hello_ack', version=3, build_id=client_sim.BUILD_ID,
+                        seed_hash='0', policy_id='or-v2', client_id='a')
+        self.assertEqual(relay.encode(a.messages[0]), relay.encode(expected))
+        self.assertIsNone(a.room.mod_hash)
+        b = self.peer(server, 'b', mod_hash='a' * 64)
+        self.assertEqual(b.messages[0]['ledger'], dict(v=1, epoch=a.room.epoch, floor=0))
+        self.assertEqual(a.room.mod_hash, 'a' * 64)
+        with mock.patch('builtins.print') as log:
+            with self.assertRaisesRegex(relay.ProtocolError, r'mod mismatch \(room a{12}, client b{12}\)'):
+                self.peer(server, 'bad', mod_hash='b' * 64)
+            self.assertIn('handshake refused: mod mismatch room=default team=default client=bad room_hash=aaaaaaaaaaaa client_hash=bbbbbbbbbbbb', log.call_args.args[0])
+        self.assertNotIn('bad', a.team.seen)
+        old = self.peer(server, 'old')
+        self.assertEqual(old.messages[0], dict(expected, client_id='old'))
+        self.assertFalse(any(p['type'] == 'catchup' for p in old.messages))
+        for value in ['A' * 64, 'x', 1, None, 'a' * 63]:
+            with self.assertRaises(relay.ProtocolError):
+                relay.validate_hello(dict(client_sim.ClientSim('bad').hello, mod_hash=value))
+        with self.assertRaisesRegex(relay.ProtocolError, 'build id mismatch'):
+            self.peer(server, 'bad', mod_hash='b' * 64, build_id='F' * 40)
+
+    def test_room_capacity_evicts_empty_oldest_only(self):
+        server = relay.Relay()
+        with mock.patch.object(relay, 'MAX_ROOMS', 2):
+            a = self.peer(server, 'a', room='a')
+            b = self.peer(server, 'b', room='b')
+            with self.assertRaisesRegex(relay.ProtocolError, 'room capacity'):
+                self.peer(server, 'c', room='c')
+            a.team.clients.clear()
+            self.peer(server, 'c', room='c')
+            self.assertEqual(set(server.rooms), {'b', 'c'})
+
+    def test_request_strictness(self):
+        server = relay.Relay()
+        a = self.peer(server, 'a')
+        for packet in [dict(type='catchup_request'), dict(type='catchup_request', after=-1),
+                       dict(type='catchup_request', after=0, extra=1), dict(type='catchup_request', after=True)]:
+            with self.assertRaises(relay.ProtocolError):
+                server.receive(a, packet)
+
+    def test_mod_hash_fixture(self):
+        hashing = load_sibling('mod_hash')
+        import hashlib
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            keys = root / 'keys.json'
+            keys.write_bytes(b'{}\n')
+            (root / 'coop-ux.json').write_bytes(b'{"version":1}\n')
+            title = root / '0000000000000001'
+            for relative, data in [('Alpha/romfs/a.bin', b'abc'), ('Beta/exefs/b.bin', b'xyz\n'),
+                                   ('Alpha/cheats/local.txt', b'ignored')]:
+                path = title / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+            text = hashing.canonical_text(keys, title)
+            self.assertEqual(hashlib.sha256(text.encode()).hexdigest(), '2d664dfd842f28a77e40468dbc1b732493b854d9f52fb91945fc4f09e240867e')
+            self.assertEqual(len(text.splitlines()), 8)
+            (title / 'Alpha').rename(title / 'Renamed')
+            self.assertEqual(text, hashing.canonical_text(keys, title))
+            (title / 'Renamed/romfs/link.bin').symlink_to('a.bin')
+            self.assertIn('mod romfs/link.bin 3 ', hashing.canonical_text(keys, title))
+            (title / 'Renamed/romfs/cycle').symlink_to('.', target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, 'cycle'):
+                hashing.canonical_text(keys, title)
+
+
+class LedgerTCPTests(unittest.IsolatedAsyncioTestCase):
+    async def test_late_join_paging_reconnect_and_bad_mod(self):
+        server = relay.Relay()
+        a = client_sim.ClientSim('a', mod_hash='a' * 64)
+        b = client_sim.ClientSim('b', mod_hash='a' * 64)
+        bad = client_sim.ClientSim('bad', mod_hash='b' * 64)
+        try:
+            port = await server.start(port=0)
+            await a.connect('127.0.0.1', port)
+            await a.change('bool_set', hash=1, value=True)
+            for n in range(260):
+                await a.change('item_give', name='Test_Item_A', category=1, count=1, get=1, flags=[0]*4)
+                await a.receive('ack')
+            await b.connect('127.0.0.1', port)
+            first = await b.catchup()
+            self.assertEqual(len(first), 260)
+            self.assertEqual([p['rev'] for p in first], list(range(2, 262)))
+            await b.close()
+            for _ in range(100):
+                if 'b' not in server.rooms['default'].teams['default'].clients: break
+                await asyncio.sleep(.01)
+            await b.connect('127.0.0.1', port)
+            self.assertEqual(await b.catchup(), first)
+            with self.assertRaisesRegex(ValueError, 'mod mismatch'):
+                await bad.connect('127.0.0.1', port)
+        finally:
+            await a.close()
+            await b.close()
+            await bad.close()
+            await server.close()
+
+    async def test_fake_peer_commands(self):
+        peer = fake_peer.FakePeer(port=0, mod_hash='a' * 64)
+        other = client_sim.ClientSim('other', mod_hash='a' * 64)
+        try:
+            port = await peer.start()
+            await other.connect('127.0.0.1', port)
+            await peer.command('item Test_Item_A 1 1')
+            self.assertEqual((await peer.command('catchup'))['count'], 1)
+            self.assertIn('mod mismatch', (await peer.command('badmod ' + 'b' * 64))['result'])
+            await peer.command('holdout 0.1')
+            await other.close()
+            with self.assertRaisesRegex(ValueError, 'held out'):
+                await other.connect('127.0.0.1', port)
+            await asyncio.sleep(.15)
+            await other.connect('127.0.0.1', port)
+        finally:
+            await other.close()
+            await peer.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

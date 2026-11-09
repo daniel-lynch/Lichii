@@ -54,7 +54,7 @@ def animation_descriptor(path):
 class ClientSim:
     def __init__(self, client_id=None, *, room="default", team="default", name="Player",
                  build_id=BUILD_ID, seed_hash="0", policy_id="or-v2", auto_heartbeat=True,
-                 on_pose=None, world_wallet=None, animation=None):
+                 on_pose=None, world_wallet=None, animation=None, mod_hash=None):
         self.hello = {"type": "hello", "version": wire.VERSION if animation else wire.LEGACY_VERSION, "build_id": build_id,
                       "seed_hash": seed_hash, "room": room, "team": team,
                       "client_id": client_id or uuid.uuid4().hex, "name": name, "policy_id": policy_id}
@@ -64,6 +64,8 @@ class ClientSim:
         if animation is not None:
             wire.validate_animation(animation)
             self.hello["animation"] = dict(animation)
+        if mod_hash is not None:
+            self.hello["mod_hash"] = wire.mod_hash(mod_hash)
         self.peer_animations = {}
         self.auto_heartbeat = auto_heartbeat
         self.seq = 0
@@ -143,6 +145,20 @@ class ClientSim:
             packet["world_wallet"] = dict(world_wallet)
         await self.send(packet)
 
+    async def catchup(self):
+        grants, after = [], 0
+        while True:
+            await self.send({"type": "catchup_request", "after": after})
+            page = await self.receive("catchup")
+            if page["after"] != after or (page["more"] and not page["grants"]):
+                raise ValueError("invalid catchup progress")
+            grants.extend(page["grants"])
+            if len(grants) > 16384:
+                raise ValueError("catchup transaction too large")
+            if not page["more"]:
+                return grants
+            after = page["grants"][-1]["rev"]
+
     def animation_matches(self, origin):
         animation = self.hello.get("animation")
         return animation is not None and self.peer_animations.get(origin) == animation
@@ -215,12 +231,14 @@ async def run(args):
                        build_id=args.build_id, seed_hash=args.seed, policy_id=args.policy,
                        world_wallet=dict(zip(("balance", "capacity"), args.world_wallet))
                        if args.world_wallet else None,
-                       animation=animation_descriptor(args.anim_table),
+                       animation=animation_descriptor(args.anim_table), mod_hash=args.mod_hash,
                        on_pose=lambda packet: print(json.dumps(packet), flush=True) if args.show_poses else None)
     try:
         await client.connect(args.host, args.port)
         print(json.dumps(client.ack), flush=True)
         print(json.dumps(client.snapshot), flush=True)
+        if args.catchup:
+            print(json.dumps(await client.catchup()), flush=True)
         for raw in args.send:
             packet = json.loads(raw)
             if packet.get("type") in wire.CHANGE_TYPES:
@@ -264,6 +282,8 @@ def main():
     parser.add_argument("--send", action="append", default=[], help="JSON packet; change origin/seq are automatic")
     parser.add_argument("--pose", action="append", default=[], help="'BANC CHILD X Y Z YAW [LOADING]' (v3 pose)")
     parser.add_argument("--show-poses", action="store_true", help="print received poses (otherwise only counted)")
+    parser.add_argument("--mod-hash", type=wire.mod_hash)
+    parser.add_argument("--catchup", action="store_true")
     args = parser.parse_args()
     try:
         asyncio.run(run(args))

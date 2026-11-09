@@ -45,6 +45,7 @@ add_executable(tests
     core/oot_coop_player.cpp
     core/oot_coop_keyfile.cpp
     core/oot_coop_ux.cpp
+    core/oot_coop_ledger.cpp
     core/oot_coop_chest.cpp
     core/oot_coop_world.cpp
     core/builtin_patches.cpp

@@ -88,6 +88,8 @@ struct Change {
     u64 chest_transaction{};
     u32 chest_part{};
     bool chest_final{};
+    bool catchup{}; // Local metadata, never encoded.
+    u64 catchup_transaction{};
     bool operator==(const Change&) const = default;
 };
 
@@ -131,6 +133,7 @@ struct Hello {
     std::string client_id;
     std::string name{"Player"};
     std::optional<World::Wallet> world_wallet;
+    std::string mod_hash;
     std::string animation_hash; // nonempty: protocol v4, animation revision 1
     bool ghost_equipment_v2{};
 };
