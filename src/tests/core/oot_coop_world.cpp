@@ -328,12 +328,13 @@ TEST_CASE("OoT world pickup contexts are thread epoch and age bounded", "[core][
     pickups.Clear();
     REQUIRE_FALSE(pickups.Take(1, 2, 11, 0x7F00));
     // The give must run nested in the component invocation: below its entry stack, not too deep.
-    for (const u64 sp : {u64{0x8000}, u64{0x8010}, u64{0x8000 - World::Pickups::StackSpan - 0x10}}) {
-        pickups.Put({Bit, 7, 2, 10, 0x8000});
+    constexpr u64 entry = 0x40000;
+    for (const u64 sp : {entry, entry + 0x10, entry - World::Pickups::StackSpan - 0x10}) {
+        pickups.Put({Bit, 7, 2, 10, entry});
         REQUIRE_FALSE(pickups.Take(7, 2, 11, sp));
     }
-    pickups.Put({Bit, 7, 2, 10, 0x8000});
-    REQUIRE(pickups.Take(7, 2, 11, 0x8000 - World::Pickups::StackSpan) == Bit);
+    pickups.Put({Bit, 7, 2, 10, entry});
+    REQUIRE(pickups.Take(7, 2, 11, entry - World::Pickups::StackSpan) == Bit);
 }
 
 TEST_CASE("OoT world wallet caller matrix preserves signed deltas and suppresses application echoes", "[core][oot_coop]") {
