@@ -1617,7 +1617,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                     }
                     continue;
                 }
-                impl->key_watch[change.key].credit += change.value;
+                impl->key_watch[change.key].Credit(change.value);
                 log(fmt::format("OoT co-op: key gain queued total={:08x} count={:08x} +{}", change.key,
                                 count.key, change.value));
                 continue;
