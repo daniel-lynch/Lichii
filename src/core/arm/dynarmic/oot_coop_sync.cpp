@@ -104,7 +104,7 @@ bool ItemName(std::string_view name) {
 
 bool ValidItem(const Change& change) {
     const auto args = UnpackItem(change.key);
-    return change.kind == Kind::Item && ItemName(change.name) && change.value >= 1 &&
+    return World::Valid(change.source) && change.kind == Kind::Item && ItemName(change.name) && change.value >= 1 &&
            change.value <= ItemCountLimit && args.category < 16 && args.get < 16 &&
            PackItem(args) == change.key;
 }
@@ -122,9 +122,10 @@ Json EncodeChange(const Change& change) {
         packet["count"] = change.value;
         packet["get"] = args.get;
         packet["flags"] = Json::array({args.flags[0], args.flags[1], args.flags[2], args.flags[3]});
-        if (change.origin_key) packet["origin_key"] = change.origin_key;
+        World::EncodeOrigin(packet, change.source);
         return packet;
     }
+    if (change.kind == Kind::Bit) World::EncodeOrigin(packet, change.source);
     if (change.kind == Kind::Quest) {
         packet["challenge"] = change.key;
         packet["step"] = change.step;
@@ -178,13 +179,16 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
             change.origin = packet.at("origin").get<std::string>();
             change.seq = packet.at("seq").get<u64>();
         }
+        const auto source = World::DecodeOrigin(packet);
+        if (!source || (*source && change.kind != Kind::Item && change.kind != Kind::Bit) ||
+            (change.kind == Kind::Bit && source->kind == World::OriginKind::Chest)) return {};
+        change.source = *source;
         if (change.kind == Kind::Item) {
             for (const auto& [field, value] : packet.items()) {
                 if (field == "type" || field == "origin" || field == "seq" || field == "name" ||
                     field == "category" || field == "count" || field == "get" || field == "flags")
                     continue;
-                if (field == "origin_key" && Unsigned(value, std::numeric_limits<u32>::max()) &&
-                    value != 0) continue;
+                if (World::OriginField(field)) continue;
                 if (field == "rev" && Unsigned(value, MaxSequence) && value != 0) continue;
                 return std::nullopt;
             }
@@ -198,7 +202,6 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
                 args.flags[i] = flags[i].get<u8>();
             }
             change.name = packet.at("name").get<std::string>();
-            if (packet.contains("origin_key")) change.origin_key = packet.at("origin_key").get<u32>();
             change.key = PackItem(args);
             change.value = packet.at("count").get<s64>();
             return ValidItem(change) ? std::optional{change} : std::nullopt;
@@ -211,10 +214,13 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
             return std::nullopt;
         }
         change.key = packet.at(key).get<u64>();
+        if (change.kind == Kind::Bit && change.source && change.key != change.source.key &&
+            (change.source.kind != World::OriginKind::Token || change.key != change.source.partner)) return {};
         const char* value_field = change.kind == Kind::Rupee || change.kind == Kind::Key ? "delta" : "value";
         if (WireKind(change.kind)) {
             for (const auto& [field, value] : packet.items()) {
                 if (field == "type" || field == key || field == value_field) continue;
+                if (change.kind == Kind::Bit && World::OriginField(field)) continue;
                 if (!snapshot && (field == "origin" || field == "seq")) continue;
                 if (!snapshot && field == "rev" && Unsigned(value, MaxSequence) && value != 0) continue;
                 return std::nullopt;
@@ -460,22 +466,8 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                     if (!at) return std::nullopt;
                     profile.item_callers.push_back(*at);
                 }
-            } else if (field == "pickup") {
-                // World pickups: {"callers": [return offsets], "names": [exact item names]}.
-                if (!value.is_object() || value.size() != 2 || !value.contains("callers") ||
-                    !value.contains("names") || !value.at("callers").is_array() ||
-                    !value.at("names").is_array() || value.at("callers").empty() ||
-                    value.at("callers").size() > 8 || value.at("names").empty() ||
-                    value.at("names").size() > 32) return std::nullopt;
-                for (const auto& item : value.at("callers")) {
-                    const auto at = offset(item);
-                    if (!at) return std::nullopt;
-                    profile.pickup_callers.push_back(*at);
-                }
-                for (const auto& item : value.at("names")) {
-                    if (!item.is_string() || !ItemName(item.get<std::string>())) return std::nullopt;
-                    profile.pickup_names.push_back(item.get<std::string>());
-                }
+            } else if (field == "pickup" || field == "wallet" || field == "token" || field == "world") {
+                if (!World::DecodeProfileSection(field, value, profile)) return {};
             } else if (field == "give") {
                 // Generic gives: {"body": [lo, hi], "deny_callers": [...], "per_player": [names
                 // from a pickup caller], "never": [names from any caller]}.
@@ -679,6 +671,7 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                 return std::nullopt;
             }
         }
+        if (!World::ValidateProfile(profile)) return {};
         // Two sites at one offset would make Identify ambiguous.
         for (size_t i = 0; i < profile.sites.size(); ++i)
             for (size_t j = i + 1; j < profile.sites.size(); ++j)
@@ -715,10 +708,12 @@ bool Enabled() {
 }
 
 Json EncodeHello(const Hello& hello) {
-    return {{"type", "hello"}, {"version", ProtocolVersion}, {"build_id", hello.build_id},
+    Json packet{{"type", "hello"}, {"version", ProtocolVersion}, {"build_id", hello.build_id},
             {"seed_hash", hello.seed_hash}, {"policy_id", hello.policy_id}, {"room", hello.room},
             {"team", hello.team},
             {"client_id", hello.client_id}, {"name", hello.name}};
+    if (hello.world_wallet) packet["world_wallet"] = World::EncodeWallet(*hello.world_wallet);
+    return packet;
 }
 
 bool MatchesHello(const Json& packet, const Hello& hello) {
@@ -885,6 +880,7 @@ std::vector<Change> State::Snapshot() const {
         auto change = value;
         change.origin.clear();
         change.seq = 0;
+        change.source = {}; // Baseline flags are state, never a benefit receipt.
         result.push_back(std::move(change));
     }
     return result;
@@ -913,13 +909,16 @@ struct Session::Impl {
     struct Connection;
     struct GhostPort;
     Impl(Endpoint endpoint_, Hello hello_, std::set<u64> denied_, std::set<Kind> allowed_,
-         std::set<std::pair<Kind, u64>> keys, u64 wallet)
+         std::set<std::pair<Kind, u64>> keys, u64 wallet, const World::Config& world)
         : endpoint{std::move(endpoint_)}, hello{std::move(hello_)}, denied{std::move(denied_)},
           local{denied}, remote{denied}, allowed_classes{std::move(allowed_)}, retry{io} {
         ApplyPolicy policy{true, allowed_classes, {}, wallet};
         for (const auto& [kind, key] : keys) {
-            if (!denied.contains(key)) policy.keys.emplace(kind, key);
+            if (!denied.contains(key) && (kind != Kind::Bit || world.families.empty() || world.AdmitsFlag(key)))
+                policy.keys.emplace(kind, key);
         }
+        for (const auto& [kind, key] : policy.keys)
+            if (kind == Kind::Bit) world_keys.insert(key);
         runtime = std::make_unique<FrameDrain<Backend>>(std::move(policy));
     }
     ~Impl() { Stop(); }
@@ -947,6 +946,21 @@ struct Session::Impl {
     std::map<u32, KeyWatch> key_watch; // by total key
     // Same-chest race (guest side, under guest_mutex).
     ChestClaims claims;
+    World::Claims world_claims;
+    World::Pickups pickups;
+    struct LocalPickup {
+        Change change;
+        u64 lr{}, stack{}, epoch{}, tick{};
+    };
+    std::map<u64, LocalPickup> local_pickups; // thread -> exact give call awaiting its return
+    std::set<u64> world_keys;
+    std::set<u64> world_flags_sent;
+    std::map<World::Origin, std::vector<Change>> world_flags_waiting;
+    bool world_quarantined{}, wallet_reconciled{};
+    std::optional<World::Wallet> wallet_probe;
+    std::optional<World::Wallet> wallet; // protected by mutex
+    std::map<std::string, World::Wallet> peer_wallets; // protected by mutex
+
     struct HeldGive {
         Change change;
         u64 event{}, tick{};
@@ -1008,7 +1022,12 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                     [self](auto connect_error, const tcp::endpoint&) {
                         if (self->failed) return;
                         if (connect_error) return self->Fail("connect: " + connect_error.message());
-                        self->Send(EncodeHello(self->owner.hello));
+                        auto hello = self->owner.hello;
+                        {
+                            std::scoped_lock lock{self->owner.mutex};
+                            hello.world_wallet = self->owner.wallet;
+                        }
+                        self->Send(EncodeHello(hello));
                         self->Read();
                     });
             });
@@ -1022,6 +1041,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
             std::scoped_lock lock{owner.mutex};
             dropped = owner.peers.size();
             owner.peers.clear();
+            owner.peer_wallets.clear();
         }
         resolver.cancel();
         boost::system::error_code ignored;
@@ -1076,7 +1096,12 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                 if (pose) self->Send(EncodePose(*pose));
                 if (request_baseline) {
                     self->baseline_requested = true;
-                    self->Send({{"type", "team_state_request"}});
+                    Json request{{"type", "team_state_request"}};
+                    {
+                        std::scoped_lock lock{self->owner.mutex};
+                        if (self->owner.wallet) request["world_wallet"] = World::EncodeWallet(*self->owner.wallet);
+                    }
+                    self->Send(request);
                 }
                 if (now - self->last_heartbeat >= 30s) {
                     self->Send({{"type", "heartbeat"}});
@@ -1151,6 +1176,13 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                     } else if (type == "client_state") {
                         // A peer that went offline hides its ghost (the frame drain parks it).
                         const auto& state = packet->at("state");
+                        if (state.is_object() && state.contains("world_wallet")) {
+                            const auto wallet = World::DecodeWallet(state.at("world_wallet"));
+                            if (!wallet || !Identity(packet->at("origin"))) return self->Fail("invalid wallet baseline");
+                            std::scoped_lock lock{self->owner.mutex};
+                            if (self->owner.peer_wallets.size() < 128)
+                                self->owner.peer_wallets[packet->at("origin").get<std::string>()] = *wallet;
+                        }
                         if (packet->contains("origin") && packet->at("origin").is_string() &&
                             state.is_object() && state.contains("name") && state.at("name").is_string()) {
                             self->owner.ux.SetName(packet->at("origin").get<std::string>(),
@@ -1161,6 +1193,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                             state.at("online") == false) {
                             const auto origin = packet->at("origin").get<std::string>();
                             std::scoped_lock lock{self->owner.mutex};
+                            self->owner.peer_wallets.erase(origin);
                             if (self->owner.peers.erase(origin))
                                 LOG_INFO(Core_ARM, "OoT co-op: peer {} offline (relay)", origin.substr(0, 8));
                         }
@@ -1258,9 +1291,19 @@ bool Session::Impl::Receive(const Json& packet) {
         while (!outgoing.empty() && outgoing.front().seq <= seq) outgoing.pop_front();
         return true;
     }
-    std::vector<Change> changes;
+    std::vector<Change> changes, world_replay;
+    std::map<std::string, World::Wallet> wallets;
     HighWater snapshot_seen;
     if (type == "team_state") {
+        if (packet.contains("world_wallet")) {
+            const auto& map = packet.at("world_wallet");
+            if (!map.is_object() || map.size() > 128) return false;
+            for (const auto& [sender, value] : map.items()) {
+                const auto wallet = World::DecodeWallet(value);
+                if (!Identity(sender) || !wallet) return false;
+                if (sender != hello.client_id) wallets.emplace(sender, *wallet);
+            }
+        }
         if (!Unsigned(packet.at("revision"), MaxSequence) || !packet.at("changes").is_array() ||
             !packet.at("replay").is_array() || !packet.at("seen").is_object() ||
             packet.at("changes").size() > StateLimit || packet.at("replay").size() > 512 ||
@@ -1285,8 +1328,12 @@ bool Session::Impl::Receive(const Json& packet) {
             if (!change || !WireKind(change->kind) || !Unsigned(value.at("rev"), MaxSequence) ||
                 value.at("rev").get<u64>() != ++revision) return false;
             if (!EventKind(change->kind)) checkpoint.Merge(*change);
+            else if (ever_ready && change->kind == Kind::Item &&
+                     (change->source.kind == World::OriginKind::Bit || change->source.kind == World::OriginKind::Token))
+                world_replay.push_back(*change);
         }
         changes = checkpoint.Snapshot();
+        changes.insert(changes.end(), world_replay.begin(), world_replay.end());
     } else {
         const auto change = DecodeChange(packet);
         if (!change || !WireKind(change->kind) || !Unsigned(packet.at("rev"), MaxSequence) ||
@@ -1301,6 +1348,7 @@ bool Session::Impl::Receive(const Json& packet) {
         }
         return false;
     }
+    if (type == "team_state") peer_wallets = std::move(wallets);
     for (auto& change : changes) pending.emplace_back(std::move(change));
     if (type == "team_state") pending.emplace_back(std::move(snapshot_seen));
     return true;
@@ -1352,8 +1400,10 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
     : owner{owner_}, base{base_}, profile{std::move(profile_)},
       impl{std::make_unique<Impl>(std::move(endpoint), std::move(hello), std::move(denied),
                                    std::move(allowed_classes), std::move(allowed_keys),
-                                   profile->wallet_hash)} {
+                                   profile->wallet_hash, profile->world)} {
     impl->binding.base = base;
+    if (profile->world.cleanup == World::Cleanup::Death)
+        LOG_WARNING(Core_ARM, "OoT co-op: world cleanup remains flag_only: no verified resident actor walk");
     for (const auto& [member, key] : profile->chest_members) impl->chest_bools.insert(key);
     if (!impl->allowed_classes.empty()) {
         Kernel::KProcessAddress stack{}, sentinel{};
@@ -1407,7 +1457,7 @@ void Session::Observe(Change change) {
     impl->outgoing.push_back(std::move(change));
 }
 
-void Session::ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory) {
+void Session::ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory, u64 thread) {
     const auto call = ReadItemCall(jit, memory, base, *profile, impl->binding.sentinel,
                                    impl->allowed_classes.contains(Kind::Item));
     // Every give is logged (bounded): the record of what the game passes, forwarded or not.
@@ -1415,7 +1465,8 @@ void Session::ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory) {
         ++impl->item_lines;
         LOG_INFO(Core_ARM, "OoT co-op: {}", call.line);
     }
-    if (call.replay || call.nested || !impl->allowed_classes.contains(Kind::Item)) return;
+    if (call.replay || call.nested || (impl->runtime->Calling() && thread == impl->frame_thread) ||
+        !impl->allowed_classes.contains(Kind::Item)) return;
     const u64 event = EventContext(memory).value_or(0);
     if (!profile->chest_members.empty() && impl->claims.SkipLocal(event)) {
         // This event opens a chest a peer opened first and whose gives we take: return from the
@@ -1424,6 +1475,30 @@ void Session::ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory) {
         jit.SetPC(jit.GetRegister(30));
         LOG_INFO(Core_ARM, "OoT co-op: chest race: local give skipped name={} (the chest was claimed by a "
                            "peer first; its give is the one)", call.change.name);
+        return;
+    }
+    if (call.pickup && profile->pickup_entry) {
+        const auto source = impl->pickups.Take(thread, impl->rebinds, impl->tick);
+        if (!call.forward) return;
+        if (impl->world_quarantined || !source || !impl->allowed_classes.contains(Kind::Bit)) {
+            LOG_INFO(Core_ARM, "OoT co-op: pickup unlinked or gated; give stays local name={}", call.change.name);
+            return;
+        }
+        if (!impl->world_claims.Reserve(*source, {})) {
+            jit.SetRegister(0, 1);
+            jit.SetPC(jit.GetRegister(30));
+            LOG_INFO(Core_ARM, "OoT co-op: pickup race: local give skipped name={}", call.change.name);
+            return;
+        }
+        if (impl->local_pickups.contains(thread) || impl->local_pickups.size() >= 64) {
+            impl->world_quarantined = true;
+            impl->runtime->Invalidate();
+            return;
+        }
+        auto change = call.change;
+        change.source = *source;
+        impl->local_pickups.emplace(thread, Impl::LocalPickup{std::move(change), jit.GetRegister(30),
+            jit.GetSP(), impl->rebinds, impl->tick});
         return;
     }
     if (!call.forward) return;
@@ -1455,11 +1530,11 @@ void Session::ObserveActorFlag(Dynarmic::A64::Jit& jit, Memory::Memory& memory) 
     if (it == profile->chest_members.end()) return;
     const u32 key = it->second;
     const u64 event = EventContext(memory).value_or(0);
-    const auto open = impl->claims.LocalOpen(key, event);
+    const auto open = impl->claims.LocalOpen(World::Origin::Chest(key), event);
     size_t dropped = 0;
     if (open == ChestClaims::Open::TakeOver) {
         dropped = impl->runtime->DropPending(
-            [&](const Change& c) { return c.kind == Kind::Item && c.origin_key == key; });
+            [&](const Change& c) { return c.kind == Kind::Item && c.source == World::Origin::Chest(key); });
     }
     LOG_INFO(Core_ARM, "OoT co-op: chest open (local) key={:08x} event={:#x}: {}", key, event,
              open == ChestClaims::Open::Ours ? "ours (first claim)"
@@ -1468,9 +1543,10 @@ void Session::ObserveActorFlag(Dynarmic::A64::Jit& jit, Memory::Memory& memory) 
                  : fmt::format("we had already given locally: ours; {} queued peer give(s) dropped", dropped));
 }
 
-void Session::ObserveRupee(Dynarmic::A64::Jit& jit) {
+void Session::ObserveRupee(Dynarmic::A64::Jit& jit, u64 thread) {
     const auto call = ReadRupeeCall(jit, base, *profile, impl->binding.sentinel,
-                                    impl->allowed_classes.contains(Kind::Rupee));
+                                    impl->allowed_classes.contains(Kind::Rupee),
+                                    impl->runtime->Calling() && thread == impl->frame_thread);
     if (impl->rupee_lines < 256) {
         ++impl->rupee_lines;
         LOG_INFO(Core_ARM, "OoT co-op: {}", call.line);
@@ -1519,6 +1595,22 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                             runtime.LastGrant()->name));
             const auto& grant = *runtime.LastGrant();
             if (result & 1) impl->ux.ItemReceived(grant.origin, grant.seq, grant.name, grant.value);
+            if (grant.source.kind == World::OriginKind::Bit || grant.source.kind == World::OriginKind::Token) {
+                if (!(result & 1) || !impl->world_claims.Complete(grant.source, grant.origin)) {
+                    impl->world_quarantined = true;
+                    runtime.Invalidate();
+                    log("OoT co-op: world give outcome uncertain; quarantined without flags");
+                } else {
+                    log(fmt::format("OoT co-op: pickup benefit received key={:016x} partner={:016x} sender={} seq={}",
+                                    grant.source.key, grant.source.partner, grant.origin, grant.seq));
+                    for (const u64 key : World::Flags(grant.source)) {
+                        Change flag{Kind::Bit, grant.origin, grant.seq, key, 1};
+                        flag.source = grant.source;
+                        if (!runtime.Queue(flag) && !runtime.Suppress(flag)) runtime.Invalidate();
+                    }
+                    impl->world_flags_waiting.erase(grant.source);
+                }
+            }
         }
         if (event == ApplyEvent::Returned && runtime.LastGrant() &&
             runtime.LastGrant()->kind == Kind::Rupee) {
@@ -1540,12 +1632,67 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         return event == ApplyEvent::Returned;
     }
     if (impl->stopped) return false;
+    if (point == OotGameDataTrace::Point::Pickup) {
+        const auto key = backend.VerifiedEntry(profile->pickup_entry) &&
+            !(runtime.Calling() && thread == impl->frame_thread)
+            ? World::PickupKey(memory, jit.GetRegister(0), profile->world) : std::nullopt;
+        auto source = key ? profile->world.Source(*key) : std::nullopt;
+        if (source) {
+            for (const u64 flag : World::Flags(*source)) {
+                if (!impl->world_keys.contains(flag) ||
+                    !backend.ReadFlag(Change{Kind::Bit, {}, 0, flag, 1}).has_value()) source.reset();
+            }
+        }
+        impl->pickups.Put({source.value_or(World::Origin{}), thread, impl->rebinds, impl->tick,
+                          EventContext(memory).value_or(0)});
+        return false;
+    }
+    if (point == OotGameDataTrace::Point::PickupReturn) {
+        const auto it = impl->local_pickups.find(thread);
+        if (it == impl->local_pickups.end()) return false;
+        const auto local = it->second;
+        const auto ret = std::find_if(profile->pickup_returns.begin(), profile->pickup_returns.end(),
+            [&](const auto& candidate) { return base + candidate.offset == pc; });
+        if (local.lr != pc || local.stack != jit.GetSP() || local.epoch != impl->rebinds ||
+            impl->tick < local.tick || impl->tick - local.tick > 1800 ||
+            ret == profile->pickup_returns.end() || !backend.VerifiedEntry(*ret)) {
+            impl->world_quarantined = true;
+            runtime.Invalidate();
+            log("OoT co-op: pickup return identity changed; quarantined");
+            return false;
+        }
+        impl->local_pickups.erase(it);
+        if (jit.GetRegister(0) & 1) {
+            impl->world_claims.Complete(local.change.source, {});
+            impl->world_flags_waiting.erase(local.change.source);
+            log(fmt::format("OoT co-op: pickup benefit returned key={:016x} partner={:016x} thread={}",
+                            local.change.source.key, local.change.source.partner, thread));
+            Observe(local.change);
+            impl->ux.ItemShared(local.change.name, local.change.value);
+        } else {
+            impl->world_claims.Cancel(local.change.source, {});
+            log("OoT co-op: pickup give declined; no benefit receipt or flags sent");
+        }
+        return false;
+    }
+    if (point == OotGameDataTrace::Point::BitSet) {
+        const u64 key = jit.GetRegister(2);
+        const auto source = impl->world_claims.GaveFlag(key);
+        if (!impl->world_quarantined && !(runtime.Calling() && thread == impl->frame_thread) &&
+            (jit.GetRegister(1) & 1) && source &&
+            profile->world.AdmitsFlag(key) && impl->allowed_classes.contains(Kind::Bit)) {
+            Change flag{Kind::Bit, {}, 0, key, 1};
+            flag.source = *source;
+            if (!runtime.Suppress(flag) && impl->world_flags_sent.insert(key).second) Observe(flag);
+        }
+        return false;
+    }
     if (point == OotGameDataTrace::Point::ItemGive) {
-        ObserveItem(jit, memory);
+        ObserveItem(jit, memory, thread);
         return false;
     }
     if (point == OotGameDataTrace::Point::RupeeAdd) {
-        ObserveRupee(jit);
+        ObserveRupee(jit, thread);
         return false;
     }
     if (point == OotGameDataTrace::Point::ActorFlagSet) {
@@ -1556,6 +1703,14 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     if (!impl->frame_thread) impl->frame_thread = thread;
     if (impl->frame_thread != thread) return false;
     ++impl->tick;
+    for (const auto& [pickup_thread, pickup] : impl->local_pickups) {
+        if (pickup.epoch != impl->rebinds || impl->tick - pickup.tick > 1800) {
+            impl->world_quarantined = true;
+            runtime.Invalidate();
+            log("OoT co-op: pickup return expired; quarantined without retry");
+            break;
+        }
+    }
     if (!binding.invalid && backend.Moved()) {
         const u64 old = binding.manager;
         const auto now =
@@ -1564,6 +1719,13 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         if (runtime.Rebind(backend, log)) {
             impl->stable_frame = false;
             impl->key_watch.clear(); // a new save epoch: re-baseline the key counts
+            impl->pickups.Clear();
+            impl->local_pickups.clear();
+            if (!profile->world.families.empty()) {
+                impl->world_quarantined = true;
+                runtime.Invalidate();
+                log("OoT co-op: world save identity changed; restart with a matched save baseline");
+            }
             if (impl->rebinds < 16) {
                 log(fmt::format("OoT co-op: manager moved {:#x} -> {:#x}; baseline re-bound", old,
                                 now.value_or(0)));
@@ -1614,17 +1776,45 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                                 count.key, change.value));
                 continue;
             }
-            if (change.kind == Kind::Item && change.origin_key && !profile->chest_members.empty() &&
+            const bool world_source = change.source.kind == World::OriginKind::Bit ||
+                                      change.source.kind == World::OriginKind::Token;
+            if (world_source) {
+                const auto flags = World::Flags(change.source);
+                if (!std::all_of(flags.begin(), flags.end(), [&](u64 key) { return impl->world_keys.contains(key); })) continue;
+                if (impl->world_quarantined || !profile->world.Admits(change.source) ||
+                    !impl->allowed_classes.contains(Kind::Bit)) continue;
+                if (change.kind == Kind::Item) {
+                    if (!impl->allowed_classes.contains(Kind::Item) ||
+                        !impl->remote.Merge(change, !change.origin.empty())) continue;
+                    if (!impl->world_claims.Reserve(change.source, change.origin)) {
+                        log("OoT co-op: pickup race: peer give dropped (source reserved or applied)");
+                        continue;
+                    }
+                    if (!runtime.Queue(change)) {
+                        impl->world_claims.Cancel(change.source, change.origin);
+                        impl->world_quarantined = true;
+                        runtime.Invalidate();
+                    }
+                    continue;
+                }
+                if (change.kind == Kind::Bit && !impl->world_claims.Applied(change.source)) {
+                    // A source flag may precede its reward, but must never stand in for a receipt.
+                    if (impl->world_flags_waiting.size() >= World::Claims::Limit) runtime.Invalidate();
+                    else impl->world_flags_waiting.try_emplace(change.source);
+                    continue;
+                }
+            }
+            if (change.kind == Kind::Item && change.source.kind == World::OriginKind::Chest && !profile->chest_members.empty() &&
                 !impl->claims.AcceptRemote(change)) {
                 if (impl->remote.Merge(change, !change.origin.empty()) && impl->race_lines++ < 256) {
                     log(fmt::format("OoT co-op: chest race: peer give dropped name={} chest={:08x} (owner {})",
-                                    change.name, change.origin_key, impl->claims.Owner(change.origin_key)));
+                                    change.name, change.source.key, impl->claims.Owner(change.source)));
                 }
                 continue;
             }
             if (change.kind == Kind::Bool && !change.origin.empty() && change.value == 1 &&
                 impl->chest_bools.contains(static_cast<u32>(change.key))) {
-                impl->claims.RemoteClaim(static_cast<u32>(change.key), change.origin);
+                impl->claims.RemoteClaim(World::Origin::Chest(static_cast<u32>(change.key)), change.origin);
             }
             if (impl->remote.Merge(change, !change.origin.empty()) && !runtime.Queue(change) &&
                 !runtime.Suppress(change) && !impl->logged_class) {
@@ -1634,10 +1824,57 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         }
     }
     const auto send = [&](Change change, bool baseline) {
+        if (change.kind == Kind::Bit && !profile->world.families.empty()) {
+            if (impl->world_quarantined || !profile->world.AdmitsFlag(change.key)) return;
+            if (const auto source = impl->world_claims.GaveFlag(change.key)) change.source = *source;
+            else if (!baseline) {
+                const auto source = profile->world.Source(change.key);
+                if (source && impl->world_claims.Busy(*source)) return;
+            }
+            if (change.source && !impl->world_flags_sent.insert(change.key).second) return;
+        }
         Observe(change);
         log(fmt::format("OoT co-op: {} class={} key={:016x} value=1 path=observer",
                         baseline ? "baseline" : "observed", ClassName(change.kind), change.key));
     };
+    if (profile->world.capacity_hash && impl->allowed_classes.contains(Kind::Rupee) &&
+        !runtime.Calling() && !runtime.Pending() && impl->local_pickups.empty()) {
+        using OotGameDataTrace::Detail::Read32;
+        using OotGameDataTrace::Detail::Read64;
+        const auto pouch = Read64(memory, base + profile->pouch_cell);
+        const auto pending_delta = pouch && *pouch &&
+            *pouch <= UINT64_MAX - profile->world.pending_off - sizeof(u32)
+                ? Read32(memory, *pouch + profile->world.pending_off) : std::nullopt;
+        const auto balance = backend.ReadInt(profile->wallet_hash);
+        const auto capacity = backend.ReadInt(profile->world.capacity_hash);
+        const auto sample = balance && capacity && *balance >= 0 && *balance <= *capacity &&
+            pending_delta == 0 ? std::optional{World::Wallet{*balance, *capacity}} : std::nullopt;
+        if (sample && impl->wallet_probe == sample) {
+            std::map<std::string, World::Wallet> peers;
+            {
+                std::scoped_lock lock{impl->mutex};
+                impl->wallet = sample;
+                peers = impl->peer_wallets;
+            }
+            if (!impl->wallet_reconciled && !peers.empty()) {
+                // A deterministic two-peer baseline target; this is not a live ordered wallet ledger.
+                const auto& [sender, target] = *peers.begin();
+                log(fmt::format("OoT co-op: wallet baseline ours={} peer={} capacity={}/{}",
+                                sample->balance, target.balance, sample->capacity, target.capacity));
+                impl->wallet_reconciled = true;
+                if (sender < impl->hello.client_id) {
+                    const auto delta = World::ReconcileDelta(*sample, target, profile->world.reconcile);
+                    if (delta && *delta && !runtime.Queue(Change{Kind::Rupee, {}, 0, profile->wallet_hash, *delta}))
+                        runtime.Invalidate();
+                    if (!delta && profile->world.reconcile == World::Reconcile::TargetCurrent)
+                        log("OoT co-op: wallet baseline correction refused (capacity/range mismatch)");
+                }
+            }
+        }
+        impl->wallet_probe = sample;
+    } else {
+        impl->wallet_probe.reset();
+    }
     const auto event = runtime.Frame(backend, {thread, 1, impl->tick, true}, send, log);
     // A give waits while an event runs or a guard pointer is dead; say so now and then.
     if (event == ApplyEvent::Blocked && runtime.Pending() && runtime.LastGrant() &&
@@ -1649,13 +1886,13 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     // Same-chest race: a held local give goes out once its event has ended, tagged with the chest.
     if (!impl->held_gives.empty()) {
         const u64 now_event = EventContext(memory).value_or(0);
-        std::map<u64, u32> ended;
+        std::map<u64, World::Origin> ended;
         for (auto& held : impl->held_gives) {
             if (held.event == now_event && impl->tick - held.tick < 1800) continue;
             if (!ended.contains(held.event)) ended[held.event] = impl->claims.End(held.event);
-            held.change.origin_key = ended[held.event];
+            held.change.source = ended[held.event];
             log(fmt::format("OoT co-op: item give sent after its event name={} chest={:08x}", held.change.name,
-                            held.change.origin_key));
+                            held.change.source.key));
             Observe(held.change);
             impl->ux.ItemShared(held.change.name, held.change.value);
             held.event = ~u64{0}; // sent
@@ -1695,7 +1932,8 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     }
     if (runtime.BaselineReady()) {
         std::scoped_lock lock{impl->mutex};
-        if (!impl->baseline_ready) {
+        if (!impl->baseline_ready && (!profile->world.capacity_hash ||
+            !impl->allowed_classes.contains(Kind::Rupee) || impl->wallet)) {
             impl->baseline_ready = true;
             log("OoT co-op: baseline exported");
         }

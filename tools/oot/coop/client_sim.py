@@ -23,13 +23,32 @@ _spec.loader.exec_module(wire)
 MAX_FRAME = wire.MAX_FRAME
 
 
+def origin_fields(text):
+    """Controller syntax: none, chest:HEX, bit:HEX, token:HEX:PARTNER_HEX."""
+    words = text.split(":")
+    result = {"origin_kind": words[0]}
+    if words[0] == "chest" and len(words) == 2:
+        result["origin_key"] = int(words[1], 16)
+    elif words[0] == "bit" and len(words) == 2:
+        result["origin_key64"] = int(words[1], 16)
+    elif words[0] == "token" and len(words) == 3:
+        result.update(origin_key64=int(words[1], 16), origin_partner=int(words[2], 16))
+    elif words != ["none"]:
+        raise ValueError("origin must be none, chest:HEX, bit:HEX or token:HEX:PARTNER_HEX")
+    wire.collectible_origin(result)
+    return result
+
+
 class ClientSim:
     def __init__(self, client_id=None, *, room="default", team="default", name="Player",
                  build_id=BUILD_ID, seed_hash="0", policy_id="or-v2", auto_heartbeat=True,
-                 on_pose=None):
+                 on_pose=None, world_wallet=None):
         self.hello = {"type": "hello", "version": wire.VERSION, "build_id": build_id,
                       "seed_hash": seed_hash, "room": room, "team": team,
                       "client_id": client_id or uuid.uuid4().hex, "name": name, "policy_id": policy_id}
+        if world_wallet is not None:
+            wire.validate_wallet(world_wallet)
+            self.hello["world_wallet"] = dict(world_wallet)
         self.auto_heartbeat = auto_heartbeat
         self.seq = 0
         self.messages = asyncio.Queue(2048)
@@ -88,6 +107,13 @@ class ClientSim:
         packet = {"type": kind, "origin": self.hello["client_id"], "seq": self.seq, **values}
         await self.send(packet)
         return packet
+
+    async def baseline(self, world_wallet=None):
+        packet = {"type": "team_state_request"}
+        if world_wallet is not None:
+            wire.validate_wallet(world_wallet)
+            packet["world_wallet"] = dict(world_wallet)
+        await self.send(packet)
 
     def pose_packet(self, banc, child, pos, yaw, loading=False, t=None, anim="idle", anim_seq=0,
                     rate=0.0, phase=0.0):
@@ -149,6 +175,8 @@ class ClientSim:
 async def run(args):
     client = ClientSim(args.client_id, room=args.room, team=args.team, name=args.name,
                        build_id=args.build_id, seed_hash=args.seed, policy_id=args.policy,
+                       world_wallet=dict(zip(("balance", "capacity"), args.world_wallet))
+                       if args.world_wallet else None,
                        on_pose=lambda packet: print(json.dumps(packet), flush=True) if args.show_poses else None)
     try:
         await client.connect(args.host, args.port)
@@ -191,6 +219,7 @@ def main():
     parser.add_argument("--build-id", default=BUILD_ID)
     parser.add_argument("--seed", default="0")
     parser.add_argument("--policy", default="or-v2")
+    parser.add_argument("--world-wallet", type=int, nargs=2, metavar=("BALANCE", "CAPACITY"))
     parser.add_argument("--duration", type=float, default=30)
     parser.add_argument("--send", action="append", default=[], help="JSON packet; change origin/seq are automatic")
     parser.add_argument("--pose", action="append", default=[], help="'BANC CHILD X Y Z YAW [LOADING]' (v3 pose)")

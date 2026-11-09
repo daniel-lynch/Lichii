@@ -41,6 +41,7 @@ add_executable(tests
     core/memory_acquire.cpp
     core/oot_coop_call_memory.cpp
     core/oot_coop_ux.cpp
+    core/oot_coop_world.cpp
     core/builtin_patches.cpp
     core/system_test_context.h
     video_core/ampere_branch_modifiers.cpp

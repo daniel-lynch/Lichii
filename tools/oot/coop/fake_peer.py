@@ -14,6 +14,9 @@ Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CT
   rupee DELTA [DELTA...]    rupee_add (wallet hash) with each signed delta, all in ONE socket write
   item NAME CAT COUNT [GET [F0 F1 F2 F3]]  item_give: one give call (get type default 7, flags 0)
   itemk HEX NAME CAT COUNT [GET [F0 F1 F2 F3]]  item_give tagged with origin_key HEX (the chest Bool)
+  item ... origin=bit:HEX   give with a collectible origin (also chest:HEX or token:HEX:PARTNER_HEX)
+  bit HEX ... origin=token:HEX:PARTNER_HEX   flags belonging to the same collectible transaction
+  wallet BALANCE CAPACITY   publish wallet baseline and request the team's wallet baselines
   key HEX DELTA             key_add: a small-key gain of DELTA for the dungeon whose total key is HEX
   expect-type TYPE SECS     wait for the emulator's next change of TYPE (rupee_add, key_add, ...)
   dup SEQ                   re-deliver this peer's accepted event SEQ to the other clients (a duplicate)
@@ -203,7 +206,7 @@ class FakePeer:
         finally:
             self.waiters.remove(waiter)
 
-    async def burst(self, kind, keys):
+    async def burst(self, kind, keys, source=None):
         """All changes in one write, so the relay forwards them back to back. For rupee_add the
         'keys' are the signed deltas."""
         field = "hash" if kind == "bool_set" else "actor"
@@ -216,6 +219,9 @@ class FakePeer:
             if kind == "rupee_add":
                 packet = {"type": kind, "origin": self.client.hello["client_id"],
                           "seq": self.client.seq, "hash": self.wallet, "delta": key}
+            if source:
+                packet.update(source)
+            relay_mod.validate_change(packet, self.client.hello["client_id"])
             packets.append(packet)
             data += relay_mod.encode(packet)
         since = len(self.seen)
@@ -230,39 +236,53 @@ class FakePeer:
         return await self.wait(lambda p: p.get("type") in relay_mod.CHANGE_TYPES and p.get(field) == key,
                                timeout)
 
-    async def state(self):
+    async def state(self, world_wallet=None):
         since = len(self.seen)
-        await self.client.send({"type": "team_state_request"})
+        await self.client.baseline(world_wallet)
         return await self.wait(lambda p: p.get("type") == "team_state", 5, since)
 
     async def command(self, line):
         words = line.split()
+        if not words:
+            raise ValueError("empty command")
         verb = words[0]
+        source = {}
+        options = [word for word in words[1:] if word.startswith("origin=")]
+        if options:
+            if len(options) != 1 or verb not in ("item", "bit"):
+                raise ValueError("one origin option is allowed on item or bit")
+            source = client_sim.origin_fields(options[0].split("=", 1)[1])
+            words.remove(options[0])
         if verb in ("grant", "bit"):
             keys = [int(word, 16) for word in words[1:]]
             if not keys:
                 raise ValueError("no keys")
-            return await self.burst("bool_set" if verb == "grant" else "bit_set", keys)
+            return await self.burst("bool_set" if verb == "grant" else "bit_set", keys, source)
+        if verb == "wallet":
+            if len(words) != 3:
+                raise ValueError("wallet BALANCE CAPACITY")
+            return await self.state({"balance": int(words[1], 0), "capacity": int(words[2], 0)})
         if verb == "rupee":
             deltas = [int(word) for word in words[1:]]
             if not deltas:
                 raise ValueError("no deltas")
             return await self.burst("rupee_add", deltas)
-        origin_key = None
         if verb == "itemk":
-            origin_key, words = int(words[1], 16), ["item"] + words[2:]
+            if len(words) < 5:
+                raise ValueError("itemk HEX NAME CATEGORY COUNT [GET [F0 F1 F2 F3]]")
+            source, words = {"origin_key": int(words[1], 16)}, ["item"] + words[2:]
             verb = "item"
         if verb == "item":
             # item NAME CATEGORY COUNT [GET [F0 F1 F2 F3]]: one give call, as an opener would send it
-            if len(words) < 4:
+            if len(words) not in (4, 5, 9):
                 raise ValueError("item NAME CATEGORY COUNT [GET [F0 F1 F2 F3]]")
             flags = [int(word, 0) for word in words[5:9]] or [0, 0, 0, 0]
             self.client.seq += 1
             packet = {"type": "item_give", "origin": self.client.hello["client_id"], "seq": self.client.seq,
                       "name": words[1], "category": int(words[2], 0), "count": int(words[3], 0),
                       "get": int(words[4], 0) if len(words) > 4 else 7, "flags": flags}
-            if origin_key:
-                packet["origin_key"] = origin_key
+            packet.update(source)
+            relay_mod.validate_change(packet, self.client.hello["client_id"])
             since = len(self.seen)
             await self.client.send(packet)
             await self.wait(lambda p: p.get("type") == "ack" and p.get("seq") == packet["seq"], 5, since)

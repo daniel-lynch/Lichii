@@ -189,7 +189,7 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
             if (m_gamedata_trace) {
                 OotGameDataTrace::Handle(*m_gamedata_trace, pc, *m_parent.m_jit, m_memory);
             } else {
-                OotGameDataTrace::Resume(point, *m_parent.m_jit, m_memory);
+                OotGameDataTrace::Resume(point, *m_parent.m_jit, m_memory, pc);
             }
             // Resume the original instruction before capturing context or redirecting PC.
             if (m_oot_coop) coop_hook(point);

@@ -832,11 +832,11 @@ TEST_CASE("OoT co-op profile: wallet observation and the Int add entry", "[core]
 
 TEST_CASE("OoT co-op same-chest race: one opener's gives per chest, every order", "[core][oot_coop]") {
     using Open = Coop::ChestClaims::Open;
-    constexpr u32 K = 0xC1;
-    const auto give = [](std::string origin, u64 seq, u32 key) {
+    const auto K = Coop::World::Origin::Chest(0xC1);
+    const auto give = [](std::string origin, u64 seq, Coop::World::Origin key) {
         Change c{Kind::Item, std::move(origin), seq, Coop::PackItem({6, 7, {0, 0, 1, 0}}), 1};
         c.name = "Item_Test_Slingshot";
-        c.origin_key = key;
+        c.source = key;
         return c;
     };
     SECTION("local first: our open owns the chest, the peer's later gives are dropped") {
@@ -876,23 +876,23 @@ TEST_CASE("OoT co-op same-chest race: one opener's gives per chest, every order"
     }
     SECTION("untagged gives always apply; an event with no chest or two chests sends untagged") {
         Coop::ChestClaims claims;
-        REQUIRE(claims.AcceptRemote(give("R", 1, 0)));
+        REQUIRE(claims.AcceptRemote(give("R", 1, {})));
         claims.Hold(0x400);
-        REQUIRE(claims.End(0x400) == 0);
+        REQUIRE(!claims.End(0x400));
         claims.LocalOpen(K, 0x500);
-        claims.LocalOpen(K + 1, 0x500);
-        REQUIRE(claims.End(0x500) == 0);
+        claims.LocalOpen(Coop::World::Origin::Chest(0xC2), 0x500);
+        REQUIRE(!claims.End(0x500));
     }
 }
 
 TEST_CASE("OoT co-op item give origin key: wire and queued-give removal", "[core][oot_coop]") {
     Change give{Kind::Item, "A", 4, Coop::PackItem({6, 7, {0, 0, 1, 0}}), 1};
     give.name = "Item_Test_Slingshot";
-    give.origin_key = 0xC1;
+    give.source = Coop::World::Origin::Chest(0xC1);
     const auto packet = Coop::EncodeChange(give);
     REQUIRE(packet.at("origin_key") == 0xC1);
     REQUIRE(Coop::DecodeChange(packet) == give);
-    give.origin_key = 0;
+    give.source = {};
     REQUIRE_FALSE(Coop::EncodeChange(give).contains("origin_key"));
     for (const Json& bad : {Json(0), Json(-1), Json(0x100000000ULL), Json("c1")}) {
         auto p = packet;
@@ -903,13 +903,13 @@ TEST_CASE("OoT co-op item give origin key: wire and queued-give removal", "[core
     struct NoBackend { using Context = int; };
     Coop::GrantApplier<NoBackend> applier{{true, {Kind::Item, Kind::Rupee}, {}, Wallet}};
     Change mine = give, other = give;
-    mine.origin_key = 0xC1;
-    other.origin_key = 0xC2;
+    mine.source = Coop::World::Origin::Chest(0xC1);
+    other.source = Coop::World::Origin::Chest(0xC2);
     other.seq = 5;
     REQUIRE(applier.Queue(mine));
     REQUIRE(applier.Queue(other));
     REQUIRE(applier.Queue({Kind::Rupee, "A", 6, Wallet, 5}));
-    REQUIRE(applier.DropPending([](const Change& c) { return c.kind == Kind::Item && c.origin_key == 0xC1; }) == 1);
+    REQUIRE(applier.DropPending([](const Change& c) { return c.kind == Kind::Item && c.source == Coop::World::Origin::Chest(0xC1); }) == 1);
     REQUIRE(applier.Pending() == 2);
     // Profile: the chest members map.
     const auto load = [](const Json& members) {

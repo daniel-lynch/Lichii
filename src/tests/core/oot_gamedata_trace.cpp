@@ -1079,7 +1079,7 @@ TEST_CASE("OoT co-op generic give mode forwards every top-level give but the den
     REQUIRE_FALSE(load(nlohmann::json::array()));
 }
 
-TEST_CASE("OoT co-op observes a flow's positive wallet delta at the wallet entry", "[oot_coop]") {
+TEST_CASE("OoT co-op observes signed gameplay wallet deltas at the wallet entry", "[oot_coop]") {
     namespace Coop = Core::OotCoop;
     constexpr u64 sentinel = Stop + 0x100;
     TraceEnvironment env;
@@ -1099,10 +1099,10 @@ TEST_CASE("OoT co-op observes a flow's positive wallet delta at the wallet entry
     REQUIRE(call.change.key == P::Wallet);
     REQUIRE(call.change.value == 20);
     REQUIRE(call.line.find("rupee-add observed delta=20 reason=7") != std::string::npos);
-    // A payment stays per-player; an unlisted caller (shop currency) is local; our replay echoes nothing.
+    // Signed gameplay deltas are shared; an unlisted caller is local; our replay echoes nothing.
     call = read(Base + reward, -30);
-    REQUIRE_FALSE(call.forward);
-    REQUIRE(call.line.find("payment, per-player") != std::string::npos);
+    REQUIRE(call.forward);
+    REQUIRE(call.change.value == -30);
     REQUIRE_FALSE(read(Base + reward + 0x40, 20).forward);
     REQUIRE(read(sentinel, 20).replay);
     REQUIRE_FALSE(read(sentinel, 20).forward);

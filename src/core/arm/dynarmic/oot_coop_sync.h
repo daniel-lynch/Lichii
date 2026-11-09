@@ -84,9 +84,7 @@ struct Change {
     s64 value{}; // Boolean, int/enum, step index, or pouch count.
     u32 step{};
     std::string name; // Item only: the actor name passed to the give call
-    /// Item only (optional): the chest Bool whose opening made this give. Every receiver applies the
-    /// gives of one chest from ONE opener: itself, or the first peer that claimed the chest.
-    u32 origin_key{};
+    World::Origin source; ///< Typed source identity, independent of sender origin/sequence.
     bool operator==(const Change&) const = default;
 };
 
@@ -129,6 +127,7 @@ struct Hello {
     std::string team{"default"};
     std::string client_id;
     std::string name{"Player"};
+    std::optional<World::Wallet> world_wallet;
 };
 [[nodiscard]] nlohmann::json EncodeHello(const Hello& hello);
 [[nodiscard]] bool MatchesHello(const nlohmann::json& packet, const Hello& hello);
@@ -187,9 +186,9 @@ public:
     /// A chest of ours really opened (the actor flag setter) during `event`. Ours: first claim.
     /// SkipLocal: a peer owns it and we have not given yet in this event: skip our gives (the peer's
     /// copy is the one). TakeOver: we already gave locally: we own it, drop the peer's pending gives.
-    Open LocalOpen(u32 key, u64 event) {
+    Open LocalOpen(World::Origin key, u64 event) {
         auto& slot = event_key[event];
-        slot = slot == 0 || slot == key ? key : Ambiguous;
+        slot = slot == World::Origin{} || slot == key ? key : Ambiguous;
         const auto it = owner.find(key);
         if (it == owner.end() || it->second.empty()) {
             owner[key] = {};
@@ -203,29 +202,29 @@ public:
         return Open::TakeOver;
     }
     /// A peer's chest Bool (its open): the first claimant owns the chest.
-    void RemoteClaim(u32 key, const std::string& origin) {
+    void RemoteClaim(World::Origin key, const std::string& origin) {
         if (key && !origin.empty()) owner.try_emplace(key, origin);
     }
     /// An inbound give: apply it? Untagged gives always apply; a tagged one only from the owner
     /// (the sender becomes the owner of an unclaimed chest).
     bool AcceptRemote(const Change& give) {
-        if (!give.origin_key) return true;
-        const auto [it, fresh] = owner.try_emplace(give.origin_key, give.origin);
+        if (!give.source) return true;
+        const auto [it, fresh] = owner.try_emplace(give.source, give.origin);
         return fresh || (!it->second.empty() && it->second == give.origin);
     }
     /// A local, forwardable top-level give during `event` (0 = none): skip it, or hold it.
     bool SkipLocal(u64 event) const { return event && skip.contains(event); }
     void Hold(u64 event) { ++held[event]; }
     /// The event ended: the chest its gives came from (0 = none or more than one), and forget it.
-    u32 End(u64 event) {
+    World::Origin End(u64 event) {
         const auto it = event_key.find(event);
-        const u32 key = it == event_key.end() || it->second == Ambiguous ? 0 : it->second;
+        const auto key = it == event_key.end() || it->second == Ambiguous ? World::Origin{} : it->second;
         event_key.erase(event);
         held.erase(event);
         skip.erase(event);
         return key;
     }
-    std::string_view Owner(u32 key) const {
+    std::string_view Owner(World::Origin key) const {
         const auto it = owner.find(key);
         if (it == owner.end()) return "none";
         if (it->second.empty()) return "us";
@@ -234,9 +233,9 @@ public:
     size_t Size() const { return owner.size(); }
 
 private:
-    static constexpr u32 Ambiguous = 0xFFFFFFFF;
-    std::map<u32, std::string> owner; ///< "" = we opened it
-    std::map<u64, u32> event_key;
+    static constexpr World::Origin Ambiguous{World::OriginKind::None, 1, 0};
+    std::map<World::Origin, std::string> owner; ///< "" = we opened it
+    std::map<u64, World::Origin> event_key;
     std::map<u64, u32> held;
     std::set<u64> skip;
 };
@@ -275,6 +274,7 @@ public:
     /// maps chest members (the same-chest race guard).
     bool Traps(OotGameDataTrace::Point point) const {
         return OotGameDataTrace::CoopPoint(point) ||
+               (point == OotGameDataTrace::Point::BitSet && !profile->world.families.empty()) ||
                (point == OotGameDataTrace::Point::ActorFlagSet && !profile->chest_members.empty());
     }
     /// Class dungeon: the small-key Int pairs to watch and apply (from the key file).
@@ -285,9 +285,9 @@ public:
 
 private:
     /// The give-to-pouch entry trapped on this (opener's) game: log it, forward chest gives.
-    void ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory);
-    /// The wallet entry trapped here: forward a listed caller's positive delta (class rupee).
-    void ObserveRupee(Dynarmic::A64::Jit& jit);
+    void ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory, u64 thread);
+    /// The wallet entry trapped here: forward a reviewed gameplay caller's signed delta (class rupee).
+    void ObserveRupee(Dynarmic::A64::Jit& jit, u64 thread);
     /// The actor flag setter trapped here: a chest of the profile really opening (claim it).
     void ObserveActorFlag(Dynarmic::A64::Jit& jit, Memory::Memory& memory);
     /// The running event's context (EventMgr+0x68), 0 when none, nothing when unreadable.

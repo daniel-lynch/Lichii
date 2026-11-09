@@ -125,7 +125,7 @@ window (so revisions stay contiguous), but never folds it into team state; clien
 `rupee_add` in a `team_state` snapshot or replay, so a reconnect never re-applies one (and a
 late joiner does not receive earlier deltas). A receiver with `rupee` in
 `EDEN_NX2_OOT_COOP_ALLOW` applies it by calling the game's wallet entry from the frame drain;
-the game's own pouch update clamps it. The local wallet is not observed or re-sent in this pass.
+the game's own pouch update clamps it. C14 observes reviewed signed gameplay calls as described below.
 
 Item gives (class `item`, C7) are an event too: the game's own give-to-pouch call, as the opener's
 game made it, replayed on the receiver:
@@ -165,6 +165,74 @@ entire room. `heartbeat` and `heartbeat_ack` have only `type`.
 `item_give` may carry `"origin_key": <chest Bool>` (1..2^32-1). Receivers apply one chest's gives
 from one opener only (themselves, or the first claimant); see HOOKS.md `chest_members`. Old relays
 reject the field: update the relay before running a C13 client with `chest_members`.
+
+## Collectible transactions and wallet baselines (C14)
+
+`origin` remains the sender ID. `item_give` and `bit_set` additionally accept a strict
+source union. All examples below use synthetic identities:
+
+| `origin_kind` | Required fields | Meaning |
+|---|---|---|
+| omitted or `none` | none | Unlinked event or ordinary flag |
+| `chest` | `origin_key` (nonzero u32) | Ordinary Bool chest source; old `origin_key`-only packets remain valid |
+| `bit` | `origin_key64` (nonzero u64) | Reviewed collectible instance |
+| `token` | `origin_key64`, `origin_partner` (distinct nonzero u64) | Reviewed source and collection pair |
+
+Mixed fields, strings/floats in place of integers, zero and overflowing keys are rejected.
+`bit_set` accepts only bit/token sources and its `actor` must match one of that source's
+keys. Pair semantics and collectible families come from the receiver's private profile;
+the relay knows no game-specific pairing rule. Old relays reject these fields: deploy
+the revised relay and use a matching policy ID on both clients before enabling them.
+
+The relay deduplicates all events by sender/sequence. It also keeps a team-lifetime
+receipt for each bit/token benefit, independent of sequence or sender and of replay-window
+eviction. Flags do not consume benefit receipts. Chest sources retain a winning sender
+instead, preserving several legitimate top-level gives from one chest opener. The combined
+source receipt/owner limit is 4096; overflow rejects the event before changing team state.
+This storage is in memory, not durable across relay restart or room expiration.
+
+The sender captures a reviewed key at the pickup-component entry on the same guest thread,
+reserves it before the outer give, and records the benefit after the verified return reports
+success. A losing local pickup returns success without running the give. Later Bool64 writes
+carry that source. The receiver reserves the source before replay, records success after the
+native return, and queues its source flags through the existing deferred flag setter. It
+never increments a separate token counter. Pending/applied receipts survive transport
+reconnect in the same loaded process; source flags in a baseline remain state, not receipts.
+Typed collectible replay is accepted on a same-process reconnect, but first-connection
+historical item replay remains disabled without save-integrated receipts. Receipts are
+not sidecars, and a save-manager move quarantines world application. Restart/catch-up
+exactly-once behavior and resettable drop generations are not implemented.
+
+Simultaneous local winners each retain their own single benefit and reject the incoming
+copy; this requires equivalent pickup content in the shared build/seed. It is not a global
+pre-grant authority or correction of different speculative payloads. Probe with two clients
+before treating this as a verified simultaneous-pickup guarantee.
+
+Private-profile defaults are `world.hearts=false`, `token.enabled=false`,
+`world.cleanup="flag_only"`, and `world.wallet_reconcile="off"`. The flag policy admits
+reviewed currency and token families; healing/permanent-health families require the heart
+switch as well as the existing item policy. Token benefit linkage requires its probe gate.
+There is no proved arbitrary resident-actor walk: even `cleanup="death"` logs a refusal and
+uses flags only. Loaded visual/collision disappearance still needs a live probe.
+
+Wallet observation accepts signed deltas from the existing reviewed callers plus the private
+shop return address. Sequence/initialization and unlisted callers remain excluded. Calls on
+the applier's guest thread while applying a remote give or delta are suppressed. A forwarded
+outer give remains the only economic event for its nested/inline credit; independent shop
+spends and direct rewards use `rupee_add`, replayed with reason 7. The separate inline capacity
+reduction path is not observed by this hook; this is not complete wallet-writer coverage.
+
+`hello` and `team_state_request` optionally carry
+`"world_wallet":{"balance":20,"capacity":100}`. The same object may appear in
+`client_state.state`; `team_state.world_wallet` is a map of connected sender IDs to those
+observations. Require integer `0 <= balance <= capacity <= INT32_MAX`, with no extra fields.
+The frame lane waits for zero pouch pending currency and two equal committed samples before
+export. Baselines are observations, not live authoritative relay balances. On first peer
+baseline, log `OoT co-op: wallet baseline ours=.. peer=..`. With `target_current`, only the
+higher client ID adjusts to the lower ID's observation, once per process, through an
+echo-suppressed signed delta. Unequal capacities and corrections outside the wire limit are
+refused. Default `off` only reports divergence. Concurrent transactions near capacity,
+inline clipping and durable baseline revisions still require a later ordered-wallet design.
 
 ## Small keys, dungeon items and per-player flags (C13)
 

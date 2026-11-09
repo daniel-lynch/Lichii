@@ -18,6 +18,7 @@
 #include <fmt/format.h>
 
 #include "common/common_types.h"
+#include "core/arm/dynarmic/oot_coop_world.h"
 #include "common/nx2_event_trace.h"
 
 namespace Kernel {
@@ -61,8 +62,10 @@ enum class Point : u8 {
     ActorFlagSet,
     ItemGive,
     RupeeAdd,
+    Pickup,
+    PickupReturn,
 };
-inline constexpr size_t PointCount = 11;
+inline constexpr size_t PointCount = 13;
 
 struct Site {
     Point point;
@@ -154,6 +157,9 @@ struct Profile {
     u32 wallet_hash{};  ///< GameData key of the wallet (rupee deltas)
     Entry bool_setter, bit_setter, rupee_entry;
     Entry int_add; ///< GameData Int add (x0 = manager, w1 = delta, w2 = key): class dungeon
+    OotCoop::World::Config world;
+    Entry pickup_entry, death_wrapper;
+    std::vector<Entry> pickup_returns;
     Entry item_entry;               ///< The give-to-pouch call (the ItemGive site's function)
     std::vector<u64> item_callers;  ///< Return addresses (module offsets) of gives to forward
     /// World pickups (class item, sub-class pickup): return addresses of the collect path's give
@@ -172,8 +178,8 @@ struct Profile {
     std::vector<u64> give_deny_callers;
     std::vector<std::string> give_per_player; ///< from the pickup callers only
     std::vector<std::string> give_never;      ///< from every caller
-    /// Wallet observation (class rupee): return addresses of wallet-entry calls whose positive
-    /// delta is shared (a flow's rupee reward). Payments (negative deltas) stay per-player.
+    /// Wallet observation: reviewed gameplay return addresses for signed deltas.
+    /// The optional world profile also admits its shop caller; replay calls are suppressed.
     std::vector<u64> rupee_callers;
     /// Same-chest race (C13): the chest-opened struct's member hash -> its backing Bool (the key
     /// the bool class syncs). The actor flag setter names the member when a chest really opens.
@@ -195,7 +201,8 @@ struct Profile {
 /// its handler ignores every other point. The Bool64 accessors are hot (the actor reader copy
 /// runs per actor per frame), so hooking them without tracing would cost a trap each.
 constexpr bool CoopPoint(Point point) {
-    return point == Point::Frame || point == Point::ItemGive || point == Point::RupeeAdd;
+    return point == Point::Frame || point == Point::ItemGive || point == Point::RupeeAdd ||
+           point == Point::Pickup || point == Point::PickupReturn;
 }
 
 /// The trace point at `address` whose original instruction is `instruction`, or None.
@@ -218,7 +225,7 @@ inline u32 InstructionFor(const Profile& profile, u64 base, u64 address, u32 ins
 
 /// Does what the replaced instruction would have: the JIT has already moved the PC past it.
 template <typename Jit, typename Memory>
-void Resume(Point point, Jit& jit, Memory& memory) {
+void Resume(Point point, Jit& jit, Memory& memory, u64 pc = 0) {
     switch (point) {
     case Point::StepSet:
         jit.SetRegister(8, 1); // mov w8, #1 (a W write clears the upper half)
@@ -232,6 +239,15 @@ void Resume(Point point, Jit& jit, Memory& memory) {
     case Point::RupeeAdd:
         jit.SetRegister(8, 0x3BD4); // mov w8, #0x3bd4
         break;
+    case Point::PickupReturn: {
+        // Only an ADRP x8 site is admitted by the private profile decoder.
+        const u32 word = memory.Read32(pc);
+        const u64 imm = ((u64{word >> 5} & 0x7FFFF) << 2) | ((word >> 29) & 3);
+        const s64 displacement = static_cast<s64>(imm << 43) >> 31;
+        jit.SetRegister(8, (pc & ~u64{0xFFF}) + static_cast<u64>(displacement));
+        break;
+    }
+    case Point::Pickup:
     case Point::StructBoolSet:
     case Point::ActorFlagSet:
     case Point::ItemGive:
@@ -255,6 +271,8 @@ constexpr std::string_view Name(Point point) {
     case Point::ActorFlagSet: return "actor-flag-set";
     case Point::ItemGive: return "item-give";
     case Point::RupeeAdd: return "rupee-add";
+    case Point::Pickup: return "pickup";
+    case Point::PickupReturn: return "pickup-return";
     case Point::Frame: return "frame";
     case Point::BitRead: return "bit-read";
     case Point::BitSet: return "bit-set";
@@ -467,6 +485,9 @@ std::string Describe(Point point, u64 base, Jit& jit, Memory& memory) {
     case Point::BitSet:
         return fmt::format("gamedata {} mgr={:#x} key={:016x}", Name(point), x0,
                            jit.GetRegister(2));
+    case Point::Pickup:
+    case Point::PickupReturn:
+        return fmt::format("gamedata {} lr={}", Name(point), caller);
     case Point::None:
         break;
     }
@@ -495,7 +516,7 @@ bool Handle(Session& session, u64 pc, Jit& jit, Memory& memory, std::string* out
             Common::Nx2EventTrace::Write(Common::Nx2EventTrace::GameDataTarget(), line);
         }
     }
-    Resume(point, jit, memory);
+    Resume(point, jit, memory, pc);
     return true;
 }
 

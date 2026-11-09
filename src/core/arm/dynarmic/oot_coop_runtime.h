@@ -120,8 +120,7 @@ ItemCall ReadItemCall(Jit& jit, Memory& memory, u64 base, const OotGameDataTrace
 }
 
 /// A wallet-entry call (x0 = pouchMgr, w1 = signed delta, w2 = reason) read at its first
-/// instruction: forwarded when it is a positive delta from a listed caller (a flow's reward) and not
-/// our own replay. Payments and every unlisted caller (shop currency, the give's own path) stay local.
+/// instruction: signed deltas from reviewed gameplay callers, excluding every applied call.
 struct RupeeCall {
     Change change;
     bool forward{};
@@ -131,20 +130,21 @@ struct RupeeCall {
 
 template <typename Jit>
 RupeeCall ReadRupeeCall(Jit& jit, u64 base, const OotGameDataTrace::Profile& profile, u64 sentinel,
-                        bool rupee_class) {
+                        bool rupee_class, bool applying = false) {
     RupeeCall call;
     const u64 lr = jit.GetRegister(30);
     const u64 caller = lr >= base ? lr - base : 0;
     const s64 delta = static_cast<s32>(jit.GetRegister(1));
-    call.replay = sentinel && lr == sentinel;
+    call.replay = applying || (sentinel && lr == sentinel);
     call.change = Change{Kind::Rupee, {}, 0, profile.wallet_hash, delta};
     const bool listed = std::find(profile.rupee_callers.begin(), profile.rupee_callers.end(),
-                                  caller) != profile.rupee_callers.end();
-    call.forward = rupee_class && !call.replay && listed && profile.wallet_hash && delta > 0 &&
+                                  caller) != profile.rupee_callers.end() ||
+                        (profile.world.shop_lr && caller == profile.world.shop_lr);
+    call.forward = rupee_class && !call.replay && listed && profile.wallet_hash &&
                    RupeeDelta(delta);
     call.line = fmt::format("rupee-add {} delta={} reason={} lr={}",
                             call.replay ? "replayed" : call.forward ? "observed"
-                            : !listed ? "seen (unlisted caller)" : delta <= 0 ? "seen (payment, per-player)"
+                            : !listed ? "seen (unlisted caller)" : !RupeeDelta(delta) ? "seen (invalid delta)"
                                                                  : "seen (class off)",
                             delta, static_cast<u32>(jit.GetRegister(2)),
                             call.replay ? std::string{"sentinel"} : fmt::format("main+{:#x}", caller));
