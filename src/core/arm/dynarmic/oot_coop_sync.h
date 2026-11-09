@@ -274,7 +274,6 @@ public:
     /// maps chest members (the same-chest race guard).
     bool Traps(OotGameDataTrace::Point point) const {
         return OotGameDataTrace::CoopPoint(point) ||
-               (point == OotGameDataTrace::Point::BitSet && !profile->world.families.empty()) ||
                (point == OotGameDataTrace::Point::ActorFlagSet && !profile->chest_members.empty());
     }
     /// Class dungeon: the small-key Int pairs to watch and apply (from the key file).

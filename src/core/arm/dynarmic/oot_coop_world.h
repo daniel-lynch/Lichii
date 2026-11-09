@@ -69,13 +69,15 @@ private:
 
 struct Capture {
     Origin origin;
-    u64 thread{}, epoch{}, tick{}, event{};
+    u64 thread{}, epoch{}, tick{}, sp{}; ///< sp: the stack pointer at the component entry
 };
 // Store identities, never guest actor pointers. One component invocation per thread; bounded age.
+// A give consumes the capture only when it runs nested in that invocation (a lower stack).
 class Pickups {
 public:
+    static constexpr u64 StackSpan = 0x10000;
     void Put(Capture capture);
-    std::optional<Origin> Take(u64 thread, u64 epoch, u64 tick);
+    std::optional<Origin> Take(u64 thread, u64 epoch, u64 tick, u64 sp);
     void Clear() { captures.clear(); }
 private:
     std::map<u64, Capture> captures;

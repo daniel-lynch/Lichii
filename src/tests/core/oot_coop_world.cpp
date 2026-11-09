@@ -288,9 +288,9 @@ TEST_CASE("OoT world pickup identity validates each synthetic pointer and retain
     REQUIRE(World::PickupKey(memory, 0x1000, config) == Key);
     REQUIRE(memory.reads == 3);
     World::Pickups captures;
-    captures.Put({*config.Source(*World::PickupKey(memory, 0x1000, config)), 7, 2, 10, 100});
+    captures.Put({*config.Source(*World::PickupKey(memory, 0x1000, config)), 7, 2, 10, 0x8000});
     memory.words.clear();
-    REQUIRE(captures.Take(7, 2, 11) == Bit);
+    REQUIRE(captures.Take(7, 2, 11, 0x7F00) == Bit);
     REQUIRE_FALSE(World::PickupKey(memory, 0x1000, config));
     REQUIRE_FALSE(World::PickupKey(memory, UINT64_MAX - 8, config));
     REQUIRE_FALSE(World::PickupKey(memory, 0, config));
@@ -306,27 +306,34 @@ TEST_CASE("OoT world pickup identity validates each synthetic pointer and retain
 
 TEST_CASE("OoT world pickup contexts are thread epoch and age bounded", "[core][oot_coop]") {
     World::Pickups pickups;
-    pickups.Put({Bit, 7, 2, 10, 100});
-    REQUIRE_FALSE(pickups.Take(8, 2, 11));
-    REQUIRE(pickups.Take(7, 2, 11) == Bit);
-    REQUIRE_FALSE(pickups.Take(7, 2, 12));
-    pickups.Put({Bit, 7, 2, 10, 100});
-    REQUIRE_FALSE(pickups.Take(7, 3, 11));
-    REQUIRE_FALSE(pickups.Take(7, 2, 11));
-    pickups.Put({Bit, 7, 2, 10, 100});
-    REQUIRE_FALSE(pickups.Take(7, 2, 9));
-    pickups.Put({Bit, 7, 2, 10, 100});
-    REQUIRE_FALSE(pickups.Take(7, 2, 1811));
-    pickups.Put({Bit, 7, 2, 10, 100});
-    REQUIRE(pickups.Take(7, 2, 1810) == Bit);
-    pickups.Put({Bit, 7, 2, 10, 100});
-    pickups.Put({Origin{}, 7, 2, 11, 100});
-    REQUIRE_FALSE(pickups.Take(7, 2, 12));
-    for (u64 thread = 1; thread <= 65; ++thread) pickups.Put({Bit, thread, 2, 10, 100});
-    REQUIRE_FALSE(pickups.Take(65, 2, 11));
-    REQUIRE(pickups.Take(64, 2, 11) == Bit);
+    pickups.Put({Bit, 7, 2, 10, 0x8000});
+    REQUIRE_FALSE(pickups.Take(8, 2, 11, 0x7F00));
+    REQUIRE(pickups.Take(7, 2, 11, 0x7F00) == Bit);
+    REQUIRE_FALSE(pickups.Take(7, 2, 12, 0x7F00));
+    pickups.Put({Bit, 7, 2, 10, 0x8000});
+    REQUIRE_FALSE(pickups.Take(7, 3, 11, 0x7F00));
+    REQUIRE_FALSE(pickups.Take(7, 2, 11, 0x7F00));
+    pickups.Put({Bit, 7, 2, 10, 0x8000});
+    REQUIRE_FALSE(pickups.Take(7, 2, 9, 0x7F00));
+    pickups.Put({Bit, 7, 2, 10, 0x8000});
+    REQUIRE_FALSE(pickups.Take(7, 2, 1811, 0x7F00));
+    pickups.Put({Bit, 7, 2, 10, 0x8000});
+    REQUIRE(pickups.Take(7, 2, 1810, 0x7F00) == Bit);
+    pickups.Put({Bit, 7, 2, 10, 0x8000});
+    pickups.Put({Origin{}, 7, 2, 11, 0x8000});
+    REQUIRE_FALSE(pickups.Take(7, 2, 12, 0x7F00));
+    for (u64 thread = 1; thread <= 65; ++thread) pickups.Put({Bit, thread, 2, 10, 0x8000});
+    REQUIRE_FALSE(pickups.Take(65, 2, 11, 0x7F00));
+    REQUIRE(pickups.Take(64, 2, 11, 0x7F00) == Bit);
     pickups.Clear();
-    REQUIRE_FALSE(pickups.Take(1, 2, 11));
+    REQUIRE_FALSE(pickups.Take(1, 2, 11, 0x7F00));
+    // The give must run nested in the component invocation: below its entry stack, not too deep.
+    for (const u64 sp : {u64{0x8000}, u64{0x8010}, u64{0x8000 - World::Pickups::StackSpan - 0x10}}) {
+        pickups.Put({Bit, 7, 2, 10, 0x8000});
+        REQUIRE_FALSE(pickups.Take(7, 2, 11, sp));
+    }
+    pickups.Put({Bit, 7, 2, 10, 0x8000});
+    REQUIRE(pickups.Take(7, 2, 11, 0x8000 - World::Pickups::StackSpan) == Bit);
 }
 
 TEST_CASE("OoT world wallet caller matrix preserves signed deltas and suppresses application echoes", "[core][oot_coop]") {

@@ -285,12 +285,13 @@ void Pickups::Put(Capture capture) {
     captures.erase(capture.thread);
     if (capture.origin && captures.size() < 64) captures.emplace(capture.thread, capture);
 }
-std::optional<Origin> Pickups::Take(u64 thread, u64 epoch, u64 tick) {
+std::optional<Origin> Pickups::Take(u64 thread, u64 epoch, u64 tick, u64 sp) {
     const auto it = captures.find(thread);
     if (it == captures.end()) return {};
     const auto capture = it->second;
     captures.erase(it);
     if (capture.epoch != epoch || tick < capture.tick || tick - capture.tick > 1800) return {};
+    if (sp >= capture.sp || capture.sp - sp > StackSpan) return {};
     return capture.origin;
 }
 std::optional<Wallet> DecodeWallet(const Json& value) {
