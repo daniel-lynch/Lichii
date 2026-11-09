@@ -512,6 +512,10 @@ TEST_CASE("OoT world cleanup resolver finds the live actor by key with pure read
     World3 big;
     big.m.W32(World3::Manager + 0x10, 65);
     REQUIRE(World::Find(big.m, World3::Base, r, Key).bounded);
+    World3 reserved; // a large reservation with few records in use is walked normally
+    reserved.m.W32(World3::Blocks, 110500);
+    REQUIRE(World::Find(reserved.m, World3::Base, r, Key).targets.size() == 1);
+    REQUIRE_FALSE(World::Find(reserved.m, World3::Base, r, Key).bounded);
     World3 used;
     used.m.W32(World3::Blocks + 0x14, 5);
     walk = World::Find(used.m, World3::Base, r, Key);

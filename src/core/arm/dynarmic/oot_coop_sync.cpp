@@ -1911,7 +1911,8 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                 ? Read32(memory, *pouch + profile->world.pending_off) : std::nullopt;
         const auto balance = backend.ReadInt(profile->wallet_hash);
         const auto capacity = backend.ReadInt(profile->world.capacity_hash);
-        const auto sample = balance && capacity && *balance >= 0 && *balance <= *capacity &&
+        // A zero capacity is a save not loaded yet (field: {0, 0} at boot, 200 once in game).
+        const auto sample = balance && capacity && *capacity > 0 && *balance >= 0 && *balance <= *capacity &&
             pending_delta == 0 ? std::optional{World::Wallet{*balance, *capacity}} : std::nullopt;
         if (sample && impl->wallet_probe == sample) {
             std::map<std::string, World::Wallet> peers;
