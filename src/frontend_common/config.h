@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <map>
 #include <memory>
 #include <string>
 #include "common/settings.h"
@@ -40,6 +41,10 @@ public:
     };
 
     virtual ~Config() = default;
+
+    std::map<std::string, std::string> ReadRawSection(const std::string& section) const;
+    void WriteRawSection(const std::string& section,
+                         const std::map<std::string, std::string>& values);
 
     void ClearControlPlayerValues() const;
 

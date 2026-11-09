@@ -269,6 +269,7 @@ Config DecodeConfig(const nlohmann::json& d, std::string_view build, bool minima
     }
     return c;
 }
+std::string AreaText(const RoomPeer& peer, const Config& config) { return Area(peer, config); }
 std::string PrettyArea(std::string_view banc) {
     std::string s;
     for (size_t i = 0; i < banc.size() && s.size() < 56; ++i) {

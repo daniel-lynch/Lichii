@@ -108,6 +108,8 @@ struct Config {
 };
 Config DecodeConfig(const nlohmann::json& document, std::string_view build, bool minimap_enabled);
 std::string PrettyArea(std::string_view banc);
+// The room window's area text for one peer ("-", "loading", sidecar name or prettified scene).
+std::string AreaText(const RoomPeer& peer, const Config& config);
 std::string Seen(u64 now, u64 then);
 struct WindowInfo {
     std::string room, seed, policy, relay, name;
