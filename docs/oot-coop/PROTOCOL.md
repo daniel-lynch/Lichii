@@ -704,7 +704,8 @@ flags, so local coverage cannot be inferred from team flags applied by co-op.
 The receipt sidecar lives at `<matched host file's parent>/coop-ledger.json`, so
 it travels with the slot directory. If the host path is empty or relative, or its
 parent directory does not exist, use `<user dir>/oot-coop-ledger/<slot>.json`.
-A rename has no host path and uses that fallback. Back up/copy the applicable
+A rename has no host path: it reuses the sidecar path last seen for that slot with a host
+path (else the fallback). Back up/copy the applicable
 receipt file together with the slot. The receipt document (distinct from the
 private regex config despite the same basename) is:
 
@@ -776,3 +777,10 @@ loses that campaign's ledger; backup and room naming remain operator responsibil
 `--reset-room NAME` is an offline, synchronous command: load, remove only that room,
 atomically write, print, exit without opening a server or event loop. Missing room
 is an error. Startup reports the state path or `memory only` and loaded room count.
+
+Every client process is a new sender ID, so a persistent team would fill its 256
+sender high-water slots. At that capacity a join forgets the longest-idle OFFLINE
+sender idle for at least an hour (`OoT co-op relay: room R: idle sender X forgotten
+(sender capacity)`); its ledger entries stay. A process alive with an unacknowledged
+outbox reconnects within its 30 s backoff, long before that. Teams persist
+`sender_active` (sender -> wall time of its last join/change) for this.
