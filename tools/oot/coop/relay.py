@@ -267,7 +267,6 @@ class Team:
     checkpoint: dict = field(default_factory=dict)
     seen: dict = field(default_factory=dict)
     benefit_receipts: set = field(default_factory=set)
-    chest_owners: dict = field(default_factory=dict)
     replay: deque = field(default_factory=deque)
     clients: dict = field(default_factory=dict)
     revision: int = 0
@@ -283,15 +282,12 @@ class Team:
         kind = packet["type"]
         accepted = key[1] not in deny
         source = collectible_origin(packet)
+        # Chest sources stay a client-side rule (C13 ChestClaims: one opener per chest, several gives).
         benefit = source if kind == "item_give" and source and source[0] != "chest" else None
-        chest = source if kind == "item_give" and source and source[0] == "chest" else None
         if source is not None:
             accepted &= not any(value in deny for value in source[1:])
         if benefit is not None:
             accepted &= benefit not in self.benefit_receipts
-        if chest is not None:
-            # One opener may give a bundle. Keep its distinct sequences, reject other openers.
-            accepted &= self.chest_owners.get(chest, origin) == origin
         if kind in ("bool_set", "bit_set"):
             accepted &= packet["value"] and old is None
         if accepted:
@@ -299,16 +295,13 @@ class Team:
                 raise ProtocolError("team state capacity reached")
             if self.revision == MAX_SEQ:
                 raise ProtocolError("team revision exhausted")
-            new_receipt = benefit is not None or chest is not None and chest not in self.chest_owners
-            if new_receipt and len(self.benefit_receipts) + len(self.chest_owners) >= MAX_ORIGIN_RECEIPTS:
+            if benefit is not None and len(self.benefit_receipts) >= MAX_ORIGIN_RECEIPTS:
                 raise ProtocolError("origin receipt capacity reached")
         self.seen[origin] = seq  # Also remember ignored false, denied and backward writes.
         if not accepted:
             return None
         if benefit is not None:
             self.benefit_receipts.add(benefit)
-        if chest is not None:
-            self.chest_owners[chest] = origin
         self.revision += 1
         event = dict(packet, rev=self.revision)
         fold(self.current, event)

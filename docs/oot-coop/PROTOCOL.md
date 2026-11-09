@@ -186,14 +186,17 @@ the revised relay and use a matching policy ID on both clients before enabling t
 
 The relay deduplicates all events by sender/sequence. It also keeps a team-lifetime
 receipt for each bit/token benefit, independent of sequence or sender and of replay-window
-eviction. Flags do not consume benefit receipts. Chest sources retain a winning sender
-instead, preserving several legitimate top-level gives from one chest opener. The combined
-source receipt/owner limit is 4096; overflow rejects the event before changing team state.
+eviction. Flags do not consume benefit receipts. Chest sources are not relay receipts: the
+clients' C13 chest claims keep one opener's (possibly several) gives. The receipt limit is
+4096; overflow rejects the event before changing team state.
 This storage is in memory, not durable across relay restart or room expiration.
 
 The sender captures a reviewed key at the pickup-component entry on the same guest thread,
 reserves it before the outer give, and records the benefit after the verified return reports
-success. A losing local pickup returns success without running the give. Later Bool64 writes
+success. A losing local pickup returns success without running the give. A pickup without a
+linked reviewed key (a dynamic drop, a gated family, or `bit` not allowed) keeps the C13
+untagged give path. A receiver whose replayed give returns w0=0 keeps the receipt and sets
+the flags (the game's own clamp, e.g. a full wallet); it never retries. Later Bool64 writes
 carry that source. The receiver reserves the source before replay, records success after the
 native return, and queues its source flags through the existing deferred flag setter. It
 never increments a separate token counter. Pending/applied receipts survive transport

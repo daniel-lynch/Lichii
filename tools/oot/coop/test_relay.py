@@ -301,23 +301,22 @@ class ProtocolTests(unittest.TestCase):
         self.assertIsNotNone(team.accept(item(3, origin_kind="bit", origin_key64=17), set()))
         self.assertIsNotNone(team.accept(item(4, origin_kind="chest", origin_key=17), set()))
         self.assertIsNotNone(team.accept(item(5, origin_key=17), set()))
-        self.assertIsNone(team.accept(item(2, origin="b", origin_key=17), set()))
+        # Chest sources are not relay receipts: the clients' ChestClaims pick one opener (C13).
+        self.assertIsNotNone(team.accept(item(2, origin="b", origin_key=17), set()))
         for seq in range(6, relay.MAX_REPLAY + 10):
             self.assertIsNotNone(team.accept(item(seq), set()))
         self.assertNotIn(packet["seq"], [p["seq"] for p in team.replay])
         self.assertIsNone(team.accept(dict(packet, origin="c"), set()))
         self.assertEqual(len(team.benefit_receipts), 2)
-        self.assertEqual(team.chest_owners, {("chest", 17): "a"})
 
-    def test_world_chest_bundle_preserves_one_opener(self):
+    def test_world_chest_bundle_keeps_every_give(self):
         team = relay.Team()
         for seq in range(1, 4):
             packet = item(seq, origin_key=17, name="Item_" + str(seq))
             self.assertIsNotNone(team.accept(packet, set()))
             self.assertIsNone(team.accept(packet, set()))
-            self.assertIsNone(team.accept(dict(packet, origin="b"), set()))
         self.assertEqual(len(team.replay), 3)
-        self.assertEqual(team.chest_owners, {("chest", 17): "a"})
+        self.assertEqual(team.benefit_receipts, set())
 
     def test_world_token_flags_share_origin_but_not_benefit_receipt(self):
         source = {"origin_kind": "token", "origin_key64": (1 << 63) + 9,
