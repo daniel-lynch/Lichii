@@ -104,6 +104,10 @@ struct GhostOffsets {
     /// id field, record's actor field, record's generation field}. Live while the record still
     /// names this actor with the generation the actor had when it was taken.
     std::array<u64, 4> link{};
+    /// Optional: the actor's lifecycle word and the closed range of values the game's own link
+    /// check and link bind reject (an actor being torn down). Offset 0: not checked.
+    u64 lifecycle{};
+    u32 lifecycle_lo{}, lifecycle_hi{};
     std::string actor_child, actor_adult; ///< Actor names; adult falls back to child
     bool Valid() const {
         return playing_info_cell && pos && rot && actor_mgr_cell && scale_const && banc_hash &&

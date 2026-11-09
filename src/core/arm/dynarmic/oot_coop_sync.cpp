@@ -500,6 +500,16 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                             if (!number || !*number || (*number & 3)) return std::nullopt;
                             ghost.link[i] = *number;
                         }
+                    } else if (name == "lifecycle") {
+                        if (!item.is_array() || item.size() != 3) return std::nullopt;
+                        const auto field_offset = Number(item[0], 0xFFFF);
+                        const auto lo = Number(item[1], 0xFFFFFFFF);
+                        const auto hi = Number(item[2], 0xFFFFFFFF);
+                        if (!field_offset || !*field_offset || (*field_offset & 3) || !lo || !hi || *lo > *hi)
+                            return std::nullopt;
+                        ghost.lifecycle = *field_offset;
+                        ghost.lifecycle_lo = static_cast<u32>(*lo);
+                        ghost.lifecycle_hi = static_cast<u32>(*hi);
                     } else if (name == "actor_fields") {
                         if (!item.is_array() || item.empty() || item.size() > 4) return std::nullopt;
                         for (const auto& f : item) {

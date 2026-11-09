@@ -304,8 +304,9 @@ FIELD-PLAN.md on disposable saves before claiming the field candidate works.
 
 ## Ghost (class `pose`, protocol v3)
 
-The private profile's `offsets.<build-id>` may carry a `ghost` object (it is a separate private
-file until this branch merges, because older binaries reject unknown profile fields):
+The private profile's `offsets.<build-id>` may carry a `ghost` object. Binaries older than the
+ghost merge reject it (they reject every unknown profile field), so the key file that carries it
+serves this head and later only:
 
 ```json
 "ghost": {"playing_info_cell": "<offset>", "pos": "<field>", "rot": "<field>",
@@ -313,7 +314,9 @@ file until this branch merges, because older binaries reject unknown profile fie
           "banc_hash": "<hash>", "child_hash": "<hash>", "loading_hash": "<hash>",
           "str64": ["<table>", "<stride>", "<field>"],
           "create": {"at": "<offset>", "words": [...]}, "get": {...}, "release": {...}, "set_mtx": {...},
-          "actor_fields": ["<field>", ...], "actor_child": "<actor>", "actor_adult": "<actor>"}
+          "actor_fields": ["<field>", ...], "link": ["<field>", "<field>", "<field>", "<field>"],
+          "lifecycle": ["<field>", "<lo>", "<hi>"],
+          "actor_child": "<actor>", "actor_adult": "<actor>"}
 ```
 
 - **Sender (pure reads at the frame hook).** Position and rotation from the player-info object,
@@ -327,9 +330,24 @@ file until this branch merges, because older binaries reject unknown profile fie
   handle); move it each frame with the actor's own set-transform call (actor, &Matrix34f, 0);
   release a failed or orphaned request with the release call. Hidden peers (other scene, loading,
   stale, offline) are parked below the map once; nothing is ever deleted by us.
-- **Lifetime.** The game deletes the puppet with its scene. Before every call the actor's vtable
-  and the profile's `actor_fields` must be unchanged and non-null; a local scene change, load or
-  GameData move drops the pointer without any call. The handle, argument block, matrix and name
-  live in our sentinel page past +0x400 (persistent, never a reused stack frame).
+- **Lifetime.** The game deletes the puppet with its scene (and when it is parked out of bounds).
+  Before every call the actor's vtable and the profile's `actor_fields` must be unchanged and
+  non-null; a local scene change, load or GameData move drops the pointer without any call. The
+  handle, argument block, matrix and name live in our sentinel page past +0x400 (persistent, never
+  a reused stack frame).
+- <a id="ghost-lifetime"></a>**Ghost lifetime: why no borrow is taken.** The pointer is checked the
+  way the game's own actor-link check does it: the actor's record still names the actor with the
+  generation it had when it was taken, and (optional `lifecycle` field) the actor's lifecycle word
+  is outside the range the game's check and its link bind both reject (teardown). The check runs
+  in the frame drain and again immediately before the set-transform call. The game's own check
+  holds no reference across the use either: on its own threads it reads without a lock, elsewhere
+  it takes the record's mutex for the check only and releases it before returning. The link bind
+  sets an exclusive "bound" flag on the record, not a reference count, so binding a link of our
+  own would not keep the actor's memory alive and is not done. Residual window (unproven either
+  way): another guest core could start the teardown between the check and the call's first
+  instruction. Deletion is staged (lifecycle first, then the link record, the vtable and the
+  memory later), which is what the lifecycle check catches.
+- **Age.** `actor_adult` is optional. Without it an adult peer is drawn with the child puppet, and
+  the create line says so.
 - Field status: `RESULT` of C8 (private).
 

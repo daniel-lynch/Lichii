@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -453,4 +454,94 @@ TEST_CASE("OoT co-op ghost offsets load only from the private profile", "[core][
     const auto plain = Coop::DecodeProfile(Json{{"offsets", {{Build, {{"manager_cell", "0x200000"}}}}}}, Build);
     REQUIRE(plain);
     REQUIRE_FALSE(plain->ghost.Valid());
+}
+
+TEST_CASE("OoT co-op ghost drops an actor in teardown and logs the adult fallback", "[core][oot_coop]") {
+    auto g = Offsets();
+    g.actor_adult.clear();
+    g.lifecycle = 0x2C;
+    g.lifecycle_lo = 7;
+    g.lifecycle_hi = 11;
+    Bytes m;
+    Port port{m};
+    m.P64(Base + g.actor_mgr_cell, 0x60000000);
+    for (u64 i = 0; i < 3; ++i) m.PF(Base + g.scale_const + i * 4, 1.0f);
+    Coop::GhostDriver<Port> ghost{g, Base};
+    using State = Coop::GhostDriver<Port>::State;
+    std::vector<std::string> lines;
+    const auto log = [&](std::string_view line) { lines.emplace_back(line); };
+    const auto logged = [&](std::string_view what) {
+        return std::any_of(lines.begin(), lines.end(),
+                           [&](const std::string& l) { return l.find(what) != std::string::npos; });
+    };
+    const Pose local = At("Forest_A", 0, 0);
+    auto adult = At("Forest_A", 3, 4, 45);
+    adult.child = false;
+    std::vector<Coop::PeerView> peers{{"peer-b", adult}};
+
+    REQUIRE(ghost.Frame(port, Block, local, peers, log));
+    std::string name;
+    for (u64 i = 0; m.b.at(Block + 0x100 + i); ++i) name.push_back(static_cast<char>(m.b.at(Block + 0x100 + i)));
+    REQUIRE(name == "Puppet_Child");
+    m.P64(Block, 0x61000000);
+    m.P32(0x61000000, 3);
+    ghost.Returned(port, Block, 1, log);
+    REQUIRE(logged("adult peer: the profile has no adult puppet"));
+    REQUIRE(ghost.Frame(port, Block, local, peers, log)); // take
+    const u64 actor = 0x62000000, record = 0x63000000;
+    m.P64(actor, 0xABC0);
+    m.P64(actor + 0x40, 0x1);
+    m.P64(actor + 0x48, 0x2);
+    m.P64(actor + 0x50, record);
+    m.P32(actor + 0x18, 0x35c);
+    m.P32(actor + 0x2C, 3);
+    m.P64(record + 0x40, actor);
+    m.P32(record + 0x48, 0x35c);
+    ghost.Returned(port, Block, actor, log);
+    REQUIRE(ghost.Slots()[0].state == State::Live);
+    REQUIRE(ghost.Frame(port, Block, local, peers, log)); // move: lifecycle 3 is alive
+    REQUIRE(port.calls.back().entry == Base + g.set_mtx.offset);
+    ghost.Returned(port, Block, 0, log);
+    // Teardown started (lifecycle in 7..11) while the link still names the actor: no call.
+    peers[0].pose->pos[0] = 5.0f;
+    m.P32(actor + 0x2C, 8);
+    const size_t before = port.calls.size();
+    REQUIRE_FALSE(ghost.Frame(port, Block, local, peers, log));
+    REQUIRE(port.calls.size() == before);
+    REQUIRE(ghost.Slots()[0].state == State::None);
+    REQUIRE(logged("dropped (actor being deleted, lifecycle 8)"));
+}
+
+TEST_CASE("OoT co-op ghost lifecycle field is optional and bounded", "[core][oot_coop]") {
+    Json ghost{{"playing_info_cell", "0x300000"}, {"pos", "0x100"}, {"rot", "0x10C"},
+               {"actor_mgr_cell", "0x300008"}, {"scale_const", "0x300010"},
+               {"banc_hash", "0x1111"}, {"child_hash", "0x2222"}, {"loading_hash", "0x3333"},
+               {"str64", Json::array({"0x80", "0x20", "0x8"})},
+               {"create", {{"at", "0x400000"}, {"words", Json::array({"0xD503237F"})}}},
+               {"get", {{"at", "0x401000"}, {"words", Json::array({"0xD503237F"})}}},
+               {"release", {{"at", "0x402000"}, {"words", Json::array({"0xD503237F"})}}},
+               {"set_mtx", {{"at", "0x403000"}, {"words", Json::array({"0xD503237F"})}}},
+               {"actor_fields", Json::array({"0x40", "0x48"})},
+               {"link", Json::array({"0x50", "0x18", "0x40", "0x48"})},
+               {"actor_child", "Puppet_Child"},
+               {"lifecycle", Json::array({"0x2C", "0x7", "0xB"})}};
+    const auto load = [&](const Json& g) {
+        return Coop::DecodeProfile(Json{{"offsets", {{Build, {{"manager_cell", "0x200000"}, {"ghost", g}}}}}}, Build);
+    };
+    const auto profile = load(ghost);
+    REQUIRE(profile);
+    REQUIRE(profile->ghost.lifecycle == 0x2C);
+    REQUIRE(profile->ghost.lifecycle_lo == 7);
+    REQUIRE(profile->ghost.lifecycle_hi == 11);
+    auto bad = ghost;
+    bad["lifecycle"] = Json::array({"0x2C", "0xB", "0x7"}); // empty range
+    REQUIRE_FALSE(load(bad));
+    bad["lifecycle"] = Json::array({"0x2D", "0x7", "0xB"}); // misaligned
+    REQUIRE_FALSE(load(bad));
+    bad["lifecycle"] = Json::array({"0x2C", "0x7"});
+    REQUIRE_FALSE(load(bad));
+    bad.erase("lifecycle");
+    const auto without = load(bad);
+    REQUIRE(without);
+    REQUIRE(without->ghost.lifecycle == 0);
 }

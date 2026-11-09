@@ -292,6 +292,7 @@ public:
         std::array<float, 4> drawn{}; ///< x, y, z, yaw last sent to set-transform
         u64 retry_tick{}, pending_tick{};
         bool pending_logged{};
+        bool adult_fallback{}; ///< Adult peer, child puppet (no adult puppet in the profile)
     };
     static constexpr u64 SlotSize = 0x180;
     static constexpr u64 CreateRetry = 1800; ///< frames after a refused/failed create
@@ -338,11 +339,8 @@ public:
                                             local.loading ? "loading" : "changed"));
                 slot.state = State::None;
                 slot.actor = 0;
-            } else if (!Alive(port, slot)) {
-                Line(log, slot, "dropped (actor no longer valid)");
-                slot.state = State::None;
-                slot.actor = 0;
-                slot.retry_tick = tick + 60;
+            } else if (const auto why = Dead(port, slot)) {
+                Drop(log, slot, *why);
             }
         }
         for (size_t n = 0; n < GhostSlots; ++n) {
@@ -401,6 +399,13 @@ public:
                                                               : peer->pose->loading ? "peer loading" : "peer elsewhere"));
                 slot.parked = true;
             }
+            // Re-check right before the call: the checks above ran for every slot first. This is
+            // the same check-then-use the game's own link check does (no reference is held across
+            // the use there either; see HOOKS.md "Ghost lifetime").
+            if (const auto why = Dead(port, slot)) {
+                Drop(log, slot, *why);
+                continue;
+            }
             const auto m = YawMatrix({target[0], target[1], target[2]}, target[3]);
             if (!port.Write(at + 0x10, m.data(), sizeof(m))) continue;
             if (Start(port, g.set_mtx, {slot.actor, at + 0x10, 0}, i, GhostOp::Move)) {
@@ -426,7 +431,10 @@ public:
                 slot.state = State::None;
                 slot.retry_tick = tick + CreateRetry;
             } else {
-                Line(log, slot, fmt::format("create requested name={} banc={}", slot_name, slot.banc));
+                Line(log, slot, fmt::format("create requested name={} banc={}{}", slot_name, slot.banc,
+                                            slot.adult_fallback ? " (adult peer: the profile has no adult "
+                                                                  "puppet, drawn as the child one)"
+                                                                : ""));
                 slot.state = State::Pending;
                 slot.pending_tick = tick;
                 slot.pending_logged = false;
@@ -480,15 +488,29 @@ private:
         return nullptr;
     }
     /// The take consumed the request handle; from then on the actor is tracked like the game's own
-    /// actor link (record still names it with the same generation), plus vtable and fields.
-    bool Alive(Port& port, const Slot& slot) {
+    /// actor link (record still names it with the same generation, lifecycle not in the teardown
+    /// range), plus vtable and fields. Nothing when it is still alive, else why not.
+    std::optional<std::string> Dead(Port& port, const Slot& slot) {
         if (port.R64(slot.actor + g.link[0]) != slot.record ||
             port.R64(slot.record + g.link[2]) != slot.actor ||
             port.R32(slot.record + g.link[3]) != slot.generation || port.R64(slot.actor) != slot.vtable)
-            return false;
+            return "actor no longer valid";
         for (size_t i = 0; i < g.actor_fields.size(); ++i)
-            if (port.R64(slot.actor + g.actor_fields[i]) != slot.fields[i]) return false;
-        return true;
+            if (port.R64(slot.actor + g.actor_fields[i]) != slot.fields[i]) return "actor no longer valid";
+        if (g.lifecycle) {
+            const auto life = port.R32(slot.actor + g.lifecycle);
+            if (!life) return "actor no longer valid";
+            if (*life >= g.lifecycle_lo && *life <= g.lifecycle_hi)
+                return fmt::format("actor being deleted, lifecycle {}", *life);
+        }
+        return std::nullopt;
+    }
+    template <typename Log>
+    void Drop(Log log, Slot& slot, std::string_view why) {
+        Line(log, slot, fmt::format("dropped ({})", why));
+        slot.state = State::None;
+        slot.actor = 0;
+        slot.retry_tick = tick + 60;
     }
     bool Start(Port& port, const OotGameDataTrace::Entry& entry, std::array<u64, 8> args, size_t i, GhostOp what) {
         const auto address = port.Verified(entry);
@@ -512,7 +534,10 @@ private:
             std::memcpy(scale.data() + i * 4, &*w, 4);
         }
         if (!manager || !*manager || !entry) return false;
+        // No adult puppet in the profile: an adult peer is drawn with the child one (logged once
+        // per create, with the create line).
         const std::string& name = peer.child || g.actor_adult.empty() ? g.actor_child : g.actor_adult;
+        slot.adult_fallback = !peer.child && g.actor_adult.empty();
         // Slot layout: +0 handle, +8 name pointer, +0x10 matrix (0x30), +0x40 create argument
         // (0xA0), +0xE0 empty instance name, +0x100 actor name (64 bytes).
         std::array<u8, 0x140> b{};
