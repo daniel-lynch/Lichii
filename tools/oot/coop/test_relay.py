@@ -231,6 +231,19 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(len(snapshot["replay"]), 512)
         self.assertEqual(materialize(snapshot), team.current)
 
+    def test_key_gains_are_events_not_state(self):
+        def key(seq, delta=1, **extra):
+            return dict({"type": "key_add", "origin": "b", "seq": seq, "hash": 0x1234, "delta": delta}, **extra)
+        for bad in (key(1, 0), key(1, -1), key(1, 33), key(1, True), key(1, hash=0), key(1, value=True)):
+            with self.subTest(bad=bad), self.assertRaises(relay.ProtocolError):
+                relay.validate_change(bad, "b")
+        team = relay.Team()
+        self.assertEqual(team.accept(key(1), set())["rev"], 1)
+        self.assertIsNone(team.accept(key(1), set()))  # duplicate: not a second key
+        self.assertEqual(team.accept(key(2, 2), set())["rev"], 2)
+        self.assertEqual(team.current, {})
+        self.assertEqual([p["delta"] for p in team.snapshot()["replay"]], [1, 2])
+
     def test_noop_highwater_and_deny(self):
         team = relay.Team()
         self.assertIsNone(team.accept(grant(3, value=False), set()))

@@ -38,6 +38,8 @@ class KProcess;
 /// - StepApply / PlayedEvent / Frame / StructBoolSet / ActorFlagSet: a `pacibsp` (a no-op).
 /// - BitRead: `ldr w8, [x0, #0xc58]`; BitSet: `mov x8, x0`.
 /// - ItemGive: the `pacibsp` at the entry of the game's give-to-pouch call (co-op item class).
+/// - RupeeAdd: the first instruction of the wallet entry, `mov w8, #0x3bd4` (the pending field's
+///   offset); co-op observes a flow's positive wallet delta there (class rupee).
 namespace Core::OotGameDataTrace {
 
 inline constexpr u64 ProgramId = 0x0400486024DEC000ULL;
@@ -57,8 +59,9 @@ enum class Point : u8 {
     StructBoolSet,
     ActorFlagSet,
     ItemGive,
+    RupeeAdd,
 };
-inline constexpr size_t PointCount = 10;
+inline constexpr size_t PointCount = 11;
 
 struct Site {
     Point point;
@@ -71,6 +74,7 @@ inline constexpr u32 Pacibsp = 0xD503237F;  // pacibsp (a hint: dynarmic runs it
 inline constexpr u32 Breakpoint = 0xD4200000; // brk #0
 inline constexpr u32 LdrW8C58 = 0xB94C5808; // ldr w8, [x0, #0xc58]
 inline constexpr u32 MovX8X0 = 0xAA0003E8;  // mov x8, x0
+inline constexpr u32 MovW8Pending = 0x52877A88; // mov w8, #0x3bd4 (the wallet entry's first word)
 
 /// The only instruction Resume can stand in for at `point`.
 constexpr u32 ReplacedInstruction(Point point) {
@@ -78,6 +82,7 @@ constexpr u32 ReplacedInstruction(Point point) {
     case Point::StepSet: return MovW8One;
     case Point::BitRead: return LdrW8C58;
     case Point::BitSet: return MovX8X0;
+    case Point::RupeeAdd: return MovW8Pending;
     case Point::None: return 0;
     default: return Pacibsp;
     }
@@ -147,6 +152,7 @@ struct Profile {
     u64 pouch_cell{};   ///< Module offset of the pouch manager pointer
     u32 wallet_hash{};  ///< GameData key of the wallet (rupee deltas)
     Entry bool_setter, bit_setter, rupee_entry;
+    Entry int_add; ///< GameData Int add (x0 = manager, w1 = delta, w2 = key): class dungeon
     Entry item_entry;               ///< The give-to-pouch call (the ItemGive site's function)
     std::vector<u64> item_callers;  ///< Return addresses (module offsets) of gives to forward
     /// World pickups (class item, sub-class pickup): return addresses of the collect path's give
@@ -154,6 +160,20 @@ struct Profile {
     /// magic, ammo drops) is per-player and only logged.
     std::vector<u64> pickup_callers;
     std::vector<std::string> pickup_names;
+    /// Generic gives (C13, optional "give" object): with it, a give from ANY caller is forwarded
+    /// except our replays, nested gives (return address inside [give_body[0], give_body[1])), the
+    /// per-player callers (sequence/initialisation gives, put-away, bottles, museum), the
+    /// per-player names from a pickup caller (refill drops: hearts, ammo) and the names never
+    /// forwarded from any caller (dungeon items the dungeon class owns). The pickup name allow
+    /// list is then not consulted.
+    bool give_all{};
+    std::array<u64, 2> give_body{};
+    std::vector<u64> give_deny_callers;
+    std::vector<std::string> give_per_player; ///< from the pickup callers only
+    std::vector<std::string> give_never;      ///< from every caller
+    /// Wallet observation (class rupee): return addresses of wallet-entry calls whose positive
+    /// delta is shared (a flow's rupee reward). Payments (negative deltas) stay per-player.
+    std::vector<u64> rupee_callers;
     u64 event_got{};                ///< Module offset of the GOT slot of the event manager's cell
     /// {cell, field}: *(*(main + cell) + field) must be non-zero before a give is replayed.
     std::vector<std::pair<u64, u64>> item_guards;
@@ -171,7 +191,7 @@ struct Profile {
 /// its handler ignores every other point. The Bool64 accessors are hot (the actor reader copy
 /// runs per actor per frame), so hooking them without tracing would cost a trap each.
 constexpr bool CoopPoint(Point point) {
-    return point == Point::Frame || point == Point::ItemGive;
+    return point == Point::Frame || point == Point::ItemGive || point == Point::RupeeAdd;
 }
 
 /// The trace point at `address` whose original instruction is `instruction`, or None.
@@ -205,6 +225,9 @@ void Resume(Point point, Jit& jit, Memory& memory) {
     case Point::BitSet:
         jit.SetRegister(8, jit.GetRegister(0));
         break;
+    case Point::RupeeAdd:
+        jit.SetRegister(8, 0x3BD4); // mov w8, #0x3bd4
+        break;
     case Point::StructBoolSet:
     case Point::ActorFlagSet:
     case Point::ItemGive:
@@ -227,6 +250,7 @@ constexpr std::string_view Name(Point point) {
     case Point::StructBoolSet: return "struct-bool-set";
     case Point::ActorFlagSet: return "actor-flag-set";
     case Point::ItemGive: return "item-give";
+    case Point::RupeeAdd: return "rupee-add";
     case Point::Frame: return "frame";
     case Point::BitRead: return "bit-read";
     case Point::BitSet: return "bit-set";
@@ -427,6 +451,10 @@ std::string Describe(Point point, u64 base, Jit& jit, Memory& memory) {
                            static_cast<u32>(jit.GetRegister(1)), x0, caller);
     case Point::Frame:
         return fmt::format("gamedata frame lr={}", caller);
+    case Point::RupeeAdd:
+        return fmt::format("gamedata rupee-add delta={} reason={} lr={}",
+                           static_cast<s32>(jit.GetRegister(1)), static_cast<u32>(jit.GetRegister(2)),
+                           caller);
     case Point::ItemGive:
         return fmt::format("gamedata item-give category={} count={} get={} lr={}",
                            static_cast<u32>(jit.GetRegister(2)), static_cast<u32>(jit.GetRegister(3)),

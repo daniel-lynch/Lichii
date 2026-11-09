@@ -25,6 +25,10 @@ struct ApplyPolicy {
         if (change.kind == Kind::Item) {
             return enabled && classes.contains(Kind::Item) && ValidItem(change);
         }
+        if (change.kind == Kind::Key) {
+            return enabled && classes.contains(Kind::Key) && KeyGain(change.value) &&
+                   keys.contains({Kind::Key, change.key});
+        }
         return enabled && WireKind(change.kind) && change.value == 1 &&
                classes.contains(change.kind) && keys.contains({change.kind, change.key});
     }

@@ -739,3 +739,93 @@ TEST_CASE("OoT co-op item gives are named events, never state", "[core][oot_coop
     bad.value = 0;
     REQUIRE_FALSE(open.Queue(bad));
 }
+
+TEST_CASE("OoT co-op small-key gains are dungeon events, never state", "[core][oot_coop]") {
+    const Change gain{Kind::Key, "B", 3, 0x1234, 1};
+    const auto packet = Coop::EncodeChange(gain);
+    REQUIRE(packet == Json{{"type", "key_add"}, {"origin", "B"}, {"seq", 3}, {"hash", 0x1234}, {"delta", 1}});
+    REQUIRE(Coop::DecodeChange(packet) == gain);
+    REQUIRE(Coop::WireKind(Kind::Key));
+    REQUIRE(Coop::EventKind(Kind::Key));
+    for (const auto& [field, value] : std::vector<std::pair<std::string, Json>>{
+             {"delta", 0}, {"delta", -1}, {"delta", 33}, {"delta", true}, {"hash", 0},
+             {"hash", 0x100000000ULL}, {"extra", 1}}) {
+        auto bad = packet;
+        bad[field] = value;
+        REQUIRE_FALSE(Coop::DecodeChange(bad));
+    }
+    REQUIRE_FALSE(Coop::DecodeChange(packet, true)); // never snapshot state
+    REQUIRE(Coop::DecodeAllowClasses("bool,dungeon") == std::set{Kind::Bool, Kind::Key});
+    Coop::State state;
+    REQUIRE(state.Merge(gain));
+    REQUIRE_FALSE(state.Merge(gain)); // a duplicate delivery is not a second key
+    REQUIRE(state.Merge({Kind::Key, "C", 1, 0x1234, 1})); // two players, two keys
+    REQUIRE(state.Snapshot().empty());
+    REQUIRE(Coop::ShouldApply(gain, state));
+    Coop::ApplyPolicy policy{true, {Kind::Key}, {{Kind::Key, 0x1234}}};
+    REQUIRE(policy.Allows(gain));
+    REQUIRE_FALSE(policy.Allows({Kind::Key, "B", 4, 0x9999, 1}));
+    REQUIRE_FALSE(Coop::ApplyPolicy{true, {Kind::Bool}, {{Kind::Key, 0x1234}}}.Allows(gain));
+}
+
+TEST_CASE("OoT co-op key watch forwards gains, never spends or our own credit", "[core][oot_coop]") {
+    Coop::KeyWatch watch;
+    REQUIRE(watch.Step(2, 1) == 0);      // baseline
+    REQUIRE(watch.Step(3, 2) == 1);      // a key picked up: total and count rise
+    REQUIRE(watch.Step(3, 1) == 0);      // a key spent on a door: per-player, nothing sent
+    REQUIRE(watch.Step(4, 1) == 1);      // a gain seen only in the total (count unchanged frame)
+    REQUIRE(watch.Step(4, 2) == 1);      // a gain seen only in the count (total not maintained)
+    watch.credit = 2;                    // two received gains applied here
+    REQUIRE(watch.Step(5, 3) == 0);      // the first one shows up: explained by the credit
+    REQUIRE(watch.Step(7, 5) == 1);      // the second plus a real local pickup in the same frame
+    REQUIRE(watch.credit == 0);
+    REQUIRE(watch.Step(std::nullopt, 5) == 0); // unreadable: reset, no forward
+    REQUIRE_FALSE(watch.total);
+    REQUIRE(watch.Step(9, 6) == 0);      // a fresh baseline after the reset
+}
+
+TEST_CASE("OoT co-op key file extras: per-player deny and the dungeon class", "[core][oot_coop]") {
+    const Json file{{"bool", {1, 2, 3}},
+                    {"deny", {{"bool", {2, 7}}}},
+                    {"dungeon", {{"bool", {11, 12}}, {"keys", {{21, 22}, {31, 32}}}}},
+                    {"offsets", Json::object()}};
+    const auto keys = Coop::DecodeKeyPolicy(file);
+    REQUIRE(keys);
+    REQUIRE(keys->size() == 3); // the extras are not allow-list entries by themselves
+    const auto extras = Coop::DecodeKeyExtras(file);
+    REQUIRE(extras);
+    REQUIRE(extras->deny == std::set<u64>{2, 7});
+    REQUIRE(extras->dungeon_bools == std::vector<u32>{11, 12});
+    REQUIRE(extras->dungeon_keys.size() == 2);
+    REQUIRE(extras->dungeon_keys[1].total == 31);
+    REQUIRE(extras->dungeon_keys[1].count == 32);
+    REQUIRE(Coop::DecodeKeyExtras(Json::array({1, 2}))->deny.empty()); // legacy bare array
+    for (const Json& bad : {Json{{"deny", {{"bit", {1}}}}}, Json{{"deny", {{"bool", {0}}}}},
+                            Json{{"deny", {{"bool", {0x100000000ULL}}}}},
+                            Json{{"dungeon", {{"keys", {{21, 21}}}}}}, Json{{"dungeon", {{"keys", {{21}}}}}},
+                            Json{{"dungeon", {{"other", Json::array()}}}}, Json{{"deny", 1}}}) {
+        REQUIRE_FALSE(Coop::DecodeKeyExtras(bad));
+    }
+    // The per-player Bools are dropped by protocol state too (the session's deny set).
+    Coop::State state{extras->deny};
+    REQUIRE_FALSE(state.Merge({Kind::Bool, "B", 1, 7, 1}));
+    REQUIRE(state.Merge({Kind::Bool, "B", 2, 1, 1}));
+}
+
+TEST_CASE("OoT co-op profile: wallet observation and the Int add entry", "[core][oot_coop]") {
+    const auto load = [](const Json& fields) {
+        Json offsets = fields;
+        offsets["manager_cell"] = "0x200000";
+        return Coop::DecodeProfile(Json{{"offsets", {{P::BuildId, offsets}}}}, P::BuildId);
+    };
+    const auto loaded = load({{"rupee_callers", {"0x160004"}},
+                              {"sites", {{"rupee_add", {"0x112000"}}}},
+                              {"entries", {{"int_add", {{"at", "0x114000"}, {"words", {"0xD503237F"}}}}}}});
+    REQUIRE(loaded);
+    REQUIRE(loaded->rupee_callers == std::vector<u64>{0x160004});
+    REQUIRE(loaded->int_add.offset == 0x114000);
+    REQUIRE(loaded->SiteOffset(Trace::Point::RupeeAdd) == 0x112000);
+    REQUIRE(loaded->sites.back().instruction == Trace::MovW8Pending);
+    REQUIRE_FALSE(load({{"rupee_callers", {"0x160005"}}}));
+    REQUIRE_FALSE(load({{"rupee_callers", "0x160004"}}));
+}

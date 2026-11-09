@@ -24,9 +24,10 @@ MAX_TEAMS = 16
 MAX_REPLAY = 512
 MAX_OUTBOX = 256
 MAX_OUTBOX_BYTES = 2 * MAX_FRAME
-CHANGE_TYPES = {"bool_set", "bit_set", "rupee_add", "item_give"}
-EVENT_TYPES = {"rupee_add", "item_give"}  # additive events: replay window only, never team state
+CHANGE_TYPES = {"bool_set", "bit_set", "rupee_add", "item_give", "key_add"}
+EVENT_TYPES = {"rupee_add", "item_give", "key_add"}  # additive events: replay window only, never team state
 RUPEE_LIMIT = 999
+KEY_GAIN_LIMIT = 32
 ITEM_COUNT_LIMIT = 999
 POSE_FIELDS = ("type", "t", "banc", "child", "loading", "pos", "yaw", "anim", "anim_seq", "rate", "phase")
 POSE_ANIMS = ("idle", "walk", "run")  # an animation hint inferred from speed; receivers may ignore it
@@ -140,7 +141,7 @@ def validate_change(packet, origin):
     if kind not in CHANGE_TYPES:
         raise ProtocolError("unsupported grant class")
     extra = {"bool_set": ("hash", "value"), "bit_set": ("actor", "value"), "rupee_add": ("hash", "delta"),
-             "item_give": ("name", "category", "count", "get", "flags")}[kind]
+             "item_give": ("name", "category", "count", "get", "flags"), "key_add": ("hash", "delta")}[kind]
     fields(packet, common + extra)
     if packet["origin"] != origin:
         raise ProtocolError("origin mismatch")
@@ -159,6 +160,11 @@ def validate_change(packet, origin):
             raise ProtocolError("rupee_add needs a wallet key")
         if integer(packet["delta"], -RUPEE_LIMIT, RUPEE_LIMIT) == 0:
             raise ProtocolError("zero rupee delta")
+    if kind == "key_add":
+        # A dungeon's small-key gain (C13): the hash names the dungeon's total-keys key (private).
+        if packet["hash"] == 0:
+            raise ProtocolError("key_add needs a dungeon key")
+        integer(packet["delta"], 1, KEY_GAIN_LIMIT)
     if kind == "item_give":
         # The game's own give call, as the opener made it: an event, applied by each receiver.
         if not isinstance(packet["name"], str) or not re.fullmatch(r"[A-Za-z0-9_]{1,63}", packet["name"]):

@@ -86,6 +86,7 @@ std::string_view Type(Kind kind) {
     case Kind::PouchTotal: return "pouch_total";
     case Kind::Rupee: return "rupee_add";
     case Kind::Item: return "item_give";
+    case Kind::Key: return "key_add";
     case Kind::Pose: return "pose";
     }
     return {};
@@ -131,7 +132,7 @@ Json EncodeChange(const Change& change) {
         packet["value"] = change.value != 0;
     } else {
         packet["hash"] = change.key;
-        if (change.kind == Kind::Rupee) {
+        if (change.kind == Kind::Rupee || change.kind == Kind::Key) {
             packet["delta"] = change.value;
         } else if (change.kind == Kind::Bool) {
             packet["value"] = change.value != 0;
@@ -153,7 +154,7 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
         const auto type = packet.at("type").get<std::string>();
         bool found = false;
         for (const Kind kind : {Kind::Bool, Kind::Int, Kind::Enum, Kind::Quest, Kind::Bit,
-                                Kind::PouchAdd, Kind::PouchTotal, Kind::Rupee, Kind::Item}) {
+                                Kind::PouchAdd, Kind::PouchTotal, Kind::Rupee, Kind::Item, Kind::Key}) {
             if (type == Type(kind)) {
                 change.kind = kind;
                 found = true;
@@ -205,7 +206,7 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
             return std::nullopt;
         }
         change.key = packet.at(key).get<u64>();
-        const char* value_field = change.kind == Kind::Rupee ? "delta" : "value";
+        const char* value_field = change.kind == Kind::Rupee || change.kind == Kind::Key ? "delta" : "value";
         if (WireKind(change.kind)) {
             for (const auto& [field, value] : packet.items()) {
                 if (field == "type" || field == key || field == value_field) continue;
@@ -219,6 +220,10 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
             if (change.key == 0 || !Signed32(delta) || !RupeeDelta(delta.get<s64>())) {
                 return std::nullopt;
             }
+            change.value = delta.get<s64>();
+        } else if (change.kind == Kind::Key) {
+            const auto& delta = packet.at("delta");
+            if (change.key == 0 || !Signed32(delta) || !KeyGain(delta.get<s64>())) return std::nullopt;
             change.value = delta.get<s64>();
         } else if (change.kind == Kind::Bool || change.kind == Kind::Bit) {
             if (!packet.at("value").is_boolean()) {
@@ -288,7 +293,8 @@ std::optional<Json> DecodeLine(std::string_view line) {
 }
 
 bool WireKind(Kind kind) {
-    return kind == Kind::Bool || kind == Kind::Bit || kind == Kind::Rupee || kind == Kind::Item;
+    return kind == Kind::Bool || kind == Kind::Bit || kind == Kind::Rupee || kind == Kind::Item ||
+           kind == Kind::Key;
 }
 
 std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text) {
@@ -301,6 +307,7 @@ std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text) {
         else if (name == "rupee") result.insert(Kind::Rupee);
         else if (name == "item") result.insert(Kind::Item);
         else if (name == "pose") result.insert(Kind::Pose);
+        else if (name == "dungeon") result.insert(Kind::Key);
         else return std::nullopt;
         if (comma == std::string_view::npos) break;
         text.remove_prefix(comma + 1);
@@ -400,8 +407,8 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
             }
             return result;
         };
-        constexpr std::array<std::pair<std::string_view, Point>, 9> points{{
-            {"item_give", Point::ItemGive},
+        constexpr std::array<std::pair<std::string_view, Point>, 10> points{{
+            {"item_give", Point::ItemGive}, {"rupee_add", Point::RupeeAdd},
             {"step_set", Point::StepSet}, {"step_apply", Point::StepApply},
             {"played_event", Point::PlayedEvent}, {"frame", Point::Frame},
             {"bit_read", Point::BitRead}, {"bit_set", Point::BitSet},
@@ -435,6 +442,7 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                                    : name == "bit_setter"  ? &profile.bit_setter
                                    : name == "rupee_entry" ? &profile.rupee_entry
                                    : name == "item_entry"  ? &profile.item_entry
+                                   : name == "int_add"     ? &profile.int_add
                                                            : nullptr;
                     const auto decoded = entry(item);
                     if (!target || !decoded) return std::nullopt;
@@ -462,6 +470,42 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                 for (const auto& item : value.at("names")) {
                     if (!item.is_string() || !ItemName(item.get<std::string>())) return std::nullopt;
                     profile.pickup_names.push_back(item.get<std::string>());
+                }
+            } else if (field == "give") {
+                // Generic gives: {"body": [lo, hi], "deny_callers": [...], "per_player": [names
+                // from a pickup caller], "never": [names from any caller]}.
+                if (!value.is_object() || !value.contains("body")) return std::nullopt;
+                for (const auto& [name, item] : value.items()) {
+                    if (name == "body") {
+                        if (!item.is_array() || item.size() != 2) return std::nullopt;
+                        const auto lo = offset(item[0]), hi = offset(item[1]);
+                        if (!lo || !hi || *hi <= *lo) return std::nullopt;
+                        profile.give_body = {*lo, *hi};
+                    } else if (name == "deny_callers") {
+                        if (!item.is_array() || item.size() > 32) return std::nullopt;
+                        for (const auto& at : item) {
+                            const auto decoded = offset(at);
+                            if (!decoded) return std::nullopt;
+                            profile.give_deny_callers.push_back(*decoded);
+                        }
+                    } else if (name == "per_player" || name == "never") {
+                        if (!item.is_array() || item.size() > 256) return std::nullopt;
+                        auto& names = name == "never" ? profile.give_never : profile.give_per_player;
+                        for (const auto& text : item) {
+                            if (!text.is_string() || !ItemName(text.get<std::string>())) return std::nullopt;
+                            names.push_back(text.get<std::string>());
+                        }
+                    } else {
+                        return std::nullopt;
+                    }
+                }
+                profile.give_all = true;
+            } else if (field == "rupee_callers") {
+                if (!value.is_array() || value.size() > 8) return std::nullopt;
+                for (const auto& item : value) {
+                    const auto at = offset(item);
+                    if (!at) return std::nullopt;
+                    profile.rupee_callers.push_back(*at);
                 }
             } else if (field == "event_got") {
                 const auto cell = Number(value, MaxModuleOffset);
@@ -691,7 +735,7 @@ std::optional<std::set<std::pair<Kind, u64>>> DecodeKeyPolicy(const Json& packet
     std::set<std::pair<Kind, u64>> keys;
     size_t count = 0;
     for (const auto& [name, values] : document.items()) {
-        if (name == "offsets") continue; // the private profile's module offsets (DecodeProfile)
+        if (name == "offsets" || name == "deny" || name == "dungeon") continue; // DecodeProfile / DecodeKeyExtras
         if (name != "bool" && name != "bit") return std::nullopt;
         const auto list = DecodeDenyList(values);
         if (!list || list->contains(0) || (count += values.size()) > StateLimit) return std::nullopt;
@@ -702,6 +746,51 @@ std::optional<std::set<std::pair<Kind, u64>>> DecodeKeyPolicy(const Json& packet
         }
     }
     return keys;
+}
+
+std::optional<KeyExtras> DecodeKeyExtras(const Json& document) {
+    KeyExtras extras;
+    if (!document.is_object()) return extras; // a legacy bare array has no extras
+    const auto u32_key = [](const Json& value) -> std::optional<u32> {
+        if (!Unsigned(value, std::numeric_limits<u32>::max()) || value.get<u64>() == 0) return std::nullopt;
+        return static_cast<u32>(value.get<u64>());
+    };
+    if (document.contains("deny")) {
+        const auto& deny = document.at("deny");
+        if (!deny.is_object()) return std::nullopt;
+        for (const auto& [name, list] : deny.items()) {
+            if (name != "bool" || !list.is_array() || list.size() > DenyLimit) return std::nullopt;
+            for (const auto& value : list) {
+                const auto key = u32_key(value);
+                if (!key) return std::nullopt;
+                extras.deny.insert(*key);
+            }
+        }
+    }
+    if (document.contains("dungeon")) {
+        const auto& dungeon = document.at("dungeon");
+        if (!dungeon.is_object()) return std::nullopt;
+        for (const auto& [name, list] : dungeon.items()) {
+            if (!list.is_array() || list.size() > 64) return std::nullopt;
+            if (name == "bool") {
+                for (const auto& value : list) {
+                    const auto key = u32_key(value);
+                    if (!key) return std::nullopt;
+                    extras.dungeon_bools.push_back(*key);
+                }
+            } else if (name == "keys") {
+                for (const auto& pair : list) {
+                    if (!pair.is_array() || pair.size() != 2) return std::nullopt;
+                    const auto total = u32_key(pair[0]), count = u32_key(pair[1]);
+                    if (!total || !count || *total == *count) return std::nullopt;
+                    extras.dungeon_keys.push_back({*total, *count});
+                }
+            } else {
+                return std::nullopt;
+            }
+        }
+    }
+    return extras;
 }
 
 bool State::Merge(const Change& change, bool deduplicate) {
@@ -716,6 +805,7 @@ bool State::Merge(const Change& change, bool deduplicate) {
     if (change.kind == Kind::Item) return ValidItem(change);
     if (denied.contains(change.key)) return false;
     if (change.kind == Kind::Rupee) return change.key != 0 && RupeeDelta(change.value);
+    if (change.kind == Kind::Key) return change.key != 0 && KeyGain(change.value);
     const auto key = std::pair{StorageKind(change.kind), change.key};
     const auto it = values.find(key);
     if (it == values.end() && values.size() >= StateLimit) return false;
@@ -747,6 +837,7 @@ bool State::Merge(const Change& change, bool deduplicate) {
         break;
     case Kind::Rupee:
     case Kind::Item:
+    case Kind::Key:
     case Kind::Pose:
         return false;
     }
@@ -797,6 +888,7 @@ bool ShouldApply(const Change& change, const State& observed) {
     }
     if (change.kind == Kind::Rupee) return change.key != 0 && RupeeDelta(change.value);
     if (change.kind == Kind::Item) return ValidItem(change);
+    if (change.kind == Kind::Key) return change.key != 0 && KeyGain(change.value);
     // Pouch totals require a save baseline/application receipt, not a comparison to inventory.
     return change.kind == Kind::PouchAdd && change.value > 0;
 }
@@ -834,7 +926,10 @@ struct Session::Impl {
     std::mutex guest_mutex;
     GuestBinding binding;
     std::unique_ptr<FrameDrain<Backend>> runtime;
-    u64 frame_thread{}, tick{}, rebinds{}, item_lines{}, item_waiting_logged{};
+    u64 frame_thread{}, tick{}, rebinds{}, item_lines{}, item_waiting_logged{}, rupee_lines{};
+    // Class dungeon (guest side, under guest_mutex): small-key Int pairs and their watches.
+    std::vector<DungeonKeys> dungeon_keys;
+    std::map<u32, KeyWatch> key_watch; // by total key
     bool stable_frame{};
     bool baseline_ready{};
     bool logged_class{};
@@ -1146,7 +1241,8 @@ bool Session::Impl::Receive(const Json& packet) {
         for (const auto& value : packet.at("changes")) {
             // A wallet delta is not state: a reconnect must never re-apply one.
             if (value.is_object() && value.contains("type") &&
-                (value.at("type") == "rupee_add" || value.at("type") == "item_give")) continue;
+                (value.at("type") == "rupee_add" || value.at("type") == "item_give" ||
+                 value.at("type") == "key_add")) continue;
             const auto change = DecodeChange(value, true);
             if (!change || !WireKind(change->kind)) return false;
             checkpoint.Merge(*change, false);
@@ -1256,8 +1352,8 @@ Session::~Session() = default;
 void Session::Stop() { impl->Stop(); }
 
 void Session::Observe(Change change) {
-    // Wallet deltas are grant-only in this pass: the local wallet is not observed or re-sent.
-    if (impl->stopped || !WireKind(change.kind) || change.kind == Kind::Rupee) return;
+    // Wallet deltas are observed only at the wallet entry's listed callers (ObserveRupee).
+    if (impl->stopped || !WireKind(change.kind)) return;
     if (change.kind == Kind::Item && !ValidItem(change)) return;
     std::scoped_lock lock{impl->mutex};
     if (impl->outgoing.size() >= QueueLimit || impl->next_seq > MaxSequence) {
@@ -1282,6 +1378,22 @@ void Session::ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory) {
         LOG_INFO(Core_ARM, "OoT co-op: {}", call.line);
     }
     if (call.forward) Observe(call.change);
+}
+
+void Session::ObserveRupee(Dynarmic::A64::Jit& jit) {
+    const auto call = ReadRupeeCall(jit, base, *profile, impl->binding.sentinel,
+                                    impl->allowed_classes.contains(Kind::Rupee));
+    if (impl->rupee_lines < 256) {
+        ++impl->rupee_lines;
+        LOG_INFO(Core_ARM, "OoT co-op: {}", call.line);
+    }
+    if (call.forward) Observe(call.change);
+}
+
+void Session::SetDungeonKeys(std::vector<DungeonKeys> keys) {
+    std::scoped_lock lock{impl->guest_mutex};
+    impl->dungeon_keys = std::move(keys);
+    impl->key_watch.clear();
 }
 
 bool Session::IsSentinel(u64 pc) const {
@@ -1340,6 +1452,10 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         ObserveItem(jit, memory);
         return false;
     }
+    if (point == OotGameDataTrace::Point::RupeeAdd) {
+        ObserveRupee(jit);
+        return false;
+    }
     if (point != OotGameDataTrace::Point::Frame || !thread) return false;
     if (!impl->frame_thread) impl->frame_thread = thread;
     if (impl->frame_thread != thread) return false;
@@ -1351,6 +1467,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         if (impl->ghost) impl->ghost->DropAll(log, "save or title: GameData moved");
         if (runtime.Rebind(backend, log)) {
             impl->stable_frame = false;
+            impl->key_watch.clear(); // a new save epoch: re-baseline the key counts
             if (impl->rebinds < 16) {
                 log(fmt::format("OoT co-op: manager moved {:#x} -> {:#x}; baseline re-bound", old,
                                 now.value_or(0)));
@@ -1381,6 +1498,26 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             if (!impl->remote.AdoptSeen(*seen)) runtime.Invalidate();
         } else {
             const auto& change = std::get<Change>(entry);
+            if (change.kind == Kind::Key) {
+                // One gain, two adds: the dungeon's total and its current count. The credit keeps
+                // our own watch from sending the gain back.
+                const auto pair = std::find_if(impl->dungeon_keys.begin(), impl->dungeon_keys.end(),
+                                               [&](const DungeonKeys& d) { return d.total == change.key; });
+                if (!impl->remote.Merge(change, !change.origin.empty())) continue;
+                Change count = change;
+                if (pair != impl->dungeon_keys.end()) count.key = pair->count;
+                if (pair == impl->dungeon_keys.end() || !runtime.Queue(change) || !runtime.Queue(count)) {
+                    if (!impl->logged_class) {
+                        log("OoT co-op: not applied: class/key policy disabled or queue full");
+                        impl->logged_class = true;
+                    }
+                    continue;
+                }
+                impl->key_watch[change.key].credit += change.value;
+                log(fmt::format("OoT co-op: key gain queued total={:08x} count={:08x} +{}", change.key,
+                                count.key, change.value));
+                continue;
+            }
             if (impl->remote.Merge(change, !change.origin.empty()) && !runtime.Queue(change) &&
                 !runtime.Suppress(change) && !impl->logged_class) {
                 log("OoT co-op: not applied: class/key policy disabled or queue full");
@@ -1400,6 +1537,25 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         impl->item_waiting_logged = impl->tick;
         log(fmt::format("OoT co-op: item give waiting name={} (event running, guard null or "
                         "not callable)", runtime.LastGrant()->name));
+    }
+    // Class dungeon: watch every dungeon's small-key pair; send a local gain as key_add.
+    if (runtime.BaselineReady() && impl->allowed_classes.contains(Kind::Key) &&
+        !runtime.Calling()) {
+        for (const auto& pair : impl->dungeon_keys) {
+            auto& watch = impl->key_watch[pair.total];
+            const auto total = backend.ReadInt(pair.total), count = backend.ReadInt(pair.count);
+            const bool first = !watch.total;
+            const s64 gain = watch.Step(total, count);
+            if (first && watch.total) {
+                log(fmt::format("OoT co-op: key baseline total={:08x}={} count={:08x}={}", pair.total,
+                                *watch.total, pair.count, *watch.count));
+            }
+            if (gain > 0 && KeyGain(gain)) {
+                log(fmt::format("OoT co-op: key gain observed total={:08x} now {} count {} +{}",
+                                pair.total, *watch.total, *watch.count, gain));
+                Observe(Change{Kind::Key, {}, 0, pair.total, gain});
+            }
+        }
     }
     if (runtime.BaselineReady()) {
         std::scoped_lock lock{impl->mutex};
@@ -1480,6 +1636,7 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
         const auto allowed = DecodeAllowClasses(Env("EDEN_NX2_OOT_COOP_ALLOW"));
         if (!allowed) throw std::runtime_error{"invalid grant class allow-list"};
         std::set<std::pair<Kind, u64>> keys;
+        std::vector<DungeonKeys> dungeon_keys;
         const auto keys_path = Env("EDEN_NX2_OOT_COOP_KEYS");
         if (!keys_path.empty()) {
             std::ifstream in{std::filesystem::path{keys_path}};
@@ -1491,6 +1648,23 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
             const auto list = parsed ? DecodeKeyPolicy(parsed->at("keys")) : std::nullopt;
             if (!list) throw std::runtime_error{"invalid key allow-list"};
             keys = *list;
+            const auto extras = DecodeKeyExtras(parsed->at("keys"));
+            if (!extras) throw std::runtime_error{"invalid key file deny/dungeon section"};
+            denied.insert(extras->deny.begin(), extras->deny.end());
+            if (allowed->contains(Kind::Key)) {
+                for (const u32 key : extras->dungeon_bools) keys.emplace(Kind::Bool, key);
+                for (const auto& pair : extras->dungeon_keys) {
+                    keys.emplace(Kind::Key, pair.total);
+                    keys.emplace(Kind::Key, pair.count);
+                }
+                dungeon_keys = extras->dungeon_keys;
+            }
+            if (!extras->deny.empty() || !extras->dungeon_keys.empty()) {
+                LOG_INFO(Loader, "OoT co-op: key file: {} per-player Bools denied; dungeon class {} "
+                                 "({} Bools, {} key pairs)", extras->deny.size(),
+                         allowed->contains(Kind::Key) ? "on" : "off", extras->dungeon_bools.size(),
+                         extras->dungeon_keys.size());
+            }
         }
         Hello hello;
         hello.build_id = std::string{build_id};
@@ -1504,6 +1678,7 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
         auto session = std::make_shared<Session>(kernel, owner, base, std::move(profile),
             *ParseEndpoint(endpoint_text),
             std::move(hello), std::move(denied), *allowed, std::move(keys));
+        session->SetDungeonKeys(std::move(dungeon_keys));
         std::scoped_lock lock{sessions_mutex};
         current_session = std::move(session);
     } catch (const std::exception& error) {

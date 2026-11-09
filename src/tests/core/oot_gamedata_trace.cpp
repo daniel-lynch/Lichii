@@ -983,3 +983,223 @@ TEST_CASE("OoT co-op reads the opener's give call and forwards only reviewed cal
     REQUIRE_FALSE(load({{"callers", {"0xC6F7E8"}}, {"names", {"../x"}}}));
     REQUIRE_FALSE(load({{"callers", {"0xC6F7E8"}}, {"names", {"Obj_Rupee_Green"}}, {"extra", 1}}));
 }
+
+TEST_CASE("OoT co-op generic give mode forwards every top-level give but the deny lists", "[oot_coop]") {
+    namespace Coop = Core::OotCoop;
+    constexpr u64 cell = Data + 0x100, text = Data + 0x200, sp = Data + 0x400;
+    constexpr u64 sentinel = Stop + 0x100;
+    TraceEnvironment env;
+    const auto set_name = [&](const std::string& name) {
+        for (size_t i = 0; i <= name.size(); ++i) env.bytes[text + i] = i < name.size() ? u8(name[i]) : 0;
+    };
+    set_name("Item_Test_Token");
+    env.Write64(cell, text);
+    env.Write64(sp, 0);
+    Dynarmic::A64::Jit jit{Config(env)};
+    jit.SetRegister(1, cell);
+    jit.SetRegister(2, 6);
+    jit.SetRegister(3, 1);
+    jit.SetRegister(4, 0);
+    for (int r : {5, 6, 7}) jit.SetRegister(r, 0);
+    jit.SetSP(sp);
+    auto profile = P::Get();
+    const u64 body = P::ItemEntry, end = P::ItemEntry + 0x5000;
+    const u64 unknown = 0x130004, put_away = 0x140004, pickup = 0x150004;
+    profile.pickup_callers = {pickup};
+    profile.pickup_names = {"Obj_Only_This"};
+    profile.give_all = true;
+    profile.give_body = {body, end};
+    profile.give_deny_callers = {put_away};
+    profile.give_per_player = {"Obj_Test_Heart"};
+    profile.give_never = {"Item_Test_SmallKey"};
+    const auto read = [&](u64 lr) {
+        jit.SetRegister(30, lr);
+        return Coop::ReadItemCall(jit, env, Base, profile, sentinel, true);
+    };
+    // A caller nobody listed (an NPC's flow, a sequence give): forwarded.
+    auto call = read(Base + unknown);
+    REQUIRE(call.forward);
+    REQUIRE(call.line.find("item-give observed name=Item_Test_Token") != std::string::npos);
+    // The chest flow caller still forwards.
+    REQUIRE(read(Base + P::ItemCaller).forward);
+    // A pickup forwards every name not denied (the allow list is not consulted).
+    call = read(Base + pickup);
+    REQUIRE(call.forward);
+    REQUIRE(call.line.find("item-give observed (pickup) name=Item_Test_Token") != std::string::npos);
+    // Nested: a sub-give returns inside the give itself; the receiver's replay recurses on its own.
+    call = read(Base + body + 0x1C2C);
+    REQUIRE_FALSE(call.forward);
+    REQUIRE(call.nested);
+    REQUIRE(call.line.find("item-give seen (nested) name=") != std::string::npos);
+    REQUIRE_FALSE(read(Base + end - 4).forward);
+    REQUIRE(read(Base + end).forward); // just past the body: an ordinary caller
+    // A per-player caller (put away, bottles, museum).
+    call = read(Base + put_away);
+    REQUIRE_FALSE(call.forward);
+    REQUIRE(call.line.find("(per-player caller)") != std::string::npos);
+    // A per-player name from a pickup caller (a refill drop); the same name from a chest is shared
+    // (a chest's ammo is its content, not a refill).
+    set_name("Obj_Test_Heart");
+    call = read(Base + pickup);
+    REQUIRE_FALSE(call.forward);
+    REQUIRE(call.line.find("item-give seen (pickup, per-player name) name=Obj_Test_Heart") != std::string::npos);
+    REQUIRE(read(Base + P::ItemCaller).forward);
+    // A never-shared name, from any caller (a dungeon item the dungeon class owns).
+    set_name("Item_Test_SmallKey");
+    call = read(Base + P::ItemCaller);
+    REQUIRE_FALSE(call.forward);
+    REQUIRE(call.line.find("(never shared)") != std::string::npos);
+    REQUIRE_FALSE(read(Base + pickup).forward);
+    // Our replay is never forwarded; the item class off forwards nothing.
+    set_name("Item_Test_Token");
+    REQUIRE(read(sentinel).replay);
+    REQUIRE_FALSE(read(sentinel).forward);
+    jit.SetRegister(30, Base + unknown);
+    REQUIRE_FALSE(Coop::ReadItemCall(jit, env, Base, profile, sentinel, false).forward);
+
+    // Key file: {"give": {"body": [lo, hi], "deny_callers": [...], "per_player": [...]}}.
+    const auto load = [](const nlohmann::json& give) {
+        return Coop::DecodeProfile(
+            nlohmann::json{{"offsets", {{"0123456789ABCDEF0123456789ABCDEF01234567",
+                                         {{"manager_cell", "0x200000"}, {"give", give}}}}}},
+            "0123456789ABCDEF0123456789ABCDEF01234567");
+    };
+    const auto loaded = load({{"body", {"0x113000", "0x118000"}}, {"deny_callers", {"0x140004"}},
+                              {"per_player", {"Obj_Test_Heart"}}, {"never", {"Item_Test_SmallKey"}}});
+    REQUIRE(loaded);
+    REQUIRE(loaded->give_all);
+    REQUIRE(loaded->give_body == std::array<u64, 2>{0x113000, 0x118000});
+    REQUIRE(loaded->give_deny_callers == std::vector<u64>{0x140004});
+    REQUIRE(loaded->give_per_player == std::vector<std::string>{"Obj_Test_Heart"});
+    REQUIRE(loaded->give_never == std::vector<std::string>{"Item_Test_SmallKey"});
+    REQUIRE_FALSE(load({{"deny_callers", {"0x140004"}}}));                // body is required
+    REQUIRE_FALSE(load({{"body", {"0x118000", "0x113000"}}}));             // empty range
+    REQUIRE_FALSE(load({{"body", {"0x113000", "0x118000"}}, {"extra", 1}})); // unknown field
+    REQUIRE_FALSE(load({{"body", {"0x113000", "0x118000"}}, {"per_player", {"no spaces"}}}));
+    REQUIRE_FALSE(load(nlohmann::json::array()));
+}
+
+TEST_CASE("OoT co-op observes a flow's positive wallet delta at the wallet entry", "[oot_coop]") {
+    namespace Coop = Core::OotCoop;
+    constexpr u64 sentinel = Stop + 0x100;
+    TraceEnvironment env;
+    Dynarmic::A64::Jit jit{Config(env)};
+    auto profile = P::Get();
+    const u64 reward = 0x160004;
+    profile.rupee_callers = {reward};
+    const auto read = [&](u64 lr, s32 delta, bool rupee_class = true) {
+        jit.SetRegister(1, static_cast<u32>(delta));
+        jit.SetRegister(2, 7);
+        jit.SetRegister(30, lr);
+        return Coop::ReadRupeeCall(jit, Base, profile, sentinel, rupee_class);
+    };
+    auto call = read(Base + reward, 20);
+    REQUIRE(call.forward);
+    REQUIRE(call.change.kind == Coop::Kind::Rupee);
+    REQUIRE(call.change.key == P::Wallet);
+    REQUIRE(call.change.value == 20);
+    REQUIRE(call.line.find("rupee-add observed delta=20 reason=7") != std::string::npos);
+    // A payment stays per-player; an unlisted caller (shop currency) is local; our replay echoes nothing.
+    call = read(Base + reward, -30);
+    REQUIRE_FALSE(call.forward);
+    REQUIRE(call.line.find("payment, per-player") != std::string::npos);
+    REQUIRE_FALSE(read(Base + reward + 0x40, 20).forward);
+    REQUIRE(read(sentinel, 20).replay);
+    REQUIRE_FALSE(read(sentinel, 20).forward);
+    REQUIRE_FALSE(read(Base + reward, 20, false).forward);
+    REQUIRE_FALSE(read(Base + reward, 1000).forward); // beyond the wire limit
+    // The trap point resumes the entry's first instruction.
+    REQUIRE(Trace::CoopPoint(Point::RupeeAdd));
+    REQUIRE(Trace::ReplacedInstruction(Point::RupeeAdd) == Trace::MovW8Pending);
+    jit.SetRegister(8, 0);
+    Trace::Resume(Point::RupeeAdd, jit, env);
+    REQUIRE(jit.GetRegister(8) == 0x3BD4);
+}
+
+TEST_CASE("OoT co-op small-key gain reads committed Ints and calls the Int add", "[oot_coop]") {
+    namespace Coop = Core::OotCoop;
+    constexpr u64 manager = Data, data = Data + 0x2000, hashes = Data + 0x3000;
+    constexpr u64 queue = Data + 0x4000, sentinel = Stop + 0x100;
+    constexpr u64 ints = Data + 0x5000, index = Data + 0x6000, iqueue = Data + 0x7000;
+    constexpr u64 int_add = 0x114000;
+    constexpr u32 total = 0x00000101, count = 0x00000202; // synthetic keys (capacity 8: slots 1, 2)
+    TraceEnvironment env;
+    for (u64 i = data; i < data + 0x30; ++i) env.bytes[i] = 0;
+    for (u64 i = hashes; i < hashes + 8 * 8; ++i) env.bytes[i] = 0;
+    for (u64 i = index; i < index + 8 * 8; ++i) env.bytes[i] = 0;
+    for (u64 i = ints; i < ints + 2 * 0x28; ++i) env.bytes[i] = 0;
+    for (u64 i = iqueue; i < iqueue + 4 * 0xC; ++i) env.bytes[i] = 0;
+    env.Write64(Base + P::ManagerCell, manager);
+    env.Write32(manager + 0x10, 2);
+    env.Write64(manager + 0x18, data);
+    env.Write64(manager + 0x20, hashes);
+    env.Write32(manager + 0x2C, 8);
+    env.Write32(manager + 0x30, 1);
+    env.Write64(manager + 0x38, queue);
+    env.Write32(manager + 0x40, 0);
+    env.Write64(queue, 0);
+    env.Write32(manager + 0xD0, 2);   // Int records
+    env.Write64(manager + 0xD8, ints);
+    env.Write64(manager + 0xE0, index);
+    env.Write32(manager + 0xEC, 8);
+    env.Write32(manager + 0xF0, 4);   // Int queue capacity, buffer, state
+    env.Write64(manager + 0xF8, iqueue);
+    env.Write32(manager + 0x100, 0);
+    env.Write32(index + (total % 8) * 8, total);
+    env.Write32(index + (total % 8) * 8 + 4, 0);
+    env.Write32(index + (count % 8) * 8, count);
+    env.Write32(index + (count % 8) * 8 + 4, 1);
+    env.Write32(ints + 0x1C, 3);         // total got 3
+    env.Write32(ints + 0x28 + 0x1C, 1);  // holding 1
+    auto profile = P::Get();
+    profile.int_add = {int_add, {Trace::Pacibsp, P::Nop}};
+    env.Code(Base + int_add, Trace::Pacibsp);
+    env.Code(Base + int_add + 4, P::Nop);
+    env.Code(sentinel, Trace::Breakpoint);
+    Coop::GuestBinding binding{Base, 0, 0, 0, sentinel, 0x20000000};
+    for (u64 i = binding.stack - 0x4000; i < binding.stack; ++i) env.bytes[i] = 0;
+    Dynarmic::A64::Jit jit{Config(env)};
+    u64 tls = 1, tls_ro = 2;
+    using Backend = Coop::GameDataBackend<Dynarmic::A64::Jit, TraceEnvironment>;
+    Backend backend{jit, env, binding, profile, tls, tls_ro, [] {}};
+    REQUIRE(backend.BindFromCell());
+    REQUIRE(backend.ReadInt(total) == 3);
+    REQUIRE(backend.ReadInt(count) == 1);
+    REQUIRE_FALSE(backend.ReadInt(0x303));
+    const Coop::Change gain{Coop::Kind::Key, "B", 1, total, 1};
+    Coop::FrameDrain<Backend> drain{{true, {Coop::Kind::Key}, {{Coop::Kind::Key, total}, {Coop::Kind::Key, count}}}};
+    std::vector<std::string> logs;
+    const auto send = [](Coop::Change, bool) { FAIL("a key gain is observed by the session's watch"); };
+    const auto log = [&](std::string_view line) { logs.emplace_back(line); };
+    drain.Frame(backend, {7, 9, 1, true}, send, log);
+    REQUIRE(drain.BaselineReady()); // no flag to poll: events only
+    SECTION("call shape and commit on return") {
+        jit.SetPC(Site(Point::Frame) + 4);
+        jit.SetSP(0x30000000);
+        const auto saved = *backend.Capture();
+        REQUIRE(drain.Queue(gain));
+        REQUIRE(drain.Frame(backend, {7, 9, 2, true}, send, log) == Coop::ApplyEvent::Started);
+        REQUIRE(jit.GetPC() == Base + int_add);
+        REQUIRE(jit.GetRegister(0) == manager);
+        REQUIRE(jit.GetRegister(1) == 1);
+        REQUIRE(jit.GetRegister(2) == total);
+        REQUIRE(jit.GetRegister(30) == sentinel);
+        REQUIRE(drain.Sentinel(backend, {7, 9, 2, true}, sentinel, log) == Coop::ApplyEvent::Returned);
+        REQUIRE(*backend.Capture() == saved);
+        REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) == Coop::ApplyEvent::Committed);
+        REQUIRE(std::count_if(logs.begin(), logs.end(), [](const auto& line) {
+            return line.find("applied class=key key=0000000000000101 value=1 path=call") != std::string::npos;
+        }) == 1);
+    }
+    SECTION("a key outside the dungeon list, a bad gain, a full queue or a changed entry blocks") {
+        REQUIRE_FALSE(drain.Queue({Coop::Kind::Key, "B", 2, 0x303, 1}));
+        REQUIRE_FALSE(drain.Queue({Coop::Kind::Key, "B", 3, total, 0}));
+        REQUIRE_FALSE(drain.Queue({Coop::Kind::Key, "B", 4, total, 33}));
+        env.Write32(manager + 0x100, 4);
+        REQUIRE_FALSE(backend.Resolve(gain));
+        env.Write32(manager + 0x100, 0);
+        REQUIRE(backend.Resolve(gain));
+        env.Code(Base + int_add + 4, 0);
+        REQUIRE_FALSE(backend.Resolve(gain));
+    }
+}

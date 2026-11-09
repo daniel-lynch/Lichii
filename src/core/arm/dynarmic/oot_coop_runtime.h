@@ -12,7 +12,7 @@ namespace Core::OotCoop {
 
 inline std::string_view ClassName(Kind kind) {
     return kind == Kind::Bit ? "bit" : kind == Kind::Rupee ? "rupee" : kind == Kind::Item ? "item"
-           : kind == Kind::Pose ? "pose" : "bool";
+           : kind == Kind::Pose ? "pose" : kind == Kind::Key ? "key" : "bool";
 }
 
 // The pouch manager is *(main + profile.pouch_cell). The wallet entry (profile.rupee_entry; x0 =
@@ -42,6 +42,8 @@ struct ItemCall {
     bool forward{}; ///< A give from a reviewed caller (a chest's event flow), well formed
     bool pickup{};  ///< From a world-pickup caller (forwarded only for the profile's names)
     bool replay{};  ///< Our own synthetic call (returns to the sentinel): never forwarded
+    bool nested{};  ///< Called from inside the give itself (sub-items): the replay recurses too
+    std::string why; ///< Why a top-level give was not forwarded ("per-player name", ...)
     std::string line;
 };
 
@@ -74,27 +76,77 @@ ItemCall ReadItemCall(Jit& jit, Memory& memory, u64 base, const OotGameDataTrace
                          static_cast<s64>(static_cast<s32>(jit.GetRegister(3)))};
     call.change.name = name;
     call.replay = sentinel && lr == sentinel;
-    const bool reviewed = std::find(profile.item_callers.begin(), profile.item_callers.end(), caller) !=
-                          profile.item_callers.end();
-    // World pickups: the collect path's give, forwarded only for the names that are shared
-    // (rupees, permanent items); hearts, magic and ammo drops stay per-player.
-    call.pickup = std::find(profile.pickup_callers.begin(), profile.pickup_callers.end(), caller) !=
-                  profile.pickup_callers.end();
-    const bool shared_pickup = call.pickup && std::find(profile.pickup_names.begin(),
-                                                        profile.pickup_names.end(), name) !=
-                                                  profile.pickup_names.end();
+    const auto listed = [](const auto& list, const auto& value) {
+        return std::find(list.begin(), list.end(), value) != list.end();
+    };
+    const bool reviewed = listed(profile.item_callers, caller);
+    // World pickups: the collect path's give. Allow-list mode (no "give" object): forwarded only
+    // for the names that are shared (rupees, permanent items).
+    call.pickup = listed(profile.pickup_callers, caller);
+    const bool shared_pickup = call.pickup && listed(profile.pickup_names, name);
+    call.nested = !call.replay && caller >= profile.give_body[0] && caller < profile.give_body[1];
     // Only calls whose small arguments survive the packing are forwarded.
     const bool valid = ValidItem(call.change) && w2 < 16 && x4 < 16 && w5 <= 0xFF && w6 <= 0xFF &&
                        w7 <= 0xFF && stack.has_value();
-    call.forward = item_class && !call.replay && (reviewed || shared_pickup) && valid;
-    call.line = fmt::format("item-give {}{} name={} category={} count={} get={} flags={},{},{},{} lr={}",
-                            call.replay ? "replayed" : call.forward ? "observed" : "seen",
-                            !call.pickup || call.replay ? ""
-                            : call.forward              ? " (pickup)"
-                            : shared_pickup             ? " (pickup, not forwarded)"
-                                                        : " (pickup, per-player)",
+    bool wanted = reviewed || shared_pickup;
+    if (profile.give_all) {
+        // Generic mode (Anchor's one hook): every top-level give, minus the explicit deny lists.
+        call.why = call.nested                                   ? "nested"
+                   : listed(profile.give_deny_callers, caller)   ? "per-player caller"
+                   : listed(profile.give_never, name)            ? "never shared"
+                   : call.pickup && listed(profile.give_per_player, name) ? "per-player name"
+                                                                 : "";
+        wanted = call.why.empty();
+    } else if (call.pickup && !shared_pickup) {
+        call.why = "per-player";
+    } else if (call.pickup && !item_class) {
+        call.why = "not forwarded";
+    } else if (!wanted) {
+        call.why = "unreviewed caller";
+    }
+    if (!valid && !call.replay && !call.nested && call.why.empty()) call.why = "malformed";
+    call.forward = item_class && !call.replay && !call.nested && wanted && valid;
+    const std::string_view tag = call.replay ? "" : call.nested ? " (nested)"
+                                 : call.pickup ? (call.forward ? " (pickup)" : "") : "";
+    call.line = fmt::format("item-give {}{}{} name={} category={} count={} get={} flags={},{},{},{} lr={}",
+                            call.replay ? "replayed" : call.forward ? "observed" : "seen", tag,
+                            call.forward || call.replay || call.nested ? std::string{}
+                            : call.why.empty() ? std::string{" (class off)"}
+                            : fmt::format(" ({}{})", call.pickup ? "pickup, " : "", call.why),
                             name.empty() ? "?" : name, w2, static_cast<s32>(jit.GetRegister(3)), x4,
                             w5, w6, w7, args.flags[3],
+                            call.replay ? std::string{"sentinel"} : fmt::format("main+{:#x}", caller));
+    return call;
+}
+
+/// A wallet-entry call (x0 = pouchMgr, w1 = signed delta, w2 = reason) read at its first
+/// instruction: forwarded when it is a positive delta from a listed caller (a flow's reward) and not
+/// our own replay. Payments and every unlisted caller (shop currency, the give's own path) stay local.
+struct RupeeCall {
+    Change change;
+    bool forward{};
+    bool replay{};
+    std::string line;
+};
+
+template <typename Jit>
+RupeeCall ReadRupeeCall(Jit& jit, u64 base, const OotGameDataTrace::Profile& profile, u64 sentinel,
+                        bool rupee_class) {
+    RupeeCall call;
+    const u64 lr = jit.GetRegister(30);
+    const u64 caller = lr >= base ? lr - base : 0;
+    const s64 delta = static_cast<s32>(jit.GetRegister(1));
+    call.replay = sentinel && lr == sentinel;
+    call.change = Change{Kind::Rupee, {}, 0, profile.wallet_hash, delta};
+    const bool listed = std::find(profile.rupee_callers.begin(), profile.rupee_callers.end(),
+                                  caller) != profile.rupee_callers.end();
+    call.forward = rupee_class && !call.replay && listed && profile.wallet_hash && delta > 0 &&
+                   RupeeDelta(delta);
+    call.line = fmt::format("rupee-add {} delta={} reason={} lr={}",
+                            call.replay ? "replayed" : call.forward ? "observed"
+                            : !listed ? "seen (unlisted caller)" : delta <= 0 ? "seen (payment, per-player)"
+                                                                 : "seen (class off)",
+                            delta, static_cast<u32>(jit.GetRegister(2)),
                             call.replay ? std::string{"sentinel"} : fmt::format("main+{:#x}", caller));
     return call;
 }
@@ -239,6 +291,20 @@ public:
                                {*pouch, static_cast<u32>(static_cast<s32>(change.value)), RupeeReason}};
         }
         if (change.kind == Kind::Item) return ResolveItem(change);
+        if (change.kind == Kind::Key) {
+            // The game's own GameData Int add (a queued add record, like the Bool setter's write).
+            if (!KeyGain(change.value) || !change.key || change.key > 0xFFFFFFFFULL ||
+                !binding.manager || !Callable() || !ReadInt(static_cast<u32>(change.key))) return {};
+            const auto entry = Verified(profile.int_add);
+            const auto capacity = Read32(memory, binding.manager + 0xF0);
+            const auto state = Read32(memory, binding.manager + 0x100);
+            const auto buffer = Read64(memory, binding.manager + 0xF8);
+            if (!entry || !capacity || !state || !buffer || !*capacity || *capacity > 0xFFFFF ||
+                (*state & 0xFFFFF) >= *capacity || !Range(*buffer, u64{*capacity} * 0xC)) return {};
+            return ApplyTarget{true, false, 0, 0, *entry, binding.sentinel, binding.stack,
+                               {binding.manager, static_cast<u32>(static_cast<s32>(change.value)),
+                                change.key}};
+        }
         if (!ReadFlag(change).has_value() || !Callable()) return {};
         const bool flat = change.kind == Kind::Bool;
         const auto entry = Verified(flat ? profile.bool_setter : profile.bit_setter);
@@ -250,6 +316,35 @@ public:
             (*state & 0xFFFFF) >= *capacity || !Range(queue, u64{*capacity} * 8)) return {};
         return ApplyTarget{true, false, 0, 0, *entry, binding.sentinel,
                            binding.stack, {binding.manager, 1, change.key}};
+    }
+
+    /// A committed GameData Int (the scalar table: index slots {key, idx} at manager+0xE0 with
+    /// capacity +0xEC, records of 0x28 bytes at +0xD8 with the value at +0x1C, count +0xD0). Queued
+    /// writes are not folded in: a change shows here once the game has committed it.
+    std::optional<s32> ReadInt(u32 key) {
+        using namespace OotGameDataTrace::Detail;
+        if (!key || !binding.manager) return {};
+        const u64 m = binding.manager;
+        const auto table = Read64(memory, m + 0xE0);
+        const auto capacity = Read32(memory, m + 0xEC);
+        const auto count = Read32(memory, m + 0xD0);
+        const auto data = Read64(memory, m + 0xD8);
+        if (!table || !capacity || !count || !data || !*table || !*capacity || *capacity > 2'000'000 ||
+            !*count || *count > 1'000'000 || !Range(*table, u64{*capacity} * 8) ||
+            !Range(*data, u64{*count} * 0x28)) return {};
+        u32 slot = key % *capacity;
+        for (u32 probe = 0; probe < std::min(*capacity, 64U); ++probe) {
+            const u64 address = *table + u64{slot} * 8;
+            const u32 found = memory.Read32(address);
+            if (!found) return {};
+            if (found == key) {
+                const u32 index = memory.Read32(address + 4);
+                if (index >= *count) return {};
+                return static_cast<s32>(memory.Read32(*data + u64{index} * 0x28 + 0x1C));
+            }
+            slot = (slot + 1) % *capacity;
+        }
+        return {};
     }
 
     /// Is the game where a give may run: no event in progress and every guard pointer live?
@@ -425,7 +520,7 @@ public:
         // Read the complete reviewed set before publishing any baseline or changing the guest.
         std::vector<std::pair<Change, bool>> values;
         for (const auto& [kind, key] : policy.keys) {
-            if (!policy.classes.contains(kind)) continue;
+            if (!policy.classes.contains(kind) || EventKind(kind)) continue; // events: no flag to poll
             Change change{kind, {}, 0, key, 1};
             const auto value = backend.ReadFlag(change);
             if (!value) {

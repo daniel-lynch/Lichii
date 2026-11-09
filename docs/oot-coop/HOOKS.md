@@ -249,6 +249,33 @@ or `"0x..."` strings; unknown fields reject the file.
   by origin/sequence on the receiver, never folded into state) and is replayed through the same
   give call, which adds the rupees to the receiver's wallet the way the chest's own nested
   rupee give does. The receiver does not get the pickup's HUD/notification call (next pass).
+- `give` (optional, C13: **generic gives**, Anchor's one-hook model): `{"body": [<offset>, <offset>],
+  "deny_callers": [<offset>, ...], "per_player": [<item>, ...], "never": [<item>, ...]}`. With it, a
+  give from **any** caller is forwarded, except:
+  - our own replay (returns to the sentinel), as before;
+  - a **nested** give, whose return address lies inside the give routine itself (`body` = its
+    [start, end)): the bag's sub-items, a rupee chest's inner wallet give. The receiver's replay of
+    the outer give recurses the same way, so forwarding these would double them;
+  - a **per-player caller** (`deny_callers`): the sequence give (initialisation: default tunics and
+    the wallet are pushed by the game's sequence at file start and at an age change), putting a
+    held item away, the bottle wrapper and the enemy museum's swaps;
+  - a **per-player name** from a pickup caller (`per_player`): world refill drops (recovery hearts,
+    ammo, magic, fairies, silver rupees). The same name from a chest or a shop is the check's
+    content and is shared;
+  - a name **never shared** from any caller (`never`): dungeon items, which the `dungeon` class owns
+    (a replayed key give would add a key that the receiver's key watch would then send back).
+  The pickup `names` allow list is then not consulted (`pickup.callers` still label the line).
+  Log reasons: `item-give seen (nested|per-player caller|never shared|pickup, per-player name) ...`.
+  Without `give`, the allow-by-site rules above apply unchanged (older key files).
+- `rupee_callers` (optional, class `rupee`) and site kind `rupee_add` (the wallet entry's first word,
+  `mov w8, #0x3bd4`, resumed by `Resume`): a flow's **reward** is a wallet-entry call, not a give
+  (NPC prizes, minigame winnings). A **positive** delta from a listed return address is sent as
+  `rupee_add` and replayed on the receiver through the same entry; payments (negative), the shop's
+  currency change and every other caller stay per-player (`rupee-add seen (...)`). A give's own
+  rupee path adds to the wallet inline and never reaches the entry, so a chest's rupees are not
+  counted twice.
+- `entries.int_add` (class `dungeon`): the GameData Int add (`x0` = manager, `w1` = delta, `w2` =
+  key; a queued add record, like the Bool setter's write). Small-key gains are applied with it.
 - `item_give` is a site kind too (the give entry's `pacibsp`); co-op traps it whenever the profile
   names it, logging each give (`item-give observed|seen|replayed ...`, at most 256 lines).
 - `event_got` is the GOT slot of the event manager's cell; a give waits while
@@ -270,7 +297,7 @@ or `"0x..."` strings; unknown fields reject the file.
 
 - `EDEN_NX2_OOT_COOP=1`: enable loopback transport, default `127.0.0.1:43390`;
   `EDEN_NX2_OOT_COOP_RELAY=host:port` overrides it. The older `COOP=host:port` form works.
-- `EDEN_NX2_OOT_COOP_ALLOW`: comma-separated `bool`, `bit`, `rupee`, `item` and `pose` tokens, no spaces or empty
+- `EDEN_NX2_OOT_COOP_ALLOW`: comma-separated `bool`, `bit`, `rupee`, `item`, `pose` and `dungeon` tokens, no spaces or empty
   tokens. Default is the **empty set**. Invalid tokens reject session creation.
   The old `ALLOW_CLASSES` variable is no longer consulted.
 - `EDEN_NX2_OOT_COOP_KEYS`: JSON policy with typed arrays, for example
@@ -289,6 +316,27 @@ python3 -I tools/oot/coop/chest_keys.py "$GAMEDATA_JSON" --struct <hash> --keys 
 Source: `GameData__GameDataList.Product.110.byml`, `Data.Struct` entry `Hash=<hash>`,
 `DefaultValue[].{Hash,Value}`. The generator verifies distinct members/backing keys and
 that each backing key is in `Data.Bool` with ResetTypeValue 24 and SaveFileIndex 0.
+
+**C13 key-file sections** (both optional; older binaries reject a file that has them, so they ship
+in a separate file):
+
+- `"deny": {"bool": [<hash>, ...]}` (up to 16384): **per-player Bools**, never shared even when an
+  allow list names them; merged into the session's deny set (protocol state drops them too). The
+  private generator derives it from the GameDataList, mapping Anchor's deny list to this game:
+  not saved at all (SaveFileIndex -1); any ResetTypeValue bit other than the two that persisted
+  checks carry (area/banc reset, time of day, minigame retry); cutscene and first-get presentation
+  (`HavePlayedEvent.*`, `HavePlayedGetEvent.*`, Navi balloons), UI/sequence state; and Anchor's
+  positional keys by name (water levels, elevators and lifts, the collapsing tower, event timers).
+- `"dungeon": {"bool": [<hash>, ...], "keys": [[<total>, <count>], ...]}`, class `dungeon`:
+  - map, compass and boss key are GameData Bools (each dungeon's info struct members): with
+    `dungeon` on they join the reviewed Bool set and travel as ordinary `bool_set` (OR, monotonic;
+    needs `bool` too);
+  - small keys: each dungeon's total-got Int and current-count Int. The frame drain reads both
+    (committed values of the scalar Int table) every frame after the baseline. A **gain** is the
+    larger rise of the two since the last frame, minus the credit of our own applied gains; it is
+    sent as `key_add {hash: <total>, delta: n}`. A drop of the count (a key spent on a door) is
+    never sent. The receiver applies a gain as two Int adds (count += n, total += n) and adds n to
+    the credit so its own watch does not send it back. Rule and reasons: PROTOCOL.md "Small keys".
 
 The observer consults the engine's class/key receipts before emitting any value.
 Receipts survive queueing, host worker changes, sentinel return, delayed commit,

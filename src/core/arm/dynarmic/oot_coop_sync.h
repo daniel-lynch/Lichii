@@ -32,7 +32,20 @@ inline constexpr size_t QueueLimit = 4096;
 inline constexpr size_t StateLimit = 4096;
 
 // Pose is a class token only (EDEN_NX2_OOT_COOP_ALLOW "pose"): poses are never grants or state.
-enum class Kind { Bool, Int, Enum, Quest, Bit, PouchAdd, PouchTotal, Rupee, Item, Pose };
+enum class Kind { Bool, Int, Enum, Quest, Bit, PouchAdd, PouchTotal, Rupee, Item, Pose, Key };
+
+// Small keys (class "dungeon", wire "key_add"): a dungeon's key GAINS, as an additive event like a
+// wallet delta. key = the dungeon's total-keys-ever-got Int key (from the private key file), value =
+// the gain. The receiver adds the gain to that total and to the dungeon's current key count.
+// Spending stays per-player (see PROTOCOL.md "Small keys").
+inline constexpr s64 KeyGainLimit = 32;
+[[nodiscard]] constexpr bool KeyGain(s64 delta) { return delta >= 1 && delta <= KeyGainLimit; }
+
+/// One dungeon's keys: the total-got Int (observed, the wire key) and the current count Int.
+struct DungeonKeys {
+    u32 total{};
+    u32 count{};
+};
 
 // Wallet deltas (class "rupee"): an additive event, never state. The key is the wallet's GameData
 // hash from the private profile; the wire accepts any non-zero 32-bit key and the receiver's
@@ -82,7 +95,9 @@ struct Change {
 [[nodiscard]] std::optional<u32> FrameLength(std::string_view header);
 [[nodiscard]] bool WireKind(Kind kind);
 /// An additive event (wallet delta, item give): applied once per origin/sequence, never state.
-[[nodiscard]] constexpr bool EventKind(Kind kind) { return kind == Kind::Rupee || kind == Kind::Item; }
+[[nodiscard]] constexpr bool EventKind(Kind kind) {
+    return kind == Kind::Rupee || kind == Kind::Item || kind == Kind::Key;
+}
 /// A well-formed item give: name, count 1..999, category and get type below 16, top bits clear.
 [[nodiscard]] bool ValidItem(const Change& change);
 [[nodiscard]] std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text);
@@ -119,6 +134,43 @@ struct Hello {
 [[nodiscard]] std::optional<std::set<std::pair<Kind, u64>>> DecodeKeyPolicy(
     const nlohmann::json& packet);
 
+/// The key file's optional C13 sections (DecodeKeyPolicy skips them):
+///   "deny": {"bool": [keys]}   per-player Bools, never shared (merged into the deny set)
+///   "dungeon": {"bool": [keys], "keys": [[total, count], ...]}
+///     map/compass/boss-key Bools (added to the reviewed Bool set when class dungeon is on; they
+///     travel as bool_set) and each dungeon's small-key Int pair (class dungeon, key_add)
+struct KeyExtras {
+    std::set<u64> deny;
+    std::vector<u32> dungeon_bools;
+    std::vector<DungeonKeys> dungeon_keys;
+};
+inline constexpr size_t DenyLimit = 16384;
+[[nodiscard]] std::optional<KeyExtras> DecodeKeyExtras(const nlohmann::json& document);
+
+/// Small-key observation for one dungeon: a gain is the larger rise of its total and its count
+/// since the last frame, minus what our own applied key_add events explain (the credit).
+struct KeyWatch {
+    std::optional<s32> total, count;
+    s64 credit{};
+    /// The gain to forward now (0: none). Unreadable values reset the watch (no forward).
+    s64 Step(std::optional<s32> new_total, std::optional<s32> new_count) {
+        if (!new_total || !new_count) {
+            total.reset();
+            count.reset();
+            return 0;
+        }
+        s64 gain = 0;
+        if (total && count) {
+            gain = std::max<s64>({0, s64{*new_total} - *total, s64{*new_count} - *count});
+        }
+        total = new_total;
+        count = new_count;
+        const s64 explained = std::min(gain, credit);
+        credit -= explained;
+        return gain - explained;
+    }
+};
+
 using HighWater = std::map<std::string, u64, std::less<>>;
 
 // Protocol state only. A successful Merge does NOT mean anything was applied to the guest.
@@ -151,6 +203,8 @@ public:
               Memory::Memory& memory, u64 thread, u64& tls, u64& tls_ro,
               std::function<void()> clear_exclusive);
     bool IsSentinel(u64 pc) const;
+    /// Class dungeon: the small-key Int pairs to watch and apply (from the key file).
+    void SetDungeonKeys(std::vector<DungeonKeys> keys);
     Kernel::KProcess* const owner;
     const u64 base;
     const std::shared_ptr<const OotGameDataTrace::Profile> profile; ///< Never null
@@ -158,6 +212,8 @@ public:
 private:
     /// The give-to-pouch entry trapped on this (opener's) game: log it, forward chest gives.
     void ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory);
+    /// The wallet entry trapped here: forward a listed caller's positive delta (class rupee).
+    void ObserveRupee(Dynarmic::A64::Jit& jit);
     struct Impl;
     /// Class "pose": send our pose, draw the peers' ghosts (one call at most, after the grants).
     template <typename Backend, typename Log>

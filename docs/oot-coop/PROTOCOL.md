@@ -160,6 +160,26 @@ or derive them from the guest. Guest scene/save-loaded discovery remains unimple
 A disconnect sends `state:{"online":false}`. Presence is scoped to the team, not the
 entire room. `heartbeat` and `heartbeat_ack` have only `type`.
 
+## Small keys, dungeon items and per-player flags (C13)
+
+- `key_add {origin, seq, hash, delta}`: a dungeon's small-key **gain** (`delta` 1..32), `hash` = that
+  dungeon's total-keys-got Int key (private key file). An event like `rupee_add`/`item_give`:
+  deduplicated by origin/sequence, kept in the relay's replay window, never folded into team state,
+  never in a snapshot. Class token `dungeon`.
+- **Rule: gains are shared, spending is per-player.** Anchor shares the absolute count as last
+  writer wins, on pickup and on use. That converges only if door unlocks are shared too, and it
+  loses a key when two players pick up (or one picks up while the other spends) within a round trip.
+  Here the door state of a dungeon is a per-actor flag that is not in the reviewed list, so a shared
+  spend would leave the other player's door locked with one key fewer: a soft lock. A shared gain is
+  safe either way: a chest's key is taken once by the team (its chest Bool is shared), so the other
+  player must be credited, and a surplus key can never block progress. Each gain is exact under
+  concurrency because it is a delta with its own origin/sequence. Cost: a player whose door was
+  opened by the peer (if door flags are ever shared) keeps an extra key; a late joiner gets no
+  earlier gains (the same gap as item gives).
+- Map, compass and boss key are Bools (`bool_set`, OR). The give path never carries them (the key
+  file's `give.never`), so nothing is counted twice.
+- Per-player Bools (`deny.bool`) are dropped by the client's protocol state and never applied.
+
 ## Poses (class `pose`, v3)
 
 A pose is a peer's live position, sent so the others can draw a ghost of it. It is **not a
