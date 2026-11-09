@@ -325,7 +325,13 @@ Work Reconciler::Step(const std::array<Observation, SlotCount>& o, const Names& 
             return {};
         }
         const bool base_tunic = s == Slot::Tunic && id == 0 && !v.child;
-        if (!base_tunic && (!v.child || v.child->name != name->target)) return {Action::Create, s, id};
+        deferred[i] = false;
+        if (!base_tunic && (!v.child || v.child->name != name->target)) {
+            // Into an empty static slot is proved (the private default head); over another child it
+            // is not, except the normal-upper wrapper path, which removes rather than creates.
+            if (i >= 2 && v.child && !(s == Slot::Tunic && id == 0)) { deferred[i] = true; continue; }
+            return {Action::Create, s, id};
+        }
         if (s == Slot::Sword && (!o[5].child || o[5].child->name != name->sheath || !o[5].idle)) {
             if (++r.updates >= 300) { quarantined = true; return {Action::Quarantine, s}; }
             return {};
@@ -562,6 +568,8 @@ bool Controller::Frame(Port& p, const std::vector<Root>& roots, std::string_view
         if (t.reconcile.Desired().boots != 0 && t.reconcile.Desired().boots != 3 && !std::exchange(t.boots_logged, true))
             dump(p, t, "boots deferred (no guarded lower-body request)");
         const auto w = t.reconcile.Step(t.observed, names, t.token.age, true, keys->recreate_none);
+        if ((t.reconcile.Deferred(Slot::Tunic) || t.reconcile.Deferred(Slot::Head)) && !std::exchange(t.deferred_logged, true))
+            dump(p, t, "static replacement deferred (occupied slot; no proved replace/remove)");
         if (w.action == Action::Quarantine || w.action == Action::Recreate) {
             retire(p, t, w.action == Action::Recreate, w.action == Action::Recreate ? "none retire/recreate" : "timeout/quarantined");
             continue;
@@ -755,8 +763,11 @@ void Controller::Returned(Port& p, u64 result) {
         if (child != done.child || !child || !Related(p, k, base, tree->token.actor, child->actor) ||
             ReadLink(p, k, child->link, &*child) != child) return;
         const u8 actual = result <= 2 ? static_cast<u8>(result) : 3;
-        if (tree->queried[done.slot] != child || tree->observed[done.slot].actual != actual)
+        auto& receipt = tree->receipts[done.slot];
+        if (!receipt || receipt->first != *child || receipt->second != actual) {
+            receipt.emplace(*child, actual);
             dump(p, *tree, fmt::format("actual state receipt slot={} state={}", SlotNames[done.slot], actual));
+        }
         tree->observed[done.slot].actual = actual;
         tree->queried[done.slot] = child;
         tree->query_ticks[done.slot] = tick;

@@ -127,11 +127,15 @@ public:
     bool Quarantined() const { return quarantined; }
     const Appearance& Desired() const { return desired; }
     bool WantsNone() const;
+    /// A static slot (tunic/head) holds another child: replacing it is unproved (field C15: the
+    /// request is accepted and never applied), so it is deferred rather than issued.
+    bool Deferred(Slot slot) const { return deferred[static_cast<size_t>(slot)]; }
 private:
     struct Request { bool pending{}; u8 id{}; u32 old_generation{0xffffffffU}; u32 updates{}; Action action{}; };
     Appearance desired;
     std::optional<u16> sequence;
     std::array<Request, SlotCount> requests{};
+    std::array<bool, SlotCount> deferred{};
     bool quarantined{};
 };
 std::array<u64, 8> Arguments(const Keys& keys, Work work, u64 equipment, u64 cell);
@@ -180,9 +184,10 @@ private:
         std::array<Observation, SlotCount> observed{};
         std::array<std::optional<Child>, SlotCount> queried{};
         std::array<u64, SlotCount> query_ticks{};
+        std::array<std::optional<std::pair<Child, u8>>, SlotCount> receipts{}; ///< last logged state
         std::vector<Child> children; ///< every validated child, parked once on retirement
         size_t parked{};
-        bool retired{}, recreate{}, none_logged{}, boots_logged{};
+        bool retired{}, recreate{}, none_logged{}, boots_logged{}, deferred_logged{};
         u64 retired_tick{};
     };
     enum class Call { None, LocalState, Work, Park };

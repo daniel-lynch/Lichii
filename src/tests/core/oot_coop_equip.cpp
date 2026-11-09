@@ -733,3 +733,28 @@ TEST_CASE("Equipment treats a request bit without a child as in flight", "[core]
     fixture.UntilCall();
     REQUIRE(fixture.calls.back().entry == ControllerFixture::CreateEntry);
 }
+
+TEST_CASE("Equipment defers replacing an occupied static slot", "[core][oot_coop][equip]") {
+    Equip::Reconciler reconcile;
+    Equip::Appearance appearance{0, 0, 0, 0, 3, 3, 1, 0, 0}; // child, no weapons, mask 1
+    REQUIRE(reconcile.Desired(Packet(appearance), 0));
+    auto observations = Empty();
+    const auto names = Names();
+    // Empty head slot: the mask is created.
+    auto work = reconcile.Step(observations, names, 0, true, false);
+    REQUIRE(work.action == Action::Create);
+    REQUIRE(work.slot == Slot::Head);
+    // Occupied by the default head: no replacement request, the slot is reported deferred.
+    observations = Empty();
+    Child(observations, Slot::Head, "PrivateF");
+    reconcile = {};
+    REQUIRE(reconcile.Desired(Packet(appearance), 0));
+    REQUIRE(reconcile.Step(observations, names, 0, true, false).action == Action::None);
+    REQUIRE(reconcile.Deferred(Slot::Head));
+    for (unsigned i = 0; i < 400; ++i) REQUIRE(reconcile.Step(observations, names, 0, true, false).action == Action::None);
+    REQUIRE_FALSE(reconcile.Quarantined());
+    appearance.mask = 0; // back to the default head the slot already holds
+    REQUIRE(reconcile.Desired(Packet(appearance, 2), 0));
+    REQUIRE(reconcile.Step(observations, names, 0, true, false).action == Action::None);
+    REQUIRE_FALSE(reconcile.Deferred(Slot::Head));
+}
