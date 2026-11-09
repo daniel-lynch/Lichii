@@ -45,6 +45,9 @@ Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CT
                             what later pose streams (posecircle, posepath) carry: an eq32 word (eqseq
                             tracks known changes) and the age; off = no equipment fields
   posestop                  stop the stream; result has how many poses it sent
+  holdout SECS              kick other clients and refuse their hellos for SECS
+  badmod HEX                probe a second client with this mod hash; return ack or error reason
+  catchup                   return count and (origin, seq, rev, type, name) of ledger grants
   kick                      close the relay's connection to every other client (the emulator), as a
                             network drop would; the peer itself stays connected
   poses [N]                 the last N (default 20) poses received from other origins, and the total
@@ -81,12 +84,20 @@ class FakePeer:
     """Relay + one scripted client in one event loop. `port=0` picks an ephemeral port."""
 
     def __init__(self, *, port=43390, room="default", team="default", policy="or-v2", seed="0",
-                 name="FakePeer", build_id=client_sim.BUILD_ID, record=None, wallet=0, anim_table=None):
-        self.relay = relay_mod.Relay()
+                 name="FakePeer", build_id=client_sim.BUILD_ID, record=None, wallet=0, anim_table=None, mod_hash=None, state_file=None):
+        self.relay = relay_mod.Relay(state_file=state_file)
+        self.holdout_until = 0.0
+        self.badmod_count = 0
+        join = self.relay.join
+        def held_join(client, packet):
+            if time.monotonic() < self.holdout_until and packet.get("client_id") != self.client.hello["client_id"]:
+                raise relay_mod.ProtocolError("held out (test)")
+            return join(client, packet)
+        self.relay.join = held_join
         self.port = port
         self.client = client_sim.ClientSim(room=room, team=team, name=name, build_id=build_id,
                                            seed_hash=seed, policy_id=policy,
-                                           animation=client_sim.animation_descriptor(anim_table))
+                                           animation=client_sim.animation_descriptor(anim_table), mod_hash=mod_hash)
         self.client.hello["ghost_equipment_v2"] = True
         self.equipment_seq = 0
         self.equipment_known = {}
@@ -440,7 +451,38 @@ class FakePeer:
             self.stream_sent = 0
             self.stream = asyncio.create_task(self.path(banc, points, hz, speed))
             return {"started": {"banc": banc, "points": points, "hz": hz, "speed": speed}}
-        if verb == "kick":
+        if verb == "catchup":
+            # listen() owns the client's receive queue; use its predicate waiters.
+            grants, after = [], 0
+            while True:
+                waiter = asyncio.create_task(self.wait(lambda p: p["type"] == "catchup", 5, len(self.seen)))
+                await asyncio.sleep(0)
+                await self.client.send({"type": "catchup_request", "after": after})
+                page = await waiter
+                grants.extend(page["grants"])
+                if not page["more"]:
+                    return {"count": len(grants), "grants": [[p["origin"], p["seq"], p["rev"], p["type"], p.get("name", "-")] for p in grants]}
+                if not page["grants"] or len(grants) > 16384:
+                    raise ValueError("invalid catchup progress")
+                after = page["grants"][-1]["rev"]
+        if verb == "badmod":
+            self.badmod_count += 1
+            h = self.client.hello
+            probe = client_sim.ClientSim(f"badmod-{self.badmod_count}", room=h["room"], team=h["team"],
+                build_id=h["build_id"], seed_hash=h["seed_hash"], policy_id=h["policy_id"], mod_hash=words[1])
+            try:
+                await probe.connect("127.0.0.1", self.port)
+                return {"result": probe.ack}
+            except ValueError as exc:
+                return {"result": str(exc)}
+            finally:
+                await probe.close()
+        if verb in ("kick", "holdout"):
+            if verb == "holdout":
+                seconds = float(words[1])
+                if not math.isfinite(seconds) or seconds < 0:
+                    raise ValueError("invalid holdout duration")
+                self.holdout_until = time.monotonic() + seconds
             me, kicked = self.client.hello["client_id"], []
             for client in list(self.relay.clients):
                 if getattr(client, "client_id", None) not in (None, me):
@@ -473,7 +515,7 @@ async def serve(args):
     commands.touch()
     peer = FakePeer(port=args.port, room=args.room, team=args.team, policy=args.policy, seed=args.seed,
                     name=args.name, build_id=args.build_id, record=ctl / "received.jsonl",
-                    wallet=args.wallet, anim_table=args.anim_table)
+                    wallet=args.wallet, anim_table=args.anim_table, mod_hash=args.mod_hash, state_file=args.state_file)
     port = await peer.start()
     print(f"fake peer ready on 127.0.0.1:{port} room={args.room} team={args.team}", flush=True)
     done = len(commands.read_text().splitlines())
@@ -513,6 +555,8 @@ def main():
     parser.add_argument("--anim-table", help="private coop-anim.json sidecar; enables v4 animation negotiation")
     parser.add_argument("--wallet", type=lambda text: int(text, 0), default=0,
                         help="wallet GameData key for rupee_add (from the private profile)")
+    parser.add_argument("--mod-hash", type=relay_mod.mod_hash)
+    parser.add_argument("--state-file", type=Path, help="optional relay campaign persistence")
     args = parser.parse_args()
     try:
         asyncio.run(serve(args))
