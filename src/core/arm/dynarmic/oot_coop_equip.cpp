@@ -723,7 +723,11 @@ void Controller::Returned(Port& p, u64 result) {
         }
         const auto e = equipment(p, found->actor, false);
         if (!e) { player.reset(); local_packet.reset(); return; }
-        if (player != found || player_equipment != *e) { absent_samples = {}; local_children = {}; }
+        if (player != found || player_equipment != *e) {
+            absent_samples = {}; local_children = {};
+            p.log(fmt::format("OoT co-op: equipment local player actor={:#x} id={:#x} name={} E={:#x}",
+                found->actor, found->generation, std::string_view{found->name}, *e));
+        }
         player = found;
         player_equipment = *e;
         snapshot(p);
