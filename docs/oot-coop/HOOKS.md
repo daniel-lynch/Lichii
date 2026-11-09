@@ -274,6 +274,25 @@ or `"0x..."` strings; unknown fields reject the file.
   currency change and every other caller stay per-player (`rupee-add seen (...)`). A give's own
   rupee path adds to the wallet inline and never reaches the entry, so a chest's rupees are not
   counted twice.
+- `chest_members` (optional, the **same-chest race guard**): `[[<member>, <bool>], ...]`, the
+  chest-opened struct's members and their backing Bools. With it co-op also traps the actor flag
+  setter's `pacibsp` (site `actor_flag_set`): a chest really opening calls it with that member, so
+  the client knows *which* chest it opened, independent of when the Bool queue commits. Field bug
+  (Daniel, two players): both opened one chest before either's Bool arrived and each kept its own
+  item plus the other's replay. Rule now: **every client applies one chest's gives from exactly one
+  opener**: itself, or the first peer that claimed it (its `bool_set` or its tagged give).
+  - A local top-level give made while an event runs is **held** until that event ends, then sent with
+    `origin_key` = the chest the event opened (none for an NPC event, or for an event that opened two).
+  - An inbound give with an `origin_key` is dropped when we own that chest (we opened it) or another
+    peer claimed it first (`chest race: peer give dropped ...`). Untagged gives always apply.
+  - We open a chest a peer claimed first, before our own give ran: our gives in that event are
+    **skipped** (the trapped give returns at once with `w0 = 1`; the get window still shows); the
+    peer's copy is the one (`chest race: local give skipped ...`).
+  - We open it after our own give already ran (the game gave first, the flag came later): we keep
+    ours and **drop the peer's queued gives** for that chest (replays wait while an event runs, so
+    they are still queued).
+  - Not covered: a peer give that was already **applied** before our event even started (only
+    possible if a loaded chest does not redraw open after the grant); world pickups (no origin key).
 - `entries.int_add` (class `dungeon`): the GameData Int add (`x0` = manager, `w1` = delta, `w2` =
   key; a queued add record, like the Bool setter's write). Small-key gains are applied with it.
 - `item_give` is a site kind too (the give entry's `pacibsp`); co-op traps it whenever the profile

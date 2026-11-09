@@ -244,6 +244,17 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(team.current, {})
         self.assertEqual([p["delta"] for p in team.snapshot()["replay"]], [1, 2])
 
+    def test_item_give_may_carry_its_chest(self):
+        give = {"type": "item_give", "origin": "b", "seq": 1, "name": "Item_X", "category": 6, "count": 1,
+                "get": 7, "flags": [0, 0, 1, 0]}
+        relay.validate_change(dict(give, origin_key=0xC1), "b")
+        for bad in (0, -1, 1 << 32, "c1", True):
+            with self.subTest(bad=bad), self.assertRaises(relay.ProtocolError):
+                relay.validate_change(dict(give, origin_key=bad), "b")
+        with self.assertRaises(relay.ProtocolError):
+            relay.validate_change(dict({"type": "key_add", "origin": "b", "seq": 1, "hash": 5, "delta": 1},
+                                       origin_key=1), "b")
+
     def test_noop_highwater_and_deny(self):
         team = relay.Team()
         self.assertIsNone(team.accept(grant(3, value=False), set()))

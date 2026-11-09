@@ -829,3 +829,97 @@ TEST_CASE("OoT co-op profile: wallet observation and the Int add entry", "[core]
     REQUIRE_FALSE(load({{"rupee_callers", {"0x160005"}}}));
     REQUIRE_FALSE(load({{"rupee_callers", "0x160004"}}));
 }
+
+TEST_CASE("OoT co-op same-chest race: one opener's gives per chest, every order", "[core][oot_coop]") {
+    using Open = Coop::ChestClaims::Open;
+    constexpr u32 K = 0xC1;
+    const auto give = [](std::string origin, u64 seq, u32 key) {
+        Change c{Kind::Item, std::move(origin), seq, Coop::PackItem({6, 7, {0, 0, 1, 0}}), 1};
+        c.name = "Item_Test_Slingshot";
+        c.origin_key = key;
+        return c;
+    };
+    SECTION("local first: our open owns the chest, the peer's later gives are dropped") {
+        Coop::ChestClaims claims;
+        REQUIRE(claims.LocalOpen(K, 0x100) == Open::Ours);
+        REQUIRE_FALSE(claims.SkipLocal(0x100));
+        claims.Hold(0x100);
+        REQUIRE(claims.End(0x100) == K); // our held give goes out tagged with the chest
+        REQUIRE_FALSE(claims.AcceptRemote(give("R", 1, K)));
+        REQUIRE(claims.Owner(K) == "us");
+    }
+    SECTION("remote first: the peer's claim arrived, our open skips our gives, the peer's apply") {
+        Coop::ChestClaims claims;
+        claims.RemoteClaim(K, "R"); // its bool_set
+        REQUIRE(claims.LocalOpen(K, 0x200) == Open::SkipLocal);
+        REQUIRE(claims.SkipLocal(0x200));
+        REQUIRE(claims.AcceptRemote(give("R", 2, K)));
+        REQUIRE_FALSE(claims.AcceptRemote(give("S", 1, K))); // a third opener's copy
+        REQUIRE(claims.End(0x200) == K);
+        REQUIRE_FALSE(claims.SkipLocal(0x200));
+    }
+    SECTION("simultaneous: we gave before the chest flag, the peer's give is queued: we take over") {
+        Coop::ChestClaims claims;
+        claims.Hold(0x300);                             // our give ran first in the event
+        REQUIRE(claims.AcceptRemote(give("R", 1, K)));  // the peer's give arrives mid-event (queued)
+        REQUIRE(claims.LocalOpen(K, 0x300) == Open::TakeOver); // the session drops its queued gives
+        REQUIRE_FALSE(claims.AcceptRemote(give("R", 2, K)));   // and every later one
+        REQUIRE(claims.Owner(K) == "us");
+    }
+    SECTION("simultaneous: both opens before either claim arrives: each keeps its own") {
+        Coop::ChestClaims a, b;
+        REQUIRE(a.LocalOpen(K, 1) == Open::Ours);
+        REQUIRE(b.LocalOpen(K, 1) == Open::Ours);
+        b.RemoteClaim(K, "A"); // A's bool_set reaches B: B already owns it
+        REQUIRE_FALSE(a.AcceptRemote(give("B", 1, K)));
+        REQUIRE_FALSE(b.AcceptRemote(give("A", 1, K)));
+    }
+    SECTION("untagged gives always apply; an event with no chest or two chests sends untagged") {
+        Coop::ChestClaims claims;
+        REQUIRE(claims.AcceptRemote(give("R", 1, 0)));
+        claims.Hold(0x400);
+        REQUIRE(claims.End(0x400) == 0);
+        claims.LocalOpen(K, 0x500);
+        claims.LocalOpen(K + 1, 0x500);
+        REQUIRE(claims.End(0x500) == 0);
+    }
+}
+
+TEST_CASE("OoT co-op item give origin key: wire and queued-give removal", "[core][oot_coop]") {
+    Change give{Kind::Item, "A", 4, Coop::PackItem({6, 7, {0, 0, 1, 0}}), 1};
+    give.name = "Item_Test_Slingshot";
+    give.origin_key = 0xC1;
+    const auto packet = Coop::EncodeChange(give);
+    REQUIRE(packet.at("origin_key") == 0xC1);
+    REQUIRE(Coop::DecodeChange(packet) == give);
+    give.origin_key = 0;
+    REQUIRE_FALSE(Coop::EncodeChange(give).contains("origin_key"));
+    for (const Json& bad : {Json(0), Json(-1), Json(0x100000000ULL), Json("c1")}) {
+        auto p = packet;
+        p["origin_key"] = bad;
+        REQUIRE_FALSE(Coop::DecodeChange(p));
+    }
+    // DropPending removes queued gives of a chest, never another chest's or another class.
+    struct NoBackend { using Context = int; };
+    Coop::GrantApplier<NoBackend> applier{{true, {Kind::Item, Kind::Rupee}, {}, Wallet}};
+    Change mine = give, other = give;
+    mine.origin_key = 0xC1;
+    other.origin_key = 0xC2;
+    other.seq = 5;
+    REQUIRE(applier.Queue(mine));
+    REQUIRE(applier.Queue(other));
+    REQUIRE(applier.Queue({Kind::Rupee, "A", 6, Wallet, 5}));
+    REQUIRE(applier.DropPending([](const Change& c) { return c.kind == Kind::Item && c.origin_key == 0xC1; }) == 1);
+    REQUIRE(applier.Pending() == 2);
+    // Profile: the chest members map.
+    const auto load = [](const Json& members) {
+        return Coop::DecodeProfile(Json{{"offsets", {{P::BuildId, {{"manager_cell", "0x200000"},
+                                                                  {"chest_members", members}}}}}}, P::BuildId);
+    };
+    const auto loaded = load(Json::array({Json::array({"0x11", "0xC1"}), Json::array({0x12, 0xC2})}));
+    REQUIRE(loaded);
+    REQUIRE(loaded->chest_members.at(0x11) == 0xC1);
+    REQUIRE(loaded->chest_members.at(0x12) == 0xC2);
+    REQUIRE_FALSE(load(Json::array({Json::array({"0x11", "0xC1"}), Json::array({"0x11", "0xC3"})})));
+    REQUIRE_FALSE(load(Json::array({Json::array({0, 1})})));
+}

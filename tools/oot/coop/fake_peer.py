@@ -13,6 +13,7 @@ Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CT
   bit HEX [HEX...]          bit_set (actor u64) the same way
   rupee DELTA [DELTA...]    rupee_add (wallet hash) with each signed delta, all in ONE socket write
   item NAME CAT COUNT [GET [F0 F1 F2 F3]]  item_give: one give call (get type default 7, flags 0)
+  itemk HEX NAME CAT COUNT [GET [F0 F1 F2 F3]]  item_give tagged with origin_key HEX (the chest Bool)
   key HEX DELTA             key_add: a small-key gain of DELTA for the dungeon whose total key is HEX
   expect-type TYPE SECS     wait for the emulator's next change of TYPE (rupee_add, key_add, ...)
   dup SEQ                   re-deliver this peer's accepted event SEQ to the other clients (a duplicate)
@@ -247,6 +248,10 @@ class FakePeer:
             if not deltas:
                 raise ValueError("no deltas")
             return await self.burst("rupee_add", deltas)
+        origin_key = None
+        if verb == "itemk":
+            origin_key, words = int(words[1], 16), ["item"] + words[2:]
+            verb = "item"
         if verb == "item":
             # item NAME CATEGORY COUNT [GET [F0 F1 F2 F3]]: one give call, as an opener would send it
             if len(words) < 4:
@@ -256,6 +261,8 @@ class FakePeer:
             packet = {"type": "item_give", "origin": self.client.hello["client_id"], "seq": self.client.seq,
                       "name": words[1], "category": int(words[2], 0), "count": int(words[3], 0),
                       "get": int(words[4], 0) if len(words) > 4 else 7, "flags": flags}
+            if origin_key:
+                packet["origin_key"] = origin_key
             since = len(self.seen)
             await self.client.send(packet)
             await self.wait(lambda p: p.get("type") == "ack" and p.get("seq") == packet["seq"], 5, since)

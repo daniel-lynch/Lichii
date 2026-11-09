@@ -160,6 +160,12 @@ or derive them from the guest. Guest scene/save-loaded discovery remains unimple
 A disconnect sends `state:{"online":false}`. Presence is scoped to the team, not the
 entire room. `heartbeat` and `heartbeat_ack` have only `type`.
 
+## Same-chest race (C13)
+
+`item_give` may carry `"origin_key": <chest Bool>` (1..2^32-1). Receivers apply one chest's gives
+from one opener only (themselves, or the first claimant); see HOOKS.md `chest_members`. Old relays
+reject the field: update the relay before running a C13 client with `chest_members`.
+
 ## Small keys, dungeon items and per-player flags (C13)
 
 - `key_add {origin, seq, hash, delta}`: a dungeon's small-key **gain** (`delta` 1..32), `hash` = that

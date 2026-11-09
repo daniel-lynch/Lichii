@@ -488,6 +488,8 @@ public:
     bool Suppress(const Change& change) const { return applier.Suppress(change); }
     bool Calling() const { return applier.Phase() == ApplyPhase::Calling; }
     size_t Pending() const { return applier.Pending(); }
+    template <typename Pred>
+    size_t DropPending(Pred drop) { return applier.DropPending(drop); }
     const std::optional<Change>& LastGrant() const { return applier.LastGrant(); }
     bool BaselineReady() const { return baseline; }
     void Invalidate() { applier.Invalidate(); }

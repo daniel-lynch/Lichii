@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -174,6 +175,9 @@ struct Profile {
     /// Wallet observation (class rupee): return addresses of wallet-entry calls whose positive
     /// delta is shared (a flow's rupee reward). Payments (negative deltas) stay per-player.
     std::vector<u64> rupee_callers;
+    /// Same-chest race (C13): the chest-opened struct's member hash -> its backing Bool (the key
+    /// the bool class syncs). The actor flag setter names the member when a chest really opens.
+    std::map<u32, u32> chest_members;
     u64 event_got{};                ///< Module offset of the GOT slot of the event manager's cell
     /// {cell, field}: *(*(main + cell) + field) must be non-zero before a give is replayed.
     std::vector<std::pair<u64, u64>> item_guards;

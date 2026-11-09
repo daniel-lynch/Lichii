@@ -142,7 +142,8 @@ def validate_change(packet, origin):
         raise ProtocolError("unsupported grant class")
     extra = {"bool_set": ("hash", "value"), "bit_set": ("actor", "value"), "rupee_add": ("hash", "delta"),
              "item_give": ("name", "category", "count", "get", "flags"), "key_add": ("hash", "delta")}[kind]
-    fields(packet, common + extra)
+    # item_give may carry the chest Bool it came from (C13 same-chest race: receivers dedupe by it)
+    fields(packet, common + extra, ("origin_key",) if kind == "item_give" else ())
     if packet["origin"] != origin:
         raise ProtocolError("origin mismatch")
     integer(packet["seq"], 1, MAX_SEQ)
@@ -172,6 +173,8 @@ def validate_change(packet, origin):
         integer(packet["category"], 0, 15)
         integer(packet["count"], 1, ITEM_COUNT_LIMIT)
         integer(packet["get"], 0, 15)
+        if "origin_key" in packet:
+            integer(packet["origin_key"], 1, (1 << 32) - 1)
         flags = packet["flags"]
         if type(flags) is not list or len(flags) != 4:
             raise ProtocolError("item flags are four bytes")
