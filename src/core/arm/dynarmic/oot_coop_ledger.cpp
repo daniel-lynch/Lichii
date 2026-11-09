@@ -277,10 +277,25 @@ std::string Digest(std::string_view bytes) {
     for (auto byte : digest) hex += fmt::format("{:02x}", byte);
     return hex;
 }
-HashResult ModHash(const fs::path& keys, const fs::path& program_load) {
+std::vector<fs::path> EnabledModFolders(const fs::path& program_load,
+                                       const std::vector<std::string>& disabled) {
+    std::vector<fs::path> folders;
+    if (!fs::exists(program_load)) return folders;
+    for (const auto& mod : fs::directory_iterator(program_load)) {
+        const auto utf8 = mod.path().filename().u8string();
+        const std::string name{utf8.begin(), utf8.end()};
+        if (mod.is_directory() && std::find(disabled.begin(), disabled.end(), name) == disabled.end())
+            folders.push_back(mod.path());
+    }
+    std::sort(folders.begin(), folders.end());
+    return folders;
+}
+
+HashResult ModHash(const fs::path& keys, const fs::path& program_load,
+                   const std::vector<std::string>& disabled) {
     HashResult result;
     auto [size, hash] = Fingerprint(keys);
-    result.text = fmt::format("oot-coop-mod-hash 1\nkeys {} {}\n", size, hash);
+    result.text = fmt::format("oot-coop-mod-hash 2\nkeys {} {}\n", size, hash);
     result.bytes = size;
     for (const auto* name : {"coop-ux.json", "coop-anim.json", "coop-equip.json", "coop-ledger.json"}) {
         const auto path = keys.parent_path() / name;
@@ -293,16 +308,30 @@ HashResult ModHash(const fs::path& keys, const fs::path& program_load) {
     }
     struct Record { std::string path, hash; u64 size; };
     std::vector<Record> records;
-    if (fs::exists(program_load)) for (const auto& mod : fs::directory_iterator(program_load)) {
-        if (!mod.is_directory()) continue;
-        for (const auto* tree : {"romfs", "exefs"}) {
-            const auto root = mod.path() / tree;
-            if (!fs::exists(fs::symlink_status(root))) continue;
+    for (const auto& mod : EnabledModFolders(program_load, disabled)) {
+        for (const auto* tree : {"romfs", "exefs", "romfslite"}) {
+            fs::path root;
+            // Match RealVfsDirectory / FindSubdirectoryCaseless: first directory in native
+            // enumeration order, not sorted order. Records retain the disk spelling.
+            for (const auto& entry : fs::directory_iterator(mod)) {
+                const auto utf8 = entry.path().filename().u8string();
+                std::string name{utf8.begin(), utf8.end()};
+                for (auto& c : name) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+                if (!entry.is_directory() || name != tree) continue;
+#ifdef _WIN32
+                // Windows patch manager uses native lookup (including case-sensitive dirs).
+                std::error_code ec;
+                if (!fs::equivalent(entry.path(), mod / tree, ec) || ec) continue;
+#endif
+                root = entry.path();
+                break;
+            }
+            if (root.empty()) continue;
             std::set<fs::path> ancestors;
             std::vector<fs::path> files;
             Files(root, ancestors, files);
             for (const auto& file : files) {
-                const auto utf8 = file.lexically_relative(mod.path()).generic_u8string();
+                const auto utf8 = file.lexically_relative(mod).generic_u8string();
                 std::string relative{utf8.begin(), utf8.end()};
                 if (relative.find_first_of("\r\n") != std::string::npos) throw std::runtime_error("newline in mod path");
                 auto [bytes, sha] = Fingerprint(file);

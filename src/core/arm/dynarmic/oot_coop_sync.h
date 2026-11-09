@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <map>
 #include <functional>
 #include <memory>
@@ -122,7 +123,17 @@ struct Endpoint {
 /// DecodeProfile of the EDEN_NX2_OOT_COOP_KEYS file; `why` says what failed.
 [[nodiscard]] std::shared_ptr<const OotGameDataTrace::Profile> LoadProfile(std::string_view build_id,
                                                                            std::string* why = nullptr);
-[[nodiscard]] bool Enabled();
+namespace detail {
+// JIT code-fetch gate (arm_dynarmic_64.cpp MemoryReadCode): refreshed from the environment by
+// BeginSession at every boot/shutdown; the hot path is one relaxed load (no call, no static guard).
+inline std::atomic<bool> enabled_gate{[] {
+    const char* value = std::getenv("EDEN_NX2_OOT_COOP");
+    return ParseEndpoint(value ? value : "").has_value();
+}()};
+} // namespace detail
+[[nodiscard]] inline bool Enabled() noexcept {
+    return detail::enabled_gate.load(std::memory_order_relaxed);
+}
 
 struct Hello {
     std::string build_id; // the running main build; RegisterMain sets it

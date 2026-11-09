@@ -134,15 +134,23 @@ list and only changes when the checkbox is explicitly changed.
 View → Co-op Panel shows published peers and provides room-window, teleport and
 team-state request controls. The panel never reads the private key file. A build
 without a status publisher displays “No live co-op status”; no connection or ping
-is inferred. Disconnect requires future runtime support. Reconnect restarts the
-game using page settings, subject to launcher overrides. Changing co-op enablement
-requires restarting the application because the core caches enablement at first
-boot. The status publisher must use `steady_clock` milliseconds for `published_ms`
+is inferred. Disconnect creates `<EdenDir>/coop-disconnect` and holds the relay
+offline while the game continues. It is enabled with a live status and no hold
+file. Connect removes the file (even with stale status); the core reconnects
+after its current backoff and repeats the handshake, baseline and catch-up.
+The header then advances from “disconnected” through “reconnecting” to “connected”.
+A stale hold file is removed at the next session start, or warns and holds if
+removal fails. The message line reports whether each file operation succeeded.
+“Reconnect with page settings” restarts the game after confirmation, subject to
+launcher overrides. Co-op enablement is refreshed at each game boot; no application
+restart is needed. The mod-folder list excludes exact disabled names using the
+same helper as the v2 hash; enabled directories without hashed trees remain listed.
+The status publisher must use `steady_clock` milliseconds for `published_ms`
 and peer `seen_ms`, and clear the board when the session ends.
 
 Field-test hooks (off unless set): `EDEN_NX2_OOT_COOP_GUI_SHOTS=<dir>` shows the Co-op Panel at
 start, saves `panel-latest.png` grabs into `<dir>` and executes `<dir>/panel.cmd` lines (`teleport ROW`,
-`resync`, `room on|off`, `copyall`, `shot NAME`) by clicking the real controls, logging to
+`resync`, `disconnect`, `connect`, `reconnect`, `room on|off`, `copyall`, `shot NAME`) by clicking the real controls, logging to
 `<dir>/panel.log`; the Co-op page saves `page-dialog.png` / `page-full.png` there.
 `EDEN_NX2_OOT_COOP_GUI_OPEN=<game file>` opens that game's Properties at start;
 `EDEN_NX2_OOT_COOP_GUI_APPLY=<room>` then types that room into the page and presses OK.

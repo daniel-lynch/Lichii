@@ -703,7 +703,7 @@ Compute SHA256, lowercase hex, of UTF-8 text with lines joined by `\n` and a fin
 `\n`. The canonical lines are exactly:
 
 ```text
-oot-coop-mod-hash 1
+oot-coop-mod-hash 2
 keys <size> <sha256>
 sidecar coop-ux.json <size> <sha256>
 sidecar coop-anim.json <size> <sha256>
@@ -716,8 +716,13 @@ For a missing sidecar its entire line is `sidecar <name> absent`. The four names
 always appear in that order, beside the exact key file loaded by the client,
 independently of feature switches. File sizes are decimal byte counts; file
 hashes cover exact bytes, without JSON normalization. Each regular file under
-`<load dir>/<program id as 16 uppercase hex>/<any mod dir>/romfs/**` or
-`.../exefs/**` contributes one `mod` line. `relpath` is the UTF-8 slash-separated
+`<load dir>/<program id as 16 uppercase hex>/<enabled mod dir>/romfs/**`,
+`.../exefs/**` or `.../romfslite/**` contributes one `mod` line. A mod folder is
+excluded if its exact name occurs in that program's disabled add-ons list.
+Tree names are matched case-insensitively, keeping their on-disk spelling in
+records. As in the patch manager, the first matching directory in native VFS
+iteration order wins on non-Windows; Windows uses native name lookup. Do not
+ship multiple case variants of one tree: their choice is filesystem dependent. `relpath` is the UTF-8 slash-separated
 path from the mod directory, such as `romfs/a/b.bin`. The mod directory's name is
 excluded. Retain duplicate records and sort bytewise by relpath, then file hash.
 Exclude `cheats/` and all other top-level trees. Follow symlinks; unreadable files,
@@ -737,8 +742,50 @@ Operators can use `python3 -I tools/oot/coop/mod_hash.py --keys FILE --load DIR
 [--text]`. DIR can be the title's 16-hex load directory, or a load root containing
 one title. With multiple titles, use `--program-id HEX` to select one; it never
 hashes unrelated titles. `--text` prints the canonical text instead of its digest.
-This does not include local FPS cheats, folder names, or enabled/disabled mod
-selection; every file in the specified mod trees contributes.
+Version 2 is the default. Repeat `--disabled NAME` to exclude exact folder names;
+`--config FILE` reads the selected title's `[DisabledAddOns]` array from an Eden
+qt-config.ini. Explicit exclusions are combined with the config list. Like Eden,
+`\default=true` (or an absent companion) uses the setting's default; non-default
+names and title IDs need `\default=false`.
+
+`--hash-version 1` reproduces C16 text: it ignores `--disabled` and `--config`,
+uses only exact-case `romfs` and `exefs`, and includes disabled folders. The
+versioned header separates v1 and v2 fingerprints even when file records match;
+they are intentionally incompatible for the relay's hash gate. Existing C16
+capability fallback behavior is unchanged.
+
+This is a kit fingerprint, not a digest of every patch-manager input: local FPS
+cheats and other top-level trees are excluded. Folder names are not records, but
+disabled selection determines which records contribute. The panel and hash share
+one enabled-folder definition, including enabled directories with no matching
+tree (shown in the panel, contributing no files). Hashing uses the selected
+program's load directory and disabled list, without merging parent-title lists.
+
+### C17 disconnect trigger
+
+`<EdenDir>/coop-disconnect` is a persistent live-session hold. The io thread polls
+it about once per second in every connection phase and during retry backoff;
+retry callbacks check it before starting another connection. Entry closes the
+socket through normal failure teardown, without a backoff retry or attempt
+counter increment, and logs once:
+
+```text
+OoT co-op: relay disconnected (trigger)
+```
+
+The GUI status board and room window display `disconnected` (`relay_state = 3`;
+0 offline, 1 connected, 2 reconnecting retain their meanings). Removing the file
+logs `OoT co-op: relay disconnect trigger removed; reconnecting`, then waits the
+current backoff (1 s after a ready connection). The normal hello, baseline and
+ledger catch-up run again, with quest/teleport negotiation and C16 fallback
+latches preserved. Success remains `relay reconnected (#N)` after a prior ready
+connection. Already applied grants retain their IDs; disconnect is not rollback.
+
+At session start, a stale file is removed before the first connection and logs
+`OoT co-op: removed a stale coop-disconnect trigger at session start`. A removal
+failure warns and holds offline until the filesystem permits removal. Probe
+errors also hold offline. No packet or relay protocol change: peers see the
+socket disconnect normally.
 
 ### Save binding and receipt sidecars
 
