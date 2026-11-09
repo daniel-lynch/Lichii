@@ -18,6 +18,7 @@
 #include <nlohmann/json.hpp>
 #include "common/common_types.h"
 #include "core/arm/dynarmic/oot_gamedata_trace.h"
+#include "core/arm/dynarmic/oot_coop_player.h"
 
 namespace Core::OotCoop::Anim {
 
@@ -56,15 +57,6 @@ struct BlackboardKeys {
     u32 magic{}, version{};
     std::vector<BlackboardField> fields;
 };
-struct PlayerKeys {
-    std::vector<u64> chain;
-    u32 count_stage{}, count_min{};
-    u64 count_off{}, name_off{}, link_id_off{}, link_record_off{}, record_actor_off{};
-    u64 record_id_off{}, lifecycle_off{};
-    u32 lifecycle_lo{}, lifecycle_hi{};
-    std::vector<u64> candidates;
-    std::array<std::string, 2> names; // adult, child
-};
 struct Keys {
     bool sender_enabled{}, receiver_enabled{}, restart_frame_reset{}, endpoint_inclusive{};
     std::vector<u64> ctl_chain;
@@ -78,7 +70,7 @@ struct Keys {
     std::string move_command;
     std::set<u32> phase_known_ids;
     std::optional<BlackboardKeys> blackboard;
-    std::optional<PlayerKeys> player;
+    std::optional<::Core::OotCoop::Player::Keys> player; ///< Resident-player resolution (shared resolver)
 };
 [[nodiscard]] std::optional<Keys> DecodeKeys(const nlohmann::json& value);
 
@@ -115,8 +107,10 @@ struct Snapshot {
     std::vector<Controller> controllers;
     std::vector<BlackboardValue> blackboard;
 };
+/// The local player as the sender and command watch see it: the shared resident plus the age
+/// the local pose reported (the actor name is the same for both ages).
 struct Player {
-    u64 actor{}, link{}, record{};
+    u64 actor{}, equipment{}, record{};
     u32 generation{};
     bool child{};
     bool operator==(const Player&) const = default;
@@ -199,45 +193,18 @@ private:
 };
 
 template <typename Memory>
-bool ValidatePlayer(Memory& memory, const Player& player, const Keys& keys) {
-    if (!keys.player || !player.actor || !player.link || !player.record) return false;
-    const auto& k = *keys.player;
-    const Reader r{memory};
-    const auto generation = r.Int(player.link, k.link_id_off, 4);
-    const auto life = r.Int(player.actor, k.lifecycle_off, 4);
-    return generation && *generation == player.generation && *generation != 0xFFFFFFFF &&
-           r.Ptr(player.link, k.link_record_off) == player.record &&
-           r.Int(player.record, k.record_id_off, 4) == generation &&
-           r.Ptr(player.record, k.record_actor_off) == player.actor && life &&
-           (*life < k.lifecycle_lo || *life > k.lifecycle_hi) &&
-           r.String(r.Ptr(player.link, k.name_off)) == k.names[player.child];
+bool ValidatePlayer(Memory& memory, u64 base, const Player& player, const Keys& keys) {
+    return keys.player &&
+           ::Core::OotCoop::Player::Validate(memory, base, {player.actor, player.record, player.equipment, player.generation},
+                            *keys.player);
 }
 
 template <typename Memory>
 std::optional<Player> FindPlayer(Memory& memory, u64 base, bool child, const Keys& keys) {
     if (!keys.player) return std::nullopt;
-    const auto& k = *keys.player;
-    const Reader r{memory};
-    for (size_t stage = 0; stage < k.chain.size(); ++stage) {
-        base = r.Ptr(base, k.chain[stage]);
-        if (!base) return std::nullopt;
-        if (stage == k.count_stage) {
-            const auto count = r.Int(base, k.count_off, 4);
-            if (!count || *count < k.count_min || *count > 4096) return std::nullopt;
-        }
-    }
-    for (const auto offset : k.candidates) {
-        Player player;
-        player.child = child;
-        player.link = r.Ptr(base, offset);
-        player.record = r.Ptr(player.link, k.link_record_off);
-        player.actor = r.Ptr(player.record, k.record_actor_off);
-        const auto generation = r.Int(player.link, k.link_id_off, 4);
-        if (!generation) continue;
-        player.generation = static_cast<u32>(*generation);
-        if (ValidatePlayer(memory, player, keys)) return player;
-    }
-    return std::nullopt;
+    const auto resident = ::Core::OotCoop::Player::Find(memory, base, *keys.player);
+    if (!resident) return std::nullopt;
+    return Player{resident->actor, resident->equipment, resident->record, resident->generation, child};
 }
 
 template <typename Memory>

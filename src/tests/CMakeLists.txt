@@ -42,6 +42,7 @@ add_executable(tests
     core/oot_coop_call_memory.cpp
     core/oot_coop_anim.cpp
     core/oot_coop_anim_backend.cpp
+    core/oot_coop_player.cpp
     core/oot_coop_ux.cpp
     core/builtin_patches.cpp
     core/system_test_context.h

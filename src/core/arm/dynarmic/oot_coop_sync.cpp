@@ -1871,7 +1871,7 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
                 impl->anim_scene = local.banc;
             }
             animation_snapshot = Anim::ReadSnapshot(memory, player->actor, local.child, *profile->anim,
-                [&] { return Anim::ValidatePlayer(memory, *player, *profile->anim); });
+                [&] { return Anim::ValidatePlayer(memory, base, *player, *profile->anim); });
             if (animation_snapshot) impl->command_watch.Observe(*animation_snapshot, *player);
             if (!sending) animation_snapshot.reset();
         }

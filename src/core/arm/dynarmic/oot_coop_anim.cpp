@@ -349,42 +349,9 @@ std::optional<Keys> DecodeKeys(const Json& value) {
             }
         }
         if (value.contains("player")) {
-            const auto& p = value.at("player");
-            PlayerKeys player;
-            const std::array player_fields{
-                std::pair{"count_off"sv, &PlayerKeys::count_off},
-                std::pair{"name_off"sv, &PlayerKeys::name_off},
-                std::pair{"link_id_off"sv, &PlayerKeys::link_id_off},
-                std::pair{"link_record_off"sv, &PlayerKeys::link_record_off},
-                std::pair{"record_actor_off"sv, &PlayerKeys::record_actor_off},
-                std::pair{"record_id_off"sv, &PlayerKeys::record_id_off},
-                std::pair{"lifecycle_off"sv, &PlayerKeys::lifecycle_off},
-            };
-            if (!p.is_object() || !Offsets(p, player, player_fields) ||
-                !Chain(p.at("chain"), player.chain) ||
-                !Chain(p.at("candidates"), player.candidates, 4) ||
-                !Text(p.at("names").at("adult"), player.names[0]) ||
-                !Text(p.at("names").at("child"), player.names[1])) return std::nullopt;
-            for (const auto& [name, member] : std::array{
-                     std::pair{"count_stage", &PlayerKeys::count_stage},
-                     std::pair{"count_min", &PlayerKeys::count_min},
-                     std::pair{"lifecycle_lo", &PlayerKeys::lifecycle_lo},
-                     std::pair{"lifecycle_hi", &PlayerKeys::lifecycle_hi}}) {
-                const auto n = Number(p.at(name), 4096);
-                if (!n) return std::nullopt;
-                player.*member = static_cast<u32>(*n);
-            }
-            if (player.count_stage >= player.chain.size() ||
-                player.lifecycle_lo > player.lifecycle_hi) return std::nullopt;
-            for (const auto& [name, ignored] : p.items()) {
-                (void)ignored;
-                if (std::any_of(player_fields.begin(), player_fields.end(),
-                                [&](const auto& f) { return f.first == name; })) continue;
-                if (name != "chain" && name != "candidates" && name != "names" &&
-                    name != "count_stage" && name != "count_min" && name != "lifecycle_lo" &&
-                    name != "lifecycle_hi") return std::nullopt;
-            }
-            keys.player = std::move(player);
+            auto player = ::Core::OotCoop::Player::DecodeKeys(value.at("player"));
+            if (!player) return std::nullopt;
+            keys.player = std::move(*player);
         }
         if (value.contains("blackboard")) {
             const auto& b = value.at("blackboard");

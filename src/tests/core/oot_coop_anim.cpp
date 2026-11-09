@@ -491,47 +491,37 @@ TEST_CASE("OoT animation blackboard reads typed bounds and byte booleans", "[cor
     REQUIRE_FALSE(read());
 }
 
-TEST_CASE("OoT animation resident player identity rechecks generation and age", "[core][oot_coop][oot_coop_anim]") {
+TEST_CASE("OoT animation player identity carries the age the local pose reports", "[core][oot_coop][oot_coop_anim]") {
     Memory memory;
     Anim::Keys keys;
-    Anim::PlayerKeys player;
-    player.chain = {8};
-    player.count_off = 16;
-    player.count_min = 1;
-    player.candidates = {32, 40};
-    player.link_id_off = 8;
-    player.link_record_off = 16;
-    player.name_off = 24;
-    player.record_actor_off = 8;
-    player.record_id_off = 16;
-    player.lifecycle_off = 24;
-    player.lifecycle_lo = 3;
-    player.lifecycle_hi = 5;
-    player.names = {"SyntheticAdult", "SyntheticChild"};
-    keys.player = player;
+    keys.player = Core::OotCoop::Player::DecodeKeys(Json{
+        {"user_cell", 8}, {"user_equipment", 16}, {"owner", 24}, {"holder", 32}, {"equipment", 40},
+        {"actor_record", 48}, {"actor_id", 56}, {"record_actor", 8}, {"record_id", 16},
+        {"actor_name", 64}, {"lifecycle", 72}, {"lifecycle_lo", 3}, {"lifecycle_hi", 5},
+        {"names", {"SyntheticPlayer"}}});
+    REQUIRE(keys.player);
     memory.Put(256 + 8, 512);
-    memory.Put(512 + 16, 2, 4);
-    memory.Put(512 + 32, 768);
-    memory.Put(768 + 8, 9, 4);
-    memory.Put(768 + 16, 1024);
-    memory.Put(768 + 24, 1536);
-    memory.String(1536, "SyntheticChild");
-    memory.Put(1024 + 8, 1280);
-    memory.Put(1024 + 16, 9, 4);
-    memory.Put(1280 + 24, 1, 4);
-    const auto found = Anim::FindPlayer(memory, 256, true, keys);
-    REQUIRE(found);
-    REQUIRE(found->actor == 1280);
-    REQUIRE(Anim::ValidatePlayer(memory, *found, keys));
-    REQUIRE_FALSE(Anim::FindPlayer(memory, 256, false, keys));
-    memory.Put(1280 + 24, 4, 4);
-    REQUIRE_FALSE(Anim::ValidatePlayer(memory, *found, keys));
-    memory.Put(1280 + 24, 1, 4);
-    memory.Put(1024 + 16, 10, 4);
-    REQUIRE_FALSE(Anim::ValidatePlayer(memory, *found, keys));
-    memory.Put(1024 + 16, 9, 4);
-    memory.Put(768 + 8, 0xFFFFFFFF, 4);
-    REQUIRE_FALSE(Anim::FindPlayer(memory, 256, true, keys));
+    memory.Put(512 + 16, 768);
+    memory.Put(768 + 24, 1024);
+    memory.Put(1024 + 32, 1280);
+    memory.Put(1280 + 40, 768);
+    memory.Put(1024 + 48, 1536);
+    memory.Put(1024 + 56, 9, 4);
+    memory.Put(1536 + 8, 1024);
+    memory.Put(1536 + 16, 9, 4);
+    memory.Put(1024 + 64, 1792);
+    memory.String(1792, "SyntheticPlayer");
+    memory.Put(1024 + 72, 1, 4);
+    const auto child = Anim::FindPlayer(memory, 256, true, keys);
+    REQUIRE(child);
+    REQUIRE(child->actor == 1024);
+    REQUIRE(child->equipment == 768);
+    REQUIRE(Anim::ValidatePlayer(memory, 256, *child, keys));
+    const auto adult = Anim::FindPlayer(memory, 256, false, keys);
+    REQUIRE(adult);
+    REQUIRE_FALSE(*adult == *child); // an age change is a new identity for the command watch
+    memory.Put(1024 + 72, 4, 4);
+    REQUIRE_FALSE(Anim::ValidatePlayer(memory, 256, *child, keys));
 }
 
 TEST_CASE("OoT animation private key decoder rejects partial and unknown configuration", "[core][oot_coop][oot_coop_anim]") {
