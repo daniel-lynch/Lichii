@@ -195,6 +195,9 @@ transient steps. The commit trap only records dirty attribution. The frame drain
 manager and record, requires index/hash agreement, suppresses restoration and our replay, and
 forwards only forward transitions relative to the stable epoch snapshot. Backwards changes
 update that snapshot silently. A periodic 60-frame pure-read poll catches missed traps.
+No quest work happens before a save is loaded: the title screen runs a live challenge manager on
+default data, so the class waits for the world class's loaded-save signal (the private wallet
+capacity Int is non-zero) and logs `quest save gate open|closed`.
 Manager/table or save-binding changes reset observation, retain remote targets for revalidation,
 and start a private `settle_frames` window (default 300). Bulk changes re-enter that window.
 
