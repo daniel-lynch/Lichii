@@ -1302,8 +1302,8 @@ Result KProcess::AllocateDebugCallMemory(KernelCore& kernel, KProcessAddress* st
     // regions, so MapPages' CanContain check refuses it (ResultInvalidCurrentMemory, 0xd401: the
     // C4 field launch). Code and AliasCode share that range; only a Code-flagged state may be
     // reprotected to RX. The page therefore stays RW: Dynarmic fetches code through
-    // MemoryReadCode, which checks only that the address is mapped, and no guest pointer to
-    // this page exists.
+    // MemoryReadCode, which checks only that the address is mapped. The rest of the page past
+    // +0x400 is the co-op ghost's persistent block (class "pose"); only its own requests point there.
     R_TRY(m_page_table.MapPages(&code, 1, KMemoryState::Stack, KMemoryPermission::UserReadWrite));
     this->GetMemory().Write32(GetInteger(code), 0xD4200000); // A64 brk #0 sentinel.
     m_debug_call_memory_size = TotalSize;

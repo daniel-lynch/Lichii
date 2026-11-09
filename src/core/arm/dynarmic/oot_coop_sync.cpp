@@ -21,6 +21,7 @@
 #include "common/logging.h"
 #include "common/thread.h"
 #include "core/arm/dynarmic/oot_coop_sync.h"
+#include "core/arm/dynarmic/oot_coop_ghost.h"
 #include "core/arm/dynarmic/oot_coop_runtime.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
@@ -84,6 +85,7 @@ std::string_view Type(Kind kind) {
     case Kind::PouchTotal: return "pouch_total";
     case Kind::Rupee: return "rupee_add";
     case Kind::Item: return "item_give";
+    case Kind::Pose: return "pose";
     }
     return {};
 }
@@ -297,6 +299,7 @@ std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text) {
         else if (name == "bit") result.insert(Kind::Bit);
         else if (name == "rupee") result.insert(Kind::Rupee);
         else if (name == "item") result.insert(Kind::Item);
+        else if (name == "pose") result.insert(Kind::Pose);
         else return std::nullopt;
         if (comma == std::string_view::npos) break;
         text.remove_prefix(comma + 1);
@@ -456,6 +459,62 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                     if (!cell || !*cell || (*cell & 7) || !member || (*member & 7)) return std::nullopt;
                     profile.item_guards.emplace_back(*cell, *member);
                 }
+            } else if (field == "ghost") {
+                if (!value.is_object()) return std::nullopt;
+                auto& ghost = profile.ghost;
+                for (const auto& [name, item] : value.items()) {
+                    if (name == "playing_info_cell" || name == "actor_mgr_cell") {
+                        const auto cell = Number(item, MaxModuleOffset);
+                        if (!cell || !*cell || (*cell & 7)) return std::nullopt;
+                        (name == "playing_info_cell" ? ghost.playing_info_cell : ghost.actor_mgr_cell) = *cell;
+                    } else if (name == "scale_const") {
+                        const auto at = offset(item);
+                        if (!at) return std::nullopt;
+                        ghost.scale_const = *at;
+                    } else if (name == "pos" || name == "rot") {
+                        const auto field_offset = Number(item, 0xFFFF);
+                        if (!field_offset || (*field_offset & 3)) return std::nullopt;
+                        (name == "pos" ? ghost.pos : ghost.rot) = *field_offset;
+                    } else if (name == "banc_hash" || name == "child_hash" || name == "loading_hash") {
+                        const auto hash = Number(item, 0xFFFFFFFF);
+                        if (!hash || !*hash) return std::nullopt;
+                        (name == "banc_hash" ? ghost.banc_hash : name == "child_hash" ? ghost.child_hash
+                                                                                     : ghost.loading_hash) =
+                            static_cast<u32>(*hash);
+                    } else if (name == "create" || name == "get" || name == "release" || name == "set_mtx") {
+                        const auto decoded = entry(item);
+                        if (!decoded) return std::nullopt;
+                        (name == "create" ? ghost.create : name == "get" ? ghost.get
+                                         : name == "release" ? ghost.release : ghost.set_mtx) = *decoded;
+                    } else if (name == "str64") {
+                        if (!item.is_array() || item.size() != 3) return std::nullopt;
+                        for (size_t i = 0; i < 3; ++i) {
+                            const auto number = Number(item[i], 0xFFFF);
+                            if (!number || !*number) return std::nullopt;
+                            ghost.str64[i] = *number;
+                        }
+                    } else if (name == "link") {
+                        if (!item.is_array() || item.size() != 4) return std::nullopt;
+                        for (size_t i = 0; i < 4; ++i) {
+                            const auto number = Number(item[i], 0xFFFF);
+                            if (!number || !*number || (*number & 3)) return std::nullopt;
+                            ghost.link[i] = *number;
+                        }
+                    } else if (name == "actor_fields") {
+                        if (!item.is_array() || item.empty() || item.size() > 4) return std::nullopt;
+                        for (const auto& f : item) {
+                            const auto number = Number(f, 0xFFFF);
+                            if (!number || !*number || (*number & 7)) return std::nullopt;
+                            ghost.actor_fields.push_back(*number);
+                        }
+                    } else if (name == "actor_child" || name == "actor_adult") {
+                        if (!item.is_string() || !ItemName(item.get<std::string>())) return std::nullopt;
+                        (name == "actor_child" ? ghost.actor_child : ghost.actor_adult) = item.get<std::string>();
+                    } else {
+                        return std::nullopt;
+                    }
+                }
+                if (!ghost.Valid()) return std::nullopt;
             } else {
                 return std::nullopt;
             }
@@ -587,6 +646,7 @@ bool State::Merge(const Change& change, bool deduplicate) {
         break;
     case Kind::Rupee:
     case Kind::Item:
+    case Kind::Pose:
         return false;
     }
     values[key] = std::move(next);
@@ -643,6 +703,7 @@ bool ShouldApply(const Change& change, const State& observed) {
 struct Session::Impl {
     using Backend = GameDataBackend<Dynarmic::A64::Jit, Memory::Memory>;
     struct Connection;
+    struct GhostPort;
     Impl(Endpoint endpoint_, Hello hello_, std::set<u64> denied_, std::set<Kind> allowed_,
          std::set<std::pair<Kind, u64>> keys, u64 wallet)
         : endpoint{std::move(endpoint_)}, hello{std::move(hello_)}, denied{std::move(denied_)},
@@ -678,6 +739,24 @@ struct Session::Impl {
     bool logged_class{};
     bool logged_overflow{};
     std::atomic<bool> stopped{};
+    // Class "pose" (v3): own pose out, peers' poses in, puppets drawn by the frame drain.
+    bool pose_enabled{};
+    PoseSender sender;
+    std::optional<Pose> pose_out;                         // under mutex: newest unsent own pose
+    std::map<std::string, PeerTrack, std::less<>> peers;  // under mutex: by origin
+    std::unique_ptr<GhostDriver<GhostPort>> ghost;        // guest side, under guest_mutex
+    std::optional<Backend::Context> ghost_saved;
+    u64 ghost_stack{}, poses_in{}, poses_out{};
+    bool logged_bad_pose{};
+    void OnPose(std::string origin, Pose pose) {
+        std::scoped_lock lock{mutex};
+        if (!peers.contains(origin) && peers.size() >= 16) return;
+        auto& track = peers[origin];
+        track.online = true;
+        track.Add(static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                      Clock::now().time_since_epoch()).count()), std::move(pose));
+        ++poses_in;
+    }
     boost::asio::io_context io;
     boost::asio::steady_timer retry;
     std::shared_ptr<Connection> connection;
@@ -706,6 +785,11 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
 
     void Fail() {
         if (std::exchange(failed, true)) return;
+        {
+            // No relay, no live peers: their ghosts park until poses arrive again.
+            std::scoped_lock lock{owner.mutex};
+            owner.peers.clear();
+        }
         resolver.cancel();
         boost::system::error_code ignored;
         socket.close(ignored);
@@ -742,6 +826,12 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                     request_baseline = self->owner.baseline_ready &&
                                        self->owner.outgoing.empty() && !self->baseline_requested;
                 }
+                std::optional<Pose> pose;
+                {
+                    std::scoped_lock lock{self->owner.mutex};
+                    pose = std::exchange(self->owner.pose_out, std::nullopt);
+                }
+                if (pose) self->Send(EncodePose(*pose));
                 if (request_baseline) {
                     self->baseline_requested = true;
                     self->Send({{"type", "team_state_request"}});
@@ -803,8 +893,27 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                         self->handshaken = true;
                     } else if (type == "heartbeat") {
                         self->Send({{"type", "heartbeat_ack"}});
-                    } else if (type == "heartbeat_ack" || type == "client_state") {
-                        // Presence has no guest representation in this draft.
+                    } else if (type == "pose") {
+                        // Poses are never grants: a bad one is ignored, never a disconnect.
+                        std::string origin;
+                        auto pose = DecodePose(*packet, &origin);
+                        if (pose && self->owner.pose_enabled) {
+                            self->owner.OnPose(std::move(origin), std::move(*pose));
+                        } else if (!pose && !self->owner.logged_bad_pose) {
+                            self->owner.logged_bad_pose = true;
+                            LOG_WARNING(Core_ARM, "OoT co-op: ignored a malformed pose");
+                        }
+                    } else if (type == "client_state") {
+                        // A peer that went offline hides its ghost (the frame drain parks it).
+                        const auto& state = packet->at("state");
+                        if (packet->contains("origin") && packet->at("origin").is_string() &&
+                            state.is_object() && state.contains("online") &&
+                            state.at("online") == false) {
+                            std::scoped_lock lock{self->owner.mutex};
+                            self->owner.peers.erase(packet->at("origin").get<std::string>());
+                        }
+                    } else if (type == "heartbeat_ack") {
+                        // Liveness only.
                     } else if (type == "error") {
                         LOG_WARNING(Core_ARM, "OoT co-op: relay rejected a packet");
                         return self->Fail();
@@ -933,6 +1042,40 @@ bool Session::Impl::Receive(const Json& packet) {
     return true;
 }
 
+// The ghost's persistent guest memory: the rest of our sentinel page (the brk word is at +0).
+inline constexpr u64 GhostBlock = 0x400;
+static_assert(GhostBlock + GhostSlots * GhostDriver<int>::SlotSize <= 0x1000);
+
+struct Session::Impl::GhostPort {
+    Backend& backend;
+    Memory::Memory& memory;
+    Impl& impl;
+    std::optional<u64> R64(u64 address) { return OotGameDataTrace::Detail::Read64(memory, address); }
+    std::optional<u32> R32(u64 address) { return OotGameDataTrace::Detail::Read32(memory, address); }
+    bool Write(u64 address, const void* data, size_t size) {
+        const u64 low = impl.binding.sentinel + GhostBlock, high = impl.binding.sentinel + 0x1000;
+        if (!impl.binding.sentinel || address < low || address + size > high ||
+            !memory.IsValidVirtualAddressRange(address, size))
+            return false;
+        return memory.WriteBlock(address, data, size);
+    }
+    std::optional<u64> Verified(const OotGameDataTrace::Entry& entry) { return backend.VerifiedEntry(entry); }
+    /// The grant path's call: full context captured, private stack, sentinel return. Up to three
+    /// stack arguments read as zero.
+    bool Call(u64 entry, const std::array<u64, 8>& args) {
+        if (!backend.CallReady()) return false;
+        auto saved = backend.Capture();
+        if (!saved) return false;
+        const u64 sp = impl.binding.stack - ItemFrame;
+        ApplyTarget target{true, false, 0, 0, entry, impl.binding.sentinel, sp, args};
+        target.stores = {{sp, 0}, {sp + 8, 0}, {sp + 0x10, 0}, {sp + 0x18, 0}};
+        if (!backend.Redirect(target)) return false;
+        impl.ghost_saved = std::move(saved);
+        impl.ghost_stack = sp;
+        return true;
+    }
+};
+
 Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_,
                  std::shared_ptr<const OotGameDataTrace::Profile> profile_, Endpoint endpoint, Hello hello,
                  std::set<u64> denied, std::set<Kind> allowed_classes,
@@ -953,6 +1096,17 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
                         "OoT co-op: private stack/sentinel allocation failed (result {:#x}, "
                         "module {}, description {})",
                         result.raw, static_cast<u32>(result.GetModule()), result.GetDescription());
+        }
+    }
+    if (impl->allowed_classes.contains(Kind::Pose)) {
+        if (profile->ghost.Valid() && impl->binding.sentinel) {
+            impl->pose_enabled = true;
+            impl->ghost = std::make_unique<GhostDriver<Impl::GhostPort>>(profile->ghost, base);
+            LOG_INFO(Core_ARM, "OoT co-op: pose class on (ghost block {:#x})",
+                     impl->binding.sentinel + GhostBlock);
+        } else {
+            LOG_WARNING(Core_ARM, "OoT co-op: pose class off: {}",
+                        profile->ghost.Valid() ? "no private call memory" : "the private profile has no ghost object");
         }
     }
     impl->Start();
@@ -1003,6 +1157,18 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     Impl::Backend backend{jit, memory, binding, *profile, tls, tls_ro, std::move(clear_exclusive)};
     const auto log = [](std::string_view line) { LOG_INFO(Core_ARM, "{}", line); };
     const DrainContext site{thread, 1, impl->tick, true};
+    if (binding.sentinel && pc == binding.sentinel && impl->ghost && impl->ghost->Calling()) {
+        const u64 result = jit.GetRegister(0);
+        if (thread != impl->frame_thread || jit.GetSP() != impl->ghost_stack || !impl->ghost_saved ||
+            !backend.Restore(*impl->ghost_saved)) {
+            log(fmt::format("OoT co-op: ghost sentinel refused thread={} pc={:#x}", thread, pc));
+            return false;
+        }
+        impl->ghost_saved.reset();
+        Impl::GhostPort port{backend, memory, *impl};
+        impl->ghost->Returned(port, binding.sentinel + GhostBlock, result, log);
+        return true;
+    }
     if (binding.sentinel && pc == binding.sentinel) {
         const u64 result = jit.GetRegister(0); // the call's return value, before the restore
         const auto event = runtime.Sentinel(backend, site, pc, log);
@@ -1041,6 +1207,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         const u64 old = binding.manager;
         const auto now =
             OotGameDataTrace::Detail::Read64(memory, binding.base + profile->manager_cell);
+        if (impl->ghost) impl->ghost->DropAll(log, "save or title: GameData moved");
         if (runtime.Rebind(backend, log)) {
             impl->stable_frame = false;
             if (impl->rebinds < 16) {
@@ -1052,6 +1219,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     }
     const bool bound = backend.BindFromCell();
     if (binding.invalid || (!bound && impl->stable_frame)) {
+        if (impl->ghost) impl->ghost->DropAll(log, "GameData binding lost");
         runtime.Invalidate();
         runtime.Frame(backend, {thread, 1, impl->tick, true}, [](Change, bool) {}, log);
         return false;
@@ -1099,7 +1267,35 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             log("OoT co-op: baseline exported");
         }
     }
-    return runtime.Calling();
+    if (impl->pose_enabled) FramePose(backend, memory, log, runtime.Calling());
+    return runtime.Calling() || (impl->ghost && impl->ghost->Calling());
+}
+
+template <typename Backend, typename Log>
+void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool grant_calling) {
+    // Own pose: pure reads, paced by the sender; the network thread sends the newest one.
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now().time_since_epoch()).count());
+    const auto local = ReadLocalPose(memory, base, impl->binding.manager, profile->ghost,
+                                     static_cast<u32>(impl->tick));
+    std::vector<PeerView> peers;
+    {
+        std::scoped_lock lock{impl->mutex};
+        if (auto out = impl->sender.Sample(local, now)) {
+            impl->pose_out = std::move(out);
+            if (impl->poses_out++ < 4 || impl->poses_out % 900 == 0) {
+                log(fmt::format("OoT co-op: pose out #{} banc={} child={} loading={} pos=({:.2f}, {:.2f}, "
+                                "{:.2f}) yaw={:.1f}", impl->poses_out, impl->pose_out->banc.empty() ? "-" : impl->pose_out->banc,
+                                impl->pose_out->child, impl->pose_out->loading, impl->pose_out->pos[0],
+                                impl->pose_out->pos[1], impl->pose_out->pos[2], impl->pose_out->yaw));
+            }
+        }
+        for (const auto& [origin, track] : impl->peers) peers.push_back({origin, track.At(now)});
+    }
+    // Grants keep priority: the one call slot of this frame is theirs when they used it.
+    if (grant_calling) return;
+    Impl::GhostPort port{backend, memory, *impl};
+    impl->ghost->Frame(port, impl->binding.sentinel + GhostBlock, local, peers, log);
 }
 
 void BeginSession() {

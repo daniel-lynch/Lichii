@@ -90,6 +90,29 @@ struct Entry {
     explicit operator bool() const { return offset != 0 && !words.empty(); }
 };
 
+/// The ghost ("pose" class): the reads that make a pose and the calls that draw a peer's puppet.
+struct GhostOffsets {
+    u64 playing_info_cell{}; ///< Module offset of the player-info pointer (pose source)
+    u64 pos{}, rot{};        ///< Fields of that object: position (3 floats), rotation 3x3 (9 floats)
+    u64 actor_mgr_cell{};    ///< Module offset of the actor manager pointer
+    u64 scale_const{};       ///< Module offset of the 12-byte unit scale the create argument copies
+    u32 banc_hash{}, child_hash{}, loading_hash{}; ///< GameData keys: String64, Bool, Bool
+    std::array<u64, 3> str64{}; ///< String64 table: {table offset in the manager, stride, char* field}
+    Entry create, get, release, set_mtx;
+    std::vector<u64> actor_fields; ///< Actor pointer fields that must stay unchanged and non-null
+    /// The game's own actor-link check, as pure reads: {actor's lifetime record field, actor's
+    /// id field, record's actor field, record's generation field}. Live while the record still
+    /// names this actor with the generation the actor had when it was taken.
+    std::array<u64, 4> link{};
+    std::string actor_child, actor_adult; ///< Actor names; adult falls back to child
+    bool Valid() const {
+        return playing_info_cell && pos && rot && actor_mgr_cell && scale_const && banc_hash &&
+               child_hash && loading_hash && str64[0] && str64[1] && str64[2] && create && get &&
+               release && set_mtx && !actor_fields.empty() && link[0] && link[1] && link[2] && link[3] &&
+               !actor_child.empty();
+    }
+};
+
 /// Everything game-derived for one main build, loaded at run time from the private profile.
 struct Profile {
     std::string build_id;
@@ -103,6 +126,7 @@ struct Profile {
     u64 event_got{};                ///< Module offset of the GOT slot of the event manager's cell
     /// {cell, field}: *(*(main + cell) + field) must be non-zero before a give is replayed.
     std::vector<std::pair<u64, u64>> item_guards;
+    GhostOffsets ghost; ///< Empty unless the profile has a "ghost" object
 
     u64 SiteOffset(Point point) const {
         for (const Site& site : sites) {

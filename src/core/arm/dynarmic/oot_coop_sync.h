@@ -25,13 +25,14 @@ namespace Core::Memory { class Memory; }
 
 namespace Core::OotCoop {
 
-inline constexpr u32 ProtocolVersion = 2;
+inline constexpr u32 ProtocolVersion = 3;
 inline constexpr u64 MaxSequence = (u64{1} << 53) - 1;
 inline constexpr size_t MaxFrame = 1 << 20;
 inline constexpr size_t QueueLimit = 4096;
 inline constexpr size_t StateLimit = 4096;
 
-enum class Kind { Bool, Int, Enum, Quest, Bit, PouchAdd, PouchTotal, Rupee, Item };
+// Pose is a class token only (EDEN_NX2_OOT_COOP_ALLOW "pose"): poses are never grants or state.
+enum class Kind { Bool, Int, Enum, Quest, Bit, PouchAdd, PouchTotal, Rupee, Item, Pose };
 
 // Wallet deltas (class "rupee"): an additive event, never state. The key is the wallet's GameData
 // hash from the private profile; the wire accepts any non-zero 32-bit key and the receiver's
@@ -158,6 +159,9 @@ private:
     /// The give-to-pouch entry trapped on this (opener's) game: log it, forward chest gives.
     void ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory);
     struct Impl;
+    /// Class "pose": send our pose, draw the peers' ghosts (one call at most, after the grants).
+    template <typename Backend, typename Log>
+    void FramePose(Backend& backend, Memory::Memory& memory, Log log, bool grant_calling);
     std::unique_ptr<Impl> impl;
 };
 

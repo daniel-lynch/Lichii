@@ -258,7 +258,7 @@ or `"0x..."` strings; unknown fields reject the file.
 
 - `EDEN_NX2_OOT_COOP=1`: enable loopback transport, default `127.0.0.1:43390`;
   `EDEN_NX2_OOT_COOP_RELAY=host:port` overrides it. The older `COOP=host:port` form works.
-- `EDEN_NX2_OOT_COOP_ALLOW`: comma-separated `bool`, `bit`, `rupee` and `item` tokens, no spaces or empty
+- `EDEN_NX2_OOT_COOP_ALLOW`: comma-separated `bool`, `bit`, `rupee`, `item` and `pose` tokens, no spaces or empty
   tokens. Default is the **empty set**. Invalid tokens reject session creation.
   The old `ALLOW_CLASSES` variable is no longer consulted.
 - `EDEN_NX2_OOT_COOP_KEYS`: JSON policy with typed arrays, for example
@@ -301,3 +301,35 @@ Unit tests exercise the real JIT's frame→synthetic setter→sentinel→continu
 and a fake two-peer observer/queue/application path. These do not validate this game's
 manager lifetime, event exclusion, queue-consumer effects or save durability. Follow
 FIELD-PLAN.md on disposable saves before claiming the field candidate works.
+
+## Ghost (class `pose`, protocol v3)
+
+The private profile's `offsets.<build-id>` may carry a `ghost` object (it is a separate private
+file until this branch merges, because older binaries reject unknown profile fields):
+
+```json
+"ghost": {"playing_info_cell": "<offset>", "pos": "<field>", "rot": "<field>",
+          "actor_mgr_cell": "<offset>", "scale_const": "<offset>",
+          "banc_hash": "<hash>", "child_hash": "<hash>", "loading_hash": "<hash>",
+          "str64": ["<table>", "<stride>", "<field>"],
+          "create": {"at": "<offset>", "words": [...]}, "get": {...}, "release": {...}, "set_mtx": {...},
+          "actor_fields": ["<field>", ...], "actor_child": "<actor>", "actor_adult": "<actor>"}
+```
+
+- **Sender (pure reads at the frame hook).** Position and rotation from the player-info object,
+  yaw = atan2(m02, m22); scene from the String64 key, age and loading from Bool keys. About 15 Hz
+  while moving, 1 Hz keepalive; after a scene change `loading` stays true until the position moves
+  (the player-info position lags the load by about a second, field P1/P4).
+- **Receiver (one synthetic call per frame at most, only when no grant call started).** Per peer:
+  create the puppet by name through the actor manager's create call (x0 manager, x1 &name pointer,
+  x2 &0xA0-byte create argument, x3 &handle, w4 1, three zero stack arguments); poll the request
+  record's state (pure read); on "created" fetch the actor with the get call (which consumes the
+  handle); move it each frame with the actor's own set-transform call (actor, &Matrix34f, 0);
+  release a failed or orphaned request with the release call. Hidden peers (other scene, loading,
+  stale, offline) are parked below the map once; nothing is ever deleted by us.
+- **Lifetime.** The game deletes the puppet with its scene. Before every call the actor's vtable
+  and the profile's `actor_fields` must be unchanged and non-null; a local scene change, load or
+  GameData move drops the pointer without any call. The handle, argument block, matrix and name
+  live in our sentinel page past +0x400 (persistent, never a reused stack frame).
+- Field status: `RESULT` of C8 (private).
+

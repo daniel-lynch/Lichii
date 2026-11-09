@@ -11,7 +11,8 @@
 namespace Core::OotCoop {
 
 inline std::string_view ClassName(Kind kind) {
-    return kind == Kind::Bit ? "bit" : kind == Kind::Rupee ? "rupee" : kind == Kind::Item ? "item" : "bool";
+    return kind == Kind::Bit ? "bit" : kind == Kind::Rupee ? "rupee" : kind == Kind::Item ? "item"
+           : kind == Kind::Pose ? "pose" : "bool";
 }
 
 // The pouch manager is *(main + profile.pouch_cell). The wallet entry (profile.rupee_entry; x0 =
@@ -281,6 +282,11 @@ public:
         }
         return target;
     }
+
+    /// For the ghost driver (class "pose"): the same entry check and call readiness as a grant.
+    std::optional<u64> VerifiedEntry(const OotGameDataTrace::Entry& entry) { return Verified(entry); }
+    bool CallReady() { return Callable() && binding.stack >= ItemStackNeed &&
+                              Range(binding.stack - ItemStackNeed, ItemStackNeed); }
 
     bool OrFlag(const ApplyTarget&) { return false; }
     std::optional<Context> Capture() {
