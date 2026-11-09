@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import contextlib
 import collections
+import hashlib
 import json
 import importlib.util
 from pathlib import Path
@@ -39,16 +40,31 @@ def origin_fields(text):
     return result
 
 
+def animation_descriptor(path):
+    """Hash the exact private sidecar bytes; never normalize or transmit its contents."""
+    if path is None:
+        return None
+    with Path(path).open("rb") as source:
+        data = source.read(16 * 1024 * 1024 + 1)
+    if not data or len(data) > 16 * 1024 * 1024:
+        raise ValueError("animation sidecar size out of range")
+    return {"av": 1, "table_sha256": hashlib.sha256(data).hexdigest()}
+
+
 class ClientSim:
     def __init__(self, client_id=None, *, room="default", team="default", name="Player",
                  build_id=BUILD_ID, seed_hash="0", policy_id="or-v2", auto_heartbeat=True,
-                 on_pose=None, world_wallet=None):
-        self.hello = {"type": "hello", "version": wire.VERSION, "build_id": build_id,
+                 on_pose=None, world_wallet=None, animation=None):
+        self.hello = {"type": "hello", "version": wire.VERSION if animation else wire.LEGACY_VERSION, "build_id": build_id,
                       "seed_hash": seed_hash, "room": room, "team": team,
                       "client_id": client_id or uuid.uuid4().hex, "name": name, "policy_id": policy_id}
         if world_wallet is not None:
             wire.validate_wallet(world_wallet)
             self.hello["world_wallet"] = dict(world_wallet)
+        if animation is not None:
+            wire.validate_animation(animation)
+            self.hello["animation"] = dict(animation)
+        self.peer_animations = {}
         self.auto_heartbeat = auto_heartbeat
         self.seq = 0
         self.messages = asyncio.Queue(2048)
@@ -70,6 +86,10 @@ class ClientSim:
         if self.ack["type"] != "hello_ack":
             await self.close()
             raise ValueError(self.ack.get("reason", "handshake refused"))
+        if (self.ack.get("version") != self.hello["version"] or
+                self.ack.get("animation") != self.hello.get("animation")):
+            await self.close()
+            raise ValueError("animation handshake mismatch")
         self.snapshot = await self.read()
         if self.snapshot["type"] != "team_state":
             await self.close()
@@ -88,12 +108,20 @@ class ClientSim:
                 if packet["type"] == "heartbeat" and self.auto_heartbeat:
                     await self.send({"type": "heartbeat_ack"})
                 if packet["type"] == "pose":
+                    if "av" in packet and not self.animation_matches(packet.get("origin")):
+                        packet = {key: value for key, value in packet.items() if key not in wire.ANIM_POSE_FIELDS}
                     self.poses.append(packet)
                     self.pose_count += 1
                     self.pose_waiter.set()
                     if self.on_pose is not None:
                         self.on_pose(packet)
                     continue
+                if packet["type"] == "client_state":
+                    state = packet.get("state", {})
+                    self.peer_animations.pop(packet["origin"], None)
+                    if state.get("online") is not False and state.get("animation") is not None:
+                        wire.validate_animation(state["animation"])
+                        self.peer_animations[packet["origin"]] = state["animation"]
                 await self.messages.put(packet)
         except (EOFError, ConnectionError, ValueError) as exc:
             await self.messages.put(exc)
@@ -115,15 +143,24 @@ class ClientSim:
             packet["world_wallet"] = dict(world_wallet)
         await self.send(packet)
 
+    def animation_matches(self, origin):
+        animation = self.hello.get("animation")
+        return animation is not None and self.peer_animations.get(origin) == animation
+
     def pose_packet(self, banc, child, pos, yaw, loading=False, t=None, anim="idle", anim_seq=0,
-                    rate=0.0, phase=0.0):
-        """A v3 pose (no origin/seq: the relay stamps origin). t defaults to a counter + 1."""
+                    rate=0.0, phase=0.0, aid=None, af=None, ar=1.0, aseq=0):
+        """Keep the legacy approximation alongside any negotiated animation state."""
         if t is None:
             t = self.pose_t + 1
         self.pose_t = t % (1 << 32)
-        return {"type": "pose", "t": self.pose_t, "banc": banc, "child": bool(child),
+        packet = {"type": "pose", "t": self.pose_t, "banc": banc, "child": bool(child),
                 "loading": bool(loading), "pos": [p for p in pos], "yaw": yaw, "anim": anim,
                 "anim_seq": anim_seq, "rate": rate, "phase": phase}
+        if aid is not None:
+            if not any(self.animation_matches(origin) for origin in self.peer_animations):
+                raise ValueError("no peer with matching animation table")
+            packet.update(av=1, aid=aid, af=af, ar=ar, aseq=aseq)
+        return packet
 
     async def pose(self, banc, child, pos, yaw, loading=False, t=None, **anim):
         packet = self.pose_packet(banc, child, pos, yaw, loading, t, **anim)
@@ -170,6 +207,7 @@ class ClientSim:
         self.messages = asyncio.Queue(2048)
         self.poses.clear()
         self.pose_count = 0
+        self.peer_animations.clear()
 
 
 async def run(args):
@@ -177,6 +215,7 @@ async def run(args):
                        build_id=args.build_id, seed_hash=args.seed, policy_id=args.policy,
                        world_wallet=dict(zip(("balance", "capacity"), args.world_wallet))
                        if args.world_wallet else None,
+                       animation=animation_descriptor(args.anim_table),
                        on_pose=lambda packet: print(json.dumps(packet), flush=True) if args.show_poses else None)
     try:
         await client.connect(args.host, args.port)
@@ -220,6 +259,7 @@ def main():
     parser.add_argument("--seed", default="0")
     parser.add_argument("--policy", default="or-v2")
     parser.add_argument("--world-wallet", type=int, nargs=2, metavar=("BALANCE", "CAPACITY"))
+    parser.add_argument("--anim-table", help="private coop-anim.json sidecar (exact-byte SHA256 negotiation)")
     parser.add_argument("--duration", type=float, default=30)
     parser.add_argument("--send", action="append", default=[], help="JSON packet; change origin/seq are automatic")
     parser.add_argument("--pose", action="append", default=[], help="'BANC CHILD X Y Z YAW [LOADING]' (v3 pose)")

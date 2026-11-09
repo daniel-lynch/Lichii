@@ -40,6 +40,9 @@ add_executable(tests
     core/gpu_dirty_memory.cpp
     core/memory_acquire.cpp
     core/oot_coop_call_memory.cpp
+    core/oot_coop_anim.cpp
+    core/oot_coop_anim_backend.cpp
+    core/oot_coop_player.cpp
     core/oot_coop_ux.cpp
     core/oot_coop_chest.cpp
     core/oot_coop_world.cpp

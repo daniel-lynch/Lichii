@@ -131,6 +131,7 @@ struct Hello {
     std::string client_id;
     std::string name{"Player"};
     std::optional<World::Wallet> world_wallet;
+    std::string animation_hash; // nonempty: protocol v4, animation revision 1
 };
 [[nodiscard]] nlohmann::json EncodeHello(const Hello& hello);
 [[nodiscard]] bool MatchesHello(const nlohmann::json& packet, const Hello& hello);

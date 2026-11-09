@@ -25,7 +25,10 @@ Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CT
   received                  every change packet received so far (from other origins)
   state                     the relay's team checkpoint as the peer sees it (team_state_request)
   mark TEXT                 a marker line in received.jsonl (for correlating with emulator logs)
-  pose BANC CHILD X Y Z YAW [LOADING]   send one v3 pose (CHILD/LOADING 0|1; BANC "-" = "")
+  pose BANC CHILD X Y Z YAW [LOADING] [aid=N af=F|null ar=R aseq=N]
+                            one pose; animation options need --anim-table and a matching peer.
+                            Omitted aseq advances on each command (including frozen frame steps).
+                            Reuse an explicit aseq for rate-only updates; frame changes need a new sequence.
   poseanim BANC X Y Z YAW ANIM RATE      one child pose with an explicit animation hint (idle|walk|run),
                             a new anim_seq each time (the receiver replays the category's command)
   posecircle BANC CX CY CZ R PERIOD_S HZ DURATION_S
@@ -74,11 +77,12 @@ class FakePeer:
     """Relay + one scripted client in one event loop. `port=0` picks an ephemeral port."""
 
     def __init__(self, *, port=43390, room="default", team="default", policy="or-v2", seed="0",
-                 name="FakePeer", build_id=client_sim.BUILD_ID, record=None, wallet=0):
+                 name="FakePeer", build_id=client_sim.BUILD_ID, record=None, wallet=0, anim_table=None):
         self.relay = relay_mod.Relay()
         self.port = port
         self.client = client_sim.ClientSim(room=room, team=team, name=name, build_id=build_id,
-                                           seed_hash=seed, policy_id=policy)
+                                           seed_hash=seed, policy_id=policy,
+                                           animation=client_sim.animation_descriptor(anim_table))
         self.record = Path(record) if record else None
         self.wallet = wallet  # the wallet key from the private profile (rupee_add)
         self.received = []
@@ -331,11 +335,30 @@ class FakePeer:
         if verb == "state":
             return {"state": await self.state()}
         if verb == "pose":
-            if len(words) not in (7, 8):
-                raise ValueError("pose BANC CHILD X Y Z YAW [LOADING]")
+            if len(words) < 7:
+                raise ValueError("pose BANC CHILD X Y Z YAW [LOADING] [aid=N af=F|null ar=R aseq=N]")
+            tail, loading, animation = words[7:], False, {}
+            if tail and "=" not in tail[0]:
+                if tail[0] not in ("0", "1"):
+                    raise ValueError("LOADING must be 0 or 1")
+                loading, tail = tail[0] == "1", tail[1:]
+            for option in tail:
+                key, separator, value = option.partition("=")
+                if not separator or key not in ("aid", "af", "ar", "aseq") or key in animation:
+                    raise ValueError("invalid animation pose option")
+                animation[key] = (int(value, 0) if key in ("aid", "aseq") else
+                                  None if key == "af" and value == "null" else float(value))
+            if animation:
+                if "aid" not in animation:
+                    raise ValueError("animation pose needs aid")
+                animation.setdefault("aseq", (getattr(self, "aseq", 0) + 1) & 0xffffffff)
+            if words[2] not in ("0", "1"):
+                raise ValueError("CHILD must be 0 or 1")
             packet = await self.send_pose("" if words[1] == "-" else words[1], words[2] == "1",
                                           [float(w) for w in words[3:6]], float(words[6]),
-                                          len(words) == 8 and words[7] == "1")
+                                          loading, **animation)
+            if animation:
+                self.aseq = animation["aseq"]
             return {"sent": packet}
         if verb == "poseanim":
             if len(words) != 8 or words[6] not in ("idle", "walk", "run"):
@@ -404,7 +427,7 @@ async def serve(args):
     commands.touch()
     peer = FakePeer(port=args.port, room=args.room, team=args.team, policy=args.policy, seed=args.seed,
                     name=args.name, build_id=args.build_id, record=ctl / "received.jsonl",
-                    wallet=args.wallet)
+                    wallet=args.wallet, anim_table=args.anim_table)
     port = await peer.start()
     print(f"fake peer ready on 127.0.0.1:{port} room={args.room} team={args.team}", flush=True)
     done = len(commands.read_text().splitlines())
@@ -441,6 +464,7 @@ def main():
     parser.add_argument("--seed", default="0")
     parser.add_argument("--name", default="FakePeer")
     parser.add_argument("--build-id", default=client_sim.BUILD_ID)
+    parser.add_argument("--anim-table", help="private coop-anim.json sidecar; enables v4 animation negotiation")
     parser.add_argument("--wallet", type=lambda text: int(text, 0), default=0,
                         help="wallet GameData key for rupee_add (from the private profile)")
     args = parser.parse_args()

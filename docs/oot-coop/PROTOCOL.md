@@ -57,7 +57,8 @@ allocation. EOF inside a frame is malformed; EOF between frames is normal discon
 JSON is chosen over msgpack to keep the relay stdlib-only and manual inspection easy.
 Length prefixing supplies bounded allocation and unambiguous framing without scanning
 for delimiters. Protocol v1 newline clients are intentionally incompatible; v2 clients are
-refused at `hello` with `protocol version mismatch` (v3 only adds `pose`).
+refused at `hello` with `protocol version mismatch`. Versions 3 and 4 share this framing;
+v4 adds negotiated animation IDs.
 
 Every payload is a typed object. Duplicate keys, non-finite numbers, invalid UTF-8,
 more than 16 nested containers, unknown packet types and unknown grant/hello/pose fields
@@ -86,6 +87,19 @@ Success yields `hello_ack` with `version`, `build_id`, `seed_hash`, `policy_id`,
 then `team_state`, then each connected peer's cached `client_state`. Failure yields
 `{"type":"error","reason":"..."}` and disconnect. Reasons include `build id mismatch`,
 `seed hash mismatch`, `policy id mismatch` and `protocol version mismatch`.
+
+Animation clients use `version:4` and add `"animation":{"av":1,"table_sha256":"<64-lowercase-hex>"}`
+to hello. SHA256 covers the exact bytes of the private `coop-anim.json` sidecar beside the
+key file. The relay echoes the descriptor in `hello_ack`, with the requested protocol
+version. For v4 recipients it includes each peer's negotiated descriptor in
+`client_state.state.animation`; that descriptor comes from hello and cannot be replaced
+by later client-state writes. Version 3 recipients receive ordinary presence without it.
+A sender emits animation IDs only while a peer advertises the identical descriptor;
+a receiver checks the origin's descriptor before interpreting an ID. Disconnect clears
+that peer's negotiation. Missing or mismatched tables retain legacy animation hints.
+A client sends the v4 hello only when its private key file turns an animation sender or
+receiver on and the sidecar loads; with both off it keeps the v3 hello (and so still joins a
+relay that predates v4). Deploy the v4 relay before enabling either.
 
 ## Grants, receipts and presence
 
@@ -291,7 +305,7 @@ inline clipping and durable baseline revisions still require a later ordered-wal
   file's `give.never`), so nothing is counted twice.
 - Per-player Bools (`deny.bool`) are dropped by the client's protocol state and never applied.
 
-## Poses (class `pose`, v3)
+## Poses (class `pose`, v3 and v4)
 
 A pose is a peer's live position, sent so the others can draw a ghost of it. It is **not a
 grant**: no `seq`, no ack, no `rev`, no replay window, never folded into team state, never in a
@@ -303,7 +317,7 @@ grant**: no `seq`, no ack, no `rev`, no replay window, never folded into team st
 
 `anim`, `anim_seq`, `rate` and `phase` are an animation hint for a later animated receiver; the v1
 statue receiver ignores them. The sender infers `anim` (`idle`, `walk` or `run`) from its speed,
-because the game's own command table names both walking and running `Move`. `anim_seq`
+because the game's command table shares a locomotion command for walking and running. `anim_seq`
 (unsigned 32-bit) changes only when the category changes, so a receiver restarts an animation
 then and never per packet. `rate` (0..10) is the speed relative to the category's nominal speed;
 `phase` (0 <= phase < 1) is the cycle position (distance per stride, or time while idle).
@@ -312,10 +326,40 @@ then and never per packet. `rate` (0..10) is the speed relative to the category'
 name, 1..63 of `[A-Za-z0-9_]`, or `""` when there is no save, the title screen is up or the scene
 cannot be read. `child` and `loading` are JSON booleans. `pos` is exactly three finite numbers
 (integer or float, never a boolean), each with magnitude at most 100000. `yaw` is a finite number
-of degrees in [-360, 360]. The framed payload, as sent, is at most 256 bytes. `origin` and `seq`
+of degrees in [-360, 360]. The JSON payload is at most 512 bytes, including the relay-added
+`origin` on forwarded packets. `origin` and `seq`
 are not accepted from the client and unknown fields are rejected. A malformed pose is a protocol
 error like any other malformed packet (an `error` and disconnect); a well-formed one never
-causes a disconnect.
+causes a disconnect unless adding the required origin exceeds the payload limit.
+
+V4 poses retain every legacy field and optionally add all five animation fields together:
+
+| Field | Encoding |
+|---|---|
+| `av` | Integer 1; other revisions rejected |
+| `aid` | Unsigned 32-bit integer; 0 selects legacy approximation; other values require an age-matching table entry |
+| `af` | Finite resource-frame number in `[0, entry.frames]`, or null when phase correspondence is unknown |
+| `ar` | Finite requested rate in `[0,4]`; 0 freezes |
+| `aseq` | Unsigned 32-bit transition generation, including restarts of the same ID |
+
+The relay validates numeric shape, finite values, rate, and a generic frame ceiling of
+1,000,000; the client validates ID membership, age and the entry's actual frame bound.
+Booleans and fractional IDs/generations are rejected. Frame and rate serialization must
+retain float32 precision. Clip strings never travel on the wire. The relay forwards these
+five fields only to peers whose hello descriptor matches the sender's; other peers receive
+the legacy fields alone. An unnegotiated sender cannot submit animation fields.
+
+Animation selection is discrete at the selected pose timestamp. Transition ordering uses
+`0 < uint32(new-old) < 0x80000000`, reset on a new session. Newer packets coalesce while a
+native call is outstanding; completion only commits that call's own generation. New
+transitions play frozen, set the frame, set the rate, then apply the anchor transform.
+Rate changes within a transition do not replay it. Verified in-place one-shots hold their
+last frame until another sender transition; they never automatically select idle.
+
+The probe peer accepts `--anim-table <private-sidecar>` and commands such as
+`pose <banc> 1 0 0 0 0 aid=<id> af=0 ar=0`. Omit `aseq` for frozen frame steps: each command
+advances the generation and reapplies the chosen frame. Reuse `aseq=<generation>` for a
+rate-only update. Same-transition frame correction is not enabled.
 
 The relay forwards `{"type":"pose","origin":"<client-id>",...same fields}` to the other members
 of the sender's team only; `origin` comes from the connection. Delivery is best effort, latest
@@ -400,7 +444,7 @@ then there is no "exactly once" consumable synchronization claim.
 
 Limits: 128 connections, 32 rooms, 16 teams/room, 256 retained sender IDs/team, 2048
 flag keys/team, 512 replay entries, 256 queued frames/client and 2 MiB queued bytes/client.
-Slow clients disconnect; capacity failures do not silently evict state. Poses: 256-byte
+Slow clients disconnect; capacity failures do not silently evict state. Poses: 512-byte
 payload, no new pose to a receiver holding more than 64 queued frames, one queued pose per
 origin per receiver, 30 poses/s per sender; pose excess is dropped and never disconnects. Heartbeat is
 30 seconds; receive idle timeout is 90 seconds. A private deny-list JSON array of numeric

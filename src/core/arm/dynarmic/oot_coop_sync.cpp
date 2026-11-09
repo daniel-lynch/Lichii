@@ -448,6 +448,10 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                 const auto cell = Number(value, MaxModuleOffset);
                 if (!cell || !*cell || (*cell & 7)) return std::nullopt;
                 (field == "manager_cell" ? profile.manager_cell : profile.pouch_cell) = *cell;
+            } else if (field == "anim") {
+                const auto decoded = Anim::DecodeKeys(value);
+                if (!decoded) return std::nullopt;
+                profile.anim = std::make_shared<const Anim::Keys>(*decoded);
             } else if (field == "wallet_hash") {
                 const auto hash = Number(value, 0xFFFFFFFF);
                 if (!hash || !*hash) return std::nullopt;
@@ -745,20 +749,36 @@ bool Enabled() {
     return enabled;
 }
 
+namespace {
+bool AnimationMatches(const Json& value, const std::string& hash) {
+    return !hash.empty() && value.is_object() && value.size() == 2 && value.contains("av") &&
+           Unsigned(value.at("av"), 1) && value.at("av") == 1 &&
+           value.contains("table_sha256") && value.at("table_sha256").is_string() &&
+           value.at("table_sha256") == hash;
+}
+} // namespace
+
 Json EncodeHello(const Hello& hello) {
-    Json packet{{"type", "hello"}, {"version", ProtocolVersion}, {"build_id", hello.build_id},
-            {"seed_hash", hello.seed_hash}, {"policy_id", hello.policy_id}, {"room", hello.room},
-            {"team", hello.team},
-            {"client_id", hello.client_id}, {"name", hello.name}};
+    Json packet = {{"type", "hello"}, {"version", hello.animation_hash.empty() ? ProtocolVersion : 4},
+                   {"build_id", hello.build_id}, {"seed_hash", hello.seed_hash},
+                   {"policy_id", hello.policy_id}, {"room", hello.room}, {"team", hello.team},
+                   {"client_id", hello.client_id}, {"name", hello.name}};
+    if (!hello.animation_hash.empty())
+        packet["animation"] = {{"av", 1}, {"table_sha256", hello.animation_hash}};
     if (hello.world_wallet) packet["world_wallet"] = World::EncodeWallet(*hello.world_wallet);
     return packet;
 }
 
 bool MatchesHello(const Json& packet, const Hello& hello) {
     try {
+        const u32 version = hello.animation_hash.empty() ? ProtocolVersion : 4;
+        if (!hello.animation_hash.empty() &&
+            (!packet.contains("animation") ||
+             !AnimationMatches(packet.at("animation"), hello.animation_hash)))
+            return false;
         return packet.at("type") == "hello_ack" &&
-               Unsigned(packet.at("version"), ProtocolVersion) &&
-               packet.at("version") == ProtocolVersion && packet.at("build_id") == hello.build_id &&
+               Unsigned(packet.at("version"), version) &&
+               packet.at("version") == version && packet.at("build_id") == hello.build_id &&
                packet.at("seed_hash") == hello.seed_hash && packet.at("policy_id") == hello.policy_id &&
                packet.at("client_id") == hello.client_id;
     } catch (const Json::exception&) {
@@ -1069,6 +1089,14 @@ struct Session::Impl {
     // Class "pose" (v3): own pose out, peers' poses in, puppets drawn by the frame drain.
     bool pose_enabled{};
     PoseSender sender;
+    Anim::Sender anim_sender;
+    Anim::CommandWatch command_watch; // guest thread: per-frame player command transitions
+    std::optional<Anim::Player> anim_player;
+    std::string anim_scene;
+    u64 anim_snapshot_lines{}, command_lines{};
+    std::shared_ptr<const Anim::Table> anim_table;
+    std::map<std::string, std::string, std::less<>> animation_peers; // under mutex
+    u64 peer_session{};
     std::optional<Pose> pose_out;                         // under mutex: newest unsent own pose
     std::map<std::string, PeerTrack, std::less<>> peers;  // under mutex: by origin
     OotGameDataTrace::GhostOffsets ghost_offsets;         // the driver holds a reference to it
@@ -1089,7 +1117,19 @@ struct Session::Impl {
             LOG_INFO(Core_ARM, "OoT co-op: peer {} online (first pose: banc={} loading={})", origin.substr(0, 8),
                      pose.banc.empty() ? "-" : pose.banc, pose.loading);
         }
+        const auto negotiated = animation_peers.find(origin);
+        if (pose.animation && (!anim_table || negotiated == animation_peers.end() ||
+                               negotiated->second != anim_table->Hash()))
+            pose.animation.reset();
+        if (pose.animation && pose.animation->aid) {
+            const auto* entry = anim_table->Find(pose.child, pose.animation->aid);
+            if (!entry) {
+                if (anim_table->Find(!pose.child, pose.animation->aid)) return;
+                pose.animation.reset(); // unavailable ID uses the legacy category
+            } else if (pose.animation->af && *pose.animation->af > entry->frames) return;
+        }
         auto& track = peers[origin];
+        if (!track.session) track.session = ++peer_session;
         track.online = true;
         track.Add(static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
                       Clock::now().time_since_epoch()).count()), std::move(pose));
@@ -1135,6 +1175,8 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
             dropped = owner.peers.size();
             owner.peers.clear();
             owner.peer_wallets.clear();
+            owner.animation_peers.clear();
+            owner.pose_out.reset();
         }
         resolver.cancel();
         boost::system::error_code ignored;
@@ -1186,7 +1228,18 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                     std::scoped_lock lock{self->owner.mutex};
                     pose = std::exchange(self->owner.pose_out, std::nullopt);
                 }
-                if (pose) self->Send(EncodePose(*pose));
+                if (pose) {
+                    {
+                        std::scoped_lock lock{self->owner.mutex};
+                        const bool matched = std::any_of(self->owner.animation_peers.begin(),
+                            self->owner.animation_peers.end(), [&](const auto& peer) {
+                                return !self->owner.hello.animation_hash.empty() &&
+                                       peer.second == self->owner.hello.animation_hash;
+                            });
+                        if (!matched) pose->animation.reset();
+                    }
+                    self->Send(EncodePose(*pose));
+                }
                 if (request_baseline) {
                     self->baseline_requested = true;
                     Json request{{"type", "team_state_request"}};
@@ -1259,7 +1312,8 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                     } else if (type == "pose") {
                         // Poses are never grants: a bad one is ignored, never a disconnect.
                         std::string origin;
-                        auto pose = DecodePose(*packet, &origin);
+                        auto pose = self->input.size() <= PoseFrameLimit
+                                        ? DecodePose(*packet, &origin) : std::nullopt;
                         if (pose && self->owner.pose_enabled) {
                             self->owner.OnPose(std::move(origin), std::move(*pose));
                         } else if (!pose && !self->owner.logged_bad_pose) {
@@ -1277,6 +1331,21 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                                 self->owner.peer_wallets[packet->at("origin").get<std::string>()] = *wallet;
                         }
                         if (packet->contains("origin") && packet->at("origin").is_string() &&
+                            state.is_object()) {
+                            const auto origin = packet->at("origin").get<std::string>();
+                            std::scoped_lock lock{self->owner.mutex};
+                            std::string hash;
+                            if (state.contains("animation") && !self->owner.hello.animation_hash.empty() &&
+                                AnimationMatches(state.at("animation"), self->owner.hello.animation_hash))
+                                hash = self->owner.hello.animation_hash;
+                            const auto old = self->owner.animation_peers.find(origin);
+                            if (old != self->owner.animation_peers.end() && old->second != hash)
+                                self->owner.peers.erase(origin);
+                            if (self->owner.animation_peers.size() < 64 ||
+                                self->owner.animation_peers.contains(origin))
+                                self->owner.animation_peers[origin] = std::move(hash);
+                        }
+                        if (packet->contains("origin") && packet->at("origin").is_string() &&
                             state.is_object() && state.contains("name") && state.at("name").is_string()) {
                             self->owner.ux.SetName(packet->at("origin").get<std::string>(),
                                                    state.at("name").get<std::string>());
@@ -1287,6 +1356,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                             const auto origin = packet->at("origin").get<std::string>();
                             std::scoped_lock lock{self->owner.mutex};
                             self->owner.peer_wallets.erase(origin);
+                            self->owner.animation_peers.erase(origin);
                             if (self->owner.peers.erase(origin))
                                 LOG_INFO(Core_ARM, "OoT co-op: peer {} offline (relay)", origin.substr(0, 8));
                         }
@@ -1450,12 +1520,17 @@ bool Session::Impl::Receive(const Json& packet) {
 
 // The ghost's persistent guest memory: the rest of our sentinel page (the brk word is at +0).
 inline constexpr u64 GhostBlock = 0x400;
+inline constexpr u64 AnimSourceLines = 512; ///< Source-slot blackboard lines per session
+inline constexpr u64 CommandLines = 2048;   ///< Player command transition lines per session
 static_assert(GhostBlock + GhostSlots * GhostDriver<int>::SlotSize <= 0x1000);
 
 struct Session::Impl::GhostPort {
     Backend& backend;
     Memory::Memory& memory;
     Impl& impl;
+    std::optional<float> AnimationFrame(u64 actor, const Anim::Keys& keys) {
+        return Anim::ReadControllerFrame(memory, actor, keys);
+    }
     std::optional<u64> R64(u64 address) { return OotGameDataTrace::Detail::Read64(memory, address); }
     std::optional<u32> R32(u64 address) { return OotGameDataTrace::Detail::Read32(memory, address); }
     bool Write(u64 address, const void* data, size_t size) {
@@ -1527,7 +1602,60 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
                 impl->ghost_offsets.tint_set = {};
                 LOG_INFO(Core_ARM, "OoT co-op: ghost tint disabled (eyes-only setter)");
             }
-            impl->ghost = std::make_unique<GhostDriver<Impl::GhostPort>>(impl->ghost_offsets, base);
+            // v4 is negotiated only when a gate is on: a key file with both gates off (the safe
+            // default) keeps the v3 hello, so it still joins a relay that predates v4.
+            if (profile->anim && (profile->anim->sender_enabled || profile->anim->receiver_enabled)) {
+                std::string why;
+                impl->anim_table = Anim::LoadTable(&why);
+                if (impl->anim_table) impl->hello.animation_hash = impl->anim_table->Hash();
+                LOG_INFO(Core_ARM, "OoT co-op: animation table {} (sender {}, receiver {}){}", why,
+                         profile->anim->sender_enabled ? "on" : "off",
+                         profile->anim->receiver_enabled ? "on" : "off",
+                         impl->anim_table ? fmt::format(" entries={} sha256={}", impl->anim_table->Size(),
+                                                        impl->anim_table->Hash().substr(0, 12))
+                                          : std::string{});
+            }
+            impl->ghost = std::make_unique<GhostDriver<Impl::GhostPort>>(impl->ghost_offsets, base,
+                profile->anim, impl->anim_table);
+            // Command watch consumers, in order: the sender (it numbers transitions), then the
+            // bounded transition log that records which command each action uses. Claim
+            // triggers subscribe the same way. EDEN_NX2_OOT_COOP_COMMAND_LOG=1 logs without sending.
+            if (profile->anim && (profile->anim->sender_enabled || Env("EDEN_NX2_OOT_COOP_COMMAND_LOG") == "1")) {
+                Impl* const self = impl.get();
+                const auto keys = profile->anim;
+                if (keys->sender_enabled)
+                    self->command_watch.Subscribe([self, keys](const Anim::CommandChange& change,
+                                                               const Anim::Snapshot&, const Anim::Player&) {
+                        if (change.slot == keys->source_slot) self->anim_sender.Transition();
+                    });
+                self->command_watch.Subscribe([self, keys](const Anim::CommandChange& change,
+                                                           const Anim::Snapshot& snapshot,
+                                                           const Anim::Player& player) {
+                    if (self->command_lines < CommandLines) {
+                        const auto& next = change.next;
+                        const auto name = [](const Anim::Controller& c) {
+                            return c.index == Anim::UnknownCommand ? std::string{"-"} : c.name;
+                        };
+                        LOG_INFO(Core_ARM,
+                                 "OoT co-op: player command slot={} {} -> {}:{} frame={:.2f} rate={:.2f} "
+                                 "actor={:#x} generation={:#x} child={}{}",
+                                 change.slot,
+                                 change.previous ? fmt::format("{}:{}", change.previous->index,
+                                                               name(*change.previous))
+                                                 : std::string{"(first)"},
+                                 next.index, name(next), next.frame, next.rate, player.actor,
+                                 player.generation, player.child,
+                                 ++self->command_lines == CommandLines ? " (command log cap reached)" : "");
+                    }
+                    if (change.slot != keys->source_slot) return;
+                    for (const auto& value : snapshot.blackboard) {
+                        if (self->anim_snapshot_lines >= AnimSourceLines) break;
+                        ++self->anim_snapshot_lines;
+                        LOG_INFO(Core_ARM, "OoT co-op: player blackboard type={} index={} name={} value={}",
+                                 value.field.type, value.field.index, value.field.name, value.value);
+                    }
+                });
+            }
             LOG_INFO(Core_ARM, "OoT co-op: pose class on (ghost block {:#x})",
                      impl->binding.sentinel + GhostBlock);
         } else {
@@ -1822,7 +1950,17 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         }
         impl->ghost_saved.reset();
         Impl::GhostPort port{backend, memory, *impl};
-        impl->ghost->Returned(port, binding.sentinel + GhostBlock, result, log);
+        const auto local = ReadLocalPose(memory, base, binding.manager, profile->ghost,
+                                         static_cast<u32>(impl->tick));
+        const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now().time_since_epoch()).count());
+        std::vector<PeerView> peers;
+        {
+            std::scoped_lock lock{impl->mutex};
+            for (const auto& [origin, track] : impl->peers)
+                peers.push_back({origin, track.At(now, 0), track.session});
+        }
+        impl->ghost->Returned(port, binding.sentinel + GhostBlock, result, log, &local, &peers);
         return true;
     }
     if (binding.sentinel && pc == binding.sentinel) {
@@ -2369,10 +2507,37 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
         Clock::now().time_since_epoch()).count());
     const auto local = ReadLocalPose(memory, base, impl->binding.manager, profile->ghost,
                                      static_cast<u32>(impl->tick));
+    // One snapshot per frame feeds the command watch (and through it the sender); it is read
+    // only while something consumes it.
+    std::optional<Anim::Snapshot> animation_snapshot;
+    const bool sending = profile->anim && impl->anim_table && profile->anim->sender_enabled;
+    if (profile->anim && (sending || impl->command_watch.HasSubscribers()) &&
+        !local.banc.empty() && !local.loading) {
+        if (const auto player = Anim::FindPlayer(memory, base, local.child, *profile->anim)) {
+            if (impl->anim_player != player || impl->anim_scene != local.banc) {
+                impl->anim_sender.Reset();
+                impl->anim_player = player;
+                impl->anim_scene = local.banc;
+            }
+            animation_snapshot = Anim::ReadSnapshot(memory, player->actor, local.child, *profile->anim,
+                [&] { return Anim::ValidatePlayer(memory, base, *player, *profile->anim); });
+            if (animation_snapshot) impl->command_watch.Observe(*animation_snapshot, *player);
+            if (!sending) animation_snapshot.reset();
+        }
+    }
     std::vector<PeerView> peers;
     {
         std::scoped_lock lock{impl->mutex};
-        if (auto out = impl->sender.Sample(local, now)) {
+        if (auto out = impl->sender.Sample(local, now, [&](Pose& pose) {
+                if (animation_snapshot) {
+                    pose.animation = impl->anim_sender.Sample(*impl->anim_table, *profile->anim,
+                        *animation_snapshot, pose.child, pose.anim == "walk" ? 1 : pose.anim == "run" ? 2 : 0);
+                } else if (impl->anim_table) {
+                    // Sampling failure is unknown, never a cached command from an old actor.
+                    impl->anim_sender.Reset();
+                    pose.animation = Anim::State{};
+                }
+            })) {
             impl->pose_out = std::move(out);
             if (impl->poses_out++ < 4 || impl->poses_out % 900 == 0) {
                 log(fmt::format("OoT co-op: pose out #{} banc={} child={} loading={} pos=({:.2f}, {:.2f}, "
@@ -2381,7 +2546,7 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
                                 impl->pose_out->pos[1], impl->pose_out->pos[2], impl->pose_out->yaw));
             }
         }
-        for (const auto& [origin, track] : impl->peers) peers.push_back({origin, track.At(now)});
+        for (const auto& [origin, track] : impl->peers) peers.push_back({origin, track.At(now), track.session});
     }
     {
         std::vector<Ux::TagPeer> tag_peers;
@@ -2395,7 +2560,7 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
     // Grants keep priority: the one call slot of this frame is theirs when they used it.
     if (grant_calling) return;
     Impl::GhostPort port{backend, memory, *impl};
-    impl->ghost->Frame(port, impl->binding.sentinel + GhostBlock, local, peers, log);
+    impl->ghost->Frame(port, impl->binding.sentinel + GhostBlock, local, peers, log, now);
 }
 
 void BeginSession() {
