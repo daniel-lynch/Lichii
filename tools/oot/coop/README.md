@@ -32,7 +32,7 @@ The external lane must run the **full** suite, including real loopback TCP:
 python3 -I tools/oot/coop/test_relay.py
 ```
 
-There are 34 tests: 21 socket-free and 13 TCP. In this sandbox only run:
+There are 52 tests: 30 socket-free and 22 TCP (6 of them drive the fake peer). In this sandbox only run:
 
 ```sh
 python3 -I tools/oot/coop/test_relay.py ProtocolTests

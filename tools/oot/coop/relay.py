@@ -7,12 +7,13 @@ import argparse
 import asyncio
 import contextlib
 import json
+import math
 import re
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-VERSION = 2
+VERSION = 3
 MAX_FRAME = 1024 * 1024  # JSON payload only; the 4-byte length is additional.
 MAX_SEQ = (1 << 53) - 1
 MAX_KEYS = 2048
@@ -27,6 +28,12 @@ CHANGE_TYPES = {"bool_set", "bit_set", "rupee_add", "item_give"}
 EVENT_TYPES = {"rupee_add", "item_give"}  # additive events: replay window only, never team state
 RUPEE_LIMIT = 999
 ITEM_COUNT_LIMIT = 999
+POSE_FIELDS = ("type", "t", "banc", "child", "loading", "pos", "yaw", "anim", "anim_seq", "rate", "phase")
+POSE_ANIMS = ("idle", "walk", "run")  # an animation hint inferred from speed; receivers may ignore it
+MAX_POSE_FRAME = 256  # JSON payload as the client sent it
+MAX_POSE_COORD = 100000
+MAX_POSE_QUEUE = 64  # a receiver whose outbox holds more frames than this gets no new pose
+POSE_RATE = 30  # poses per sender per second (sliding 1 s window); the excess is dropped
 
 
 class ProtocolError(ValueError):
@@ -166,6 +173,35 @@ def validate_change(packet, origin):
             integer(flag, 0, 255)
 
 
+def finite(value, limit):
+    if type(value) not in (int, float) or not math.isfinite(value) or abs(value) > limit:
+        raise ProtocolError("invalid pose number")
+    return value
+
+
+def validate_pose(packet, size=None):
+    """A live position for drawing a ghost; never a grant. Malformed poses are protocol errors."""
+    fields(packet, POSE_FIELDS)
+    integer(packet["t"], 0, (1 << 32) - 1)
+    banc = packet["banc"]
+    if not isinstance(banc, str) or not re.fullmatch(r"(?:[A-Za-z0-9_]{1,63})?", banc):
+        raise ProtocolError("invalid pose banc")
+    if type(packet["child"]) is not bool or type(packet["loading"]) is not bool:
+        raise ProtocolError("expected boolean")
+    pos = packet["pos"]
+    if type(pos) is not list or len(pos) != 3:
+        raise ProtocolError("pose position is three numbers")
+    for value in pos:
+        finite(value, MAX_POSE_COORD)
+    finite(packet["yaw"], 360)
+    if packet["anim"] not in POSE_ANIMS:
+        raise ProtocolError("invalid pose anim")
+    integer(packet["anim_seq"], 0, (1 << 32) - 1)
+    if finite(packet["rate"], 10) < 0 or not 0 <= finite(packet["phase"], 1) < 1:
+        raise ProtocolError("pose rate/phase out of range")
+    if (len(encode(packet)) - 4 if size is None else size) > MAX_POSE_FRAME:
+        raise ProtocolError("pose too large")
+
 
 def state_key(packet):
     return packet["type"], packet.get("hash", packet.get("actor"))
@@ -236,8 +272,16 @@ class Room:
 class Client:
     def __init__(self, reader, writer):
         self.reader, self.writer = reader, writer
-        self.outbox = asyncio.Queue(MAX_OUTBOX)
+        # Entries are [data, pose_origin]; pose_origin is None for every non-pose frame.
+        self.outbox = deque()
+        self.pending = {}  # pose origin -> its still-unsent outbox entry (latest wins)
+        self.wakeup = asyncio.Event()
+        self.writing = False
         self.queued_bytes = 0
+        self.poses_dropped = 0  # poses not queued for this receiver (outbox busy) or evicted
+        self.poses_rate_dropped = 0  # this sender's poses over POSE_RATE
+        self.poses_coalesced = 0  # queued poses replaced by a newer one from the same origin
+        self.pose_times = deque()
         self.room = self.team = None
         self.client_id = None
         self.state = {}
@@ -249,23 +293,63 @@ class Client:
         if self.failed:
             return
         data = encode(packet)
-        if self.outbox.full() or self.queued_bytes + len(data) > MAX_OUTBOX_BYTES:
+        # Poses are dropped before any frame that matters: evict queued poses to make room.
+        while (len(self.outbox) >= MAX_OUTBOX or self.queued_bytes + len(data) > MAX_OUTBOX_BYTES) \
+                and self.pending:
+            entry = self.pending.pop(next(iter(self.pending)))
+            self.outbox.remove(entry)
+            self.queued_bytes -= len(entry[0])
+            self.poses_dropped += 1
+        if len(self.outbox) >= MAX_OUTBOX or self.queued_bytes + len(data) > MAX_OUTBOX_BYTES:
             self.failed = True
             self.writer.close()
             return
         self.queued_bytes += len(data)
-        self.outbox.put_nowait(data)
+        self.outbox.append([data, None])
+        self.wakeup.set()
+
+    def send_pose(self, packet):
+        """Best effort, never a disconnect: latest wins per origin; dropped when the outbox is busy."""
+        if self.failed:
+            return False
+        data = encode(packet)
+        entry = self.pending.get(packet["origin"])
+        if entry is not None:  # still unsent: replace it in place
+            self.queued_bytes += len(data) - len(entry[0])
+            entry[0] = data
+            self.poses_coalesced += 1  # the replaced pose was never sent
+            return True
+        if len(self.outbox) > MAX_POSE_QUEUE or self.queued_bytes + len(data) > MAX_OUTBOX_BYTES // 2:
+            self.poses_dropped += 1
+            return False
+        entry = [data, packet["origin"]]
+        self.pending[packet["origin"]] = entry
+        self.queued_bytes += len(data)
+        self.outbox.append(entry)
+        self.wakeup.set()
+        return True
+
+    async def flush(self):
+        while self.outbox or self.writing:
+            await asyncio.sleep(0.01)
 
     async def write_loop(self):
         try:
             while True:
-                data = await self.outbox.get()
+                while not self.outbox:
+                    self.wakeup.clear()
+                    await self.wakeup.wait()
+                entry = self.outbox.popleft()
+                if entry[1] is not None:
+                    self.pending.pop(entry[1], None)
+                data = entry[0]
+                self.writing = True
                 try:
                     self.writer.write(data)
                     await asyncio.wait_for(self.writer.drain(), 5)
                 finally:
                     self.queued_bytes -= len(data)
-                    self.outbox.task_done()
+                    self.writing = False
         except OSError:
             self.failed = True
             self.writer.close()
@@ -346,9 +430,11 @@ class Relay:
             if peer is not client:
                 peer.send(packet)
 
-    def receive(self, client, packet):
+    def receive(self, client, packet, size=None):
         kind = packet["type"]
-        if kind in CHANGE_TYPES:
+        if kind == "pose":
+            self.pose(client, packet, size)
+        elif kind in CHANGE_TYPES:
             validate_change(packet, client.client_id)
             event = client.team.accept(packet, self.deny_list)
             client.send({"type": "ack", "seq": packet["seq"]})
@@ -371,6 +457,23 @@ class Relay:
         else:
             raise ProtocolError("unsupported message type")
 
+    @staticmethod
+    def pose(client, packet, size=None):
+        validate_pose(packet, size)
+        now = asyncio.get_running_loop().time()
+        times = client.pose_times
+        while times and now - times[0] >= 1:
+            times.popleft()
+        if len(times) >= POSE_RATE:
+            client.poses_rate_dropped += 1
+            return
+        times.append(now)
+        forwarded = {"type": "pose", "origin": client.client_id,
+                     **{key: packet[key] for key in POSE_FIELDS[1:]}}
+        for peer in tuple(client.team.clients.values()):
+            if peer is not client:
+                peer.send_pose(forwarded)
+
     async def handle(self, client):
         sending = asyncio.create_task(client.write_loop())
         try:
@@ -381,11 +484,11 @@ class Relay:
                 if client.team is None:
                     self.join(client, packet)
                 else:
-                    self.receive(client, packet)
+                    self.receive(client, packet, len(data) - 4)
         except (ProtocolError, ValueError, UnicodeError, RecursionError) as exc:
             client.send({"type": "error", "reason": str(exc)[:160]})
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(client.outbox.join(), 0.5)
+                await asyncio.wait_for(client.flush(), 0.5)
         except (OSError, EOFError):
             pass
         finally:

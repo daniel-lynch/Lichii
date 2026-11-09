@@ -19,13 +19,24 @@ Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CT
   received                  every change packet received so far (from other origins)
   state                     the relay's team checkpoint as the peer sees it (team_state_request)
   mark TEXT                 a marker line in received.jsonl (for correlating with emulator logs)
+  pose BANC CHILD X Y Z YAW [LOADING]   send one v3 pose (CHILD/LOADING 0|1; BANC "-" = "")
+  posecircle BANC CX CY CZ R PERIOD_S HZ DURATION_S
+                            start (returns at once) a pose stream walking a circle of radius R
+                            around (CX,CY,CZ) in the X/Z plane, one lap per PERIOD_S, HZ poses/s,
+                            for DURATION_S (0 = until posestop); yaw = atan2(dx, dz) of travel,
+                            child, not loading, t += round(60/HZ) per pose. Replaces any stream.
+  posestop                  stop the stream; result has how many poses it sent
+  poses [N]                 the last N (default 20) poses received from other origins, and the total
   quit
-Every packet the peer receives is also appended to CTL/received.jsonl with a wall-clock time."""
+Every packet the peer receives is also appended to CTL/received.jsonl with a wall-clock time,
+except poses: only every 15th received pose (the 1st, 16th, ...) is recorded there."""
 
 import argparse
 import asyncio
 import importlib.util
+import collections
 import json
+import math
 from pathlib import Path
 import sys
 import time
@@ -60,6 +71,11 @@ class FakePeer:
         self.seen = []
         self.waiters = []
         self.task = None
+        self.client.on_pose = self.pose_received
+        self.poses = collections.deque(maxlen=1000)  # poses from other origins (the emulator's)
+        self.pose_count = 0
+        self.stream = None  # the posecircle task
+        self.stream_sent = 0
 
     async def start(self):
         self.port = await self.relay.start("127.0.0.1", self.port)
@@ -71,6 +87,54 @@ class FakePeer:
         if self.record:
             with self.record.open("a") as stream:
                 stream.write(json.dumps({"t": round(time.time(), 3), **packet}) + "\n")
+
+    def pose_received(self, packet):
+        self.pose_count += 1
+        self.poses.append(packet)
+        if self.pose_count % 15 == 1:
+            self.log(dict(packet, pose_n=self.pose_count))
+
+    async def send_pose(self, banc, child, pos, yaw, loading=False, step=1, **anim):
+        return await self.client.pose(banc, child, pos, yaw, loading, t=self.client.pose_t + step, **anim)
+
+    async def circle(self, banc, centre, radius, period, hz, duration):
+        loop = asyncio.get_running_loop()
+        start, step, n = loop.time(), max(1, round(60 / hz)), 0
+        cx, cy, cz = centre
+        omega = 2 * math.pi / period
+        # The animation hint the emulator's sender would infer from this speed (metres per second).
+        speed = omega * radius
+        anim = "idle" if speed < 0.3 else "walk" if speed < 2.6 else "run"
+        nominal, stride = (1.5, 1.2) if anim == "walk" else (4.5, 2.4)
+        self.anim_seq = getattr(self, "anim_seq", 0) + 1
+        while duration == 0 or n / hz < duration:
+            # Absolute schedule: tick n at start + n/hz, so sends never drift.
+            delay = start + n / hz - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            angle = omega * (n / hz)
+            pos = [round(cx + radius * math.cos(angle), 3), cy, round(cz + radius * math.sin(angle), 3)]
+            dx, dz = -math.sin(angle), math.cos(angle)  # direction of travel (counter-clockwise in X/Z)
+            yaw = round(math.degrees(math.atan2(dx, dz)), 3)
+            phase = 0.0 if anim == "idle" else (speed * n / hz / stride) % 1.0
+            await self.send_pose(banc, True, pos, yaw, False, step, anim=anim, anim_seq=self.anim_seq,
+                                 rate=round(min(10.0, 1.0 if anim == "idle" else speed / nominal), 2),
+                                 phase=min(0.99, round(phase, 2)))
+            self.stream_sent += 1
+            n += 1
+
+    async def stop_stream(self):
+        stopped = self.stream is not None and not self.stream.done()
+        if self.stream is not None:
+            self.stream.cancel()
+            try:
+                await self.stream
+            except asyncio.CancelledError:
+                pass
+            except (ConnectionError, OSError):
+                pass
+            self.stream = None
+        return stopped
 
     async def listen(self):
         """The only reader of the client's queue; commands wait on predicates instead."""
@@ -185,12 +249,38 @@ class FakePeer:
             return {"received": self.received}
         if verb == "state":
             return {"state": await self.state()}
+        if verb == "pose":
+            if len(words) not in (7, 8):
+                raise ValueError("pose BANC CHILD X Y Z YAW [LOADING]")
+            packet = await self.send_pose("" if words[1] == "-" else words[1], words[2] == "1",
+                                          [float(w) for w in words[3:6]], float(words[6]),
+                                          len(words) == 8 and words[7] == "1")
+            return {"sent": packet}
+        if verb == "posecircle":
+            if len(words) != 9:
+                raise ValueError("posecircle BANC CX CY CZ R PERIOD_S HZ DURATION_S")
+            banc = "" if words[1] == "-" else words[1]
+            cx, cy, cz, radius, period, hz, duration = (float(w) for w in words[2:9])
+            if period <= 0 or not 0 < hz <= 60 or duration < 0 or radius < 0:
+                raise ValueError("need PERIOD_S > 0, 0 < HZ <= 60, R >= 0, DURATION_S >= 0")
+            await self.stop_stream()
+            self.stream_sent = 0
+            self.stream = asyncio.create_task(self.circle(banc, (cx, cy, cz), radius, period, hz, duration))
+            return {"started": {"banc": banc, "centre": [cx, cy, cz], "r": radius, "period": period,
+                                "hz": hz, "duration": duration}}
+        if verb == "posestop":
+            stopped = await self.stop_stream()
+            return {"stopped": stopped, "sent": self.stream_sent}
+        if verb == "poses":
+            count = int(words[1]) if len(words) > 1 else 20
+            return {"poses": list(self.poses)[-count:] if count > 0 else [], "count": self.pose_count}
         if verb == "mark":
             self.log({"type": "mark", "text": " ".join(words[1:])})
             return {"marked": " ".join(words[1:])}
         raise ValueError("unknown command " + verb)
 
     async def close(self):
+        await self.stop_stream()
         if self.task:
             self.task.cancel()
         await self.client.close()

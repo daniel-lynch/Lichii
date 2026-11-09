@@ -6,6 +6,7 @@
 import argparse
 import asyncio
 import contextlib
+import collections
 import json
 import importlib.util
 from pathlib import Path
@@ -24,7 +25,8 @@ MAX_FRAME = wire.MAX_FRAME
 
 class ClientSim:
     def __init__(self, client_id=None, *, room="default", team="default", name="Player",
-                 build_id=BUILD_ID, seed_hash="0", policy_id="or-v2", auto_heartbeat=True):
+                 build_id=BUILD_ID, seed_hash="0", policy_id="or-v2", auto_heartbeat=True,
+                 on_pose=None):
         self.hello = {"type": "hello", "version": wire.VERSION, "build_id": build_id,
                       "seed_hash": seed_hash, "room": room, "team": team,
                       "client_id": client_id or uuid.uuid4().hex, "name": name, "policy_id": policy_id}
@@ -34,6 +36,13 @@ class ClientSim:
         self.backlog = []
         self.reader = self.writer = self.task = None
         self.ack = self.snapshot = None
+        # Received poses bypass the message queue (they arrive at ~15 Hz): the newest are kept
+        # here, counted, optionally handed to on_pose(packet), and awaited with receive_pose().
+        self.poses = collections.deque(maxlen=1024)
+        self.pose_count = 0
+        self.pose_waiter = asyncio.Event()
+        self.on_pose = on_pose
+        self.pose_t = 0
 
     async def connect(self, host, port):
         self.reader, self.writer = await asyncio.open_connection(host, port, limit=MAX_FRAME)
@@ -59,6 +68,13 @@ class ClientSim:
                 packet = await self.read()
                 if packet["type"] == "heartbeat" and self.auto_heartbeat:
                     await self.send({"type": "heartbeat_ack"})
+                if packet["type"] == "pose":
+                    self.poses.append(packet)
+                    self.pose_count += 1
+                    self.pose_waiter.set()
+                    if self.on_pose is not None:
+                        self.on_pose(packet)
+                    continue
                 await self.messages.put(packet)
         except (EOFError, ConnectionError, ValueError) as exc:
             await self.messages.put(exc)
@@ -72,6 +88,32 @@ class ClientSim:
         packet = {"type": kind, "origin": self.hello["client_id"], "seq": self.seq, **values}
         await self.send(packet)
         return packet
+
+    def pose_packet(self, banc, child, pos, yaw, loading=False, t=None, anim="idle", anim_seq=0,
+                    rate=0.0, phase=0.0):
+        """A v3 pose (no origin/seq: the relay stamps origin). t defaults to a counter + 1."""
+        if t is None:
+            t = self.pose_t + 1
+        self.pose_t = t % (1 << 32)
+        return {"type": "pose", "t": self.pose_t, "banc": banc, "child": bool(child),
+                "loading": bool(loading), "pos": [p for p in pos], "yaw": yaw, "anim": anim,
+                "anim_seq": anim_seq, "rate": rate, "phase": phase}
+
+    async def pose(self, banc, child, pos, yaw, loading=False, t=None, **anim):
+        packet = self.pose_packet(banc, child, pos, yaw, loading, t, **anim)
+        wire.validate_pose(packet)  # a malformed pose is a protocol error: never send one (use send())
+        await self.send(packet)
+        return packet
+
+    async def receive_pose(self, since=None, timeout=2):
+        """Wait until more than `since` poses (default: the count now) have arrived; return the newest."""
+        target = self.pose_count if since is None else since
+        async def wait():
+            while self.pose_count <= target:
+                self.pose_waiter.clear()
+                await self.pose_waiter.wait()
+            return self.poses[-1]
+        return await asyncio.wait_for(wait(), timeout)
 
     async def receive(self, kind=None, timeout=2):
         for index, packet in enumerate(self.backlog):
@@ -100,11 +142,14 @@ class ClientSim:
             self.writer = None
         self.backlog.clear()
         self.messages = asyncio.Queue(2048)
+        self.poses.clear()
+        self.pose_count = 0
 
 
 async def run(args):
     client = ClientSim(args.client_id, room=args.room, team=args.team, name=args.name,
-                       build_id=args.build_id, seed_hash=args.seed, policy_id=args.policy)
+                       build_id=args.build_id, seed_hash=args.seed, policy_id=args.policy,
+                       on_pose=lambda packet: print(json.dumps(packet), flush=True) if args.show_poses else None)
     try:
         await client.connect(args.host, args.port)
         print(json.dumps(client.ack), flush=True)
@@ -116,6 +161,14 @@ async def run(args):
                 await client.change(kind, **packet)
             else:
                 await client.send(packet)
+        for raw in args.pose:
+            # BANC CHILD X Y Z YAW [LOADING]; BANC "-" is the empty banc
+            words = raw.split()
+            if len(words) not in (6, 7):
+                raise SystemExit("--pose 'BANC CHILD X Y Z YAW [LOADING]'")
+            await client.pose("" if words[0] == "-" else words[0], words[1] == "1",
+                              [float(w) for w in words[2:5]], float(words[5]),
+                              len(words) == 7 and words[6] == "1")
         until = asyncio.get_running_loop().time() + args.duration
         while asyncio.get_running_loop().time() < until:
             try:
@@ -140,6 +193,8 @@ def main():
     parser.add_argument("--policy", default="or-v2")
     parser.add_argument("--duration", type=float, default=30)
     parser.add_argument("--send", action="append", default=[], help="JSON packet; change origin/seq are automatic")
+    parser.add_argument("--pose", action="append", default=[], help="'BANC CHILD X Y Z YAW [LOADING]' (v3 pose)")
+    parser.add_argument("--show-poses", action="store_true", help="print received poses (otherwise only counted)")
     args = parser.parse_args()
     try:
         asyncio.run(run(args))
