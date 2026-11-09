@@ -5,6 +5,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -21,6 +22,11 @@
 #include "common/logging.h"
 #include "common/thread.h"
 #include "core/arm/dynarmic/oot_coop_sync.h"
+#include "core/arm/dynarmic/oot_coop_ghost.h"
+#include "core/arm/dynarmic/oot_coop_runtime.h"
+#include "core/hle/kernel/k_process.h"
+#include "core/memory.h"
+#include "dynarmic/interface/A64/a64.h"
 
 namespace Core::OotCoop {
 namespace {
@@ -78,16 +84,43 @@ std::string_view Type(Kind kind) {
     case Kind::Bit: return "bit_set";
     case Kind::PouchAdd: return "pouch_add";
     case Kind::PouchTotal: return "pouch_total";
+    case Kind::Rupee: return "rupee_add";
+    case Kind::Item: return "item_give";
+    case Kind::Pose: return "pose";
     }
     return {};
 }
 } // namespace
+
+bool ItemName(std::string_view name) {
+    return !name.empty() && name.size() <= ItemNameLimit &&
+           std::all_of(name.begin(), name.end(), [](unsigned char c) {
+               return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                      c == '_';
+           });
+}
+
+bool ValidItem(const Change& change) {
+    const auto args = UnpackItem(change.key);
+    return change.kind == Kind::Item && ItemName(change.name) && change.value >= 1 &&
+           change.value <= ItemCountLimit && args.category < 16 && args.get < 16 &&
+           PackItem(args) == change.key;
+}
 
 Json EncodeChange(const Change& change) {
     Json packet{{"type", Type(change.kind)}};
     if (!change.origin.empty()) {
         packet["origin"] = change.origin;
         packet["seq"] = change.seq;
+    }
+    if (change.kind == Kind::Item) {
+        const auto args = UnpackItem(change.key);
+        packet["name"] = change.name;
+        packet["category"] = args.category;
+        packet["count"] = change.value;
+        packet["get"] = args.get;
+        packet["flags"] = Json::array({args.flags[0], args.flags[1], args.flags[2], args.flags[3]});
+        return packet;
     }
     if (change.kind == Kind::Quest) {
         packet["challenge"] = change.key;
@@ -98,7 +131,9 @@ Json EncodeChange(const Change& change) {
         packet["value"] = change.value != 0;
     } else {
         packet["hash"] = change.key;
-        if (change.kind == Kind::Bool) {
+        if (change.kind == Kind::Rupee) {
+            packet["delta"] = change.value;
+        } else if (change.kind == Kind::Bool) {
             packet["value"] = change.value != 0;
         } else {
             packet[change.kind == Kind::PouchAdd || change.kind == Kind::PouchTotal ? "count"
@@ -118,7 +153,7 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
         const auto type = packet.at("type").get<std::string>();
         bool found = false;
         for (const Kind kind : {Kind::Bool, Kind::Int, Kind::Enum, Kind::Quest, Kind::Bit,
-                                Kind::PouchAdd, Kind::PouchTotal}) {
+                                Kind::PouchAdd, Kind::PouchTotal, Kind::Rupee, Kind::Item}) {
             if (type == Type(kind)) {
                 change.kind = kind;
                 found = true;
@@ -126,6 +161,10 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
             }
         }
         if (!found || (!snapshot && change.kind == Kind::PouchTotal)) {
+            return std::nullopt;
+        }
+        // A delta is an event with an origin and sequence; it never appears as snapshot state.
+        if (snapshot && EventKind(change.kind)) {
             return std::nullopt;
         }
         if (!snapshot || packet.contains("origin") || packet.contains("seq")) {
@@ -136,6 +175,28 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
             change.origin = packet.at("origin").get<std::string>();
             change.seq = packet.at("seq").get<u64>();
         }
+        if (change.kind == Kind::Item) {
+            for (const auto& [field, value] : packet.items()) {
+                if (field == "type" || field == "origin" || field == "seq" || field == "name" ||
+                    field == "category" || field == "count" || field == "get" || field == "flags")
+                    continue;
+                if (field == "rev" && Unsigned(value, MaxSequence) && value != 0) continue;
+                return std::nullopt;
+            }
+            const auto& flags = packet.at("flags");
+            if (!packet.at("name").is_string() || !Unsigned(packet.at("category"), 15) ||
+                !Unsigned(packet.at("get"), 15) || !Unsigned(packet.at("count"), ItemCountLimit) ||
+                !flags.is_array() || flags.size() != 4) return std::nullopt;
+            ItemArgs args{packet.at("category").get<u32>(), packet.at("get").get<u32>(), {}};
+            for (size_t i = 0; i < 4; ++i) {
+                if (!Unsigned(flags[i], 255)) return std::nullopt;
+                args.flags[i] = flags[i].get<u8>();
+            }
+            change.name = packet.at("name").get<std::string>();
+            change.key = PackItem(args);
+            change.value = packet.at("count").get<s64>();
+            return ValidItem(change) ? std::optional{change} : std::nullopt;
+        }
         const char* key = change.kind == Kind::Quest ? "challenge"
                           : change.kind == Kind::Bit ? "actor" : "hash";
         if (!Unsigned(packet.at(key), change.kind == Kind::Bit
@@ -144,15 +205,22 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
             return std::nullopt;
         }
         change.key = packet.at(key).get<u64>();
+        const char* value_field = change.kind == Kind::Rupee ? "delta" : "value";
         if (WireKind(change.kind)) {
             for (const auto& [field, value] : packet.items()) {
-                if (field == "type" || field == key || field == "value") continue;
+                if (field == "type" || field == key || field == value_field) continue;
                 if (!snapshot && (field == "origin" || field == "seq")) continue;
                 if (!snapshot && field == "rev" && Unsigned(value, MaxSequence) && value != 0) continue;
                 return std::nullopt;
             }
         }
-        if (change.kind == Kind::Bool || change.kind == Kind::Bit) {
+        if (change.kind == Kind::Rupee) {
+            const auto& delta = packet.at("delta");
+            if (change.key == 0 || !Signed32(delta) || !RupeeDelta(delta.get<s64>())) {
+                return std::nullopt;
+            }
+            change.value = delta.get<s64>();
+        } else if (change.kind == Kind::Bool || change.kind == Kind::Bit) {
             if (!packet.at("value").is_boolean()) {
                 return std::nullopt;
             }
@@ -220,7 +288,7 @@ std::optional<Json> DecodeLine(std::string_view line) {
 }
 
 bool WireKind(Kind kind) {
-    return kind == Kind::Bool || kind == Kind::Bit;
+    return kind == Kind::Bool || kind == Kind::Bit || kind == Kind::Rupee || kind == Kind::Item;
 }
 
 std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text) {
@@ -230,6 +298,9 @@ std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text) {
         const auto name = text.substr(0, comma);
         if (name == "bool") result.insert(Kind::Bool);
         else if (name == "bit") result.insert(Kind::Bit);
+        else if (name == "rupee") result.insert(Kind::Rupee);
+        else if (name == "item") result.insert(Kind::Item);
+        else if (name == "pose") result.insert(Kind::Pose);
         else return std::nullopt;
         if (comma == std::string_view::npos) break;
         text.remove_prefix(comma + 1);
@@ -257,6 +328,7 @@ std::string EncodeFrame(const Json& packet) {
 }
 
 std::optional<Endpoint> ParseEndpoint(std::string_view text) {
+    if (text == "1") return Endpoint{"127.0.0.1", 43390};
     const auto colon = text.rfind(':');
     if (colon == std::string_view::npos || colon == 0) return std::nullopt;
     auto host = text.substr(0, colon);
@@ -277,9 +349,258 @@ std::optional<Endpoint> ParseEndpoint(std::string_view text) {
     return Endpoint{std::string{host}, static_cast<u16>(port)};
 }
 
-bool Gate(std::string_view endpoint, u64 program_id, std::string_view build_id) {
-    return ParseEndpoint(endpoint).has_value() && program_id == OotGameDataTrace::ProgramId &&
-           build_id == OotGameDataTrace::BuildId;
+bool Gate(std::string_view endpoint, u64 program_id) {
+    return ParseEndpoint(endpoint).has_value() && program_id == OotGameDataTrace::ProgramId;
+}
+
+namespace {
+std::optional<u64> Number(const Json& value, u64 maximum) {
+    if (Unsigned(value, maximum)) return value.get<u64>();
+    if (!value.is_string()) return std::nullopt;
+    const auto& text = value.get_ref<const std::string&>();
+    if (text.size() < 3 || text.size() > 18 || text[0] != '0' || (text[1] != 'x' && text[1] != 'X'))
+        return std::nullopt;
+    u64 number = 0;
+    const auto [end, error] = std::from_chars(text.data() + 2, text.data() + text.size(), number, 16);
+    if (error != std::errc{} || end != text.data() + text.size() || number > maximum)
+        return std::nullopt;
+    return number;
+}
+
+constexpr u64 MaxModuleOffset = 0x10000000; // 256 MiB: larger than any main module
+} // namespace
+
+std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
+                                                       std::string_view build_id) {
+    using OotGameDataTrace::Point;
+    try {
+        if (build_id.size() != 40 || !document.is_object() || !document.contains("offsets"))
+            return std::nullopt;
+        const auto& all = document.at("offsets");
+        const auto found = all.find(std::string{build_id});
+        if (!all.is_object() || found == all.end() || !found->is_object()) return std::nullopt;
+        const Json& source = *found;
+        OotGameDataTrace::Profile profile;
+        profile.build_id = std::string{build_id};
+        const auto offset = [](const Json& value) -> std::optional<u64> {
+            const auto number = Number(value, MaxModuleOffset);
+            return number && *number && !(*number & 3) ? number : std::nullopt;
+        };
+        const auto entry = [&](const Json& value) -> std::optional<OotGameDataTrace::Entry> {
+            if (!value.is_object() || value.size() != 2 || !value.at("words").is_array() ||
+                value.at("words").empty() || value.at("words").size() > 16) return std::nullopt;
+            OotGameDataTrace::Entry result;
+            const auto at = offset(value.at("at"));
+            if (!at) return std::nullopt;
+            result.offset = *at;
+            for (const auto& word : value.at("words")) {
+                const auto number = Number(word, 0xFFFFFFFF);
+                if (!number) return std::nullopt;
+                result.words.push_back(static_cast<u32>(*number));
+            }
+            return result;
+        };
+        constexpr std::array<std::pair<std::string_view, Point>, 9> points{{
+            {"item_give", Point::ItemGive},
+            {"step_set", Point::StepSet}, {"step_apply", Point::StepApply},
+            {"played_event", Point::PlayedEvent}, {"frame", Point::Frame},
+            {"bit_read", Point::BitRead}, {"bit_set", Point::BitSet},
+            {"struct_bool_set", Point::StructBoolSet}, {"actor_flag_set", Point::ActorFlagSet}}};
+        for (const auto& [field, value] : source.items()) {
+            if (field == "manager_cell" || field == "pouch_cell") {
+                const auto cell = Number(value, MaxModuleOffset);
+                if (!cell || !*cell || (*cell & 7)) return std::nullopt;
+                (field == "manager_cell" ? profile.manager_cell : profile.pouch_cell) = *cell;
+            } else if (field == "wallet_hash") {
+                const auto hash = Number(value, 0xFFFFFFFF);
+                if (!hash || !*hash) return std::nullopt;
+                profile.wallet_hash = static_cast<u32>(*hash);
+            } else if (field == "sites") {
+                if (!value.is_object()) return std::nullopt;
+                for (const auto& [name, list] : value.items()) {
+                    const auto it = std::find_if(points.begin(), points.end(),
+                                                 [&](const auto& row) { return row.first == name; });
+                    if (it == points.end() || !list.is_array() || list.size() > 4) return std::nullopt;
+                    for (const auto& item : list) {
+                        const auto at = offset(item);
+                        if (!at) return std::nullopt;
+                        profile.sites.push_back(
+                            {it->second, *at, OotGameDataTrace::ReplacedInstruction(it->second)});
+                    }
+                }
+            } else if (field == "entries") {
+                if (!value.is_object()) return std::nullopt;
+                for (const auto& [name, item] : value.items()) {
+                    auto* target = name == "bool_setter"   ? &profile.bool_setter
+                                   : name == "bit_setter"  ? &profile.bit_setter
+                                   : name == "rupee_entry" ? &profile.rupee_entry
+                                   : name == "item_entry"  ? &profile.item_entry
+                                                           : nullptr;
+                    const auto decoded = entry(item);
+                    if (!target || !decoded) return std::nullopt;
+                    *target = *decoded;
+                }
+            } else if (field == "item_callers") {
+                if (!value.is_array() || value.size() > 16) return std::nullopt;
+                for (const auto& item : value) {
+                    const auto at = offset(item);
+                    if (!at) return std::nullopt;
+                    profile.item_callers.push_back(*at);
+                }
+            } else if (field == "event_got") {
+                const auto cell = Number(value, MaxModuleOffset);
+                if (!cell || !*cell || (*cell & 7)) return std::nullopt;
+                profile.event_got = *cell;
+            } else if (field == "item_guards") {
+                if (!value.is_array() || value.size() > 8) return std::nullopt;
+                for (const auto& pair : value) {
+                    if (!pair.is_array() || pair.size() != 2) return std::nullopt;
+                    const auto cell = Number(pair[0], MaxModuleOffset);
+                    const auto member = Number(pair[1], 0xFFFF);
+                    if (!cell || !*cell || (*cell & 7) || !member || (*member & 7)) return std::nullopt;
+                    profile.item_guards.emplace_back(*cell, *member);
+                }
+            } else if (field == "ghost") {
+                if (!value.is_object()) return std::nullopt;
+                auto& ghost = profile.ghost;
+                for (const auto& [name, item] : value.items()) {
+                    if (name == "playing_info_cell" || name == "actor_mgr_cell") {
+                        const auto cell = Number(item, MaxModuleOffset);
+                        if (!cell || !*cell || (*cell & 7)) return std::nullopt;
+                        (name == "playing_info_cell" ? ghost.playing_info_cell : ghost.actor_mgr_cell) = *cell;
+                    } else if (name == "scale_const") {
+                        const auto at = offset(item);
+                        if (!at) return std::nullopt;
+                        ghost.scale_const = *at;
+                    } else if (name == "pos" || name == "rot") {
+                        const auto field_offset = Number(item, 0xFFFF);
+                        if (!field_offset || (*field_offset & 3)) return std::nullopt;
+                        (name == "pos" ? ghost.pos : ghost.rot) = *field_offset;
+                    } else if (name == "banc_hash" || name == "child_hash" || name == "loading_hash") {
+                        const auto hash = Number(item, 0xFFFFFFFF);
+                        if (!hash || !*hash) return std::nullopt;
+                        (name == "banc_hash" ? ghost.banc_hash : name == "child_hash" ? ghost.child_hash
+                                                                                     : ghost.loading_hash) =
+                            static_cast<u32>(*hash);
+                    } else if (name == "create" || name == "get" || name == "release" || name == "set_mtx") {
+                        const auto decoded = entry(item);
+                        if (!decoded) return std::nullopt;
+                        (name == "create" ? ghost.create : name == "get" ? ghost.get
+                                         : name == "release" ? ghost.release : ghost.set_mtx) = *decoded;
+                    } else if (name == "str64") {
+                        if (!item.is_array() || item.size() != 3) return std::nullopt;
+                        for (size_t i = 0; i < 3; ++i) {
+                            const auto number = Number(item[i], 0xFFFF);
+                            if (!number || !*number) return std::nullopt;
+                            ghost.str64[i] = *number;
+                        }
+                    } else if (name == "link") {
+                        if (!item.is_array() || item.size() != 4) return std::nullopt;
+                        for (size_t i = 0; i < 4; ++i) {
+                            const auto number = Number(item[i], 0xFFFF);
+                            if (!number || !*number || (*number & 3)) return std::nullopt;
+                            ghost.link[i] = *number;
+                        }
+                    } else if (name == "lifecycle") {
+                        if (!item.is_array() || item.size() != 3) return std::nullopt;
+                        const auto field_offset = Number(item[0], 0xFFFF);
+                        const auto lo = Number(item[1], 0xFFFFFFFF);
+                        const auto hi = Number(item[2], 0xFFFFFFFF);
+                        if (!field_offset || !*field_offset || (*field_offset & 3) || !lo || !hi || *lo > *hi)
+                            return std::nullopt;
+                        ghost.lifecycle = *field_offset;
+                        ghost.lifecycle_lo = static_cast<u32>(*lo);
+                        ghost.lifecycle_hi = static_cast<u32>(*hi);
+                    } else if (name == "actor_fields") {
+                        if (!item.is_array() || item.empty() || item.size() > 4) return std::nullopt;
+                        for (const auto& f : item) {
+                            const auto number = Number(f, 0xFFFF);
+                            if (!number || !*number || (*number & 7)) return std::nullopt;
+                            ghost.actor_fields.push_back(*number);
+                        }
+                    } else if (name == "actor_fallback") {
+                        if (!item.is_string() || !ItemName(item.get<std::string>())) return std::nullopt;
+                        ghost.actor_fallback = item.get<std::string>();
+                    } else if (name == "alpha") {
+                        if (!item.is_object()) return std::nullopt;
+                        for (const auto& [key, part] : item.items()) {
+                            if (key == "set") {
+                                const auto decoded = entry(part);
+                                if (!decoded) return std::nullopt;
+                                ghost.alpha_set = *decoded;
+                            } else if (key == "chain") {
+                                if (!part.is_array() || part.size() != 2) return std::nullopt;
+                                for (size_t i = 0; i < 2; ++i) {
+                                    const auto number = Number(part[i], 0xFFFF);
+                                    if (!number || !*number || (*number & 7)) return std::nullopt;
+                                    ghost.alpha_chain[i] = *number;
+                                }
+                            } else if (key == "percent") {
+                                const auto number = Number(part, 100);
+                                if (!number || !*number) return std::nullopt;
+                                ghost.alpha_percent = static_cast<u32>(*number);
+                            } else {
+                                return std::nullopt;
+                            }
+                        }
+                        if (!ghost.alpha_set || !ghost.alpha_chain[0] || !ghost.alpha_percent) return std::nullopt;
+                    } else if (name == "anim") {
+                        if (!item.is_object()) return std::nullopt;
+                        for (const auto& [key, part] : item.items()) {
+                            if (key == "play") {
+                                const auto decoded = entry(part);
+                                if (!decoded) return std::nullopt;
+                                ghost.anim_play = *decoded;
+                            } else if (key == "idle" || key == "walk" || key == "run") {
+                                if (!part.is_string() || !ItemName(part.get<std::string>())) return std::nullopt;
+                                (key == "idle" ? ghost.anim_idle : key == "walk" ? ghost.anim_walk
+                                                                                 : ghost.anim_run) =
+                                    part.get<std::string>();
+                            } else {
+                                return std::nullopt;
+                            }
+                        }
+                        if (!ghost.anim_play) return std::nullopt;
+                    } else if (name == "actor_child" || name == "actor_adult") {
+                        if (!item.is_string() || !ItemName(item.get<std::string>())) return std::nullopt;
+                        (name == "actor_child" ? ghost.actor_child : ghost.actor_adult) = item.get<std::string>();
+                    } else {
+                        return std::nullopt;
+                    }
+                }
+                if (!ghost.Valid()) return std::nullopt;
+            } else {
+                return std::nullopt;
+            }
+        }
+        // Two sites at one offset would make Identify ambiguous.
+        for (size_t i = 0; i < profile.sites.size(); ++i)
+            for (size_t j = i + 1; j < profile.sites.size(); ++j)
+                if (profile.sites[i].offset == profile.sites[j].offset) return std::nullopt;
+        return profile;
+    } catch (const Json::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::shared_ptr<const OotGameDataTrace::Profile> LoadProfile(std::string_view build_id,
+                                                             std::string* why) {
+    const auto fail = [&](std::string text) {
+        if (why) *why = std::move(text);
+        return nullptr;
+    };
+    const auto path = Env("EDEN_NX2_OOT_COOP_KEYS");
+    if (path.empty()) return fail("no private profile (EDEN_NX2_OOT_COOP_KEYS is unset)");
+    std::ifstream in{std::filesystem::path{path}};
+    if (!in) return fail("cannot read the private profile");
+    std::string text;
+    char c;
+    while (in.get(c) && text.size() <= MaxFrame) text.push_back(c);
+    const auto parsed = DecodeLine(text);
+    if (!parsed) return fail("the private profile is not a JSON object");
+    auto profile = DecodeProfile(*parsed, build_id);
+    if (!profile) return fail("the private profile has no valid offsets for this main build");
+    return std::make_shared<const OotGameDataTrace::Profile>(std::move(*profile));
 }
 
 bool Enabled() {
@@ -316,6 +637,26 @@ std::optional<std::set<u64>> DecodeDenyList(const Json& packet) {
     return denied;
 }
 
+std::optional<std::set<std::pair<Kind, u64>>> DecodeKeyPolicy(const Json& packet) {
+    // Legacy arrays remain Bool64 policies. Typed files keep namespaces separate.
+    const Json document = packet.is_array() ? Json{{"bit", packet}} : packet;
+    if (!document.is_object()) return std::nullopt;
+    std::set<std::pair<Kind, u64>> keys;
+    size_t count = 0;
+    for (const auto& [name, values] : document.items()) {
+        if (name == "offsets") continue; // the private profile's module offsets (DecodeProfile)
+        if (name != "bool" && name != "bit") return std::nullopt;
+        const auto list = DecodeDenyList(values);
+        if (!list || list->contains(0) || (count += values.size()) > StateLimit) return std::nullopt;
+        const Kind kind = name == "bool" ? Kind::Bool : Kind::Bit;
+        for (const u64 key : *list) {
+            if (kind == Kind::Bool && key > std::numeric_limits<u32>::max()) return std::nullopt;
+            keys.emplace(kind, key);
+        }
+    }
+    return keys;
+}
+
 bool State::Merge(const Change& change, bool deduplicate) {
     if (deduplicate) {
         if (change.origin.empty() || change.seq == 0 || change.seq > MaxSequence) return false;
@@ -324,7 +665,10 @@ bool State::Merge(const Change& change, bool deduplicate) {
         if (change.seq <= high) return false;
         high = change.seq;
     }
+    // Events are deduplicated by origin/sequence above and never folded into state.
+    if (change.kind == Kind::Item) return ValidItem(change);
     if (denied.contains(change.key)) return false;
+    if (change.kind == Kind::Rupee) return change.key != 0 && RupeeDelta(change.value);
     const auto key = std::pair{StorageKind(change.kind), change.key};
     const auto it = values.find(key);
     if (it == values.end() && values.size() >= StateLimit) return false;
@@ -354,6 +698,10 @@ bool State::Merge(const Change& change, bool deduplicate) {
     case Kind::PouchTotal:
         if (change.value <= old || change.value > static_cast<s64>(MaxSequence)) return false;
         break;
+    case Kind::Rupee:
+    case Kind::Item:
+    case Kind::Pose:
+        return false;
     }
     values[key] = std::move(next);
     return true;
@@ -400,41 +748,26 @@ bool ShouldApply(const Change& change, const State& observed) {
     if (change.kind == Kind::Int || change.kind == Kind::Enum) {
         return !local || local->value != change.value;
     }
+    if (change.kind == Kind::Rupee) return change.key != 0 && RupeeDelta(change.value);
+    if (change.kind == Kind::Item) return ValidItem(change);
     // Pouch totals require a save baseline/application receipt, not a comparison to inventory.
     return change.kind == Kind::PouchAdd && change.value > 0;
 }
 
-thread_local u32 IncomingScope::depth{};
-IncomingScope::IncomingScope() { ++depth; }
-IncomingScope::~IncomingScope() { --depth; }
-bool IncomingScope::SuppressSend() { return depth != 0; }
-
-ApplyStatus GuestWriter::Apply(const Change& change) const {
-    const auto it = std::find_if(Sites.begin(), Sites.end(), [&](const Site& site) {
-        return site.kind == change.kind;
-    });
-    if (it == Sites.end() || it->offset == 0) return ApplyStatus::NotAppliedNoSite;
-    if constexpr (!GuestWritesVerified) {
-        return ApplyStatus::NotAppliedUnverified;
-    }
-    return strategy == Strategy::GuestCall ? InjectCall(change) : WriteStorage(change);
-}
-
-ApplyStatus GuestWriter::InjectCall(const Change&) const {
-    // TODO full CPU context + guest thread ownership, setter ABI, x0..x7, sentinel LR, restore.
-    return ApplyStatus::NotAppliedNoSite;
-}
-
-ApplyStatus GuestWriter::WriteStorage(const Change&) const {
-    // TODO storage layout, manager lifetime, synchronization, notifications and save dirty bits.
-    return ApplyStatus::NotAppliedNoSite;
-}
-
 struct Session::Impl {
+    using Backend = GameDataBackend<Dynarmic::A64::Jit, Memory::Memory>;
     struct Connection;
-    Impl(Endpoint endpoint_, Hello hello_, std::set<u64> denied_, std::set<Kind> allowed_)
+    struct GhostPort;
+    Impl(Endpoint endpoint_, Hello hello_, std::set<u64> denied_, std::set<Kind> allowed_,
+         std::set<std::pair<Kind, u64>> keys, u64 wallet)
         : endpoint{std::move(endpoint_)}, hello{std::move(hello_)}, denied{std::move(denied_)},
-          local{denied}, remote{denied}, allowed_classes{std::move(allowed_)}, retry{io} {}
+          local{denied}, remote{denied}, allowed_classes{std::move(allowed_)}, retry{io} {
+        ApplyPolicy policy{true, allowed_classes, {}, wallet};
+        for (const auto& [kind, key] : keys) {
+            if (!denied.contains(key)) policy.keys.emplace(kind, key);
+        }
+        runtime = std::make_unique<FrameDrain<Backend>>(std::move(policy));
+    }
     ~Impl() { Stop(); }
     void Start();
     void Stop();
@@ -451,11 +784,33 @@ struct Session::Impl {
     std::deque<Change> outgoing;
     std::deque<std::variant<Change, HighWater>> pending;
     u64 next_seq{1};
-    bool logged_no_site{};
-    bool logged_diagnostic{};
+    std::mutex guest_mutex;
+    GuestBinding binding;
+    std::unique_ptr<FrameDrain<Backend>> runtime;
+    u64 frame_thread{}, tick{}, rebinds{}, item_lines{}, item_waiting_logged{};
+    bool stable_frame{};
+    bool baseline_ready{};
     bool logged_class{};
     bool logged_overflow{};
     std::atomic<bool> stopped{};
+    // Class "pose" (v3): own pose out, peers' poses in, puppets drawn by the frame drain.
+    bool pose_enabled{};
+    PoseSender sender;
+    std::optional<Pose> pose_out;                         // under mutex: newest unsent own pose
+    std::map<std::string, PeerTrack, std::less<>> peers;  // under mutex: by origin
+    std::unique_ptr<GhostDriver<GhostPort>> ghost;        // guest side, under guest_mutex
+    std::optional<Backend::Context> ghost_saved;
+    u64 ghost_stack{}, poses_in{}, poses_out{};
+    bool logged_bad_pose{};
+    void OnPose(std::string origin, Pose pose) {
+        std::scoped_lock lock{mutex};
+        if (!peers.contains(origin) && peers.size() >= 16) return;
+        auto& track = peers[origin];
+        track.online = true;
+        track.Add(static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                      Clock::now().time_since_epoch()).count()), std::move(pose));
+        ++poses_in;
+    }
     boost::asio::io_context io;
     boost::asio::steady_timer retry;
     std::shared_ptr<Connection> connection;
@@ -484,6 +839,11 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
 
     void Fail() {
         if (std::exchange(failed, true)) return;
+        {
+            // No relay, no live peers: their ghosts park until poses arrive again.
+            std::scoped_lock lock{owner.mutex};
+            owner.peers.clear();
+        }
         resolver.cancel();
         boost::system::error_code ignored;
         socket.close(ignored);
@@ -513,6 +873,22 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                 for (const auto& change : changes) {
                     self->Send(EncodeChange(change));
                     self->sent_seq = change.seq;
+                }
+                bool request_baseline = false;
+                {
+                    std::scoped_lock lock{self->owner.mutex};
+                    request_baseline = self->owner.baseline_ready &&
+                                       self->owner.outgoing.empty() && !self->baseline_requested;
+                }
+                std::optional<Pose> pose;
+                {
+                    std::scoped_lock lock{self->owner.mutex};
+                    pose = std::exchange(self->owner.pose_out, std::nullopt);
+                }
+                if (pose) self->Send(EncodePose(*pose));
+                if (request_baseline) {
+                    self->baseline_requested = true;
+                    self->Send({{"type", "team_state_request"}});
                 }
                 if (now - self->last_heartbeat >= 30s) {
                     self->Send({{"type", "heartbeat"}});
@@ -571,19 +947,41 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                         self->handshaken = true;
                     } else if (type == "heartbeat") {
                         self->Send({{"type", "heartbeat_ack"}});
-                    } else if (type == "heartbeat_ack" || type == "client_state") {
-                        // Presence has no guest representation in this draft.
+                    } else if (type == "pose") {
+                        // Poses are never grants: a bad one is ignored, never a disconnect.
+                        std::string origin;
+                        auto pose = DecodePose(*packet, &origin);
+                        if (pose && self->owner.pose_enabled) {
+                            self->owner.OnPose(std::move(origin), std::move(*pose));
+                        } else if (!pose && !self->owner.logged_bad_pose) {
+                            self->owner.logged_bad_pose = true;
+                            LOG_WARNING(Core_ARM, "OoT co-op: ignored a malformed pose");
+                        }
+                    } else if (type == "client_state") {
+                        // A peer that went offline hides its ghost (the frame drain parks it).
+                        const auto& state = packet->at("state");
+                        if (packet->contains("origin") && packet->at("origin").is_string() &&
+                            state.is_object() && state.contains("online") &&
+                            state.at("online") == false) {
+                            std::scoped_lock lock{self->owner.mutex};
+                            self->owner.peers.erase(packet->at("origin").get<std::string>());
+                        }
+                    } else if (type == "heartbeat_ack") {
+                        // Liveness only.
                     } else if (type == "error") {
                         LOG_WARNING(Core_ARM, "OoT co-op: relay rejected a packet");
                         return self->Fail();
                     } else {
                         if (!self->ready && type != "team_state") return self->Fail();
                         if (!self->owner.Receive(*packet)) return self->Fail();
+                        if (self->baseline_requested && type == "team_state") {
+                            LOG_INFO(Core_ARM, "OoT co-op: baseline exchanged");
+                        }
                         if (!self->ready) {
                             self->ready = true;
                             self->Send({{"type", "client_state"},
-                                        {"state", {{"apply_enabled", false}}}});
-                            LOG_INFO(Core_ARM, "OoT co-op: connected; guest application disabled");
+                                        {"state", {{"apply_enabled", !self->owner.allowed_classes.empty()}}}});
+                            LOG_INFO(Core_ARM, "OoT co-op: relay connected; frame drain class-gated");
                         }
                     }
                 } catch (const std::exception&) {
@@ -601,6 +999,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
     Clock::time_point last_heartbeat{Clock::now()};
     bool failed{};
     bool handshaken{};
+    bool baseline_requested{};
     bool ready{};
     u64 sent_seq{};
     std::array<char, 4> header{};
@@ -663,6 +1062,9 @@ bool Session::Impl::Receive(const Json& packet) {
             snapshot_seen.emplace(origin, value.get<u64>());
         }
         for (const auto& value : packet.at("changes")) {
+            // A wallet delta is not state: a reconnect must never re-apply one.
+            if (value.is_object() && value.contains("type") &&
+                (value.at("type") == "rupee_add" || value.at("type") == "item_give")) continue;
             const auto change = DecodeChange(value, true);
             if (!change || !WireKind(change->kind)) return false;
             checkpoint.Merge(*change, false);
@@ -672,7 +1074,7 @@ bool Session::Impl::Receive(const Json& packet) {
             const auto change = DecodeChange(value);
             if (!change || !WireKind(change->kind) || !Unsigned(value.at("rev"), MaxSequence) ||
                 value.at("rev").get<u64>() != ++revision) return false;
-            checkpoint.Merge(*change);
+            if (!EventKind(change->kind)) checkpoint.Merge(*change);
         }
         changes = checkpoint.Snapshot();
     } else {
@@ -694,18 +1096,87 @@ bool Session::Impl::Receive(const Json& packet) {
     return true;
 }
 
-Session::Session(const Kernel::KProcess* owner_, u64 base_, Endpoint endpoint, Hello hello,
-                 std::set<u64> denied, bool played_events_, std::set<Kind> allowed_classes)
-    : owner{owner_}, base{base_}, played_events{played_events_},
+// The ghost's persistent guest memory: the rest of our sentinel page (the brk word is at +0).
+inline constexpr u64 GhostBlock = 0x400;
+static_assert(GhostBlock + GhostSlots * GhostDriver<int>::SlotSize <= 0x1000);
+
+struct Session::Impl::GhostPort {
+    Backend& backend;
+    Memory::Memory& memory;
+    Impl& impl;
+    std::optional<u64> R64(u64 address) { return OotGameDataTrace::Detail::Read64(memory, address); }
+    std::optional<u32> R32(u64 address) { return OotGameDataTrace::Detail::Read32(memory, address); }
+    bool Write(u64 address, const void* data, size_t size) {
+        const u64 low = impl.binding.sentinel + GhostBlock, high = impl.binding.sentinel + 0x1000;
+        if (!impl.binding.sentinel || address < low || address + size > high ||
+            !memory.IsValidVirtualAddressRange(address, size))
+            return false;
+        return memory.WriteBlock(address, data, size);
+    }
+    std::optional<u64> Verified(const OotGameDataTrace::Entry& entry) { return backend.VerifiedEntry(entry); }
+    /// The grant path's call: full context captured, private stack, sentinel return. Up to three
+    /// stack arguments read as zero.
+    bool Call(u64 entry, const std::array<u64, 8>& args, std::optional<float> s0 = std::nullopt) {
+        if (!backend.CallReady()) return false;
+        auto saved = backend.Capture();
+        if (!saved) return false;
+        const u64 sp = impl.binding.stack - ItemFrame;
+        ApplyTarget target{true, false, 0, 0, entry, impl.binding.sentinel, sp, args};
+        target.stores = {{sp, 0}, {sp + 8, 0}, {sp + 0x10, 0}, {sp + 0x18, 0}};
+        if (s0) {
+            u32 bits;
+            std::memcpy(&bits, &*s0, 4);
+            target.s0_bits = bits;
+        }
+        if (!backend.Redirect(target)) return false;
+        impl.ghost_saved = std::move(saved);
+        impl.ghost_stack = sp;
+        return true;
+    }
+};
+
+Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_,
+                 std::shared_ptr<const OotGameDataTrace::Profile> profile_, Endpoint endpoint, Hello hello,
+                 std::set<u64> denied, std::set<Kind> allowed_classes,
+                 std::set<std::pair<Kind, u64>> allowed_keys)
+    : owner{owner_}, base{base_}, profile{std::move(profile_)},
       impl{std::make_unique<Impl>(std::move(endpoint), std::move(hello), std::move(denied),
-                                   std::move(allowed_classes))} {
+                                   std::move(allowed_classes), std::move(allowed_keys),
+                                   profile->wallet_hash)} {
+    impl->binding.base = base;
+    if (!impl->allowed_classes.empty()) {
+        Kernel::KProcessAddress stack{}, sentinel{};
+        const auto result = owner->AllocateDebugCallMemory(kernel, &stack, &sentinel);
+        if (result.IsSuccess()) {
+            impl->binding.stack = GetInteger(stack);
+            impl->binding.sentinel = GetInteger(sentinel);
+        } else {
+            LOG_WARNING(Core_ARM,
+                        "OoT co-op: private stack/sentinel allocation failed (result {:#x}, "
+                        "module {}, description {})",
+                        result.raw, static_cast<u32>(result.GetModule()), result.GetDescription());
+        }
+    }
+    if (impl->allowed_classes.contains(Kind::Pose)) {
+        if (profile->ghost.Valid() && impl->binding.sentinel) {
+            impl->pose_enabled = true;
+            impl->ghost = std::make_unique<GhostDriver<Impl::GhostPort>>(profile->ghost, base);
+            LOG_INFO(Core_ARM, "OoT co-op: pose class on (ghost block {:#x})",
+                     impl->binding.sentinel + GhostBlock);
+        } else {
+            LOG_WARNING(Core_ARM, "OoT co-op: pose class off: {}",
+                        profile->ghost.Valid() ? "no private call memory" : "the private profile has no ghost object");
+        }
+    }
     impl->Start();
 }
 Session::~Session() = default;
 void Session::Stop() { impl->Stop(); }
 
 void Session::Observe(Change change) {
-    if (impl->stopped || IncomingScope::SuppressSend() || !WireKind(change.kind)) return;
+    // Wallet deltas are grant-only in this pass: the local wallet is not observed or re-sent.
+    if (impl->stopped || !WireKind(change.kind) || change.kind == Kind::Rupee) return;
+    if (change.kind == Kind::Item && !ValidItem(change)) return;
     std::scoped_lock lock{impl->mutex};
     if (impl->outgoing.size() >= QueueLimit || impl->next_seq > MaxSequence) {
         if (!impl->logged_overflow) {
@@ -720,49 +1191,170 @@ void Session::Observe(Change change) {
     impl->outgoing.push_back(std::move(change));
 }
 
-void Session::ObserveDiagnostic() {
-    std::scoped_lock lock{impl->mutex};
-    if (!impl->logged_diagnostic) {
-        LOG_INFO(Core_ARM, "OoT co-op: observation only; setter request is not a grant receipt");
-        impl->logged_diagnostic = true;
+void Session::ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory) {
+    const auto call = ReadItemCall(jit, memory, base, *profile, impl->binding.sentinel,
+                                   impl->allowed_classes.contains(Kind::Item));
+    // Every give is logged (bounded): the record of what the game passes, forwarded or not.
+    if (impl->item_lines < 256) {
+        ++impl->item_lines;
+        LOG_INFO(Core_ARM, "OoT co-op: {}", call.line);
     }
+    if (call.forward) Observe(call.change);
 }
 
-void Session::Drain() {
-    if (impl->stopped || IncomingScope::SuppressSend()) return;
-    // Only called from the guest breakpoint callback; the I/O thread never accesses guest state.
-    std::scoped_lock lock{impl->mutex};
-    const GuestWriter writer;
-    for (size_t count = 0; count < 64 && !impl->pending.empty(); ++count) {
-        auto entry = std::move(impl->pending.front());
-        impl->pending.pop_front();
-        if (const auto* seen = std::get_if<HighWater>(&entry)) {
-            if (!impl->remote.AdoptSeen(*seen)) {
-                LOG_WARNING(Core_ARM, "OoT co-op stopped: snapshot sender capacity exceeded");
-                impl->stopped = true;
-                impl->io.stop();
-            }
-            continue;
+bool Session::IsSentinel(u64 pc) const {
+    std::scoped_lock lock{impl->guest_mutex};
+    return impl->binding.sentinel && pc == impl->binding.sentinel;
+}
+
+bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& jit,
+                   Memory::Memory& memory, u64 thread, u64& tls, u64& tls_ro,
+                   std::function<void()> clear_exclusive) {
+    std::scoped_lock guest_lock{impl->guest_mutex};
+    auto& binding = impl->binding;
+    auto& runtime = *impl->runtime;
+    Impl::Backend backend{jit, memory, binding, *profile, tls, tls_ro, std::move(clear_exclusive)};
+    const auto log = [](std::string_view line) { LOG_INFO(Core_ARM, "{}", line); };
+    const DrainContext site{thread, 1, impl->tick, true};
+    if (binding.sentinel && pc == binding.sentinel && impl->ghost && impl->ghost->Calling()) {
+        const u64 result = jit.GetRegister(0);
+        if (thread != impl->frame_thread || jit.GetSP() != impl->ghost_stack || !impl->ghost_saved ||
+            !backend.Restore(*impl->ghost_saved)) {
+            log(fmt::format("OoT co-op: ghost sentinel refused thread={} pc={:#x}", thread, pc));
+            return false;
         }
-        const auto& change = std::get<Change>(entry);
-        if (!impl->remote.Merge(change, !change.origin.empty())) continue;
-        // TODO read authoritative guest values here before enabling either writer. Observations
-        // alone cannot account for pre-session saves, local resets or rejected setter requests.
-        if (change.kind != Kind::PouchTotal && !ShouldApply(change, impl->local)) continue;
-        if (!impl->allowed_classes.contains(change.kind)) {
-            if (!impl->logged_class) {
-                LOG_INFO(Core_ARM, "OoT co-op: not applied: grant class disabled");
-                impl->logged_class = true;
-            }
-            continue;
+        impl->ghost_saved.reset();
+        Impl::GhostPort port{backend, memory, *impl};
+        impl->ghost->Returned(port, binding.sentinel + GhostBlock, result, log);
+        return true;
+    }
+    if (binding.sentinel && pc == binding.sentinel) {
+        const u64 result = jit.GetRegister(0); // the call's return value, before the restore
+        const auto event = runtime.Sentinel(backend, site, pc, log);
+        if (event == ApplyEvent::Returned && runtime.LastGrant() &&
+            runtime.LastGrant()->kind == Kind::Item) {
+            log(fmt::format("OoT co-op: item give returned w0={} name={}", result & 1,
+                            runtime.LastGrant()->name));
         }
-        IncomingScope incoming;
-        const auto status = writer.Apply(change);
-        if (status != ApplyStatus::Applied && !impl->logged_no_site) {
-            LOG_INFO(Core_ARM, "OoT co-op: not applied: no site (guest writes disabled)");
-            impl->logged_no_site = true;
+        if (event == ApplyEvent::Returned && runtime.LastGrant() &&
+            runtime.LastGrant()->kind == Kind::Rupee) {
+            using OotGameDataTrace::Detail::Read32;
+            using OotGameDataTrace::Detail::Read64;
+            const u64 pouch = profile->pouch_cell
+                                  ? Read64(memory, binding.base + profile->pouch_cell).value_or(0)
+                                  : 0;
+            const auto pending = pouch ? Read32(memory, pouch + 0x3BD4) : std::nullopt;
+            log(fmt::format("OoT co-op: rupee pending={} after the call (pouch {:#x})",
+                            static_cast<s32>(pending.value_or(0)), pouch));
+        }
+        // An unowned/invalid sentinel must reach the normal breakpoint fault, never resume.
+        if (event != ApplyEvent::Returned) {
+            log(fmt::format("OoT co-op: sentinel refused thread={} pc={:#x}", thread, pc));
+        }
+        return event == ApplyEvent::Returned;
+    }
+    if (impl->stopped) return false;
+    if (point == OotGameDataTrace::Point::ItemGive) {
+        ObserveItem(jit, memory);
+        return false;
+    }
+    if (point != OotGameDataTrace::Point::Frame || !thread) return false;
+    if (!impl->frame_thread) impl->frame_thread = thread;
+    if (impl->frame_thread != thread) return false;
+    ++impl->tick;
+    if (!binding.invalid && backend.Moved()) {
+        const u64 old = binding.manager;
+        const auto now =
+            OotGameDataTrace::Detail::Read64(memory, binding.base + profile->manager_cell);
+        if (impl->ghost) impl->ghost->DropAll(log, "save or title: GameData moved");
+        if (runtime.Rebind(backend, log)) {
+            impl->stable_frame = false;
+            if (impl->rebinds < 16) {
+                log(fmt::format("OoT co-op: manager moved {:#x} -> {:#x}; baseline re-bound", old,
+                                now.value_or(0)));
+            }
+            ++impl->rebinds;
         }
     }
+    const bool bound = backend.BindFromCell();
+    if (binding.invalid || (!bound && impl->stable_frame)) {
+        if (impl->ghost) impl->ghost->DropAll(log, "GameData binding lost");
+        runtime.Invalidate();
+        runtime.Frame(backend, {thread, 1, impl->tick, true}, [](Change, bool) {}, log);
+        return false;
+    }
+    if (!bound) return false;
+    if (!std::exchange(impl->stable_frame, true)) return false;
+
+    std::deque<std::variant<Change, HighWater>> batch;
+    {
+        std::scoped_lock lock{impl->mutex};
+        for (size_t count = 0; count < 64 && !impl->pending.empty(); ++count) {
+            batch.push_back(std::move(impl->pending.front()));
+            impl->pending.pop_front();
+        }
+    }
+    for (const auto& entry : batch) {
+        if (const auto* seen = std::get_if<HighWater>(&entry)) {
+            if (!impl->remote.AdoptSeen(*seen)) runtime.Invalidate();
+        } else {
+            const auto& change = std::get<Change>(entry);
+            if (impl->remote.Merge(change, !change.origin.empty()) && !runtime.Queue(change) &&
+                !runtime.Suppress(change) && !impl->logged_class) {
+                log("OoT co-op: not applied: class/key policy disabled or queue full");
+                impl->logged_class = true;
+            }
+        }
+    }
+    const auto send = [&](Change change, bool baseline) {
+        Observe(change);
+        log(fmt::format("OoT co-op: {} class={} key={:016x} value=1 path=observer",
+                        baseline ? "baseline" : "observed", ClassName(change.kind), change.key));
+    };
+    const auto event = runtime.Frame(backend, {thread, 1, impl->tick, true}, send, log);
+    // A give waits while an event runs or a guard pointer is dead; say so now and then.
+    if (event == ApplyEvent::Blocked && runtime.Pending() && runtime.LastGrant() &&
+        runtime.LastGrant()->kind == Kind::Item && impl->tick - impl->item_waiting_logged >= 600) {
+        impl->item_waiting_logged = impl->tick;
+        log(fmt::format("OoT co-op: item give waiting name={} (event running, guard null or "
+                        "not callable)", runtime.LastGrant()->name));
+    }
+    if (runtime.BaselineReady()) {
+        std::scoped_lock lock{impl->mutex};
+        if (!impl->baseline_ready) {
+            impl->baseline_ready = true;
+            log("OoT co-op: baseline exported");
+        }
+    }
+    if (impl->pose_enabled) FramePose(backend, memory, log, runtime.Calling());
+    return runtime.Calling() || (impl->ghost && impl->ghost->Calling());
+}
+
+template <typename Backend, typename Log>
+void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool grant_calling) {
+    // Own pose: pure reads, paced by the sender; the network thread sends the newest one.
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now().time_since_epoch()).count());
+    const auto local = ReadLocalPose(memory, base, impl->binding.manager, profile->ghost,
+                                     static_cast<u32>(impl->tick));
+    std::vector<PeerView> peers;
+    {
+        std::scoped_lock lock{impl->mutex};
+        if (auto out = impl->sender.Sample(local, now)) {
+            impl->pose_out = std::move(out);
+            if (impl->poses_out++ < 4 || impl->poses_out % 900 == 0) {
+                log(fmt::format("OoT co-op: pose out #{} banc={} child={} loading={} pos=({:.2f}, {:.2f}, "
+                                "{:.2f}) yaw={:.1f}", impl->poses_out, impl->pose_out->banc.empty() ? "-" : impl->pose_out->banc,
+                                impl->pose_out->child, impl->pose_out->loading, impl->pose_out->pos[0],
+                                impl->pose_out->pos[1], impl->pose_out->pos[2], impl->pose_out->yaw));
+            }
+        }
+        for (const auto& [origin, track] : impl->peers) peers.push_back({origin, track.At(now)});
+    }
+    // Grants keep priority: the one call slot of this frame is theirs when they used it.
+    if (grant_calling) return;
+    Impl::GhostPort port{backend, memory, *impl};
+    impl->ghost->Frame(port, impl->binding.sentinel + GhostBlock, local, peers, log);
 }
 
 void BeginSession() {
@@ -774,12 +1366,19 @@ void BeginSession() {
     if (old) old->Stop();
 }
 
-void RegisterMain(const Kernel::KProcess* owner, u64 program_id, u64 base,
+void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 program_id, u64 base,
                   std::string_view build_id) {
     BeginSession();
-    const auto endpoint_text = Env("EDEN_NX2_OOT_COOP");
-    if (!Gate(endpoint_text, program_id, build_id) || base == 0) {
-        if (!endpoint_text.empty()) LOG_INFO(Loader, "OoT co-op off: endpoint/title/build gate");
+    const auto endpoint_text = Env("EDEN_NX2_OOT_COOP") == "1"
+        ? Env("EDEN_NX2_OOT_COOP_RELAY", "127.0.0.1:43390") : Env("EDEN_NX2_OOT_COOP");
+    if (!Gate(endpoint_text, program_id) || base == 0) {
+        if (!endpoint_text.empty()) LOG_INFO(Loader, "OoT co-op off: endpoint/title gate");
+        return;
+    }
+    std::string why;
+    auto profile = LoadProfile(build_id, &why);
+    if (!profile) {
+        LOG_INFO(Loader, "OoT co-op off: {}", why);
         return;
     }
     try {
@@ -796,9 +1395,23 @@ void RegisterMain(const Kernel::KProcess* owner, u64 program_id, u64 base,
             if (!list) throw std::runtime_error{"invalid deny-list"};
             denied = *list;
         }
-        const auto allowed = DecodeAllowClasses(Env("EDEN_NX2_OOT_COOP_ALLOW_CLASSES"));
+        const auto allowed = DecodeAllowClasses(Env("EDEN_NX2_OOT_COOP_ALLOW"));
         if (!allowed) throw std::runtime_error{"invalid grant class allow-list"};
+        std::set<std::pair<Kind, u64>> keys;
+        const auto keys_path = Env("EDEN_NX2_OOT_COOP_KEYS");
+        if (!keys_path.empty()) {
+            std::ifstream in{std::filesystem::path{keys_path}};
+            if (!in) throw std::runtime_error{"cannot read key allow-list"};
+            std::string text;
+            char c;
+            while (in.get(c) && text.size() <= MaxFrame) text.push_back(c);
+            const auto parsed = DecodeLine("{\"keys\":" + text + "}");
+            const auto list = parsed ? DecodeKeyPolicy(parsed->at("keys")) : std::nullopt;
+            if (!list) throw std::runtime_error{"invalid key allow-list"};
+            keys = *list;
+        }
         Hello hello;
+        hello.build_id = std::string{build_id};
         hello.seed_hash = Env("EDEN_NX2_OOT_COOP_SEED", "0");
         hello.policy_id = Env("EDEN_NX2_OOT_COOP_POLICY", "or-v2");
         hello.room = Env("EDEN_NX2_OOT_COOP_ROOM", "default");
@@ -806,8 +1419,9 @@ void RegisterMain(const Kernel::KProcess* owner, u64 program_id, u64 base,
         hello.name = Env("EDEN_NX2_OOT_COOP_NAME", "Player");
         std::random_device random;
         hello.client_id = fmt::format("{:08x}{:08x}{:08x}{:08x}", random(), random(), random(), random());
-        auto session = std::make_shared<Session>(owner, base, *ParseEndpoint(endpoint_text),
-            std::move(hello), std::move(denied), false, *allowed);
+        auto session = std::make_shared<Session>(kernel, owner, base, std::move(profile),
+            *ParseEndpoint(endpoint_text),
+            std::move(hello), std::move(denied), *allowed, std::move(keys));
         std::scoped_lock lock{sessions_mutex};
         current_session = std::move(session);
     } catch (const std::exception& error) {

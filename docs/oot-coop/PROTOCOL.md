@@ -1,8 +1,10 @@
-# OoT co-op protocol v2
+# OoT co-op protocol v3
 
 This document supersedes the wire and conflict sections of `docs/nx2/oot-coop.md`.
 The relay and simulator implement this protocol. Emulator guest application is still
-unverified and disabled. A transport acknowledgement never means that a save changed.
+unverified and disabled by default; C4 has opt-in chest Bool and actor Bool64 frame
+adapters. Chest flags mark locations checked; they grant no items. Bool64 covers pickups, breakables and enemies.
+A transport acknowledgement never means that a save changed.
 
 ## Anchor source comparison
 
@@ -10,7 +12,8 @@ This is an independent protocol inspired by the locally inspected Anchor impleme
 not an Anchor-compatible client. Source references below use `Ship` for
 `~/dev/research/shipwright/soh/soh/Network/Anchor/` and `Relay` for
 `~/dev/research/anchor/`. The research summary is
-`~/Downloads/OOT/randomizer/RESEARCH.md`, section 2. No game tables or names are imported.
+`~/Downloads/OOT/randomizer/RESEARCH.md`, section 2. No Anchor game tables or names are
+imported. The C4 chest adapter ships only the reviewed member/backing-Bool hashes from this game's schema (see HOOKS.md).
 
 Anchor frames JSON with NUL (`Relay/server.go:328`, `Relay/client.go:42`), limits packets
 to 8 MiB, and retains 512 queued team events (`Relay/team.go:10`). It forwards requests
@@ -22,7 +25,7 @@ in-process access to the original game's save/actors is unavailable in this emul
 No Anchor packet is adopted **as-is on the wire**. The table distinguishes reused
 semantics from omitted capabilities:
 
-| Anchor packet or lifecycle | v2 mapping and status |
+| Anchor packet or lifecycle | v3 mapping and status |
 |---|---|
 | `HANDSHAKE` | `hello`/`hello_ack`: retain room/team/client identity, require exact build, seed and policy identity. Server no longer trusts client-supplied routing targets. |
 | `SET_FLAG` | `bool_set` or `bit_set`, depending on the verified storage key namespace. Retain monotonic true flag semantics; no hardcoded game deny-list. `Ship/Packets/SetFlag.cpp`. |
@@ -34,11 +37,11 @@ semantics from omitted capabilities:
 | `REQUEST_TEAM_STATE`, `UPDATE_TEAM_STATE` | `team_state_request`/`team_state`: authoritative relay union of flags plus checkpoint/replay, never a whole guest save. Clients cannot replace relay state. |
 | `UPDATE_CLIENT_STATE`, `ALL_CLIENT_STATE` | `client_state` to other team members and cached state on join. Retain online/name/save-loaded/scene/room presence concepts. Presence has no guest-write authority. |
 | `UPDATE_ROOM_STATE` | Drop mutable owner settings. Room build, seed and policy are fixed by first join. No mid-session team migration. |
-| `PLAYER_UPDATE` | Drop position, joints, equipment and animation. `Ship/Packets/PlayerUpdate.cpp` targets same-scene peers; v2 is save progress only. |
-| Dummy player creation/update/destruction | No packet or guest actor injection. `Ship/Anchor.cpp:199` refreshes remote actors; `Ship/DummyPlayer.cpp:115` gates updates on scene, online and save-loaded state. All of this needs a separate verified actor integration. |
+| `PLAYER_UPDATE` | `pose` (v3): position, facing, scene (`banc`), age and a loading bit only, best effort, forwarded to the team, never state. Joints, equipment and animation are dropped. Like `Ship/Packets/PlayerUpdate.cpp` it is drawn only for same-scene peers. |
+| Dummy player creation/update/destruction | No packet. With class `pose` allowed, each same-scene peer is a "statue" ghost: a Link-shaped puppet actor created through the game's own actor manager and moved only by the actor's own set-transform call (no joints, animation, collision or equipment). It is parked below the map, not destroyed, when the peer leaves the scene or disconnects. `Ship/Anchor.cpp:199` refreshes remote actors; `Ship/DummyPlayer.cpp:115` gates updates on scene, online and save-loaded state. |
 | `PLAYER_SFX`, `OCARINA_SFX`, `DAMAGE_PLAYER`, `REQUEST_TELEPORT`, `TELEPORT_TO` | Drop audio, PvP and teleportation. |
 | `HEARTBEAT` | `heartbeat`/`heartbeat_ack`, same liveness purpose, new schema. |
-| `DISABLE_ANCHOR`, disconnect, unload | No remote disable command. Socket closure broadcasts `client_state` with `online:false`. Local session teardown cancels transport and pending applications; no remote actors exist to remove. Anchor's `Disable()` clears clients and refreshes actors (`Ship/Anchor.cpp:23`). |
+| `DISABLE_ANCHOR`, disconnect, unload | No remote disable command. Socket closure broadcasts `client_state` with `online:false`. Local session teardown cancels transport and pending applications; ghost actors are parked below the map. Anchor's `Disable()` clears clients and refreshes actors (`Ship/Anchor.cpp:23`). |
 
 ## Framing and handshake
 
@@ -53,17 +56,18 @@ process concatenated frames in order. A zero/oversized length is rejected before
 allocation. EOF inside a frame is malformed; EOF between frames is normal disconnect.
 JSON is chosen over msgpack to keep the relay stdlib-only and manual inspection easy.
 Length prefixing supplies bounded allocation and unambiguous framing without scanning
-for delimiters. Protocol v1 newline clients are intentionally incompatible.
+for delimiters. Protocol v1 newline clients are intentionally incompatible; v2 clients are
+refused at `hello` with `protocol version mismatch` (v3 only adds `pose`).
 
 Every payload is a typed object. Duplicate keys, non-finite numbers, invalid UTF-8,
-more than 16 nested containers, unknown packet types and unknown grant/hello fields
+more than 16 nested containers, unknown packet types and unknown grant/hello/pose fields
 are rejected. JSON integer decoders must preserve unsigned 64-bit actor keys exactly;
 JavaScript `Number` is unsuitable. Sequence and revision numbers are limited to 2^53−1.
 
 The first payload must be:
 
 ```json
-{"type":"hello","version":2,"build_id":"E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348","seed_hash":"0","room":"field-round-1","team":"together","client_id":"session-a","name":"Daniel","policy_id":"or-v2"}
+{"type":"hello","version":3,"build_id":"<build-id>","seed_hash":"0","room":"field-round-1","team":"together","client_id":"session-a","name":"Daniel","policy_id":"or-v2"}
 ```
 
 `build_id` is 40 uppercase hex characters. `seed_hash` is 1..128 hex characters,
@@ -75,7 +79,8 @@ A duplicate connected client ID in a team is refused. A changed policy needs a n
 `policy_id` identifies the reviewed allow/deny configuration shared by testers; use a
 shared policy name or digest. Default `or-v2` is only the conservative prototype policy,
 not proof that two private configuration files match. The relay checks the supplied
-identity, not their content. Automatically deriving a policy digest remains future work.
+identity, not their content. The C4 one-host harness derives a digest of its typed
+bool/bit key policy; manually configured clients must still supply a consistent policy identity.
 
 Success yields `hello_ack` with `version`, `build_id`, `seed_hash`, `policy_id`, `client_id`,
 then `team_state`, then each connected peer's cached `client_state`. Failure yields
@@ -107,7 +112,40 @@ its actual save before applying, keeps an application receipt/echo guard across 
 guest execution, and records success only after verified completion. Protocol retries
 must not bypass the local class/key allow list or build/lifecycle guards.
 
-`quest_step`, `int_set`, `enum_set`, `pouch_add`, `pouch_total` are **rejected in v2**.
+Wallet deltas (class `rupee`, C6) are an additive event, not state:
+
+```json
+{"type":"rupee_add","origin":"session-a","seq":3,"hash":<hash>,"delta":5}
+```
+
+`hash` is the wallet key `PlayerStatus.CurrentRupee` (non-zero; the receiver admits only the
+wallet key of its private profile, the relay any non-zero key); `delta` is a non-zero
+integer in [-999, 999]. The relay forwards and acks it like a grant and keeps it in the replay
+window (so revisions stay contiguous), but never folds it into team state; clients ignore
+`rupee_add` in a `team_state` snapshot or replay, so a reconnect never re-applies one (and a
+late joiner does not receive earlier deltas). A receiver with `rupee` in
+`EDEN_NX2_OOT_COOP_ALLOW` applies it by calling the game's wallet entry from the frame drain;
+the game's own pouch update clamps it. The local wallet is not observed or re-sent in this pass.
+
+Item gives (class `item`, C7) are an event too: the game's own give-to-pouch call, as the opener's
+game made it, replayed on the receiver:
+
+```json
+{"type":"item_give","origin":"session-a","seq":4,"name":"<actor name>","category":6,"count":1,"get":7,"flags":[0,0,1,0]}
+```
+
+`name` is the item's actor name (1-63 of `[A-Za-z0-9_]`), `category` and `get` the call's pouch
+category and get type (0-15), `count` 1-999, `flags` the call's three flag registers and its
+stack byte (0-255 each). The opener forwards a call only when its return address is one of the
+profile's `item_callers` (a chest's event-flow give); every other give is logged as `seen` and
+not sent, and the receiver's own replay (it returns to the co-op sentinel) is never re-sent. Like
+`rupee_add` it is deduplicated by origin/sequence, kept in the replay window and never folded into
+team state or applied from a snapshot, so a duplicate delivery never gives twice and two
+different gives of the same item both add. The chest's opened Bool travels separately as an
+ordinary `bool_set`. The receiver replays it from the frame drain only when no event is running and
+the profile's guard pointers are live; until then it waits at the head of the queue.
+
+`quest_step`, `int_set`, `enum_set`, `pouch_add`, `pouch_total` are **rejected** (since v2).
 A quest index maximum is not an OR over flags and an observed setter request is not
 proof of successful progress. The existing trace can still observe it locally. Pouch
 stock, health, ammo, small-key balances, progressive tiers and spending are not inferred
@@ -122,12 +160,57 @@ or derive them from the guest. Guest scene/save-loaded discovery remains unimple
 A disconnect sends `state:{"online":false}`. Presence is scoped to the team, not the
 entire room. `heartbeat` and `heartbeat_ack` have only `type`.
 
+## Poses (class `pose`, v3)
+
+A pose is a peer's live position, sent so the others can draw a ghost of it. It is **not a
+grant**: no `seq`, no ack, no `rev`, no replay window, never folded into team state, never in a
+`team_state` snapshot and never sent on join. A client sends exactly these fields:
+
+```json
+{"type":"pose","t":123456,"banc":"<banc>","child":true,"loading":false,"pos":[-46.09,118.46,15.39],"yaw":108.6,"anim":"walk","anim_seq":3,"rate":1.0,"phase":0.25}
+```
+
+`anim`, `anim_seq`, `rate` and `phase` are an animation hint for a later animated receiver; the v1
+statue receiver ignores them. The sender infers `anim` (`idle`, `walk` or `run`) from its speed,
+because the game's own command table names both walking and running `Move`. `anim_seq`
+(unsigned 32-bit) changes only when the category changes, so a receiver restarts an animation
+then and never per packet. `rate` (0..10) is the speed relative to the category's nominal speed;
+`phase` (0 <= phase < 1) is the cycle position (distance per stride, or time while idle).
+
+`t` is the sender's frame counter (unsigned 32-bit, wraps). `banc` is the sender's current scene
+name, 1..63 of `[A-Za-z0-9_]`, or `""` when there is no save, the title screen is up or the scene
+cannot be read. `child` and `loading` are JSON booleans. `pos` is exactly three finite numbers
+(integer or float, never a boolean), each with magnitude at most 100000. `yaw` is a finite number
+of degrees in [-360, 360]. The framed payload, as sent, is at most 256 bytes. `origin` and `seq`
+are not accepted from the client and unknown fields are rejected. A malformed pose is a protocol
+error like any other malformed packet (an `error` and disconnect); a well-formed one never
+causes a disconnect.
+
+The relay forwards `{"type":"pose","origin":"<client-id>",...same fields}` to the other members
+of the sender's team only; `origin` comes from the connection. Delivery is best effort, latest
+wins:
+
+- A pose from an origin still queued unsent in a receiver's outbox is replaced in place.
+- A receiver whose outbox already holds more than 64 frames gets no new pose (dropped and
+  counted). When a grant, ack or snapshot needs room, queued poses are evicted first, so poses
+  can never push a client into the slow-client disconnect, which still applies to everything else.
+- A sender over 30 poses in a sliding one-second window has the excess dropped silently.
+
+Client side: when `pose` is in `EDEN_NX2_OOT_COOP_ALLOW` the emulator sends its own pose at about
+15 Hz while it moves, with a 1 Hz keepalive while it stands still. Each peer whose latest pose is
+in the receiver's own scene is drawn as a "statue" ghost: a Link-shaped puppet actor created
+through the game's own actor manager and moved with the actor's own set-transform call from the
+frame drain. The ghost is parked below the map when the peer leaves the scene or disconnects
+(`client_state` with `online:false`). Grants keep priority in the drain's one guest call per
+frame; a pose only ever moves a ghost and never changes a save.
+
 ## Pre-existing saves and restart reconciliation
 
 The desired baseline is the **union of verified permanent true flags**, never one
 player's whole save replacing another. The wire already represents this without a
-special baseline packet. A baseline exporter is not implemented in the emulator; the
-following is a required field-tested workflow before claiming save synchronization:
+special baseline packet. C4 exports the configured reviewed Bool/Bool64 key set at
+the frame boundary and requests a FIFO snapshot after upload acknowledgements. The following still requires field
+validation before claiming save synchronization:
 
 1. Use backed-up disposable saves, a new room name and identical build/seed/policy.
    Pause progression while each client enumerates the reviewed keys from its loaded save.
@@ -177,7 +260,9 @@ then there is no "exactly once" consumable synchronization claim.
 
 Limits: 128 connections, 32 rooms, 16 teams/room, 256 retained sender IDs/team, 2048
 flag keys/team, 512 replay entries, 256 queued frames/client and 2 MiB queued bytes/client.
-Slow clients disconnect; capacity failures do not silently evict state. Heartbeat is
+Slow clients disconnect; capacity failures do not silently evict state. Poses: 256-byte
+payload, no new pose to a receiver holding more than 64 queued frames, one queued pose per
+origin per receiver, 30 poses/s per sender; pose excess is dropped and never disconnects. Heartbeat is
 30 seconds; receive idle timeout is 90 seconds. A private deny-list JSON array of numeric
 keys is loaded at relay startup with `--deny-list`; guest allow lists remain independent.
 
@@ -187,7 +272,8 @@ Socket-free suite, run in this sandbox:
 python3 -I tools/oot/coop/test_relay.py ProtocolTests
 ```
 
-**External lane must run the exact full command** (34 tests: 21 pure, 13 real TCP):
+**External lane must run the exact full command** (52 tests: 30 pure, 22 real TCP, of which
+6 drive the single-emulator fake peer):
 
 ```sh
 python3 -I tools/oot/coop/test_relay.py
@@ -195,5 +281,7 @@ python3 -I tools/oot/coop/test_relay.py
 
 TCP cases cover routing, concurrent check identity, snapshots after compaction, reconnect,
 refusal, presence teardown, heartbeat/expiry, pre-existing baseline union, unsafe grant
-rejection, malformed JSON/length, split/coalesced frames and deny-list enforcement.
+rejection, malformed JSON/length, split/coalesced frames, deny-list enforcement, v2 refusal,
+pose routing without ack, malformed and oversized poses, the pose rate cap, and the fake peer's
+pose commands. Pose coalescing and the stalled-receiver drop are pure tests.
 A pure-test pass is not evidence that these real-socket tests passed.

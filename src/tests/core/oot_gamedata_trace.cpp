@@ -11,6 +11,8 @@
 
 #include "common/nx2_event_trace.h"
 #include "core/arm/dynarmic/oot_gamedata_trace.h"
+#include "core/arm/dynarmic/oot_coop_runtime.h"
+#include "tests/core/oot_test_profile.h"
 #include "dynarmic/interface/A64/a64.h"
 
 namespace {
@@ -18,6 +20,7 @@ namespace {
 namespace Trace = Core::OotGameDataTrace;
 using Trace::Point;
 using Common::Nx2EventTrace::Murmur3;
+namespace P = OotTestProfile;
 
 constexpr u64 Base = 0x10000000;
 constexpr u64 Stop = 0x08000000;
@@ -37,6 +40,7 @@ public:
     std::map<u64, u8> bytes;
     std::vector<std::string> lines;
     u32 breakpoints{};
+    std::function<void(u64)> on_breakpoint;
 
     void Code(u64 address, u32 word) {
         code[address] = word;
@@ -80,7 +84,7 @@ public:
         if (it == code.end()) {
             return std::nullopt;
         }
-        return enabled ? Trace::InstructionFor(Base, address, it->second) : it->second;
+        return enabled ? Trace::InstructionFor(P::Get(), Base, address, it->second) : it->second;
     }
     u64 MemoryRead(u64, size_t) override {
         FAIL("Unexpected memory read");
@@ -101,6 +105,7 @@ public:
     }
     void ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) override {
         REQUIRE(exception == Dynarmic::A64::Exception::Breakpoint);
+        if (on_breakpoint) { on_breakpoint(pc); return; }
         REQUIRE(session.has_value());
         ++breakpoints;
         std::string line;
@@ -124,7 +129,7 @@ Dynarmic::A64::UserConfig Config(TraceEnvironment& env) {
 }
 
 u64 Site(Point point) {
-    for (const auto& site : Trace::Sites) {
+    for (const auto& site : P::Get().sites) {
         if (site.point == point) {
             return Base + site.offset;
         }
@@ -169,21 +174,26 @@ void RunAndCheck(TraceEnvironment& env, u64 entry, const std::array<u64, 6>& arg
 
 TEST_CASE("GameData trace sites need the traced build's base and original instructions",
           "[oot_gamedata_trace]") {
-    for (const auto& site : Trace::Sites) {
-        REQUIRE(Trace::Identify(Base, Base + site.offset, site.instruction) == site.point);
-        REQUIRE(Trace::InstructionFor(Base, Base + site.offset, site.instruction) ==
+    const auto& profile = P::Get();
+    for (const auto& site : profile.sites) {
+        REQUIRE(site.instruction == Trace::ReplacedInstruction(site.point));
+        REQUIRE(Trace::Identify(profile, Base, Base + site.offset, site.instruction) == site.point);
+        REQUIRE(Trace::InstructionFor(profile, Base, Base + site.offset, site.instruction) ==
                 Trace::Breakpoint);
         // No module registered (another build), or a different word there (a mod, a cheat, a
         // debugger breakpoint): the JIT gets the word unchanged.
-        REQUIRE(Trace::Identify(0, site.offset, site.instruction) == Point::None);
-        REQUIRE(Trace::InstructionFor(0, site.offset, site.instruction) == site.instruction);
-        REQUIRE(Trace::Identify(Base, Base + site.offset, Trace::Breakpoint) == Point::None);
-        REQUIRE(Trace::InstructionFor(Base, Base + site.offset, 0xD503201F) == 0xD503201F);
-        REQUIRE(Trace::Identify(Base, Base + site.offset + 4, site.instruction) == Point::None);
+        REQUIRE(Trace::Identify(profile, 0, site.offset, site.instruction) == Point::None);
+        REQUIRE(Trace::InstructionFor(profile, 0, site.offset, site.instruction) == site.instruction);
+        REQUIRE(Trace::Identify(profile, Base, Base + site.offset, Trace::Breakpoint) == Point::None);
+        REQUIRE(Trace::InstructionFor(profile, Base, Base + site.offset, P::Nop) == P::Nop);
+        REQUIRE(Trace::Identify(profile, Base, Base + site.offset + 4, site.instruction) ==
+                Point::None);
     }
-    REQUIRE(Trace::Identify(Base, Base - 4, Trace::Pacibsp) == Point::None);
-    REQUIRE(Trace::BuildId.size() == 40);
-    REQUIRE(Trace::BuildId.starts_with("E0F3CCFAF50065AE"));
+    REQUIRE(Trace::Identify(profile, Base, Base - 4, Trace::Pacibsp) == Point::None);
+    // No profile for this build: no sites at all.
+    const Trace::Profile empty;
+    for (const auto& site : profile.sites)
+        REQUIRE(Trace::Identify(empty, Base, Base + site.offset, site.instruction) == Point::None);
 }
 
 TEST_CASE("GameData trace: the step setter hook keeps its mov w8, #1",
@@ -195,7 +205,7 @@ TEST_CASE("GameData trace: the step setter hook keeps its mov w8, #1",
     for (const bool enabled : {false, true}) {
         TraceEnvironment env;
         env.enabled = enabled;
-        env.session.emplace(nullptr, Base, 1);
+        env.session.emplace(nullptr, Base, 1, P::Shared());
         env.Code(entry, MovzX9Seven);
         env.Code(entry + 4, Trace::MovW8One);
         env.Code(entry + 8, Ret);
@@ -235,7 +245,7 @@ TEST_CASE("GameData trace: the step apply hook reports the direction",
     for (const bool enabled : {false, true}) {
         TraceEnvironment env;
         env.enabled = enabled;
-        env.session.emplace(nullptr, Base, 1);
+        env.session.emplace(nullptr, Base, 1, P::Shared());
         env.Code(entry, Trace::Pacibsp);
         env.Code(entry + 4, MovzX9Seven);
         env.Code(entry + 8, Ret);
@@ -278,7 +288,7 @@ TEST_CASE("GameData trace: the HavePlayedEvent hook reads the event name",
     for (const bool enabled : {false, true}) {
         TraceEnvironment env;
         env.enabled = enabled;
-        env.session.emplace(nullptr, Base, 1);
+        env.session.emplace(nullptr, Base, 1, P::Shared());
         env.Code(entry, Trace::Pacibsp);
         env.Code(entry + 4, MovzX9Seven);
         env.Code(entry + 8, Ret);
@@ -309,7 +319,7 @@ TEST_CASE("GameData trace reads nothing it cannot and stops logging at the cap",
     const u64 entry = Site(Point::PlayedEvent);
     TraceEnvironment env;
     env.enabled = true;
-    env.session.emplace(nullptr, Base, 1);
+    env.session.emplace(nullptr, Base, 1, P::Shared());
     env.Code(entry, Trace::Pacibsp);
     env.Code(entry + 4, MovzX9Seven);
     env.Code(entry + 8, Ret);
@@ -320,7 +330,7 @@ TEST_CASE("GameData trace reads nothing it cannot and stops logging at the cap",
     REQUIRE(env.lines.size() == 1);
     REQUIRE(env.lines[0].starts_with("gamedata played-event name=? "));
 
-    Trace::Session session{nullptr, Base, 2};
+    Trace::Session session{nullptr, Base, 2, P::Shared()};
     bool last = false;
     for (u32 i = 0; i < Trace::Session::LineLimit; ++i) {
         REQUIRE(session.Take(Point::StepSet, last));
@@ -337,7 +347,9 @@ TEST_CASE("GameData trace sessions follow the loaded main module", "[oot_gamedat
     const auto* a = reinterpret_cast<const Kernel::KProcess*>(&process_a);
     const auto* b = reinterpret_cast<const Kernel::KProcess*>(&process_b);
     REQUIRE_FALSE(sessions.Find(a));
-    sessions.Reset(a, Base);
+    sessions.Reset(a, Base); // no profile for this build: no hooks
+    REQUIRE_FALSE(sessions.Find(a));
+    sessions.Reset(a, Base, P::Shared());
     const auto first = sessions.Find(a);
     REQUIRE(first);
     REQUIRE(first->base == Base);
@@ -345,4 +357,590 @@ TEST_CASE("GameData trace sessions follow the loaded main module", "[oot_gamedat
     sessions.Reset(b, 0); // another build: no hooks
     REQUIRE_FALSE(sessions.Find(a));
     REQUIRE_FALSE(sessions.Find(b));
+}
+
+TEST_CASE("GameData frame hook executes the replaced hint once", "[oot_gamedata_trace]") {
+    TraceEnvironment env;
+    env.enabled = true;
+    env.session.emplace(nullptr, Base, 1, P::Shared());
+    const u64 entry = Site(Point::Frame);
+    env.Code(entry, Trace::Pacibsp);
+    env.Code(entry + 4, MovzX9Seven);
+    env.Code(entry + 8, Ret);
+    env.Code(Stop, Svc0);
+    RunAndCheck(env, entry, {}, ~u64{0}, 7);
+    REQUIRE(env.breakpoints == 1);
+    REQUIRE(env.lines.size() == 1);
+    REQUIRE(env.lines[0].starts_with("gamedata frame"));
+}
+
+TEST_CASE("OoT frame redirects a real JIT and sentinel restores full context", "[oot_coop][oot_gamedata_trace]") {
+    namespace Coop = Core::OotCoop;
+    TraceEnvironment env;
+    env.enabled = true;
+    env.session.emplace(nullptr, Base, 1, P::Shared());
+    const u64 frame = Site(Point::Frame);
+    const u64 entry = Base + P::BitSetter;
+    constexpr u64 sentinel = Stop + 0x100;
+    constexpr u64 manager = Data;
+    constexpr u64 data = Data + 0x2000;
+    constexpr u64 queue = Data + 0x3000;
+    env.Code(frame, Trace::Pacibsp);
+    env.Code(frame + 4, Svc0);
+    env.Code(entry, P::BitWords[0]);
+    env.Code(entry + 4, P::BitWords[1]);
+    env.Code(entry + 8, Svc0); // Pause inside the synthetic setter to clobber its CPU context.
+    env.Code(entry + 12, Ret);
+    env.Code(sentinel, Trace::Breakpoint);
+    env.Write32(manager + 0xC58, 1);
+    env.Write64(manager + 0xC60, data);
+    env.Write32(manager + 0xC68, 1);
+    env.Write64(manager + 0xC70, queue);
+    env.Write32(manager + 0xC78, 0);
+    env.Write64(data, 101);
+    env.Write64(data + 8, 0);
+    env.Write64(queue, 0);
+    Dynarmic::A64::Jit jit{Config(env)};
+    env.jit = &jit;
+    u64 tls = 0x1234, tls_ro = 0x5678;
+    int exclusive_clears = 0;
+    Coop::GuestBinding binding{Base, 0, 0, 0, sentinel, 0x20000000};
+    for (u64 i = binding.stack - 0x4000; i < binding.stack; ++i) env.bytes[i] = 0;
+    using Backend = Coop::GameDataBackend<Dynarmic::A64::Jit, TraceEnvironment>;
+    Backend backend{jit, env, binding, P::Get(), tls, tls_ro, [&] { ++exclusive_clears; }};
+    REQUIRE(backend.Bind(manager));
+    const Coop::Change grant{Coop::Kind::Bit, "A", 1, 101, 1};
+    REQUIRE(backend.ReadFlag(grant) == false);
+    SECTION("queue full fails closed") {
+        env.Write32(manager + 0xC78, 1);
+        REQUIRE_FALSE(backend.Resolve(grant));
+        REQUIRE(exclusive_clears == 0);
+        return;
+    }
+    SECTION("changed table quarantines binding") {
+        env.Write64(manager + 0xC70, queue + 8);
+        REQUIRE_FALSE(backend.Bind(manager));
+        REQUIRE(binding.invalid);
+        REQUIRE_FALSE(backend.Resolve(grant));
+        return;
+    }
+    SECTION("sentinel round trip") {}
+    Coop::FrameDrain<Backend> drain{{true, {Coop::Kind::Bit}, {{Coop::Kind::Bit, 101}}}};
+    REQUIRE(drain.Queue(grant));
+    std::vector<std::string> logs;
+    const auto log = [&](std::string_view line) { logs.emplace_back(line); };
+    const auto send = [](Coop::Change, bool) { FAIL("Injected grant echoed"); };
+    int frames = 0, returns = 0;
+    env.on_breakpoint = [&](u64 pc) {
+        if (pc == sentinel) {
+            REQUIRE(drain.Sentinel(backend, {7, 9, 1, true}, pc, log) == Coop::ApplyEvent::Returned);
+            ++returns;
+        } else {
+            std::string line;
+            REQUIRE(Trace::Handle(*env.session, pc, jit, env, &line));
+            if (pc == frame) {
+                ++frames;
+                REQUIRE(drain.Frame(backend, {7, 9, 1, true}, send, log) == Coop::ApplyEvent::Started);
+            }
+        }
+    };
+    for (size_t i = 0; i < 31; ++i) jit.SetRegister(i, 0x12340000 + i);
+    for (size_t i = 0; i < 32; ++i) jit.SetVector(i, {0x45670000 + i, 0x78900000 + i});
+    jit.SetSP(0x30000000);
+    jit.SetPC(frame + 4);
+    jit.SetPstate(0xA0000000);
+    jit.SetFpcr(0x400000);
+    jit.SetFpsr(0x8000001);
+    auto expected = *backend.Capture();
+    jit.SetPC(frame);
+    jit.Run();
+    REQUIRE(jit.GetPC() == entry + 12);
+    REQUIRE(jit.GetRegister(0) == manager);
+    REQUIRE(jit.GetRegister(1) == 1);
+    REQUIRE(jit.GetRegister(2) == 101);
+    REQUIRE(jit.GetRegister(30) == sentinel);
+    REQUIRE(jit.GetSP() == binding.stack);
+    for (size_t i = 0; i < 30; ++i) jit.SetRegister(i, i);
+    for (size_t i = 0; i < 32; ++i) jit.SetVector(i, {i, i});
+    jit.SetPstate(0);
+    jit.SetFpcr(0);
+    jit.SetFpsr(0);
+    tls = tls_ro = 0;
+    jit.Run();
+    expected.pc = frame + 8; // Original continuation executed exactly one SVC.
+    REQUIRE(*backend.Capture() == expected);
+    REQUIRE(exclusive_clears == 2);
+    REQUIRE(frames == 1);
+    REQUIRE(returns == 1);
+    REQUIRE(backend.ReadFlag(grant) == false); // Return alone is not a commit.
+    env.bytes[data + 0xC] = 1;
+    REQUIRE(drain.Frame(backend, {7, 9, 2, true}, send, log) == Coop::ApplyEvent::Committed);
+    REQUIRE(drain.Suppress(grant));
+}
+
+TEST_CASE("GameData Bool64 reader hook resumes its zero extending load", "[oot_gamedata_trace]") {
+    TraceEnvironment env;
+    env.enabled = true;
+    env.session.emplace(nullptr, Base, 1, P::Shared());
+    const u64 entry = Site(Point::BitRead);
+    env.Code(entry, Trace::LdrW8C58);
+    env.Code(entry + 4, MovzX9Seven);
+    env.Code(entry + 8, Ret);
+    env.Code(Stop, Svc0);
+    env.Write32(Data + 0xC58, 0x80000001);
+    RunAndCheck(env, entry, {Data, 0, 101, 0, 0, 0}, 0x80000001, 7);
+    REQUIRE(env.breakpoints == 1);
+    REQUIRE(env.lines.front().starts_with("gamedata bit-read mgr="));
+}
+
+TEST_CASE("OoT flat Bool polling and deferred chest grants", "[oot_coop]") {
+    namespace Coop = Core::OotCoop;
+    constexpr u32 key = 0x5EED0006; // synthetic; key % 8 == 6
+    constexpr u64 manager = Data, data = Data + 0x2000, hashes = Data + 0x3000;
+    constexpr u64 queue = Data + 0x4000, sentinel = Stop + 0x100;
+    constexpr u64 entry = Base + P::BoolSetter;
+    TraceEnvironment env;
+    for (u64 i = data; i < data + 0x30; ++i) env.bytes[i] = 0;
+    for (u64 i = hashes; i < hashes + 8 * 8; ++i) env.bytes[i] = 0;
+    env.Write64(Base + P::ManagerCell, manager);
+    env.Write32(manager + 0x10, 2);
+    env.Write64(manager + 0x18, data);
+    env.Write64(manager + 0x20, hashes);
+    env.Write32(manager + 0x2C, 8);
+    env.Write32(manager + 0x30, 1);
+    env.Write64(manager + 0x38, queue);
+    env.Write32(manager + 0x40, 0);
+    env.Write64(queue, 0);
+    // Force collision and wraparound: key % 8 == 6, found at slot 0, record index 1.
+    env.Write32(hashes + 6 * 8, 1);
+    env.Write32(hashes + 7 * 8, 2);
+    env.Write32(hashes, key);
+    env.Write32(hashes + 4, 1);
+    env.Code(entry, P::BoolWords[0]);
+    env.Code(entry + 4, P::BoolWords[1]);
+    env.Code(sentinel, Trace::Breakpoint);
+    Coop::GuestBinding binding{Base, 0, 0, 0, sentinel, 0x20000000};
+    for (u64 i = binding.stack - 0x4000; i < binding.stack; ++i) env.bytes[i] = 0;
+    Dynarmic::A64::Jit jit{Config(env)};
+    u64 tls = 123, tls_ro = 456;
+    int clears = 0;
+    using Backend = Coop::GameDataBackend<Dynarmic::A64::Jit, TraceEnvironment>;
+    Backend backend{jit, env, binding, P::Get(), tls, tls_ro, [&] { ++clears; }};
+    const Coop::Change grant{Coop::Kind::Bool, "A", 1, key, 1};
+    REQUIRE(backend.BindFromCell()); // No Bool64 table or accessor call exists in this fixture.
+    REQUIRE(backend.ReadFlag(grant) == false);
+    Coop::FrameDrain<Backend> drain{{true, {Coop::Kind::Bool}, {{Coop::Kind::Bool, key}}}};
+    std::vector<Coop::Change> sent;
+    std::vector<std::string> logs;
+    const auto send = [&](Coop::Change change, bool) { sent.push_back(change); };
+    const auto log = [&](std::string_view line) { logs.emplace_back(line); };
+    drain.Frame(backend, {7, 9, 1, true}, send, log);
+    REQUIRE(drain.BaselineReady());
+    REQUIRE(sent.empty());
+    SECTION("local flip observed exactly once and rollback quarantines") {
+        env.bytes[data + 0x18 + 0x16] = 1;
+        drain.Frame(backend, {7, 9, 2, true}, send, log);
+        drain.Frame(backend, {7, 9, 3, true}, send, log);
+        REQUIRE(sent.size() == 1);
+        REQUIRE(sent[0].kind == Coop::Kind::Bool);
+        REQUIRE(sent[0].key == key);
+        env.bytes[data + 0x18 + 0x16] = 0;
+        REQUIRE(drain.Frame(backend, {7, 9, 4, true}, send, log) == Coop::ApplyEvent::Quarantined);
+    }
+    SECTION("grant shape, full restoration, deferred commit and echo suppression") {
+        for (size_t i = 0; i < 31; ++i) jit.SetRegister(i, 100 + i);
+        for (size_t i = 0; i < 32; ++i) jit.SetVector(i, {200 + i, 300 + i});
+        jit.SetPC(Site(Point::Frame) + 4);
+        jit.SetSP(0x30000000);
+        jit.SetPstate(0xA0000000);
+        jit.SetFpcr(0x400000);
+        jit.SetFpsr(0x8000001);
+        const auto saved = *backend.Capture();
+        REQUIRE(drain.Queue(grant));
+        REQUIRE(drain.Frame(backend, {7, 9, 2, true}, send, log) == Coop::ApplyEvent::Started);
+        REQUIRE(jit.GetPC() == entry);
+        REQUIRE(jit.GetRegister(0) == manager);
+        REQUIRE(jit.GetRegister(1) == 1);
+        REQUIRE(jit.GetRegister(2) == key);
+        REQUIRE(jit.GetRegister(30) == sentinel);
+        REQUIRE(jit.GetSP() == binding.stack);
+        for (size_t i = 0; i < 31; ++i) jit.SetRegister(i, 0);
+        for (size_t i = 0; i < 32; ++i) jit.SetVector(i, {0, 0});
+        jit.SetPstate(0); jit.SetFpcr(0); jit.SetFpsr(0);
+        tls = tls_ro = 0;
+        REQUIRE(drain.Sentinel(backend, {7, 9, 2, true}, sentinel, log) == Coop::ApplyEvent::Returned);
+        REQUIRE(*backend.Capture() == saved);
+        REQUIRE(clears == 2);
+        REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) == Coop::ApplyEvent::Blocked);
+        env.bytes[data + 0x18 + 0x16] = 1;
+        REQUIRE(drain.Frame(backend, {7, 9, 4, true}, send, log) == Coop::ApplyEvent::Committed);
+        drain.Frame(backend, {7, 9, 5, true}, send, log);
+        REQUIRE(sent.empty());
+        REQUIRE(drain.Suppress(grant));
+        REQUIRE_FALSE(drain.Queue(grant));
+        for (const auto event : {"applied", "suppressed"}) {
+            REQUIRE(std::count_if(logs.begin(), logs.end(), [&](const auto& line) {
+                return line.find(std::string{event} + " class=bool key=000000005eed0006") !=
+                       std::string::npos;
+            }) == 1);
+        }
+    }
+    SECTION("full queue blocks") {
+        env.Write32(manager + 0x40, 1);
+        REQUIRE_FALSE(backend.Resolve(grant));
+    }
+    SECTION("wrong setter word blocks") {
+        env.Code(entry + 4, 0);
+        REQUIRE_FALSE(backend.Resolve(grant));
+    }
+    SECTION("bad index blocks") {
+        env.Write32(hashes + 4, 2);
+        REQUIRE_FALSE(backend.ReadFlag(grant));
+    }
+    SECTION("non-boolean byte blocks") {
+        env.bytes[data + 0x18 + 0x16] = 2;
+        REQUIRE_FALSE(backend.ReadFlag(grant));
+    }
+    SECTION("changed table quarantines") {
+        env.Write32(manager + 0x2C, 4);
+        REQUIRE_FALSE(backend.ReadFlag(grant));
+        REQUIRE(binding.invalid);
+    }
+    SECTION("an unhandled manager cell change still quarantines the backend") {
+        env.Write64(Base + P::ManagerCell, 0);
+        REQUIRE_FALSE(backend.BindFromCell());
+        REQUIRE(binding.invalid);
+    }
+    SECTION("a moved or cleared manager re-binds the baseline instead of quarantining") {
+        REQUIRE_FALSE(backend.Moved());
+        env.bytes[data + 0x18 + 0x16] = 1;
+        drain.Frame(backend, {7, 9, 2, true}, send, log);
+        REQUIRE(sent.size() == 1);
+        // Back to the title screen: the cell is cleared.
+        env.Write64(Base + P::ManagerCell, 0);
+        REQUIRE(backend.Moved());
+        REQUIRE(drain.Rebind(backend, log));
+        REQUIRE_FALSE(binding.invalid);
+        REQUIRE(binding.manager == 0);
+        REQUIRE(binding.sentinel == sentinel);
+        REQUIRE_FALSE(backend.Moved());
+        REQUIRE_FALSE(backend.BindFromCell());
+        REQUIRE_FALSE(drain.BaselineReady());
+        // A save loads into a new manager whose tables read the key false: no rollback.
+        constexpr u64 moved = Data + 0x5000, moved_data = Data + 0x6000;
+        for (u64 i = 0; i < 0x48; ++i)
+            if (env.bytes.contains(manager + i)) env.bytes[moved + i] = env.bytes.at(manager + i);
+        for (u64 i = moved_data; i < moved_data + 0x30; ++i) env.bytes[i] = 0;
+        env.Write64(moved + 0x18, moved_data);
+        env.Write64(Base + P::ManagerCell, moved);
+        REQUIRE(backend.BindFromCell());
+        REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) == Coop::ApplyEvent::None);
+        REQUIRE(drain.BaselineReady());
+        REQUIRE(binding.bool_data == moved_data);
+        REQUIRE_FALSE(backend.Moved());
+        REQUIRE(sent.size() == 1);
+        env.bytes[moved_data + 0x18 + 0x16] = 1;
+        drain.Frame(backend, {7, 9, 4, true}, send, log);
+        REQUIRE(sent.size() == 2); // A new epoch's local open is observed again.
+        // Same manager, reallocated table: also a move.
+        env.Write64(moved + 0x18, data);
+        REQUIRE(backend.Moved());
+        REQUIRE(std::none_of(logs.begin(), logs.end(), [](const auto& line) {
+            return line.find("quarantined") != std::string::npos;
+        }));
+    }
+    SECTION("a grant awaiting commit is re-read against the moved tables") {
+        REQUIRE(drain.Queue(grant));
+        REQUIRE(drain.Frame(backend, {7, 9, 2, true}, send, log) == Coop::ApplyEvent::Started);
+        REQUIRE(drain.Sentinel(backend, {7, 9, 2, true}, sentinel, log) ==
+                Coop::ApplyEvent::Returned);
+        env.Write64(Base + P::ManagerCell, 0);
+        REQUIRE(backend.Moved());
+        REQUIRE(drain.Rebind(backend, log));
+        env.Write64(Base + P::ManagerCell, manager);
+        REQUIRE(backend.BindFromCell());
+        env.bytes[data + 0x18 + 0x16] = 1; // The new epoch already holds it: no second call.
+        REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) == Coop::ApplyEvent::Committed);
+        REQUIRE(sent.empty());
+        REQUIRE(drain.Suppress(grant));
+    }
+    SECTION("a move while a synthetic call is in flight quarantines") {
+        REQUIRE(drain.Queue(grant));
+        REQUIRE(drain.Frame(backend, {7, 9, 2, true}, send, log) == Coop::ApplyEvent::Started);
+        env.Write64(Base + P::ManagerCell, 0);
+        REQUIRE(backend.Moved());
+        REQUIRE_FALSE(drain.Rebind(backend, log));
+        REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) ==
+                Coop::ApplyEvent::Quarantined);
+    }
+}
+
+TEST_CASE("Chest trace sites preserve hints and report keys", "[oot_gamedata_trace]") {
+    TraceEnvironment env;
+    Dynarmic::A64::Jit jit{Config(env)};
+    jit.SetRegister(0, Data);
+    jit.SetRegister(1, 1);
+    jit.SetRegister(3, 0x0A0B0C0D);
+    jit.SetRegister(8, Data + 0x100);
+    env.Write32(Data + 0x108, 0x0A0B0C0D);
+    env.Write64(Data + 0x188, 0x1122334455667788);
+    for (const auto point : {Point::StructBoolSet, Point::ActorFlagSet}) {
+        REQUIRE(Trace::Identify(P::Get(), Base, Site(point), Trace::Pacibsp) == point);
+        REQUIRE_FALSE(Trace::CoopPoint(point));
+        const auto before = jit.GetRegisters();
+        Trace::Resume(point, jit, env);
+        REQUIRE(jit.GetRegisters() == before);
+        const auto line = Trace::Describe(point, Base, jit, env);
+        REQUIRE(line.find("0a0b0c0d") != std::string::npos);
+        REQUIRE(line.find("value=1") != std::string::npos);
+    }
+    REQUIRE(Trace::Identify(P::Get(), Base, Base + 0x106004, Trace::LdrW8C58) == Point::BitRead);
+    REQUIRE(Trace::Identify(P::Get(), Base, Base + 0x107004, Trace::MovX8X0) == Point::BitSet);
+    // Co-op without tracing traps only the frame boundary, never the hot Bool64 accessors.
+    REQUIRE(Trace::CoopPoint(Point::Frame));
+    for (const auto point : {Point::BitRead, Point::BitSet, Point::StepSet, Point::StepApply,
+                             Point::PlayedEvent, Point::None})
+        REQUIRE_FALSE(Trace::CoopPoint(point));
+}
+
+TEST_CASE("OoT co-op rupee grant calls the wallet entry with the pouch manager", "[oot_coop]") {
+    namespace Coop = Core::OotCoop;
+    constexpr u64 manager = Data, data = Data + 0x2000, hashes = Data + 0x3000;
+    constexpr u64 queue = Data + 0x4000, sentinel = Stop + 0x100, pouch = Data + 0x8000;
+    constexpr u64 entry = Base + P::RupeeEntry;
+    TraceEnvironment env;
+    for (u64 i = data; i < data + 0x30; ++i) env.bytes[i] = 0;
+    for (u64 i = hashes; i < hashes + 8 * 8; ++i) env.bytes[i] = 0;
+    env.Write64(Base + P::ManagerCell, manager);
+    env.Write32(manager + 0x10, 2);
+    env.Write64(manager + 0x18, data);
+    env.Write64(manager + 0x20, hashes);
+    env.Write32(manager + 0x2C, 8);
+    env.Write32(manager + 0x30, 1);
+    env.Write64(manager + 0x38, queue);
+    env.Write32(manager + 0x40, 0);
+    env.Write64(queue, 0);
+    env.Write64(Base + P::PouchCell, pouch);
+    env.Write64(pouch + 0x3BD4, 0);
+    env.Code(entry, P::RupeeWords[0]);
+    env.Code(entry + 4, P::RupeeWords[1]);
+    env.Code(sentinel, Trace::Breakpoint);
+    Coop::GuestBinding binding{Base, 0, 0, 0, sentinel, 0x20000000};
+    for (u64 i = binding.stack - 0x4000; i < binding.stack; ++i) env.bytes[i] = 0;
+    Dynarmic::A64::Jit jit{Config(env)};
+    u64 tls = 123, tls_ro = 456;
+    int clears = 0;
+    using Backend = Coop::GameDataBackend<Dynarmic::A64::Jit, TraceEnvironment>;
+    Backend backend{jit, env, binding, P::Get(), tls, tls_ro, [&] { ++clears; }};
+    REQUIRE(backend.BindFromCell());
+    const Coop::Change minus{Coop::Kind::Rupee, "B", 1, P::Wallet, -5};
+    SECTION("call shape, restoration and commit on return") {
+        Coop::FrameDrain<Backend> drain{{true, {Coop::Kind::Rupee}, {}, P::Wallet}};
+        std::vector<std::string> logs;
+        const auto send = [](Coop::Change, bool) { FAIL("a delta is never observed"); };
+        const auto log = [&](std::string_view line) { logs.emplace_back(line); };
+        drain.Frame(backend, {7, 9, 1, true}, send, log);
+        REQUIRE(drain.BaselineReady());
+        jit.SetPC(Site(Point::Frame) + 4);
+        jit.SetSP(0x30000000);
+        const auto saved = *backend.Capture();
+        REQUIRE(drain.Queue(minus));
+        REQUIRE(drain.Frame(backend, {7, 9, 2, true}, send, log) == Coop::ApplyEvent::Started);
+        REQUIRE(jit.GetPC() == entry);
+        REQUIRE(jit.GetRegister(0) == pouch);
+        REQUIRE(jit.GetRegister(1) == 0xFFFFFFFBU); // w1 = -5
+        REQUIRE(jit.GetRegister(2) == Coop::RupeeReason);
+        REQUIRE(jit.GetRegister(30) == sentinel);
+        REQUIRE(jit.GetSP() == binding.stack);
+        REQUIRE(drain.Sentinel(backend, {7, 9, 2, true}, sentinel, log) == Coop::ApplyEvent::Returned);
+        REQUIRE(*backend.Capture() == saved);
+        REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) == Coop::ApplyEvent::Committed);
+        REQUIRE(std::count_if(logs.begin(), logs.end(), [](const auto& line) {
+            return line.find("applied class=rupee key=000000000badcafe value=-5 path=call") !=
+                   std::string::npos;
+        }) == 1);
+        REQUIRE(drain.Queue({Coop::Kind::Rupee, "B", 2, P::Wallet, -5}));
+    }
+    SECTION("a changed wallet entry word blocks") {
+        env.Code(entry + 4, 0);
+        REQUIRE_FALSE(backend.Resolve(minus));
+    }
+    SECTION("no pouch manager yet blocks") {
+        env.Write64(Base + P::PouchCell, 0);
+        REQUIRE_FALSE(backend.Resolve(minus));
+    }
+    SECTION("an unmapped pending field blocks") {
+        env.Write64(Base + P::PouchCell, pouch + 0x100000);
+        REQUIRE_FALSE(backend.Resolve(minus));
+    }
+    SECTION("a missing sentinel breakpoint blocks") {
+        env.Code(sentinel, 0);
+        REQUIRE_FALSE(backend.Resolve(minus));
+    }
+}
+
+TEST_CASE("OoT co-op item give replays the give call with a private argument frame", "[oot_coop]") {
+    namespace Coop = Core::OotCoop;
+    constexpr u64 manager = Data, data = Data + 0x2000, hashes = Data + 0x3000;
+    constexpr u64 queue = Data + 0x4000, sentinel = Stop + 0x100, pouch = Data + 0x8000;
+    constexpr u64 events = Data + 0x9000, events_cell = Data + 0x9100, guard = Data + 0xA000;
+    constexpr u64 entry = Base + P::ItemEntry;
+    TraceEnvironment env;
+    for (u64 i = data; i < data + 0x30; ++i) env.bytes[i] = 0;
+    for (u64 i = hashes; i < hashes + 8 * 8; ++i) env.bytes[i] = 0;
+    env.Write64(Base + P::ManagerCell, manager);
+    env.Write32(manager + 0x10, 2);
+    env.Write64(manager + 0x18, data);
+    env.Write64(manager + 0x20, hashes);
+    env.Write32(manager + 0x2C, 8);
+    env.Write32(manager + 0x30, 1);
+    env.Write64(manager + 0x38, queue);
+    env.Write32(manager + 0x40, 0);
+    env.Write64(queue, 0);
+    env.Write64(Base + P::PouchCell, pouch);
+    env.Write64(pouch, 0);
+    env.Write64(pouch + 8, 0x1234);
+    env.Write64(Base + P::EventGot, events_cell); // GOT slot -> cell -> event manager
+    env.Write64(events_cell, events);
+    env.Write64(events + 0x68, 0); // no event running
+    env.Write64(Base + P::GuardCell, guard);
+    env.Write64(guard + P::GuardField, 0x5678);
+    env.Code(entry, P::ItemWords[0]);
+    env.Code(entry + 4, P::ItemWords[1]);
+    env.Code(sentinel, Trace::Breakpoint);
+    Coop::GuestBinding binding{Base, 0, 0, 0, sentinel, 0x20000000};
+    for (u64 i = binding.stack - Coop::ItemStackNeed; i < binding.stack; ++i) env.bytes[i] = 0xEE;
+    Dynarmic::A64::Jit jit{Config(env)};
+    u64 tls = 1, tls_ro = 2;
+    int clears = 0;
+    using Backend = Coop::GameDataBackend<Dynarmic::A64::Jit, TraceEnvironment>;
+    Backend backend{jit, env, binding, P::Get(), tls, tls_ro, [&] { ++clears; }};
+    REQUIRE(backend.BindFromCell());
+    Coop::Change give{Coop::Kind::Item, "B", 1, Coop::PackItem({6, 7, {0, 0, 1, 0}}), 1};
+    give.name = "Item_Test_Slingshot";
+    SECTION("call shape, argument frame, restoration and commit on return") {
+        Coop::FrameDrain<Backend> drain{{true, {Coop::Kind::Item}, {}}};
+        std::vector<std::string> logs;
+        const auto send = [](Coop::Change, bool) { FAIL("a replayed give is never observed here"); };
+        const auto log = [&](std::string_view line) { logs.emplace_back(line); };
+        drain.Frame(backend, {7, 9, 1, true}, send, log);
+        jit.SetPC(Site(Point::Frame) + 4);
+        jit.SetSP(0x30000000);
+        const auto saved = *backend.Capture();
+        REQUIRE(drain.Queue(give));
+        REQUIRE(drain.Frame(backend, {7, 9, 2, true}, send, log) == Coop::ApplyEvent::Started);
+        const u64 sp = binding.stack - Coop::ItemFrame;
+        REQUIRE(jit.GetPC() == entry);
+        REQUIRE(jit.GetSP() == sp);
+        REQUIRE(jit.GetRegister(0) == pouch);
+        REQUIRE(jit.GetRegister(1) == sp + 0x20);
+        REQUIRE(jit.GetRegister(2) == 6);
+        REQUIRE(jit.GetRegister(3) == 1);
+        REQUIRE(jit.GetRegister(4) == 7);
+        REQUIRE(jit.GetRegister(5) == 0);
+        REQUIRE(jit.GetRegister(6) == 0);
+        REQUIRE(jit.GetRegister(7) == 1);
+        REQUIRE(jit.GetRegister(30) == sentinel);
+        REQUIRE(env.Read64(sp) == 0); // the ninth argument byte and its padding
+        REQUIRE(env.Read64(sp + 8) == 0);
+        REQUIRE(env.Read64(sp + 0x20) == sp + 0x30); // cell = {const char* name}
+        std::string name;
+        for (u64 i = 0; env.Read8(sp + 0x30 + i) != 0; ++i) name.push_back(char(env.Read8(sp + 0x30 + i)));
+        REQUIRE(name == give.name);
+        REQUIRE(env.Read8(binding.stack - Coop::ItemFrame - 1) == 0xEE); // nothing below the frame
+        REQUIRE(drain.Sentinel(backend, {7, 9, 2, true}, sentinel, log) == Coop::ApplyEvent::Returned);
+        REQUIRE(*backend.Capture() == saved);
+        REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) == Coop::ApplyEvent::Committed);
+        REQUIRE(std::count_if(logs.begin(), logs.end(), [](const auto& line) {
+            return line.find("applied class=item") != std::string::npos;
+        }) == 1);
+        // A second give of the same item (a new origin/sequence) calls again: counts add.
+        Coop::Change again = give;
+        again.seq = 2;
+        REQUIRE(drain.Queue(again));
+        REQUIRE(drain.Frame(backend, {7, 9, 4, true}, send, log) == Coop::ApplyEvent::Started);
+    }
+    SECTION("a running event holds the give until it ends") {
+        Coop::FrameDrain<Backend> drain{{true, {Coop::Kind::Item}, {}}};
+        const auto send = [](Coop::Change, bool) {};
+        const auto log = [](std::string_view) {};
+        drain.Frame(backend, {7, 9, 1, true}, send, log);
+        env.Write64(events + 0x68, 0xABC);
+        REQUIRE(drain.Queue(give));
+        REQUIRE(drain.Frame(backend, {7, 9, 2, true}, send, log) == Coop::ApplyEvent::Blocked);
+        REQUIRE(drain.Frame(backend, {7, 9, 3, true}, send, log) == Coop::ApplyEvent::Blocked);
+        env.Write64(events + 0x68, 0);
+        REQUIRE(drain.Frame(backend, {7, 9, 4, true}, send, log) == Coop::ApplyEvent::Started);
+    }
+    SECTION("a dead guard pointer blocks") {
+        env.Write64(guard + P::GuardField, 0);
+        REQUIRE_FALSE(backend.Resolve(give));
+    }
+    SECTION("no pouch manager blocks") {
+        env.Write64(Base + P::PouchCell, 0);
+        REQUIRE_FALSE(backend.Resolve(give));
+    }
+    SECTION("a changed entry word blocks") {
+        env.Code(entry + 4, P::Nop);
+        REQUIRE_FALSE(backend.Resolve(give));
+    }
+    SECTION("an unmapped deep stack blocks") {
+        env.bytes.erase(binding.stack - Coop::ItemStackNeed);
+        REQUIRE_FALSE(backend.Resolve(give));
+    }
+    SECTION("a malformed give never resolves") {
+        give.name = "bad name";
+        REQUIRE_FALSE(backend.Resolve(give));
+    }
+}
+
+TEST_CASE("OoT co-op reads the opener's give call and forwards only reviewed callers", "[oot_coop]") {
+    namespace Coop = Core::OotCoop;
+    constexpr u64 cell = Data + 0x100, text = Data + 0x200, sp = Data + 0x400;
+    constexpr u64 sentinel = Stop + 0x100;
+    TraceEnvironment env;
+    const std::string name = "Item_Test_Bomb";
+    for (size_t i = 0; i <= name.size(); ++i) env.bytes[text + i] = i < name.size() ? u8(name[i]) : 0;
+    env.Write64(cell, text);
+    env.Write64(sp, 0);
+    Dynarmic::A64::Jit jit{Config(env)};
+    jit.SetRegister(1, cell);
+    jit.SetRegister(2, 6);
+    jit.SetRegister(3, 20);
+    jit.SetRegister(4, 7);
+    jit.SetRegister(5, 0);
+    jit.SetRegister(6, 0);
+    jit.SetRegister(7, 1);
+    jit.SetSP(sp);
+    jit.SetRegister(30, Base + P::ItemCaller);
+    auto call = Coop::ReadItemCall(jit, env, Base, P::Get(), sentinel, true);
+    REQUIRE(call.forward);
+    REQUIRE_FALSE(call.replay);
+    REQUIRE(call.change.name == name);
+    REQUIRE(call.change.value == 20);
+    REQUIRE(Coop::UnpackItem(call.change.key).category == 6);
+    REQUIRE(Coop::UnpackItem(call.change.key).get == 7);
+    REQUIRE(Coop::UnpackItem(call.change.key).flags == std::array<u8, 4>{0, 0, 1, 0});
+    REQUIRE(call.line.find("item-give observed name=Item_Test_Bomb") != std::string::npos);
+    // The item class off: logged, never forwarded.
+    REQUIRE_FALSE(Coop::ReadItemCall(jit, env, Base, P::Get(), sentinel, false).forward);
+    // Another caller (a pickup, a sub-item): seen only.
+    jit.SetRegister(30, Base + P::ItemCaller + 0x40);
+    call = Coop::ReadItemCall(jit, env, Base, P::Get(), sentinel, true);
+    REQUIRE_FALSE(call.forward);
+    REQUIRE(call.line.find("item-give seen") != std::string::npos);
+    // Our own replay returns to the sentinel: never forwarded again (no echo).
+    jit.SetRegister(30, sentinel);
+    call = Coop::ReadItemCall(jit, env, Base, P::Get(), sentinel, true);
+    REQUIRE(call.replay);
+    REQUIRE_FALSE(call.forward);
+    // Out-of-range small arguments are not forwarded.
+    jit.SetRegister(30, Base + P::ItemCaller);
+    jit.SetRegister(5, 0x100);
+    REQUIRE_FALSE(Coop::ReadItemCall(jit, env, Base, P::Get(), sentinel, true).forward);
+    jit.SetRegister(5, 0);
+    jit.SetRegister(3, 0);
+    REQUIRE_FALSE(Coop::ReadItemCall(jit, env, Base, P::Get(), sentinel, true).forward);
+    REQUIRE(Trace::CoopPoint(Point::ItemGive));
+    REQUIRE(Trace::Identify(P::Get(), Base, Base + P::ItemEntry, Trace::Pacibsp) == Point::ItemGive);
 }

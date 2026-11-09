@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <map>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <set>
@@ -18,15 +19,49 @@
 
 #include "core/arm/dynarmic/oot_gamedata_trace.h"
 
+namespace Kernel { class KernelCore; }
+namespace Dynarmic::A64 { class Jit; }
+namespace Core::Memory { class Memory; }
+
 namespace Core::OotCoop {
 
-inline constexpr u32 ProtocolVersion = 2;
+inline constexpr u32 ProtocolVersion = 3;
 inline constexpr u64 MaxSequence = (u64{1} << 53) - 1;
 inline constexpr size_t MaxFrame = 1 << 20;
 inline constexpr size_t QueueLimit = 4096;
 inline constexpr size_t StateLimit = 4096;
 
-enum class Kind { Bool, Int, Enum, Quest, Bit, PouchAdd, PouchTotal };
+// Pose is a class token only (EDEN_NX2_OOT_COOP_ALLOW "pose"): poses are never grants or state.
+enum class Kind { Bool, Int, Enum, Quest, Bit, PouchAdd, PouchTotal, Rupee, Item, Pose };
+
+// Wallet deltas (class "rupee"): an additive event, never state. The key is the wallet's GameData
+// hash from the private profile; the wire accepts any non-zero 32-bit key and the receiver's
+// ApplyPolicy admits only its profile's wallet.
+inline constexpr s64 RupeeLimit = 999;
+[[nodiscard]] constexpr bool RupeeDelta(s64 delta) {
+    return delta != 0 && delta >= -RupeeLimit && delta <= RupeeLimit;
+}
+
+// Item gives (class "item"): the game's own give-to-pouch call as the opener made it, replayed on
+// the peer. An event like a wallet delta: deduplicated by origin/sequence, never team state.
+// key packs the call's small arguments, value is the count, name the item's actor name.
+inline constexpr s64 ItemCountLimit = 999;
+inline constexpr size_t ItemNameLimit = 63;
+struct ItemArgs {
+    u32 category{}; // w2
+    u32 get{};      // x4, the get type
+    std::array<u8, 4> flags{}; // w5, w6, w7 and the stack byte
+};
+[[nodiscard]] constexpr u64 PackItem(const ItemArgs& args) {
+    return u64{args.category & 0xFF} | (u64{args.get & 0xFF} << 8) | (u64{args.flags[0]} << 16) |
+           (u64{args.flags[1]} << 24) | (u64{args.flags[2]} << 32) | (u64{args.flags[3]} << 40);
+}
+[[nodiscard]] constexpr ItemArgs UnpackItem(u64 key) {
+    return {static_cast<u32>(key & 0xFF), static_cast<u32>((key >> 8) & 0xFF),
+            {static_cast<u8>(key >> 16), static_cast<u8>(key >> 24), static_cast<u8>(key >> 32),
+             static_cast<u8>(key >> 40)}};
+}
+[[nodiscard]] bool ItemName(std::string_view name);
 
 struct Change {
     Kind kind{Kind::Bool};
@@ -35,6 +70,7 @@ struct Change {
     u64 key{}; // Hash, challenge hash, or 64-bit actor hash; never a guest address.
     s64 value{}; // Boolean, int/enum, step index, or pouch count.
     u32 step{};
+    std::string name; // Item only: the actor name passed to the give call
     bool operator==(const Change&) const = default;
 };
 
@@ -45,6 +81,10 @@ struct Change {
 [[nodiscard]] std::string EncodeFrame(const nlohmann::json& packet);
 [[nodiscard]] std::optional<u32> FrameLength(std::string_view header);
 [[nodiscard]] bool WireKind(Kind kind);
+/// An additive event (wallet delta, item give): applied once per origin/sequence, never state.
+[[nodiscard]] constexpr bool EventKind(Kind kind) { return kind == Kind::Rupee || kind == Kind::Item; }
+/// A well-formed item give: name, count 1..999, category and get type below 16, top bits clear.
+[[nodiscard]] bool ValidItem(const Change& change);
 [[nodiscard]] std::optional<std::set<Kind>> DecodeAllowClasses(std::string_view text);
 
 struct Endpoint {
@@ -52,11 +92,19 @@ struct Endpoint {
     u16 port{};
 };
 [[nodiscard]] std::optional<Endpoint> ParseEndpoint(std::string_view text);
-[[nodiscard]] bool Gate(std::string_view endpoint, u64 program_id, std::string_view build_id);
+[[nodiscard]] bool Gate(std::string_view endpoint, u64 program_id);
+
+/// The "offsets" object of a private profile document for `build_id` (40 hex digits), or nothing
+/// when that build is absent or any field is malformed. Numbers may be JSON integers or "0x" strings.
+[[nodiscard]] std::optional<OotGameDataTrace::Profile> DecodeProfile(const nlohmann::json& document,
+                                                                     std::string_view build_id);
+/// DecodeProfile of the EDEN_NX2_OOT_COOP_KEYS file; `why` says what failed.
+[[nodiscard]] std::shared_ptr<const OotGameDataTrace::Profile> LoadProfile(std::string_view build_id,
+                                                                           std::string* why = nullptr);
 [[nodiscard]] bool Enabled();
 
 struct Hello {
-    std::string build_id{OotGameDataTrace::BuildId};
+    std::string build_id; // the running main build; RegisterMain sets it
     std::string seed_hash{"0"};
     std::string policy_id{"or-v2"};
     std::string room{"default"};
@@ -67,6 +115,9 @@ struct Hello {
 [[nodiscard]] nlohmann::json EncodeHello(const Hello& hello);
 [[nodiscard]] bool MatchesHello(const nlohmann::json& packet, const Hello& hello);
 [[nodiscard]] std::optional<std::set<u64>> DecodeDenyList(const nlohmann::json& packet);
+
+[[nodiscard]] std::optional<std::set<std::pair<Kind, u64>>> DecodeKeyPolicy(
+    const nlohmann::json& packet);
 
 using HighWater = std::map<std::string, u64, std::less<>>;
 
@@ -87,73 +138,40 @@ private:
 
 [[nodiscard]] bool ShouldApply(const Change& change, const State& observed);
 
-// The scope covers synchronous setters. An injected call must keep this token alive until its
-// sentinel returns; TODO bind that lifetime to the guest thread, not the host worker thread.
-class IncomingScope {
-public:
-    IncomingScope();
-    ~IncomingScope();
-    IncomingScope(const IncomingScope&) = delete;
-    IncomingScope& operator=(const IncomingScope&) = delete;
-    [[nodiscard]] static bool SuppressSend();
-
-private:
-    static thread_local u32 depth;
-};
-
-enum class Strategy { GuestCall, DirectWrite };
-enum class ApplyStatus { NotAppliedNoSite, NotAppliedUnverified, Applied };
-struct Site {
-    Kind kind;
-    u64 offset;
-    u32 instruction;
-};
-inline constexpr std::array<Site, 6> Sites{{
-    {Kind::Bool, 0, 0},     // TODO locate and verify GameData bool setter and ABI.
-    {Kind::Int, 0, 0},      // TODO locate and verify GameData int setter and ABI.
-    {Kind::Enum, 0, 0},     // TODO locate and verify GameData enum setter and ABI.
-    {Kind::Quest, 0, 0},    // TODO verify callable entry/ABI; StepSet is an observation at +4.
-    {Kind::Bit, 0, 0},      // TODO locate and verify Bool64bitKey setter and ABI.
-    {Kind::PouchAdd, 0, 0}, // TODO locate and verify pouch add entry and result semantics.
-}};
-inline constexpr bool GuestWritesVerified = false;
-
-class GuestWriter {
-public:
-    explicit GuestWriter(Strategy strategy_ = Strategy::GuestCall) : strategy{strategy_} {}
-    [[nodiscard]] ApplyStatus Apply(const Change& change) const;
-
-private:
-    [[nodiscard]] ApplyStatus InjectCall(const Change& change) const;
-    [[nodiscard]] ApplyStatus WriteStorage(const Change& change) const;
-    Strategy strategy;
-};
-
 class Session {
 public:
-    Session(const Kernel::KProcess* owner_, u64 base_, Endpoint endpoint, Hello hello,
-            std::set<u64> denied, bool played_events_, std::set<Kind> allowed_classes = {});
+    Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_,
+            std::shared_ptr<const OotGameDataTrace::Profile> profile_, Endpoint endpoint, Hello hello,
+            std::set<u64> denied, std::set<Kind> allowed_classes = {},
+            std::set<std::pair<Kind, u64>> allowed_keys = {});
     ~Session();
     void Stop();
     void Observe(Change change);
-    void Drain();
-    void ObserveDiagnostic();
-    const Kernel::KProcess* const owner;
+    bool Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& jit,
+              Memory::Memory& memory, u64 thread, u64& tls, u64& tls_ro,
+              std::function<void()> clear_exclusive);
+    bool IsSentinel(u64 pc) const;
+    Kernel::KProcess* const owner;
     const u64 base;
-    const bool played_events;
+    const std::shared_ptr<const OotGameDataTrace::Profile> profile; ///< Never null
 
 private:
+    /// The give-to-pouch entry trapped on this (opener's) game: log it, forward chest gives.
+    void ObserveItem(Dynarmic::A64::Jit& jit, Memory::Memory& memory);
     struct Impl;
+    /// Class "pose": send our pose, draw the peers' ghosts (one call at most, after the grants).
+    template <typename Backend, typename Log>
+    void FramePose(Backend& backend, Memory::Memory& memory, Log log, bool grant_calling);
     std::unique_ptr<Impl> impl;
 };
 
 // Reset stops the previous transport even when a JIT still owns its shared session.
 void BeginSession();
-void RegisterMain(const Kernel::KProcess* owner, u64 program_id, u64 base,
+void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 program_id, u64 base,
                   std::string_view build_id);
 [[nodiscard]] std::shared_ptr<Session> FindSession(const Kernel::KProcess* owner);
 
-// Reuse only layouts already present in the read-only trace. No names or data tables are shipped.
+// Reuse the quest layout already present in the read-only trace.
 template <typename Memory>
 std::optional<u32> StepIndex(Memory& memory, u64 manager, u32 challenge, u32 step) {
     using namespace OotGameDataTrace::Detail;
@@ -184,14 +202,6 @@ std::optional<u32> StepIndex(Memory& memory, u64 manager, u32 challenge, u32 ste
         }
     }
     return std::nullopt;
-}
-
-template <typename Jit, typename Memory>
-void OnHook(Session& session, OotGameDataTrace::Point point, Jit& jit, Memory& memory) {
-    // Requests are not receipts. PlayedEvent is a struct member, not a dotted-name hash.
-    // Until successful mutation hooks exist, the shared breakpoints are diagnostic only.
-    session.ObserveDiagnostic();
-    session.Drain();
 }
 
 } // namespace Core::OotCoop

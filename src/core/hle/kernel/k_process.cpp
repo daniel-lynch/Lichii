@@ -201,6 +201,7 @@ Result KProcess::Initialize(KernelCore& kernel, const Svc::CreateProcessParamete
     // Set misc fields.
     m_state = State::Created;
     m_main_thread_stack_size = 0;
+    m_debug_call_memory_size = 0;
     m_used_kernel_memory_size = 0;
     m_ideal_core_id = 0;
     m_flags = params.flags;
@@ -854,7 +855,7 @@ void KProcess::UnregisterThread(KernelCore& kernel, KThread* thread) {
 
 size_t KProcess::GetUsedUserPhysicalMemorySize(KernelCore& kernel) const {
     const size_t norm_size = m_page_table.GetNormalMemorySize();
-    const size_t other_size = m_code_size + m_main_thread_stack_size;
+    const size_t other_size = m_code_size + m_main_thread_stack_size + m_debug_call_memory_size;
     const size_t sec_size = this->GetRequiredSecureMemorySizeNonDefault();
 
     return norm_size + other_size + sec_size;
@@ -870,7 +871,7 @@ size_t KProcess::GetTotalUserPhysicalMemorySize(KernelCore& kernel) const {
     // NOTE: This does *not* check this->IsDefaultApplicationSystemResource(), unlike
     // GetUsedUserPhysicalMemorySize().
     const size_t norm_size = m_page_table.GetNormalMemorySize();
-    const size_t other_size = m_code_size + m_main_thread_stack_size;
+    const size_t other_size = m_code_size + m_main_thread_stack_size + m_debug_call_memory_size;
     const size_t sec_size = this->GetRequiredSecureMemorySize();
     const size_t used_size = norm_size + other_size + sec_size;
 
@@ -885,7 +886,7 @@ size_t KProcess::GetTotalUserPhysicalMemorySize(KernelCore& kernel) const {
 
 size_t KProcess::GetUsedNonSystemUserPhysicalMemorySize(KernelCore& kernel) const {
     const size_t norm_size = m_page_table.GetNormalMemorySize();
-    const size_t other_size = m_code_size + m_main_thread_stack_size;
+    const size_t other_size = m_code_size + m_main_thread_stack_size + m_debug_call_memory_size;
 
     return norm_size + other_size;
 }
@@ -900,7 +901,7 @@ size_t KProcess::GetTotalNonSystemUserPhysicalMemorySize(KernelCore& kernel) con
     // NOTE: This does *not* check this->IsDefaultApplicationSystemResource(), unlike
     // GetUsedUserPhysicalMemorySize().
     const size_t norm_size = m_page_table.GetNormalMemorySize();
-    const size_t other_size = m_code_size + m_main_thread_stack_size;
+    const size_t other_size = m_code_size + m_main_thread_stack_size + m_debug_call_memory_size;
     const size_t sec_size = this->GetRequiredSecureMemorySize();
     const size_t used_size = norm_size + other_size + sec_size;
 
@@ -930,8 +931,9 @@ Result KProcess::Run(KernelCore& kernel, s32 priority, size_t stack_size) {
 
     // Ensure that we're allocating a valid stack.
     stack_size = Common::AlignUp(stack_size, PageSize);
-    R_UNLESS(stack_size + m_code_size <= m_max_process_memory, ResultOutOfMemory);
-    R_UNLESS(stack_size + m_code_size >= m_code_size, ResultOutOfMemory);
+    const size_t fixed_size = m_code_size + m_debug_call_memory_size;
+    R_UNLESS(fixed_size <= m_max_process_memory &&
+                 stack_size <= m_max_process_memory - fixed_size, ResultOutOfMemory);
 
     // Place a tentative reservation of memory for our new stack.
     KScopedResourceReservation mem_reservation(kernel, this, Svc::LimitableResource::PhysicalMemoryMax,
@@ -961,7 +963,7 @@ Result KProcess::Run(KernelCore& kernel, s32 priority, size_t stack_size) {
 
     // Set our maximum heap size.
     R_TRY(m_page_table.SetMaxHeapSize(m_max_process_memory -
-                                      (m_main_thread_stack_size + m_code_size)));
+                                      (m_main_thread_stack_size + m_code_size + m_debug_call_memory_size)));
 
     // Initialize our handle table.
     R_TRY(this->InitializeHandleTable(kernel, m_capabilities.GetHandleTableSize()));
@@ -1273,6 +1275,41 @@ Result KProcess::LoadFromMetadata(KernelCore& kernel, const FileSys::ProgramMeta
     this->InitializeInterfaces(kernel);
 
     // We succeeded.
+    R_SUCCEED();
+}
+
+Result KProcess::AllocateDebugCallMemory(KernelCore& kernel, KProcessAddress* stack_top,
+                                         KProcessAddress* sentinel) {
+    // Loader-only allocation: never acquire page-table locks inside a running JIT callback.
+    constexpr size_t StackSize = 0x10000; // 64 KiB: the game's give-to-pouch call is deep
+    constexpr size_t TotalSize = StackSize + PageSize;
+    R_UNLESS((m_state == State::Created || m_state == State::CreatedAttached) &&
+                 m_debug_call_memory_size == 0, ResultInvalidState);
+    R_UNLESS(m_code_size <= m_max_process_memory &&
+                 TotalSize <= m_max_process_memory - m_code_size, ResultOutOfMemory);
+    KScopedResourceReservation reservation(kernel, this, Svc::LimitableResource::PhysicalMemoryMax,
+                                           TotalSize);
+    R_UNLESS(reservation.Succeeded(), ResultLimitReached);
+    KProcessAddress stack{}, code{};
+    R_TRY(m_page_table.MapPages(&stack, StackSize / PageSize, KMemoryState::Stack,
+                               KMemoryPermission::UserReadWrite));
+    // One failure guard per scope (result.h); the sentinel mapping is the last fallible step.
+    ON_RESULT_FAILURE {
+        R_ASSERT(m_page_table.UnmapPages(stack, StackSize / PageSize, KMemoryState::Stack));
+    };
+    // The sentinel page is a separate Stack-region mapping, not AliasCode: in a 39-bit address
+    // space the AliasCode region is the whole Map39Bit range, which contains the heap and alias
+    // regions, so MapPages' CanContain check refuses it (ResultInvalidCurrentMemory, 0xd401: the
+    // C4 field launch). Code and AliasCode share that range; only a Code-flagged state may be
+    // reprotected to RX. The page therefore stays RW: Dynarmic fetches code through
+    // MemoryReadCode, which checks only that the address is mapped. The rest of the page past
+    // +0x400 is the co-op ghost's persistent block (class "pose"); only its own requests point there.
+    R_TRY(m_page_table.MapPages(&code, 1, KMemoryState::Stack, KMemoryPermission::UserReadWrite));
+    this->GetMemory().Write32(GetInteger(code), 0xD4200000); // A64 brk #0 sentinel.
+    m_debug_call_memory_size = TotalSize;
+    *stack_top = stack + StackSize;
+    *sentinel = code;
+    reservation.Commit();
     R_SUCCEED();
 }
 

@@ -113,6 +113,7 @@ private:
 
     size_t m_code_size{};
     size_t m_main_thread_stack_size{};
+    size_t m_debug_call_memory_size{};
     size_t m_max_process_memory{};
     size_t m_memory_release_hint{};
     s64 m_schedule_count{};
@@ -541,6 +542,9 @@ public:
 
 public:
     Result LoadFromMetadata(KernelCore& kernel, const FileSys::ProgramMetadata& metadata, std::size_t code_size, KProcessAddress aslr_space_start, size_t aslr_space_offset);
+
+    Result AllocateDebugCallMemory(KernelCore& kernel, KProcessAddress* stack_top,
+                                   KProcessAddress* sentinel);
 
     void LoadModule(KernelCore& kernel, CodeSet code_set, KProcessAddress base_addr);
 

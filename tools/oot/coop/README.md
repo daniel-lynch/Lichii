@@ -32,7 +32,7 @@ The external lane must run the **full** suite, including real loopback TCP:
 python3 -I tools/oot/coop/test_relay.py
 ```
 
-There are 34 tests: 21 socket-free and 13 TCP. In this sandbox only run:
+There are 52 tests: 30 socket-free and 22 TCP (6 of them drive the fake peer). In this sandbox only run:
 
 ```sh
 python3 -I tools/oot/coop/test_relay.py ProtocolTests
@@ -50,6 +50,39 @@ the relay does not calculate a digest of each emulator's local configuration.
 
 A relay ack is not a guest-write receipt. Before real synchronization, both disposable
 saves must export their verified allowlisted true flags and finish baseline reconciliation.
-That guest exporter is not implemented. Relay restart loses memory; reconnecting cannot
+C3 exports the explicitly reviewed Bool64 key set at the frame hook; its game/save
+semantics remain unverified in the field. Relay restart loses memory; reconnecting cannot
 recover flags never observed or exported. See the protocol's baseline and duplicate-check
 sections before testing pre-existing saves or adding inventory support.
+
+C3 adds `two_instances.py` (owner-run Linux relay + two portable/disposable copies),
+`check_logs.py` (positive applied/suppressed receipt checking) and socket-free
+`test_harness.py`. See the field plan for the exact command and required environment.
+Do not run the harness during a playing session; it refuses `.aot-priority` and any
+existing `lichii` process. Class and key allow lists ship empty.
+
+## Single-emulator tests: `fake_peer.py`
+
+One real emulator is enough to exercise both directions: `fake_peer.py` runs the relay **in
+its own process** on a loopback port and joins it as a scripted second player. No separate
+relay service and no second emulator are needed.
+
+```sh
+python3 -I tools/oot/coop/fake_peer.py --ctl /path/to/ctl --port 43391 \
+    --room R --team together --policy flags-... --seed 0 \
+    --build-id "$MAIN_BUILD_ID" --wallet "$WALLET_KEY"
+```
+
+`--build-id` (the running main build) and `--wallet` (for `rupee DELTA...`) come from your private
+profile; the defaults are placeholders, and the relay refuses an emulator whose build differs from
+the first client's.
+
+Start the emulator with `EDEN_NX2_OOT_COOP=1 EDEN_NX2_OOT_COOP_RELAY=127.0.0.1:43391` and the
+same room/team/policy/seed. Then append commands to `ctl/cmd.txt`; each gets one JSON line in
+`ctl/out.jsonl`, and every packet the peer receives is logged to `ctl/received.jsonl`:
+
+- `grant HEX...` sends bool grants in one socket write (a batch);
+- `expect HEX SECS` waits for the emulator to broadcast that flag;
+- `received`, `state`, `mark TEXT`, `quit`.
+
+`FakePeerTests` in `test_relay.py` covers it over real loopback TCP.

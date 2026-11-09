@@ -4,19 +4,27 @@
 #pragma once
 
 #include <deque>
+#include <optional>
 
 #include "core/arm/dynarmic/oot_coop_sync.h"
 
 namespace Core::OotCoop {
 
-// This engine has no production memory/JIT adapter. A verified adapter must capture all CPU
-// state, own a private stack and executable sentinel, and validate the current save generation.
+// Backends capture full CPU state and own the private stack and executable sentinel.
 struct ApplyPolicy {
     bool enabled{};
     std::set<Kind> classes;
     std::set<std::pair<Kind, u64>> keys;
+    u64 wallet{}; // the profile's wallet key; 0 refuses every rupee delta
 
     bool Allows(const Change& change) const {
+        if (change.kind == Kind::Rupee) {
+            return enabled && classes.contains(Kind::Rupee) && wallet && change.key == wallet &&
+                   RupeeDelta(change.value);
+        }
+        if (change.kind == Kind::Item) {
+            return enabled && classes.contains(Kind::Item) && ValidItem(change);
+        }
         return enabled && WireKind(change.kind) && change.value == 1 &&
                classes.contains(change.kind) && keys.contains({change.kind, change.key});
     }
@@ -38,6 +46,11 @@ struct ApplyTarget {
     u64 sentinel{};
     u64 stack{};
     std::array<u64, 8> arguments{};
+    /// 64-bit stores into the private stack region that Redirect makes before the call (an
+    /// argument block the callee reads); empty for the flag setters and the wallet entry.
+    std::vector<std::pair<u64, u64>> stores;
+    /// The float argument in s0 (bits), for the ghost's alpha and frame setters; unset: v0 as is.
+    std::optional<u32> s0_bits;
 };
 
 enum class ApplyPhase { Idle, Calling, AwaitingCommit, Quarantined };
@@ -54,10 +67,14 @@ public:
     bool Queue(const Change& change) {
         const auto key = std::pair{change.kind, change.key};
         if (phase == ApplyPhase::Quarantined || !policy.Allows(change) ||
-            pending.size() >= QueueLimit || receipts.size() >= StateLimit || receipts.contains(key)) {
+            pending.size() >= QueueLimit) {
             return false;
         }
-        receipts.emplace(key, false);
+        // A delta repeats by design (each one is a new origin/sequence); flags commit once.
+        if (!EventKind(change.kind)) {
+            if (receipts.size() >= StateLimit || receipts.contains(key)) return false;
+            receipts.emplace(key, false);
+        }
         pending.push_back(change);
         return true;
     }
@@ -68,6 +85,9 @@ public:
 
     ApplyPhase Phase() const { return phase; }
     size_t Pending() const { return pending.size(); }
+    const std::optional<Change>& LastGrant() const { return last_grant; }
+    std::string_view LastPath() const { return last_path; }
+    void Invalidate() { Quarantine(); }
 
     ApplyEvent Drain(Backend& backend, const DrainContext& site) {
         if (phase == ApplyPhase::Quarantined) return ApplyEvent::Quarantined;
@@ -82,17 +102,25 @@ public:
             thread = site.thread;
         }
         if (phase == ApplyPhase::AwaitingCommit) {
+            // The wallet leaf adds to the pending field synchronously; the game's pouch update
+            // applies and clamps it later. The return is the commit.
+            // An item give commits the same way: the game's call has run to completion.
+            if (EventKind(active->kind)) return Commit();
             if (backend.ReadFlag(*active) == true) return Commit();
             return site.tick >= deadline ? Quarantine() : ApplyEvent::Blocked;
         }
         if (pending.empty()) return ApplyEvent::None;
         active = pending.front();
-        const auto current = backend.ReadFlag(*active);
-        if (!current) {
-            active.reset();
-            return ApplyEvent::Blocked;
+        last_grant = active;
+        last_path = "already-true";
+        if (!EventKind(active->kind)) {
+            const auto current = backend.ReadFlag(*active);
+            if (!current) {
+                active.reset();
+                return ApplyEvent::Blocked;
+            }
+            if (*current) return Commit();
         }
-        if (*current) return Commit();
         const auto candidate = backend.Resolve(*active);
         if (!candidate || !candidate->verified) {
             active.reset();
@@ -102,6 +130,11 @@ public:
         generation = site.generation;
         thread = site.thread;
         deadline = site.tick > MaxSequence - 120 ? MaxSequence : site.tick + 120;
+        last_path = target.pure_flag ? "data-or" : EventKind(active->kind) ? "call" : "setter";
+        if (target.pure_flag && EventKind(active->kind)) {
+            active.reset();
+            return ApplyEvent::Blocked;
+        }
         if (target.pure_flag) {
             // The adapter must prove this is the authoritative word with no notifications,
             // queue, dirty bits or concurrent writer; OrFlag is an atomic masked update.
@@ -155,6 +188,18 @@ public:
         return ApplyEvent::None;
     }
 
+    // The GameData manager or one of its tables moved (title screen <-> save load). A call in
+    // flight would return into the old manager, so that stays a quarantine. A grant awaiting its
+    // commit is re-read against the new tables (it is still pending.front()); receipts stay.
+    bool Rebind() {
+        if (phase == ApplyPhase::Calling || phase == ApplyPhase::Quarantined) return false;
+        if (phase == ApplyPhase::AwaitingCommit) {
+            active.reset();
+            phase = ApplyPhase::Idle;
+        }
+        return true;
+    }
+
     // Called only after the old guest thread/process is destroyed, never while it can return.
     void ResetAfterGuestStopped() {
         pending.clear();
@@ -171,7 +216,7 @@ private:
         return ApplyEvent::Quarantined;
     }
     ApplyEvent Commit() {
-        receipts.at({active->kind, active->key}) = true;
+        if (!EventKind(active->kind)) receipts.at({active->kind, active->key}) = true;
         pending.pop_front();
         active.reset();
         phase = ApplyPhase::Idle;
@@ -182,6 +227,8 @@ private:
     std::deque<Change> pending;
     std::map<std::pair<Kind, u64>, bool> receipts;
     std::optional<Change> active;
+    std::optional<Change> last_grant;
+    std::string_view last_path;
     std::optional<typename Backend::Context> saved;
     ApplyTarget target;
     ApplyPhase phase{ApplyPhase::Idle};

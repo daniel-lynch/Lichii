@@ -11,6 +11,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -23,27 +25,22 @@ class KProcess;
 
 /// EDEN_NX2_GAMEDATA_TRACE: Ocarina of Time's quest-step changes and HavePlayedEvent writes, for
 /// randomizer research. A pure observer that never writes guest memory: the JIT is handed a
-/// `brk #0` in place of the original instruction at three sites (DynarmicCallbacks64::
+/// `brk #0` in place of the original instruction at verified sites (DynarmicCallbacks64::
 /// MemoryReadCode, the same way as Core::WindowTrace), and the breakpoint's handler logs the
 /// arguments and then does exactly what the replaced instruction does (Resume) before execution
 /// continues at the next instruction. Guest data reads of the code still see the original words.
 ///
-/// Sites (main 1.1.0, build id E0F3CCFAF50065AE..., offsets from the main module's base), from
-/// static analysis on 2026-11-06 (findings-silver-gauntlets-adult.md, addendum 1 and 4); the
-/// register layouts are NOT yet verified at run time:
-/// - StepSet: FUN_7102cf54a0(mgr, challenge hash, step hash, ui, ?, force), the quest step setter
-///   (EventExecuteProgressChallengeStep and friends). Hooked at +4 (`mov w8, #1`) because its
-///   first instruction is a load; x0-x5 are still the arguments there.
-/// - StepApply: FUN_7102cf1830(challenge + 0x18, ?), where the challenge manager applies a pending
-///   step (also once per challenge when a save loads). `pacibsp`, a no-op in the JIT.
-/// - PlayedEvent: vt_7104b21598::vslot3, the generic HavePlayedEvent.<event> = true setter; the
-///   task's event name is at *(*(x0 + 0x10) + 8), its length (with the terminator) at
-///   *(*(x0 + 0x10) + 0x10). `pacibsp`.
+/// The sites belong to one build of the game's main module. Their module offsets, the build id
+/// and every other game-derived constant come from a user-supplied private profile (the
+/// "offsets" object of the EDEN_NX2_OOT_COOP_KEYS file, keyed by build id); none is compiled in.
+/// What each point's replaced instruction is, and so what Resume does, is fixed here:
+/// - StepSet: the quest step setter, hooked at its `mov w8, #1` (x0-x5 are its arguments).
+/// - StepApply / PlayedEvent / Frame / StructBoolSet / ActorFlagSet: a `pacibsp` (a no-op).
+/// - BitRead: `ldr w8, [x0, #0xc58]`; BitSet: `mov x8, x0`.
+/// - ItemGive: the `pacibsp` at the entry of the game's give-to-pouch call (co-op item class).
 namespace Core::OotGameDataTrace {
 
 inline constexpr u64 ProgramId = 0x0400486024DEC000ULL;
-/// The main NSO's build id (its first 20 bytes) the sites belong to.
-inline constexpr std::string_view BuildId = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348";
 
 [[nodiscard]] inline bool Enabled() {
     return Common::Nx2EventTrace::GameDataTarget().On();
@@ -54,31 +51,120 @@ enum class Point : u8 {
     StepSet,
     StepApply,
     PlayedEvent,
+    Frame,
+    BitRead,
+    BitSet,
+    StructBoolSet,
+    ActorFlagSet,
+    ItemGive,
 };
-inline constexpr size_t PointCount = 4;
+inline constexpr size_t PointCount = 10;
 
 struct Site {
     Point point;
-    u64 offset;      ///< From the main module's base (0x7100000000 in the Ghidra project)
+    u64 offset;      ///< From the main module's base
     u32 instruction; ///< The original instruction there; any other word means no hook
 };
 
 inline constexpr u32 MovW8One = 0x52800028; // mov w8, #1
 inline constexpr u32 Pacibsp = 0xD503237F;  // pacibsp (a hint: dynarmic runs it as a no-op)
 inline constexpr u32 Breakpoint = 0xD4200000; // brk #0
+inline constexpr u32 LdrW8C58 = 0xB94C5808; // ldr w8, [x0, #0xc58]
+inline constexpr u32 MovX8X0 = 0xAA0003E8;  // mov x8, x0
 
-inline constexpr std::array<Site, 3> Sites{{
-    {Point::StepSet, 0x2CF54A4, MovW8One},
-    {Point::StepApply, 0x2CF1830, Pacibsp},
-    {Point::PlayedEvent, 0x2BDC4E0, Pacibsp},
-}};
+/// The only instruction Resume can stand in for at `point`.
+constexpr u32 ReplacedInstruction(Point point) {
+    switch (point) {
+    case Point::StepSet: return MovW8One;
+    case Point::BitRead: return LdrW8C58;
+    case Point::BitSet: return MovX8X0;
+    case Point::None: return 0;
+    default: return Pacibsp;
+    }
+}
+
+/// A guest function the co-op drain may call: its module offset and the first words it must have.
+struct Entry {
+    u64 offset{};
+    std::vector<u32> words;
+    explicit operator bool() const { return offset != 0 && !words.empty(); }
+};
+
+/// The ghost ("pose" class): the reads that make a pose and the calls that draw a peer's puppet.
+struct GhostOffsets {
+    u64 playing_info_cell{}; ///< Module offset of the player-info pointer (pose source)
+    u64 pos{}, rot{};        ///< Fields of that object: position (3 floats), rotation 3x3 (9 floats)
+    u64 actor_mgr_cell{};    ///< Module offset of the actor manager pointer
+    u64 scale_const{};       ///< Module offset of the 12-byte unit scale the create argument copies
+    u32 banc_hash{}, child_hash{}, loading_hash{}; ///< GameData keys: String64, Bool, Bool
+    std::array<u64, 3> str64{}; ///< String64 table: {table offset in the manager, stride, char* field}
+    Entry create, get, release, set_mtx;
+    std::vector<u64> actor_fields; ///< Actor pointer fields that must stay unchanged and non-null
+    /// The game's own actor-link check, as pure reads: {actor's lifetime record field, actor's
+    /// id field, record's actor field, record's generation field}. Live while the record still
+    /// names this actor with the generation the actor had when it was taken.
+    std::array<u64, 4> link{};
+    /// Optional: the actor's lifecycle word and the closed range of values the game's own link
+    /// check and link bind reject (an actor being torn down). Offset 0: not checked.
+    u64 lifecycle{};
+    u32 lifecycle_lo{}, lifecycle_hi{};
+    std::string actor_child, actor_adult; ///< Actor names; adult falls back to child
+    /// Optional animation path: the actor's own AS play call (x0 = &0x30-byte request) and the
+    /// command each pose category plays. Empty play entry: statue (no animation calls).
+    Entry anim_play;
+    std::string anim_idle, anim_walk, anim_run;
+    /// Optional: the puppet created when the age's puppet cannot be (e.g. its mod is not
+    /// installed: the create is refused). Animation and alpha apply to the primary puppet only.
+    std::string actor_fallback;
+    /// Optional see-through ghost: model component = *(*(actor + chain[0]) + chain[1]); the
+    /// setter takes it in x0 and the alpha in s0 (percent / 100). Called once per puppet.
+    Entry alpha_set;
+    std::array<u64, 2> alpha_chain{};
+    u32 alpha_percent{};
+    bool Valid() const {
+        return playing_info_cell && pos && rot && actor_mgr_cell && scale_const && banc_hash &&
+               child_hash && loading_hash && str64[0] && str64[1] && str64[2] && create && get &&
+               release && set_mtx && !actor_fields.empty() && link[0] && link[1] && link[2] && link[3] &&
+               !actor_child.empty();
+    }
+};
+
+/// Everything game-derived for one main build, loaded at run time from the private profile.
+struct Profile {
+    std::string build_id;
+    std::vector<Site> sites;
+    u64 manager_cell{}; ///< Module offset of the GameData manager pointer
+    u64 pouch_cell{};   ///< Module offset of the pouch manager pointer
+    u32 wallet_hash{};  ///< GameData key of the wallet (rupee deltas)
+    Entry bool_setter, bit_setter, rupee_entry;
+    Entry item_entry;               ///< The give-to-pouch call (the ItemGive site's function)
+    std::vector<u64> item_callers;  ///< Return addresses (module offsets) of gives to forward
+    u64 event_got{};                ///< Module offset of the GOT slot of the event manager's cell
+    /// {cell, field}: *(*(main + cell) + field) must be non-zero before a give is replayed.
+    std::vector<std::pair<u64, u64>> item_guards;
+    GhostOffsets ghost; ///< Empty unless the profile has a "ghost" object
+
+    u64 SiteOffset(Point point) const {
+        for (const Site& site : sites) {
+            if (site.point == point) return site.offset;
+        }
+        return 0;
+    }
+};
+
+/// Co-op alone hooks only the frame boundary: it binds GameData from the manager cell there, and
+/// its handler ignores every other point. The Bool64 accessors are hot (the actor reader copy
+/// runs per actor per frame), so hooking them without tracing would cost a trap each.
+constexpr bool CoopPoint(Point point) {
+    return point == Point::Frame || point == Point::ItemGive;
+}
 
 /// The trace point at `address` whose original instruction is `instruction`, or None.
-constexpr Point Identify(u64 base, u64 address, u32 instruction) {
+inline Point Identify(const Profile& profile, u64 base, u64 address, u32 instruction) {
     if (base == 0 || address < base) {
         return Point::None;
     }
-    for (const Site& site : Sites) {
+    for (const Site& site : profile.sites) {
         if (address - base == site.offset && instruction == site.instruction) {
             return site.point;
         }
@@ -87,17 +173,27 @@ constexpr Point Identify(u64 base, u64 address, u32 instruction) {
 }
 
 /// What the JIT translates at `address`: a breakpoint at a trace point, the original otherwise.
-constexpr u32 InstructionFor(u64 base, u64 address, u32 instruction) {
-    return Identify(base, address, instruction) == Point::None ? instruction : Breakpoint;
+inline u32 InstructionFor(const Profile& profile, u64 base, u64 address, u32 instruction) {
+    return Identify(profile, base, address, instruction) == Point::None ? instruction : Breakpoint;
 }
 
 /// Does what the replaced instruction would have: the JIT has already moved the PC past it.
-template <typename Jit>
-void Resume(Point point, Jit& jit) {
+template <typename Jit, typename Memory>
+void Resume(Point point, Jit& jit, Memory& memory) {
     switch (point) {
     case Point::StepSet:
         jit.SetRegister(8, 1); // mov w8, #1 (a W write clears the upper half)
         break;
+    case Point::BitRead:
+        jit.SetRegister(8, memory.Read32(jit.GetRegister(0) + 0xC58));
+        break;
+    case Point::BitSet:
+        jit.SetRegister(8, jit.GetRegister(0));
+        break;
+    case Point::StructBoolSet:
+    case Point::ActorFlagSet:
+    case Point::ItemGive:
+    case Point::Frame:
     case Point::StepApply:
     case Point::PlayedEvent: // pacibsp: nothing
     case Point::None:
@@ -113,6 +209,12 @@ constexpr std::string_view Name(Point point) {
         return "step-apply";
     case Point::PlayedEvent:
         return "played-event";
+    case Point::StructBoolSet: return "struct-bool-set";
+    case Point::ActorFlagSet: return "actor-flag-set";
+    case Point::ItemGive: return "item-give";
+    case Point::Frame: return "frame";
+    case Point::BitRead: return "bit-read";
+    case Point::BitSet: return "bit-set";
     case Point::None:
         break;
     }
@@ -124,8 +226,9 @@ class Session {
 public:
     static constexpr u32 LineLimit = 4096; ///< Per point and session; the hooks keep resuming
 
-    Session(const Kernel::KProcess* owner_, u64 base_, u64 id_)
-        : owner{owner_}, base{base_}, id{id_} {}
+    Session(const Kernel::KProcess* owner_, u64 base_, u64 id_,
+            std::shared_ptr<const Profile> profile_)
+        : owner{owner_}, base{base_}, id{id_}, profile{std::move(profile_)} {}
 
     /// Whether this hit may log: true LineLimit times per point. `last` is set on the last one.
     bool Take(Point point, bool& last) {
@@ -137,6 +240,7 @@ public:
     const Kernel::KProcess* const owner;
     const u64 base;
     const u64 id;
+    const std::shared_ptr<const Profile> profile; ///< Never null
 
 private:
     std::array<std::atomic<u32>, PointCount> lines{};
@@ -144,10 +248,13 @@ private:
 
 class Sessions {
 public:
-    /// The main module of `owner` loaded at `base` (0: not the traced build, no hooks).
-    void Reset(const Kernel::KProcess* owner, u64 base) {
-        auto session =
-            base != 0 ? std::make_shared<Session>(owner, base, next_id.fetch_add(1)) : nullptr;
+    /// The main module of `owner` loaded at `base` (0 or no profile: not a profiled build, no hooks).
+    void Reset(const Kernel::KProcess* owner, u64 base,
+               std::shared_ptr<const Profile> profile = nullptr) {
+        auto session = base != 0 && profile
+                           ? std::make_shared<Session>(owner, base, next_id.fetch_add(1),
+                                                       std::move(profile))
+                           : nullptr;
         std::scoped_lock lock{mutex};
         current = std::move(session);
     }
@@ -192,7 +299,7 @@ inline std::string Index(std::optional<u32> value) {
 
 /// The current step hash of challenge `challenge` in the manager at `manager`: three arrays of
 /// 0x160-byte records ({count, data} at +0x40/+0x48, +0x50/+0x58, +0x60/+0x68), name hash at +8,
-/// current step hash at +0x10 (FUN_7102cf54a0's own search).
+/// current step hash at +0x10 (the step setter's own search).
 template <typename Memory>
 std::optional<u32> CurrentStep(Memory& memory, u64 manager, u32 challenge) {
     constexpr u32 MaxRecords = 4096;
@@ -294,6 +401,25 @@ std::string Describe(Point point, u64 base, Jit& jit, Memory& memory) {
         return fmt::format("gamedata played-event name={} hash={:#010x} lr={}", name,
                            Common::Nx2EventTrace::Murmur3(name), caller);
     }
+    case Point::StructBoolSet:
+        return fmt::format("gamedata struct-bool-set member={:08x} value={} mgr={:#x} lr={}",
+                           static_cast<u32>(jit.GetRegister(3)),
+                           static_cast<u32>(jit.GetRegister(1)), x0, caller);
+    case Point::ActorFlagSet:
+        return fmt::format("gamedata actor-flag-set member={} key={} value={} actor={:#x} lr={}",
+                           Hash(Read32(memory, jit.GetRegister(8) + 8)),
+                           fmt::format("{:016x}", Read64(memory, jit.GetRegister(8) + 0x88).value_or(0)),
+                           static_cast<u32>(jit.GetRegister(1)), x0, caller);
+    case Point::Frame:
+        return fmt::format("gamedata frame lr={}", caller);
+    case Point::ItemGive:
+        return fmt::format("gamedata item-give category={} count={} get={} lr={}",
+                           static_cast<u32>(jit.GetRegister(2)), static_cast<u32>(jit.GetRegister(3)),
+                           jit.GetRegister(4), caller);
+    case Point::BitRead:
+    case Point::BitSet:
+        return fmt::format("gamedata {} mgr={:#x} key={:016x}", Name(point), x0,
+                           jit.GetRegister(2));
     case Point::None:
         break;
     }
@@ -305,7 +431,8 @@ std::string Describe(Point point, u64 base, Jit& jit, Memory& memory) {
 template <typename Jit, typename Memory>
 bool Handle(Session& session, u64 pc, Jit& jit, Memory& memory, std::string* out = nullptr) {
     const auto original = Detail::Read32(memory, pc);
-    const Point point = original ? Identify(session.base, pc, *original) : Point::None;
+    const Point point =
+        original ? Identify(*session.profile, session.base, pc, *original) : Point::None;
     if (point == Point::None) {
         return false;
     }
@@ -321,7 +448,7 @@ bool Handle(Session& session, u64 pc, Jit& jit, Memory& memory, std::string* out
             Common::Nx2EventTrace::Write(Common::Nx2EventTrace::GameDataTarget(), line);
         }
     }
-    Resume(point, jit);
+    Resume(point, jit, memory);
     return true;
 }
 

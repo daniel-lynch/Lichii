@@ -5,11 +5,16 @@
 
 import asyncio
 import importlib.util
+import math
 from pathlib import Path
+import json
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
+
+WALLET = 0x0BADCAFE  # synthetic wallet key (the real one is game-derived and private)
 
 sys.dont_write_bytecode = True
 
@@ -24,6 +29,7 @@ def load_sibling(name):
 
 relay = load_sibling("relay")
 client_sim = load_sibling("client_sim")
+fake_peer = load_sibling("fake_peer")
 
 
 def framed(payload):
@@ -33,6 +39,24 @@ def framed(payload):
 def grant(seq=1, *, origin="a", key=1, kind="bool_set", value=True):
     return {"type": kind, "origin": origin, "seq": seq,
             "hash" if kind == "bool_set" else "actor": key, "value": value}
+
+
+def pose(**changes):
+    return dict({"type": "pose", "t": 1234, "banc": "Field_1", "child": True, "loading": False,
+                 "pos": [-46.09, 118.46, 15.39], "yaw": 108.6, "anim": "walk", "anim_seq": 3,
+                 "rate": 1.0, "phase": 0.25}, **changes)
+
+
+BAD_POSES = (
+    {"banc": "bad banc"}, {"banc": "a-b"}, {"banc": "x" * 64}, {"banc": 7},
+    {"pos": [float("nan"), 0, 0]}, {"pos": [0, float("inf"), 0]}, {"yaw": float("-inf")},
+    {"pos": [100000.5, 0, 0]}, {"pos": [0, 0, -100001]}, {"yaw": 400}, {"yaw": -360.1},
+    {"pos": [1, 2]}, {"pos": [1, 2, 3, 4]}, {"pos": (1, 2, 3)}, {"pos": [True, 0, 0]},
+    {"yaw": False}, {"yaw": "1"}, {"t": -1}, {"t": 1 << 32}, {"t": 1.0}, {"child": 1},
+    {"loading": None}, {"extra": 1}, {"origin": "a"}, {"seq": 1},
+    {"anim": "jump"}, {"anim": None}, {"anim_seq": -1}, {"anim_seq": 1 << 32}, {"rate": -0.1},
+    {"rate": 11}, {"phase": 1.0}, {"phase": -0.01}, {"phase": float("nan")},
+)
 
 
 def materialize(snapshot):
@@ -47,11 +71,37 @@ def materialize(snapshot):
 
 class ProtocolTests(unittest.TestCase):
     def memory_server(self):
+        self.now = 0.0
         clock = mock.patch.object(relay.asyncio, "get_running_loop",
-                                  return_value=SimpleNamespace(time=lambda: 0.0))
+                                  return_value=SimpleNamespace(time=lambda: self.now))
         clock.start()
         self.addCleanup(clock.stop)
         return relay.Relay()
+
+    @staticmethod
+    def stalled(server, client_id, **kwargs):
+        """A real relay Client whose write loop never runs: its outbox only fills."""
+        closed = []
+        peer = relay.Client(None, SimpleNamespace(close=lambda: closed.append(True)))
+        peer.closed = closed
+        server.join(peer, client_sim.ClientSim(client_id, **kwargs).hello)
+        return peer
+
+    @staticmethod
+    def queued(peer):
+        return [relay.decode(entry[0]) for entry in peer.outbox]
+
+    @staticmethod
+    def drain(peer):
+        """What the write loop does, without a socket."""
+        sent = []
+        while peer.outbox:
+            entry = peer.outbox.popleft()
+            if entry[1] is not None:
+                peer.pending.pop(entry[1], None)
+            peer.queued_bytes -= len(entry[0])
+            sent.append(relay.decode(entry[0]))
+        return sent
 
     @staticmethod
     def peer(server, client_id, **kwargs):
@@ -124,7 +174,7 @@ class ProtocolTests(unittest.TestCase):
     def test_handshake_validation(self):
         packet = client_sim.ClientSim("a").hello
         relay.validate_hello(packet)
-        for changes in ({"version": True}, {"version": 1}, {"build_id": "F" * 39},
+        for changes in ({"version": True}, {"version": 1}, {"version": 2}, {"build_id": "F" * 39},
                         {"seed_hash": 0}, {"room": "bad room"}, {"name": "\n"},
                         {"policy_id": "bad policy"}):
             with self.subTest(changes=changes), self.assertRaises(relay.ProtocolError):
@@ -140,7 +190,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_bool_bit_or_and_duplicate_check_across_players(self):
         team = relay.Team()
-        for kind in relay.CHANGE_TYPES:
+        for kind in ("bool_set", "bit_set"):
             self.assertIsNone(team.accept(grant(1, origin=kind, kind=kind, value=False), set()))
             self.assertIsNotNone(team.accept(grant(2, origin=kind, kind=kind), set()))
             self.assertIsNone(team.accept(grant(3, origin=kind, kind=kind, value=False), set()))
@@ -155,6 +205,31 @@ class ProtocolTests(unittest.TestCase):
                 team.accept(dict(grant(), type=kind), set())
         self.assertEqual(team.current, {})
         self.assertEqual(team.seen, {})
+
+    def test_rupee_deltas_are_events_not_state(self):
+        def rupee(seq, delta=5, **extra):
+            return dict({"type": "rupee_add", "origin": "b", "seq": seq, "hash": WALLET,
+                         "delta": delta}, **extra)
+        for bad in (rupee(1, 0), rupee(1, 1000), rupee(1, -1000), rupee(1, True), rupee(1, 2.5),
+                    rupee(1, hash=0), rupee(1, value=True)):
+            with self.subTest(bad=bad), self.assertRaises(relay.ProtocolError):
+                relay.validate_change(bad, "b")
+        team = relay.Team()
+        team.accept(grant(1), set())
+        self.assertEqual(team.accept(rupee(1), set())["rev"], 2)
+        self.assertEqual(team.accept(rupee(2, -999), set())["rev"], 3)
+        self.assertIsNone(team.accept(rupee(2), set()))  # duplicate sequence: no second +5
+        self.assertIsNone(team.accept(rupee(3), {WALLET}))
+        self.assertEqual(list(team.current), [("bool_set", 1)])
+        snapshot = team.snapshot()
+        self.assertEqual([p["delta"] for p in snapshot["replay"] if p["type"] == "rupee_add"], [5, -999])
+        self.assertEqual(materialize(snapshot), team.current)
+        for seq in range(4, 604):
+            team.accept(rupee(seq), set())
+        snapshot = team.snapshot()
+        self.assertEqual(snapshot["changes"], [{"type": "bool_set", "hash": 1, "value": True}])
+        self.assertEqual(len(snapshot["replay"]), 512)
+        self.assertEqual(materialize(snapshot), team.current)
 
     def test_noop_highwater_and_deny(self):
         team = relay.Team()
@@ -274,6 +349,144 @@ class ProtocolTests(unittest.TestCase):
         client.send({"type": "heartbeat"})
         self.assertTrue(client.failed)
         self.assertEqual(closed, [True])
+
+    def test_v2_hello_refused(self):
+        hello = dict(client_sim.ClientSim("a").hello, version=2)
+        with self.assertRaisesRegex(relay.ProtocolError, "protocol version mismatch"):
+            relay.validate_hello(hello)
+        self.assertEqual(relay.VERSION, 3)
+
+    def test_pose_validation(self):
+        relay.validate_pose(pose())
+        relay.validate_pose(pose(banc="", t=0, pos=[100000, -100000, 0], yaw=-360, loading=True))
+        relay.validate_pose(pose(banc="x" * 63, t=(1 << 32) - 1, yaw=360))
+        for changes in BAD_POSES:
+            with self.subTest(changes=changes), self.assertRaises(relay.ProtocolError):
+                relay.validate_pose(dict(pose(), **changes))
+        for missing in relay.POSE_FIELDS[1:]:
+            packet = pose()
+            del packet[missing]
+            with self.subTest(missing=missing), self.assertRaises(relay.ProtocolError):
+                relay.validate_pose(packet)
+        with self.assertRaisesRegex(relay.ProtocolError, "too large"):
+            relay.validate_pose(pose(), size=relay.MAX_POSE_FRAME + 1)
+        relay.validate_pose(pose(), size=relay.MAX_POSE_FRAME)
+
+    def test_pose_forwarded_to_team_only_with_origin_and_no_ack(self):
+        server = self.memory_server()
+        a, b, c = (self.stalled(server, name) for name in ("a", "b", "c"))
+        others = [self.stalled(server, "d", team="other"), self.stalled(server, "e", room="other")]
+        for peer in (a, b, c, *others):
+            self.drain(peer)
+        server.receive(a, pose())
+        expected = {"type": "pose", "origin": "a", **{k: v for k, v in pose().items() if k != "type"}}
+        self.assertEqual(self.queued(b), [expected])
+        self.assertEqual(self.queued(c), [expected])
+        self.assertEqual(self.queued(a), [])  # no ack, no echo
+        self.assertTrue(all(not peer.outbox for peer in others))
+        self.assertEqual((a.team.revision, a.team.seen, a.team.current, list(a.team.replay)),
+                         (0, {"a": 0, "b": 0, "c": 0}, {}, []))
+
+    def test_malformed_pose_is_a_protocol_error_without_forwarding(self):
+        server = self.memory_server()
+        a, b = self.stalled(server, "a"), self.stalled(server, "b")
+        self.drain(b)
+        for changes in BAD_POSES:
+            with self.subTest(changes=changes), self.assertRaises(relay.ProtocolError):
+                server.receive(a, dict(pose(), **changes))
+        self.assertEqual(self.queued(b), [])
+
+    def test_pose_latest_wins_in_a_stalled_outbox(self):
+        server = self.memory_server()
+        a, b, c = (self.stalled(server, name) for name in ("a", "b", "c"))
+        self.drain(c)
+        server.receive(a, pose(t=1))
+        server.receive(b, pose(t=10))
+        server.receive(a, grant(1))
+        server.receive(a, pose(t=2))
+        server.receive(a, pose(t=3, pos=[1, 2, 3]))
+        got = self.queued(c)
+        self.assertEqual([(p["type"], p.get("origin"), p.get("t")) for p in got],
+                         [("pose", "a", 3), ("pose", "b", 10), ("bool_set", "a", None)])
+        self.assertEqual(got[0]["pos"], [1, 2, 3])
+        self.assertEqual(c.poses_coalesced, 2)
+        self.assertEqual(c.queued_bytes, sum(len(entry[0]) for entry in c.outbox))
+        self.drain(c)
+        server.receive(a, pose(t=4))  # sent poses are not replaced: a new frame is queued
+        self.assertEqual([p["t"] for p in self.queued(c)], [4])
+
+    def test_stalled_peer_drops_poses_and_keeps_its_grant_session(self):
+        server = self.memory_server()
+        a, b = self.stalled(server, "a"), self.stalled(server, "b")
+        self.drain(b)
+        for seq in range(1, relay.MAX_POSE_QUEUE + 2):  # 65 queued grant events
+            server.receive(a, grant(seq, key=seq))
+            self.drain(a)  # a reads its acks; only b is stalled
+        self.assertEqual(len(b.outbox), relay.MAX_POSE_QUEUE + 1)
+        for t in range(5):
+            server.receive(a, pose(t=t))
+        self.assertEqual(len(b.outbox), relay.MAX_POSE_QUEUE + 1)
+        self.assertEqual(b.poses_dropped, 5)
+        self.assertFalse(b.failed)
+        self.assertEqual(b.closed, [])
+        # A queued pose can never push a client over the grant limit: it is evicted first.
+        self.drain(b)
+        server.receive(a, pose(t=9))
+        for seq in range(100, 100 + relay.MAX_OUTBOX):
+            server.receive(a, grant(seq, key=seq))
+            self.drain(a)
+        self.assertFalse(b.failed)
+        self.assertEqual(len(b.outbox), relay.MAX_OUTBOX)
+        self.assertTrue(all(p["type"] == "bool_set" for p in self.queued(b)))
+        self.assertEqual(b.poses_dropped, 6)
+        # The grant session still works once the peer drains.
+        sent = self.drain(b)
+        self.assertEqual(sent[-1]["seq"], 100 + relay.MAX_OUTBOX - 1)
+        self.drain(a)
+        server.receive(b, grant(1, origin="b", key=0xB0B0))
+        self.assertEqual(self.queued(b), [{"type": "ack", "seq": 1}])
+        self.assertEqual(self.queued(a), [dict(grant(1, origin="b", key=0xB0B0), rev=a.team.revision)])
+        self.drain(a)
+        server.receive(a, grant(500, key=500))
+        self.assertEqual(self.queued(b)[-1]["seq"], 500)
+        server.receive(a, pose(t=11))
+        self.assertEqual(self.queued(b)[-1]["t"], 11)
+        # The genuine slow-client rule still holds for grants once no pose is left to evict.
+        self.drain(b)
+        for seq in range(600, 600 + relay.MAX_OUTBOX + 1):
+            server.receive(a, grant(seq, key=seq))
+            self.drain(a)
+        self.assertTrue(b.failed)
+
+    def test_pose_never_in_snapshot_replay_or_join(self):
+        server = self.memory_server()
+        a, b = self.stalled(server, "a"), self.stalled(server, "b")
+        server.receive(a, grant(1))
+        server.receive(a, pose())
+        late = self.stalled(server, "late")
+        self.assertFalse(any(p["type"] == "pose" for p in self.queued(late)))
+        snapshot = a.team.snapshot()
+        self.assertEqual([p["type"] for p in snapshot["replay"]], ["bool_set"])
+        self.assertNotIn("pose", json.dumps(snapshot))
+        self.assertEqual(materialize(snapshot), {("bool_set", 1): {"type": "bool_set", "hash": 1, "value": True}})
+
+    def test_pose_rate_cap_drops_without_disconnect(self):
+        server = self.memory_server()
+        a, b = self.stalled(server, "a"), self.stalled(server, "b")
+        self.drain(b)
+        for t in range(40):
+            self.now = t * 0.001
+            server.receive(a, pose(t=t))
+        self.assertEqual(a.poses_rate_dropped, 40 - relay.POSE_RATE)
+        self.assertEqual(b.poses_coalesced + len(b.outbox), relay.POSE_RATE)
+        self.assertEqual(self.queued(b)[0]["t"], relay.POSE_RATE - 1)
+        self.assertFalse(a.failed or b.failed)
+        self.now = 0.5  # still inside the window of the first accepted pose
+        server.receive(a, pose(t=50))
+        self.assertEqual(a.poses_rate_dropped, 40 - relay.POSE_RATE + 1)
+        self.now = 1.0  # the first accepted pose (t=0) has left the window
+        server.receive(a, pose(t=51))
+        self.assertEqual(self.queued(b)[0]["t"], 51)
 
 
 class RelayTests(unittest.IsolatedAsyncioTestCase):
@@ -444,6 +657,165 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         for kind, key in (("bool_set", {"hash": 7}), ("bit_set", {"actor": 7})):
             await self.change(a, kind=kind, **key, value=True)
         self.assertEqual(materialize(await self.snapshot(a)), {})
+
+    async def test_v2_client_refused(self):
+        client = client_sim.ClientSim("old")
+        client.hello["version"] = 2
+        self.clients.append(client)
+        with self.assertRaisesRegex(ValueError, "protocol version mismatch"):
+            await client.connect("127.0.0.1", self.port)
+
+    async def test_pose_routing_origin_and_no_ack(self):
+        a, b = await self.connect("a"), await self.connect("b")
+        other = await self.connect("c", team="other")
+        sent = await a.pose("Field_1", True, [1.5, -2, 3], -90.25, t=77)
+        got = await b.receive_pose(since=0)
+        self.assertEqual(got, dict(sent, origin="a"))
+        self.assertEqual(list(got)[:2], ["type", "origin"])
+        with self.assertRaises(TimeoutError):
+            await a.receive("ack", timeout=0.05)
+        self.assertEqual((a.pose_count, other.pose_count), (0, 0))
+        self.assertEqual(materialize(await self.snapshot(b)), {})
+        # The session is still a normal grant session afterwards.
+        await self.change(a, hash=5, value=True)
+        self.assertEqual((await b.receive("bool_set"))["hash"], 5)
+
+    async def test_malformed_pose_errors_but_well_formed_flood_does_not(self):
+        bad = await self.connect("bad")
+        await bad.send(pose(banc="no spaces"))
+        self.assertEqual((await bad.receive("error"))["reason"], "invalid pose banc")
+        a, b = await self.connect("a"), await self.connect("b")
+        a.writer.write(b"".join(relay.encode(pose(t=t)) for t in range(40)))
+        await a.writer.drain()
+        await a.send({"type": "heartbeat"})
+        self.assertEqual(await a.receive("heartbeat_ack"), {"type": "heartbeat_ack"})
+        server_a = next(c for c in self.server.clients if c.client_id == "a")
+        self.assertEqual(server_a.poses_rate_dropped, 40 - relay.POSE_RATE)
+        await b.send({"type": "heartbeat"})
+        await b.receive("heartbeat_ack")
+        self.assertLessEqual(b.pose_count, relay.POSE_RATE)
+        self.assertGreater(b.pose_count, 0)
+        self.assertEqual(b.poses[-1]["t"], relay.POSE_RATE - 1)
+        # An oversized (whitespace-padded) pose frame is rejected on its wire size.
+        big = await self.connect("big")
+        big.writer.write(framed(json.dumps(pose(), indent=40).encode()))
+        await big.writer.drain()
+        self.assertEqual((await big.receive("error"))["reason"], "pose too large")
+
+
+class FakePeerTests(unittest.IsolatedAsyncioTestCase):
+    """The single-emulator fake peer: in-process relay plus a scripted peer (TCP loopback)."""
+
+    async def asyncSetUp(self):
+        self.peer = fake_peer.FakePeer(port=0, room="r", team="t", policy="p", wallet=WALLET)
+        self.port = await self.peer.start()
+        self.emu = client_sim.ClientSim("emu", room="r", team="t", policy_id="p")
+        await self.emu.connect("127.0.0.1", self.port)
+
+    async def asyncTearDown(self):
+        await self.emu.close()
+        await self.peer.close()
+
+    async def test_records_the_emulator_broadcast(self):
+        await self.emu.change("bool_set", hash=0xC1, value=True)
+        packet = (await self.peer.command("expect c1 2"))["packet"]
+        self.assertEqual((packet["hash"], packet["origin"], packet["rev"]), (0xC1, "emu", 1))
+        self.assertEqual((await self.peer.command("expect c2 0.05")), {"timeout": True})
+
+    async def test_burst_arrives_in_order_and_duplicates_add_nothing(self):
+        result = await self.peer.command("grant a1 a2 a3 a4")
+        self.assertEqual(result["sent"], [1, 2, 3, 4])
+        got = [(await self.emu.receive("bool_set"))["hash"] for _ in range(4)]
+        self.assertEqual(got, [0xA1, 0xA2, 0xA3, 0xA4])
+        await self.peer.command("grant a2")
+        with self.assertRaises(TimeoutError):
+            await self.emu.receive("bool_set", timeout=0.05)
+        state = (await self.peer.command("state"))["state"]
+        self.assertEqual(len(materialize(state)), 4)
+
+    async def test_rupee_burst_reaches_the_emulator_and_never_becomes_state(self):
+        result = await self.peer.command("rupee 5 -2")
+        self.assertEqual(result["sent"], [1, 2])
+        got = [(await self.emu.receive("rupee_add"))["delta"] for _ in range(2)]
+        self.assertEqual(got, [5, -2])
+        state = (await self.peer.command("state"))["state"]
+        self.assertEqual(state["changes"], [])
+        self.assertEqual(materialize(state), {})
+        with self.assertRaises(ValueError):
+            await self.peer.command("rupee")
+
+    async def test_snapshot_replays_grants_made_before_the_emulator_joined(self):
+        late = client_sim.ClientSim("late", room="r", team="t", policy_id="p")
+        await self.peer.command("grant b1 b2")
+        await late.connect("127.0.0.1", self.port)
+        try:
+            self.assertEqual({p["hash"] for p in late.snapshot["replay"]}, {0xB1, 0xB2})
+        finally:
+            await late.close()
+
+    async def test_pose_commands_both_ways(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.peer.record = Path(directory) / "received.jsonl"
+            for t in range(16):
+                await self.emu.pose("Field_1", t % 2 == 0, [t, 0, 0], 0, t=t + 1)
+                await asyncio.sleep(0.04)  # under the relay's 30/s cap
+            for _ in range(100):
+                if self.peer.pose_count >= 16:
+                    break
+                await asyncio.sleep(0.01)
+            result = await self.peer.command("poses 3")
+            self.assertEqual(result["count"], 16)
+            self.assertEqual([p["t"] for p in result["poses"]], [14, 15, 16])
+            self.assertTrue(all(p["origin"] == "emu" for p in result["poses"]))
+            lines = [json.loads(line) for line in self.peer.record.read_text().splitlines()]
+            self.assertEqual([line["pose_n"] for line in lines if line["type"] == "pose"], [1, 16])
+            self.peer.record = None
+        sent = (await self.peer.command("pose - 0 1 2 3 45.5 1"))["sent"]
+        got = await self.emu.receive_pose(since=0)
+        self.assertEqual((got["banc"], got["child"], got["loading"], got["pos"], got["yaw"]),
+                         ("", False, True, [1.0, 2.0, 3.0], 45.5))
+        self.assertEqual(got["origin"], self.peer.client.hello["client_id"])
+        self.assertEqual(sent["t"], got["t"])
+        with self.assertRaises(ValueError):
+            await self.peer.command("pose Field_1 1 2 3")
+        with self.assertRaises(ValueError):  # refused locally, so the peer's session survives
+            await self.peer.command("pose bad-banc 1 0 0 0 0")
+        self.assertIn("state", await self.peer.command("state"))
+
+    async def test_posecircle_stream_and_stop(self):
+        result = await self.peer.command("posecircle Field_1 10 5 -20 100 4 20 0")
+        self.assertIn("started", result)
+        first = await self.emu.receive_pose(since=0)
+        self.assertEqual((first["pos"], first["yaw"], first["child"], first["loading"]),
+                         ([110.0, 5.0, -20.0], 0.0, True, False))  # at +X moving toward +Z
+        for _ in range(200):
+            if self.emu.pose_count >= 6:
+                break
+            await asyncio.sleep(0.01)
+        stopped = await self.peer.command("posestop")
+        self.assertTrue(stopped["stopped"])
+        self.assertGreaterEqual(stopped["sent"], 6)
+        poses = list(self.emu.poses)
+        self.assertEqual([b["t"] - a["t"] for a, b in zip(poses, poses[1:])], [3] * (len(poses) - 1))
+        for packet in poses:
+            x, _, z = packet["pos"]
+            self.assertAlmostEqual(math.hypot(x - 10, z + 20), 100, places=2)
+            # Counter-clockwise in X/Z: travel is (-(z - cz), x - cx); yaw = atan2(dx, dz).
+            self.assertAlmostEqual(packet["yaw"], math.degrees(math.atan2(-(z + 20), x - 10)), places=1)
+        self.assertLess(poses[1]["yaw"], 0)  # past +X, heading toward -X as well as +Z
+        count = self.emu.pose_count
+        await asyncio.sleep(0.15)
+        self.assertLessEqual(self.emu.pose_count - count, 1)  # at most one in flight
+        self.assertEqual((await self.peer.command("posestop"))["stopped"], False)
+        timed = await self.peer.command("posecircle - 0 0 0 1 1 30 0.1")
+        self.assertEqual(timed["started"]["banc"], "")
+        for _ in range(100):
+            if self.peer.stream.done():
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual((await self.peer.command("posestop"))["sent"], 3)
+        with self.assertRaises(ValueError):
+            await self.peer.command("posecircle Field_1 0 0 0 1 0 15 0")
 
 
 if __name__ == "__main__":
