@@ -35,6 +35,9 @@ Commands are lines appended to CTL/cmd.txt; each gets one JSON result line in CT
                             start (returns at once) a pose stream walking the waypoints in order at
                             SPEED m/s, HZ poses/s, then holding the last one (1 Hz keepalive) until
                             posestop. Replaces any stream.
+  poseequip WORD|off [child=0|1]
+                            what later pose streams (posecircle, posepath) carry: an eq32 word (eqseq
+                            tracks known changes) and the age; off = no equipment fields
   posestop                  stop the stream; result has how many poses it sent
   kick                      close the relay's connection to every other client (the emulator), as a
                             network drop would; the peer itself stays connected
@@ -80,6 +83,7 @@ class FakePeer:
         self.client.hello["ghost_equipment_v2"] = True
         self.equipment_seq = 0
         self.equipment_known = {}
+        self.stream_eq32, self.stream_child = None, True  # poseequip: what the pose streams carry
         self.record = Path(record) if record else None
         self.wallet = wallet  # the wallet key from the private profile (rupee_add)
         self.received = []
@@ -158,7 +162,7 @@ class FakePeer:
             dx, dz = -math.sin(angle), math.cos(angle)  # direction of travel (counter-clockwise in X/Z)
             yaw = round(math.degrees(math.atan2(dx, dz)), 3)
             phase = 0.0 if anim == "idle" else (speed * n / hz / stride) % 1.0
-            await self.send_pose(banc, True, pos, yaw, False, step, anim=anim, anim_seq=self.anim_seq,
+            await self.send_pose(banc, self.stream_child, pos, yaw, False, step, eq32=self.stream_eq32, anim=anim, anim_seq=self.anim_seq,
                                  rate=round(min(10.0, 1.0 if anim == "idle" else speed / nominal), 2),
                                  phase=min(0.99, round(phase, 2)))
             self.stream_sent += 1
@@ -181,14 +185,14 @@ class FakePeer:
                 move = min(dist, speed / hz)
                 pos = [round(pos[i] + (target[i] - pos[i]) * move / dist, 3) for i in range(3)]
                 travelled += move
-                await self.send_pose(banc, True, pos, yaw, False, step, anim=anim, anim_seq=self.anim_seq,
+                await self.send_pose(banc, self.stream_child, pos, yaw, False, step, eq32=self.stream_eq32, anim=anim, anim_seq=self.anim_seq,
                                      rate=round(min(10.0, speed / nominal), 2),
                                      phase=min(0.99, round((travelled / stride) % 1.0, 2)))
                 self.stream_sent += 1
                 await asyncio.sleep(1 / hz)
         self.anim_seq += 1
         while True:  # hold: idle keepalive
-            await self.send_pose(banc, True, pos, yaw, False, step, anim="idle", anim_seq=self.anim_seq,
+            await self.send_pose(banc, self.stream_child, pos, yaw, False, step, eq32=self.stream_eq32, anim="idle", anim_seq=self.anim_seq,
                                  rate=1.0, phase=0.0)
             self.stream_sent += 1
             await asyncio.sleep(1.0)
@@ -359,6 +363,15 @@ class FakePeer:
                                           [float(w) for w in words[3:6]], float(words[6]),
                                           len(words) == 8 and words[7] == "1", **options)
             return {"sent": packet}
+        if verb == "poseequip":
+            if len(words) not in (2, 3) or (len(words) == 3 and words[2] not in ("child=0", "child=1")):
+                raise ValueError("poseequip WORD|off [child=0|1]")
+            child = self.stream_child if len(words) == 2 else words[2] == "child=1"
+            word = None if words[1] == "off" else int(words[1], 0)
+            if word is not None:
+                relay_mod.validate_equipment(word, child)
+            self.stream_eq32, self.stream_child = word, child
+            return {"stream_eq32": word, "stream_child": child}
         if verb == "poseanim":
             if len(words) != 8 or words[6] not in ("idle", "walk", "run"):
                 raise ValueError("poseanim BANC X Y Z YAW idle|walk|run RATE")

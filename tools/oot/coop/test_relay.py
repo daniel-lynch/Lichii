@@ -503,6 +503,19 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not negotiated"):
             peer.command("pose Field_1 1 0 0 0 0 eq32=0x10000000").send(None)
 
+    def test_fake_peer_poseequip_sets_what_streams_carry(self):
+        peer = fake_peer.FakePeer()
+        with self.assertRaises(StopIteration) as done:
+            peer.command("poseequip 0x10040292 child=0").send(None)
+        self.assertEqual(done.exception.value, {"stream_eq32": 0x10040292, "stream_child": False})
+        self.assertEqual((peer.stream_eq32, peer.stream_child), (0x10040292, False))
+        for bad in ("poseequip 0x10000289 child=0", "poseequip", "poseequip 0x10000289 child=2"):
+            with self.subTest(bad=bad), self.assertRaises((ValueError, relay.ProtocolError)):
+                peer.command(bad).send(None)
+        with self.assertRaises(StopIteration) as done:
+            peer.command("poseequip off child=1").send(None)
+        self.assertEqual((peer.stream_eq32, peer.stream_child), (None, True))
+
     def test_pose_forwarded_to_team_only_with_origin_and_no_ack(self):
         server = self.memory_server()
         a, b, c = (self.stalled(server, name) for name in ("a", "b", "c"))
