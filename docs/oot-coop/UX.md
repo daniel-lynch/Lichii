@@ -119,3 +119,29 @@ letter squares and expire after 250 ms, like name tags.
 **Minimap plumbing only:** `Room::ReadMinimap` intentionally returns no transform. The integrator
 must wire researched guest reads and visibility validation before any markers appear. Enabling
 the switch alone does not assume a transform or draw markers.
+
+## Desktop co-op controls
+
+For a supported title, Properties → Co-op saves connection and kit settings in the
+per-game `Coop` section. Launcher environment variables take precedence. Select a
+private key file; the page lists only filenames, sizes and short SHA-256 digests.
+Session switches apply only to existing typed leaves. Changes create a session
+copy beside copies of the available kit sidecars; unchanged settings retain the
+original file bytes. Both players must select matching switches because the mod
+hash covers the key file. Ghost mod enablement uses the existing disabled add-ons
+list and only changes when the checkbox is explicitly changed.
+
+View → Co-op Panel shows published peers and provides room-window, teleport and
+team-state request controls. The panel never reads the private key file. A build
+without a status publisher displays “No live co-op status”; no connection or ping
+is inferred. Disconnect requires future runtime support. Reconnect restarts the
+game using page settings, subject to launcher overrides. Changing co-op enablement
+requires restarting the application because the core caches enablement at first
+boot. The status publisher must use `steady_clock` milliseconds for `published_ms`
+and peer `seen_ms`, and clear the board when the session ends.
+
+Field-test hooks (off unless set): `EDEN_NX2_OOT_COOP_GUI_SHOTS=<dir>` shows the Co-op Panel at
+start, saves `panel-latest.png` grabs into `<dir>` and executes `<dir>/panel.cmd` lines (`teleport ROW`,
+`resync`, `room on|off`, `copyall`, `shot NAME`) by clicking the real controls, logging to
+`<dir>/panel.log`; the Co-op page saves `page-dialog.png` / `page-full.png` there.
+`EDEN_NX2_OOT_COOP_GUI_OPEN=<game file>` opens that game's Properties at start.

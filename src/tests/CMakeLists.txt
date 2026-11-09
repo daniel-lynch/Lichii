@@ -49,6 +49,7 @@ add_executable(tests
     core/oot_coop_teleport.cpp
     core/oot_coop_ux.cpp
     core/oot_coop_ledger.cpp
+    core/oot_coop_gui.cpp
     core/oot_coop_chest.cpp
     core/oot_coop_world.cpp
     core/builtin_patches.cpp

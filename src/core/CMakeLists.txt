@@ -28,6 +28,7 @@ add_library(core STATIC
     arm/dynarmic/oot_coop_ux.cpp
     arm/dynarmic/oot_coop_ledger.cpp
     arm/dynarmic/oot_coop_ledger.h
+    arm/dynarmic/oot_coop_gui.cpp arm/dynarmic/oot_coop_gui.h
     arm/dynarmic/oot_coop_chest.cpp
     arm/dynarmic/oot_coop_world.cpp
     arm/dynarmic/oot_coop_ux.h
