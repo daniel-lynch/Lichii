@@ -144,4 +144,5 @@ Field-test hooks (off unless set): `EDEN_NX2_OOT_COOP_GUI_SHOTS=<dir>` shows the
 start, saves `panel-latest.png` grabs into `<dir>` and executes `<dir>/panel.cmd` lines (`teleport ROW`,
 `resync`, `room on|off`, `copyall`, `shot NAME`) by clicking the real controls, logging to
 `<dir>/panel.log`; the Co-op page saves `page-dialog.png` / `page-full.png` there.
-`EDEN_NX2_OOT_COOP_GUI_OPEN=<game file>` opens that game's Properties at start.
+`EDEN_NX2_OOT_COOP_GUI_OPEN=<game file>` opens that game's Properties at start;
+`EDEN_NX2_OOT_COOP_GUI_APPLY=<room>` then types that room into the page and presses OK.
