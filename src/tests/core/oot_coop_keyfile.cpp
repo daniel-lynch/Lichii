@@ -3,8 +3,9 @@
 
 // Hidden check of a PRIVATE key file and its sidecars with the real decoders (the same strict
 // decoders the emulator runs). Nothing game-derived lives here: the file is named at run time.
-//   EDEN_NX2_OOT_COOP_KEYS=<kit>/chest-keys-cNN.json EDEN_NX2_OOT_COOP_KEYS_BUILD=<40-hex main build id> \
-//     tests "[.oot_coop_keyfile]"
+//   EDEN_NX2_OOT_COOP_KEYS=<kit>/chest-keys-cNN.json
+//   EDEN_NX2_OOT_COOP_KEYS_BUILD=<40-hex main build id>
+//   tests "[.oot_coop_keyfile]"
 // The sidecars (coop-anim.json, coop-equip.json, coop-ux.json) are read beside the key file.
 
 #include <cstdlib>
