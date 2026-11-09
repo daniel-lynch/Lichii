@@ -80,6 +80,8 @@ bool DecodeProfileSection(std::string_view field, const Json& value, OotGameData
             if (!item.is_string() || !ItemName(item.get<std::string>())) return {};
             profile.pickup_names.push_back(item.get<std::string>());
         }
+    } else if (field == "cleanup") {
+        if (profile.world.resolver || !World::DecodeResolver(value, profile.world.resolver)) return {};
     } else if (field == "world") {
         if (!World::DecodeConfig(value, profile.world)) return {};
     } else if (field == "wallet") {
@@ -126,6 +128,7 @@ bool DecodeProfileSection(std::string_view field, const Json& value, OotGameData
 }
 
 bool ValidateProfile(const OotGameDataTrace::Profile& profile) {
+    if (profile.world.resolver && (!profile.death_wrapper || profile.world.families.empty())) return false;
     if (profile.world.capacity_hash && !profile.world.pending_off) return false;
     if (!profile.world.families.empty() || profile.pickup_entry) {
         if (!profile.pickup_entry || !profile.world.actor_off || !profile.world.metadata_off || !profile.world.key_off ||
@@ -226,6 +229,86 @@ bool DecodeConfig(const Json& value, Config& config) {
         } else return false;
     }
     return true;
+}
+bool DecodeResolver(const Json& value, Resolver& r) {
+    // {"root_cell", "groups": [[count, array]...], "block": {stride, capacity, records, used},
+    //  "record": {stride, flags, in_use, key, keyed_flags, keyed, actor}, "list" (optional):
+    //  {head, sentinel, next, back}, "actor": {record, lifecycle, live: [lo, hi], refs, flags,
+    //  deleting, link: [4]}, "death": {chain: [2], actor, state, flags, disabled, reason}}
+    const auto field = [](const Json& object, const char* name, u64 maximum, u64& out, bool nonzero) {
+        if (!object.is_object() || !object.contains(name)) return false;
+        const auto number = Number(object.at(name), maximum);
+        if (!number || (nonzero && !*number)) return false;
+        out = *number;
+        return true;
+    };
+    const auto exact = [](const Json& object, std::initializer_list<const char*> names) {
+        if (!object.is_object() || object.size() != names.size()) return false;
+        for (const char* name : names) if (!object.contains(name)) return false;
+        return true;
+    };
+    const auto array = [](const Json& list, size_t size, u64 maximum, auto& out) {
+        if (!list.is_array() || list.size() != size) return false;
+        for (size_t i = 0; i < size; ++i) {
+            const auto number = Number(list[i], maximum);
+            if (!number) return false;
+            out[i] = *number;
+        }
+        return true;
+    };
+    constexpr u64 Off = 0x10000, Mask = UINT32_MAX;
+    u64 v{};
+    if (!value.is_object() || !(value.size() == 6 || (value.size() == 7 && value.contains("list"))) ||
+        !field(value, "root_cell", 0x10000000, r.root_cell, true) || (r.root_cell & 7) ||
+        !value.contains("groups") || !value.at("groups").is_array() || value.at("groups").empty() ||
+        value.at("groups").size() > 4) return false;
+    for (const auto& group : value.at("groups")) {
+        std::array<u64, 2> pair{};
+        if (!array(group, 2, Off, pair)) return false;
+        r.groups.emplace_back(pair[0], pair[1]);
+    }
+    const auto& block = value.contains("block") ? value.at("block") : Json{};
+    if (!exact(block, {"stride", "capacity", "records", "used"}) || !field(block, "stride", Off, r.block_stride, true) ||
+        !field(block, "capacity", Off, r.block_capacity, false) || !field(block, "records", Off, r.block_records, false) ||
+        !field(block, "used", Off, r.block_used, false)) return false;
+    const auto& record = value.contains("record") ? value.at("record") : Json{};
+    if (!exact(record, {"stride", "flags", "in_use", "key", "keyed_flags", "keyed", "actor"}) ||
+        !field(record, "stride", Off, r.record_stride, true) || !field(record, "flags", Off, r.record_flags, false) ||
+        !field(record, "key", Off, r.record_key, false) || !field(record, "keyed_flags", Off, r.record_keyed, false) ||
+        !field(record, "actor", Off, r.record_actor, false) || !field(record, "in_use", Mask, v, true)) return false;
+    r.in_use = static_cast<u32>(v);
+    if (!field(record, "keyed", Mask, v, true)) return false;
+    r.keyed = static_cast<u32>(v);
+    if (value.contains("list")) {
+        const auto& list = value.at("list");
+        if (!exact(list, {"head", "sentinel", "next", "back"}) || !field(list, "head", Off, r.list_head, true) ||
+            !field(list, "sentinel", Off, r.list_sentinel, false) || !field(list, "next", Off, r.list_next, false) ||
+            !field(list, "back", Off, r.list_back, false)) return false;
+    }
+    const auto& actor = value.contains("actor") ? value.at("actor") : Json{};
+    std::array<u64, 2> live{};
+    if (!exact(actor, {"record", "lifecycle", "live", "refs", "flags", "deleting", "link"}) ||
+        !field(actor, "record", Off, r.actor_record, true) || !field(actor, "lifecycle", Off, r.actor_lifecycle, false) ||
+        !field(actor, "refs", Off, r.actor_refs, false) || !field(actor, "flags", Off, r.actor_flags, false) ||
+        !array(actor.at("live"), 2, 0xFF, live) || live[0] > live[1] || !array(actor.at("link"), 4, Off, r.link) ||
+        !field(actor, "deleting", Mask, v, true)) return false;
+    r.live_lo = static_cast<u32>(live[0]);
+    r.live_hi = static_cast<u32>(live[1]);
+    r.deleting = static_cast<u32>(v);
+    const auto& death = value.contains("death") ? value.at("death") : Json{};
+    if (!exact(death, {"chain", "actor", "state", "flags", "disabled", "reason"}) ||
+        !array(death.at("chain"), 2, Off, r.death_chain) || !field(death, "actor", Off, r.death_actor, false) ||
+        !field(death, "state", Off, r.death_state, false) || !field(death, "flags", Off, r.death_flags, false) ||
+        !field(death, "disabled", Mask, v, true)) return false;
+    r.death_disabled = static_cast<u32>(v);
+    if (!field(death, "reason", 15, v, true)) return false;
+    r.reason = static_cast<u32>(v);
+    return true;
+}
+bool Config::Cleans(u64 key) const {
+    const auto it = families.find(key);
+    return resolver && cleanup == Cleanup::Death && it != families.end() &&
+           (it->second == Family::Rupee || (it->second == Family::Heart && hearts));
 }
 bool Config::AdmitsFlag(u64 key) const {
     const auto it = families.find(key);

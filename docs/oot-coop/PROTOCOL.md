@@ -215,8 +215,16 @@ Private-profile defaults are `world.hearts=false`, `token.enabled=false`,
 `world.cleanup="flag_only"`, and `world.wallet_reconcile="off"`. The flag policy admits
 reviewed currency and token families; healing/permanent-health families require the heart
 switch as well as the existing item policy. Token benefit linkage requires its probe gate.
-There is no proved arbitrary resident-actor walk: even `cleanup="death"` logs a refusal and
-uses flags only. Loaded visual/collision disappearance still needs a live probe.
+A committed flag stops the next spawn but does not remove an already-loaded collectible (field
+probe). With `cleanup="death"` and a private `cleanup` object (the placement-record walk: root
+cell, block groups, record/actor/link/death-component offsets, all `0x????` placeholders here),
+the receiver of a live peer flag for a currency (or, with hearts, heart) key walks the game's
+placement records for that key once the flag has committed, checks the attached actor with pure
+reads (back link, lifecycle range, destroy marker, lifetime link, no delete/death pending) and
+issues the game's own death request for it (`pickup.death_wrapper`, reason from the profile) from
+the frame drain, one call per frame, never when a grant or ghost call runs; it re-walks 60
+frames later to log the outcome. `EDEN_NX2_OOT_COOP_WORLD_CLEANUP=walk` logs the walk without
+calling. Tokens are never cleaned this way (their AI waits for its own death signal).
 
 Wallet observation accepts signed deltas from the existing reviewed callers plus the private
 shop return address. Sequence/initialization and unlisted callers remain excluded. Calls on

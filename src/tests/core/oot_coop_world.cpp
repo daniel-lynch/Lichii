@@ -422,3 +422,155 @@ TEST_CASE("OoT world typed chest claims keep ambiguous events unlinked", "[core]
     claims.LocalOpen(Origin::Chest(103), 1);
     REQUIRE_FALSE(claims.End(1));
 }
+
+namespace {
+// Byte-addressed synthetic guest memory for the cleanup resolver (little endian).
+struct Bytes {
+    std::map<u64, u8> bytes;
+    void W64(u64 a, u64 v) { for (int i = 0; i < 8; ++i) bytes[a + i] = static_cast<u8>(v >> (8 * i)); }
+    void W32(u64 a, u32 v) { for (int i = 0; i < 4; ++i) bytes[a + i] = static_cast<u8>(v >> (8 * i)); }
+    bool IsValidVirtualAddressRange(u64 a, size_t size) const {
+        for (size_t i = 0; i < size; ++i) if (!bytes.contains(a + i)) return false;
+        return true;
+    }
+    u64 Read64(u64 a) const { u64 v{}; for (int i = 7; i >= 0; --i) v = v << 8 | bytes.at(a + i); return v; }
+    u32 Read32(u64 a) const { u32 v{}; for (int i = 3; i >= 0; --i) v = v << 8 | bytes.at(a + i); return v; }
+};
+
+Json ResolverJson() {
+    return {{"root_cell", "0x1000"},
+            {"groups", Json::array({Json::array({"0x10", "0x18"}), Json::array({"0x20", "0x28"})})},
+            {"block", {{"stride", "0x30"}, {"capacity", "0x0"}, {"records", "0x8"}, {"used", "0x14"}}},
+            {"record", {{"stride", "0x80"}, {"flags", "0x40"}, {"in_use", "0x10"}, {"key", "0x48"},
+                        {"keyed_flags", "0x4"}, {"keyed", "0x8"}, {"actor", "0x20"}}},
+            {"list", {{"head", "0x38"}, {"sentinel", "0x30"}, {"next", "0x8"}, {"back", "0x80"}}},
+            {"actor", {{"record", "0x50"}, {"lifecycle", "0x4"}, {"live", Json::array({2, 6})},
+                       {"refs", "0x58"}, {"flags", "0x8"}, {"deleting", "0x10000"},
+                       {"link", Json::array({"0x60", "0x10", "0x8", "0x10"})}}},
+            {"death", {{"chain", Json::array({"0x68", "0x18"})}, {"actor", "0x8"}, {"state", "0x10"},
+                       {"flags", "0x14"}, {"disabled", "0x20"}, {"reason", 4}}}};
+}
+
+// One manager at base+0x1000 -> 0x10000; group A: one block of two records; the second holds Key.
+struct World3 {
+    static constexpr u64 Base = 0x100000, Manager = 0x10000, Blocks = 0x11000, Records = 0x12000;
+    static constexpr u64 Actor = 0x14000, LinkRecord = 0x15000, Table = 0x16000, Death = 0x17000;
+    Bytes m;
+    World3() {
+        m.W64(Base + 0x1000, Manager);
+        m.W32(Manager + 0x10, 1); m.W64(Manager + 0x18, Blocks);
+        m.W32(Manager + 0x20, 0); m.W64(Manager + 0x28, 0);
+        m.W64(Manager + 0x38, Manager + 0x30); // empty list
+        m.W32(Blocks, 4); m.W64(Blocks + 8, Records); m.W32(Blocks + 0x14, 2);
+        for (u64 i = 0; i < 2; ++i) {
+            const u64 rec = Records + i * 0x80;
+            m.W32(rec + 0x4, 0x8); m.W32(rec + 0x40, 0x10); m.W64(rec + 0x48, i ? Key : 99);
+            m.W64(rec + 0x20, i ? Actor : 0);
+        }
+        m.W64(Actor + 0x50, Records + 0x80); m.W32(Actor + 0x4, 4); m.W32(Actor + 0x58, 1);
+        m.W32(Actor + 0x8, 0); m.W64(Actor + 0x60, LinkRecord); m.W32(Actor + 0x10, 77);
+        m.W64(LinkRecord + 0x8, Actor); m.W32(LinkRecord + 0x10, 77);
+        m.W64(Actor + 0x68, Table); m.W64(Table + 0x18, Death);
+        m.W64(Death + 0x8, Actor); m.W32(Death + 0x10, 0); m.W32(Death + 0x14, 0);
+    }
+};
+} // namespace
+
+TEST_CASE("OoT world cleanup resolver finds the live actor by key with pure reads", "[core][oot_coop]") {
+    World::Resolver r;
+    REQUIRE(World::DecodeResolver(ResolverJson(), r));
+    World3 w;
+    auto walk = World::Find(w.m, World3::Base, r, Key);
+    REQUIRE(walk.targets.size() == 1);
+    REQUIRE(walk.targets[0].record == World3::Records + 0x80);
+    REQUIRE(walk.targets[0].actor == World3::Actor);
+    REQUIRE(walk.targets[0].Callable());
+    REQUIRE(walk.records == 2);
+    REQUIRE_FALSE(walk.bounded);
+    REQUIRE(World::Find(w.m, World3::Base, r, 12345).targets.empty());
+    // Each failed check names itself; none is callable.
+    const auto state = [&](auto edit) {
+        World3 x;
+        edit(x.m);
+        const auto found = World::Find(x.m, World3::Base, r, Key);
+        return found.targets.empty() ? std::string{"none"} : std::string{found.targets[0].state};
+    };
+    REQUIRE(state([](Bytes& m) { m.W32(World3::Records + 0x80 + 0x40, 0); }) == "none"); // not in use
+    REQUIRE(state([](Bytes& m) { m.W64(World3::Records + 0x80 + 0x20, 0); }) == "unloaded");
+    REQUIRE(state([](Bytes& m) { m.W64(World3::Records + 0x80 + 0x20, World3::Actor | 1); }) == "detached");
+    REQUIRE(state([](Bytes& m) { m.W64(World3::Actor + 0x50, 0); }) == "back link");
+    REQUIRE(state([](Bytes& m) { m.W32(World3::Actor + 0x4, 7); }) == "lifecycle");
+    REQUIRE(state([](Bytes& m) { m.W32(World3::Actor + 0x58, 0xFFFFFFFF); }) == "destroying");
+    REQUIRE(state([](Bytes& m) { m.W32(World3::LinkRecord + 0x10, 78); }) == "link");
+    REQUIRE(state([](Bytes& m) { m.W32(World3::Actor + 0x8, 0x10000); }) == "delete requested");
+    REQUIRE(state([](Bytes& m) { m.W64(World3::Death + 0x8, 0); }) == "death component");
+    REQUIRE(state([](Bytes& m) { m.W32(World3::Death + 0x10, 0x41); }) == "death pending");
+    REQUIRE(state([](Bytes& m) { m.W32(World3::Death + 0x14, 0x20); }) == "death disabled");
+    REQUIRE(state([](Bytes& m) { m.W32(World3::Records + 0x80 + 0x4, 0); }) == "no key flag");
+    // Bounds: an implausible block count or used > capacity is skipped and reported.
+    World3 big;
+    big.m.W32(World3::Manager + 0x10, 65);
+    REQUIRE(World::Find(big.m, World3::Base, r, Key).bounded);
+    World3 used;
+    used.m.W32(World3::Blocks + 0x14, 5);
+    walk = World::Find(used.m, World3::Base, r, Key);
+    REQUIRE(walk.bounded);
+    REQUIRE(walk.targets.empty());
+    // The list is walked only when the arrays have no match: a record reached through node - back.
+    World3 listed;
+    listed.m.W64(World3::Records + 0x80 + 0x48, 5);             // the array no longer holds Key
+    const u64 rec = 0x18000, node = rec + 0x80;
+    listed.m.W32(rec + 0x4, 0x8); listed.m.W32(rec + 0x40, 0x10); listed.m.W64(rec + 0x48, Key);
+    listed.m.W64(rec + 0x20, 0);
+    listed.m.W64(World3::Manager + 0x38, node); listed.m.W64(node + 0x8, World3::Manager + 0x30);
+    walk = World::Find(listed.m, World3::Base, r, Key);
+    REQUIRE(walk.list == 1);
+    REQUIRE(walk.targets.size() == 1);
+    REQUIRE(walk.targets[0].state == "unloaded");
+    listed.m.W64(node + 0x8, node); // a cycle stops at the cap
+    REQUIRE(World::Find(listed.m, World3::Base, r, Key).bounded);
+}
+
+TEST_CASE("OoT world cleanup profile is strict and gated by family and mode", "[core][oot_coop]") {
+    World::Resolver r;
+    REQUIRE(World::DecodeResolver(ResolverJson(), r));
+    for (const char* drop : {"root_cell", "groups", "block", "record", "actor", "death"}) {
+        auto bad = ResolverJson();
+        bad.erase(drop);
+        World::Resolver x;
+        REQUIRE_FALSE(World::DecodeResolver(bad, x));
+    }
+    auto bad = ResolverJson();
+    bad["record"]["extra"] = 1;
+    World::Resolver x;
+    REQUIRE_FALSE(World::DecodeResolver(bad, x));
+    bad = ResolverJson();
+    bad["death"]["reason"] = 16;
+    REQUIRE_FALSE(World::DecodeResolver(bad, x = {}));
+    bad = ResolverJson();
+    bad["actor"]["live"] = Json::array({6, 2});
+    REQUIRE_FALSE(World::DecodeResolver(bad, x = {}));
+    bad = ResolverJson();
+    bad.erase("list");
+    REQUIRE(World::DecodeResolver(bad, x = {}));
+    REQUIRE(x.list_head == 0);
+
+    World::Config config;
+    config.families = {{Key, World::Family::Rupee}, {Partner, World::Family::TokenH}, {7, World::Family::Heart}};
+    REQUIRE_FALSE(config.Cleans(Key)); // no resolver, flag_only
+    config.resolver = r;
+    REQUIRE_FALSE(config.Cleans(Key)); // flag_only
+    config.cleanup = World::Cleanup::Death;
+    REQUIRE(config.Cleans(Key));
+    REQUIRE_FALSE(config.Cleans(Partner)); // tokens wait for their own death signal: never
+    REQUIRE_FALSE(config.Cleans(7));
+    config.hearts = true;
+    REQUIRE(config.Cleans(7));
+    REQUIRE_FALSE(config.Cleans(99));
+
+    auto fields = ProfileFields();
+    fields["cleanup"] = ResolverJson();
+    REQUIRE(DecodeProfile(fields));
+    fields["pickup"].erase("death_wrapper");
+    REQUIRE_FALSE(DecodeProfile(fields));
+}

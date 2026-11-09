@@ -466,7 +466,8 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                     if (!at) return std::nullopt;
                     profile.item_callers.push_back(*at);
                 }
-            } else if (field == "pickup" || field == "wallet" || field == "token" || field == "world") {
+            } else if (field == "pickup" || field == "wallet" || field == "token" || field == "world" ||
+                       field == "cleanup") {
                 if (!World::DecodeProfileSection(field, value, profile)) return {};
             } else if (field == "give") {
                 // Generic gives: {"body": [lo, hi], "deny_callers": [...], "per_player": [names
@@ -960,6 +961,21 @@ struct Session::Impl {
     bool world_quarantined{}, wallet_reconciled{};
     u32 world_lines{}, trap_lines{}, wallet_wait{};
     u64 pickup_traps{}; // hot-path receipt, logged now and then
+    // Loaded-collectible cleanup (guest side): keys waiting, the call in flight, its verification.
+    struct CleanupJob {
+        u64 key{}, tick{}, epoch{};
+    };
+    std::deque<CleanupJob> cleanup_jobs;
+    std::set<u64> cleanup_keys;
+    std::optional<Backend::Context> cleanup_saved;
+    struct CleanupCall {
+        u64 key{}, record{}, actor{}, tick{};
+        std::optional<u64> result;
+    };
+    std::optional<CleanupCall> cleanup_call;
+    u64 cleanup_stack{};
+    u32 cleanup_lines{};
+    bool cleanup_walk_only{};
     std::optional<World::Wallet> wallet_probe;
     std::optional<World::Wallet> wallet; // protected by mutex
     std::map<std::string, World::Wallet> peer_wallets; // protected by mutex
@@ -1406,8 +1422,10 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
                                    std::move(allowed_classes), std::move(allowed_keys),
                                    profile->wallet_hash, profile->world)} {
     impl->binding.base = base;
+    impl->cleanup_walk_only = Env("EDEN_NX2_OOT_COOP_WORLD_CLEANUP") == "walk";
     if (profile->world.cleanup == World::Cleanup::Death)
-        LOG_WARNING(Core_ARM, "OoT co-op: world cleanup remains flag_only: no verified resident actor walk");
+        LOG_INFO(Core_ARM, "OoT co-op: world cleanup {}", !profile->world.resolver ? "flag_only (no resolver in the key file)"
+                 : impl->cleanup_walk_only ? "walk only (EDEN_NX2_OOT_COOP_WORLD_CLEANUP=walk)" : "death request");
     for (const auto& [member, key] : profile->chest_members) impl->chest_bools.insert(key);
     if (!impl->allowed_classes.empty()) {
         Kernel::KProcessAddress stack{}, sentinel{};
@@ -1603,6 +1621,20 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     Impl::Backend backend{jit, memory, binding, *profile, tls, tls_ro, std::move(clear_exclusive)};
     const auto log = [](std::string_view line) { LOG_INFO(Core_ARM, "{}", line); };
     const DrainContext site{thread, 1, impl->tick, true};
+    if (binding.sentinel && pc == binding.sentinel && impl->cleanup_saved && impl->cleanup_call) {
+        const u64 result = jit.GetRegister(0);
+        if (thread != impl->frame_thread || jit.GetSP() != impl->cleanup_stack ||
+            !backend.Restore(*impl->cleanup_saved)) {
+            log(fmt::format("OoT co-op: world cleanup sentinel refused thread={} pc={:#x}", thread, pc));
+            return false;
+        }
+        impl->cleanup_saved.reset();
+        impl->cleanup_call->result = result;
+        impl->cleanup_call->tick = impl->tick;
+        log(fmt::format("OoT co-op: world cleanup death request returned w0={} key={:016x} actor={:#x}", result & 1,
+                        impl->cleanup_call->key, impl->cleanup_call->actor));
+        return true;
+    }
     if (binding.sentinel && pc == binding.sentinel && impl->ghost && impl->ghost->Calling()) {
         const u64 result = jit.GetRegister(0);
         if (thread != impl->frame_thread || jit.GetSP() != impl->ghost_stack || !impl->ghost_saved ||
@@ -1639,6 +1671,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                         Change flag{Kind::Bit, grant.origin, grant.seq, key, 1};
                         flag.source = grant.source;
                         if (!runtime.Queue(flag) && !runtime.Suppress(flag)) runtime.Invalidate();
+                        QueueCleanup(key);
                     }
                 }
             }
@@ -1849,6 +1882,9 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                 log("OoT co-op: not applied: class/key policy disabled or queue full");
                 impl->logged_class = true;
             }
+            // A live peer flag of a collectible (not a baseline): its loaded actor goes too.
+            if (change.kind == Kind::Bit && !change.origin.empty() && !impl->world_quarantined)
+                QueueCleanup(change.key);
         }
     }
     const auto send = [&](Change change, bool baseline) {
@@ -1971,8 +2007,86 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
                                                : "OoT co-op: baseline exported");
         }
     }
-    if (impl->pose_enabled) FramePose(backend, memory, log, runtime.Calling());
-    return runtime.Calling() || (impl->ghost && impl->ghost->Calling());
+    const bool cleaning = !runtime.Calling() && FrameCleanup(backend, memory, log);
+    if (impl->pose_enabled) FramePose(backend, memory, log, runtime.Calling() || cleaning);
+    return runtime.Calling() || cleaning || (impl->ghost && impl->ghost->Calling());
+}
+
+void Session::QueueCleanup(u64 key) {
+    if (!profile->world.Cleans(key) || impl->cleanup_jobs.size() >= 64 || !impl->cleanup_keys.insert(key).second) return;
+    impl->cleanup_jobs.push_back({key, impl->tick, impl->rebinds});
+}
+
+template <typename Backend, typename Log>
+bool Session::FrameCleanup(Backend& backend, Memory::Memory& memory, Log log) {
+    const auto& resolver = profile->world.resolver;
+    if (!resolver || impl->cleanup_saved || (impl->ghost && impl->ghost->Calling())) return false;
+    const auto line = [&](std::string text) {
+        if (impl->cleanup_lines < 256) {
+            ++impl->cleanup_lines;
+            log("OoT co-op: world cleanup " + text);
+        }
+    };
+    // A returned call: verify with pure reads (by key again, never the cached pointer) 60 frames on.
+    if (impl->cleanup_call) {
+        auto& call = *impl->cleanup_call;
+        if (!call.result) return false; // in flight on another path: cannot happen; wait
+        if (impl->tick - call.tick < 60) return false;
+        const auto walk = World::Find(memory, base, resolver, call.key);
+        std::string states;
+        for (const auto& target : walk.targets)
+            states += fmt::format(" {:#x}:{}", target.record, target.state);
+        line(fmt::format("verify key={:016x} w0={} flag={} records:{}", call.key, *call.result & 1,
+                         backend.ReadFlag(Change{Kind::Bit, {}, 0, call.key, 1}).value_or(false) ? 1 : 0,
+                         states.empty() ? std::string{" none"} : states));
+        const bool again = *call.result & 1 && std::any_of(walk.targets.begin(), walk.targets.end(),
+                                                           [](const auto& t) { return t.Callable(); });
+        const u64 key = call.key;
+        impl->cleanup_call.reset();
+        if (again) impl->cleanup_jobs.push_front({key, impl->tick, impl->rebinds}); // a second placement
+        return false;
+    }
+    while (!impl->cleanup_jobs.empty()) {
+        const auto job = impl->cleanup_jobs.front();
+        if (job.epoch != impl->rebinds || impl->tick - job.tick > 600 || impl->world_quarantined) {
+            line(fmt::format("key={:016x} dropped (expired or world stopped)", job.key));
+            impl->cleanup_jobs.pop_front();
+            continue;
+        }
+        // Only once the flag has committed: the record then also stops a respawn.
+        if (backend.ReadFlag(Change{Kind::Bit, {}, 0, job.key, 1}) != true) return false;
+        impl->cleanup_jobs.pop_front();
+        const auto walk = World::Find(memory, base, resolver, job.key);
+        std::string states;
+        for (const auto& target : walk.targets)
+            states += fmt::format(" {:#x}/{:#x}:{}", target.record, target.actor, target.state);
+        line(fmt::format("key={:016x} walk blocks={} records={} list={}{} targets:{}", job.key, walk.blocks,
+                         walk.records, walk.list, walk.bounded ? " (bounded)" : "",
+                         states.empty() ? std::string{" none"} : states));
+        const auto target = std::find_if(walk.targets.begin(), walk.targets.end(),
+                                         [](const auto& t) { return t.Callable(); });
+        if (target == walk.targets.end() || impl->cleanup_walk_only) continue;
+        const auto entry = backend.VerifiedEntry(profile->death_wrapper);
+        if (!entry || !backend.CallReady()) {
+            line("death request not callable (entry words or private stack)");
+            continue;
+        }
+        // Re-check right before the call: the same frame, the same reads.
+        if (!World::Check(memory, resolver, target->record).Callable()) continue;
+        auto saved = backend.Capture();
+        if (!saved) continue;
+        const u64 sp = impl->binding.stack - ItemFrame;
+        ApplyTarget call{true, false, 0, 0, *entry, impl->binding.sentinel, sp,
+                         {target->actor, resolver.reason, 0, 0, 0, 0, 0, 0}};
+        call.stores = {{sp, 0}, {sp + 8, 0}, {sp + 0x10, 0}, {sp + 0x18, 0}};
+        if (!backend.Redirect(call)) continue;
+        impl->cleanup_saved = std::move(saved);
+        impl->cleanup_stack = sp;
+        impl->cleanup_call = Impl::CleanupCall{job.key, target->record, target->actor, impl->tick, std::nullopt};
+        line(fmt::format("key={:016x} death request actor={:#x} reason={}", job.key, target->actor, resolver.reason));
+        return true;
+    }
+    return false;
 }
 
 template <typename Backend, typename Log>

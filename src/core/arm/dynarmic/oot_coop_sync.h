@@ -304,6 +304,11 @@ private:
     /// Class "pose": send our pose, draw the peers' ghosts (one call at most, after the grants).
     template <typename Backend, typename Log>
     void FramePose(Backend& backend, Memory::Memory& memory, Log log, bool grant_calling);
+    /// World cleanup (receiver): remove the loaded actor of a peer-collected key, one call at most.
+    /// True when it redirected the frame thread into the game's death request.
+    template <typename Backend, typename Log>
+    bool FrameCleanup(Backend& backend, Memory::Memory& memory, Log log);
+    void QueueCleanup(u64 key);
     std::unique_ptr<Impl> impl;
 };
 
