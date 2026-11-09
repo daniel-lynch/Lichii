@@ -22,6 +22,7 @@
 #include "common/logging.h"
 #include "common/thread.h"
 #include "core/arm/dynarmic/oot_coop_sync.h"
+#include "core/arm/dynarmic/oot_coop_teleport.h"
 #include "core/arm/dynarmic/oot_coop_ghost.h"
 #include "core/arm/dynarmic/oot_coop_runtime.h"
 #include "core/arm/dynarmic/oot_coop_ux.h"
@@ -448,6 +449,10 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                 const auto cell = Number(value, MaxModuleOffset);
                 if (!cell || !*cell || (*cell & 7)) return std::nullopt;
                 (field == "manager_cell" ? profile.manager_cell : profile.pouch_cell) = *cell;
+            } else if (field == "teleport") {
+                const auto decoded = Teleport::DecodeKeys(value);
+                if (!decoded) return std::nullopt;
+                profile.teleport = std::make_shared<const Teleport::Keys>(*decoded);
             } else if (field == "anim") {
                 const auto decoded = Anim::DecodeKeys(value);
                 if (!decoded) return std::nullopt;
@@ -770,12 +775,15 @@ Json EncodeHello(const Hello& hello) {
         packet["animation"] = {{"av", 1}, {"table_sha256", hello.animation_hash}};
     if (hello.world_wallet) packet["world_wallet"] = World::EncodeWallet(*hello.world_wallet);
     if (hello.ghost_equipment_v2) packet["ghost_equipment_v2"] = true;
+    if (hello.teleport) packet["teleport"] = 1;
     return packet;
 }
 
 bool MatchesHello(const Json& packet, const Hello& hello) {
     try {
         const u32 version = hello.animation_hash.empty() ? ProtocolVersion : 4;
+        if (hello.teleport && (!packet.contains("teleport") || !Unsigned(packet.at("teleport"), 1) || packet.at("teleport") != 1))
+            return false;
         if (!hello.animation_hash.empty() &&
             (!packet.contains("animation") ||
              !AnimationMatches(packet.at("animation"), hello.animation_hash)))
@@ -1110,6 +1118,27 @@ struct Session::Impl {
     std::optional<Backend::Context> ghost_saved;
     u64 ghost_stack{}, poses_in{}, poses_out{};
     bool logged_bad_pose{};
+    std::unique_ptr<Teleport::Controller> teleport; // all access under mutex; immutable pointer
+    Teleport::TriggerFile teleport_trigger{Env("EDEN_NX2_OOT_COOP_TELEPORT_TRIGGER")};
+    std::map<std::string, std::string, std::less<>> teleport_peers; // negotiated presence, under mutex
+    std::optional<Backend::Context> teleport_saved; // guest_mutex only
+    u64 teleport_stack{};
+    bool logged_bad_teleport{};
+    static u64 NowMs() {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count());
+    }
+    std::atomic<u64> teleport_lines{};
+    Teleport::Log TeleportLog() {
+        return [this](std::string_view line) {
+            const u64 n = teleport_lines.fetch_add(1, std::memory_order_relaxed);
+            if (n < 4096) LOG_INFO(Core_ARM, "{}", line);
+            if (n == 4096) LOG_INFO(Core_ARM, "OoT co-op: teleport receipt cap reached (4096 lines)");
+        };
+    }
+    void InvalidateTeleport(std::string_view why) {
+        std::scoped_lock lock{mutex};
+        if (teleport) teleport->Invalidate(TeleportLog(), why);
+    }
     // Relay connection attempts: the delay doubles per failed attempt (1 s .. 30 s) and resets
     // once a connection is ready. Network thread only.
     u32 attempts{}, reconnects{};
@@ -1186,6 +1215,8 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
             owner.peers.clear();
             owner.peer_wallets.clear();
             owner.animation_peers.clear();
+            owner.teleport_peers.clear();
+            if (owner.teleport) owner.teleport->Invalidate(owner.TeleportLog(), "connection lost", true);
             owner.pose_out.reset();
             owner.equipment_negotiated = false;
         }
@@ -1215,6 +1246,24 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
             if (now - self->last_receive > (self->ready ? 90s : 10s))
                 return self->Fail(self->ready ? "nothing received for 90 s" : "no handshake within 10 s");
             if (self->ready) {
+                if (self->owner.teleport) {
+                    std::deque<Teleport::Packet> packets;
+                    {
+                        std::scoped_lock lock{self->owner.mutex};
+                        auto& controller = *self->owner.teleport;
+                        const auto ms = Impl::NowMs();
+                        controller.Tick(ms, self->owner.TeleportLog());
+                        std::vector<Teleport::Peer> peers;
+                        for (const auto& [id, name] : self->owner.teleport_peers) peers.push_back({id, name});
+                        for (const auto& line : self->owner.teleport_trigger.Poll(ms)) {
+                            if (const auto target = Teleport::ResolveTrigger(line, peers))
+                                controller.Trigger(*target, ms, self->owner.TeleportLog());
+                            else self->owner.TeleportLog()("OoT co-op: teleport refused reason=unavailable (invalid or ambiguous trigger)");
+                        }
+                        packets = controller.TakeOutput();
+                    }
+                    for (const auto& packet : packets) self->Send(Teleport::EncodePacket(packet));
+                }
                 std::vector<Change> changes;
                 {
                     std::scoped_lock lock{self->owner.mutex};
@@ -1322,6 +1371,15 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                         self->handshaken = true;
                     } else if (type == "heartbeat") {
                         self->Send({{"type", "heartbeat_ack"}});
+                    } else if (type == "teleport_request" || type == "teleport_to") {
+                        const auto decoded = self->input.size() <= 512 ? Teleport::DecodePacket(*packet) : std::nullopt;
+                        if (decoded && self->owner.teleport) {
+                            std::scoped_lock lock{self->owner.mutex};
+                            self->owner.teleport->Receive(*decoded, Impl::NowMs(), self->owner.TeleportLog());
+                        } else if (!self->owner.logged_bad_teleport) {
+                            self->owner.logged_bad_teleport = true;
+                            self->owner.TeleportLog()("OoT co-op: teleport ignored malformed or unnegotiated packet");
+                        }
                     } else if (type == "pose") {
                         // Poses are never grants: a bad one is ignored, never a disconnect.
                         std::string origin;
@@ -1337,6 +1395,19 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                     } else if (type == "client_state") {
                         // A peer that went offline hides its ghost (the frame drain parks it).
                         const auto& state = packet->at("state");
+                        if (self->owner.teleport && Identity(packet->at("origin")) && state.is_object()) {
+                            const auto id = packet->at("origin").get<std::string>();
+                            std::scoped_lock lock{self->owner.mutex};
+                            const bool capable = state.contains("teleport") && Unsigned(state.at("teleport"), 1) && state.at("teleport") == 1 &&
+                                (!state.contains("online") || state.at("online") == true) && id != self->owner.hello.client_id;
+                            if (capable && state.contains("name") && state.at("name").is_string() && state.at("name").get_ref<const std::string&>().size() <= 96 &&
+                                (self->owner.teleport_peers.size() < 128 || self->owner.teleport_peers.contains(id)))
+                                self->owner.teleport_peers[id] = state.at("name").get<std::string>();
+                            else {
+                                self->owner.teleport_peers.erase(id);
+                                self->owner.teleport->PeerGone(id, self->owner.TeleportLog());
+                            }
+                        }
                         if (state.is_object() && state.contains("world_wallet")) {
                             const auto wallet = World::DecodeWallet(state.at("world_wallet"));
                             if (!wallet || !Identity(packet->at("origin"))) return self->Fail("invalid wallet baseline");
@@ -1726,6 +1797,15 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
             LOG_INFO(Core_ARM, "OoT co-op: equipment v2 enabled (sword, shield, tunic, mask; boots deferred)");
         } else LOG_WARNING(Core_ARM, "OoT co-op: equipment disabled: missing or invalid coop-equip.json");
     }
+    impl->hello.teleport = impl->pose_enabled && profile->teleport && profile->teleport->enabled &&
+        profile->anim && profile->anim->player && profile->event_got;
+    if (impl->hello.teleport) {
+        impl->teleport = std::make_unique<Teleport::Controller>(*profile->teleport);
+        LOG_INFO(Core_ARM, "OoT co-op: teleport on (same-scene experimental matrix call)");
+    } else {
+        LOG_INFO(Core_ARM, "OoT co-op: teleport off: {}", !profile->teleport || !profile->teleport->enabled ? "key-file disabled" :
+            !impl->pose_enabled ? "pose/ghost/private call memory unavailable" : "anim.player or event_got missing");
+    }
     impl->Start();
 }
 Session::~Session() = default;
@@ -1985,6 +2065,19 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     };
     const auto log = [](std::string_view line) { LOG_INFO(Core_ARM, "{}", line); };
     const DrainContext site{thread, 1, impl->tick, true};
+    if (binding.sentinel && pc == binding.sentinel && impl->teleport_saved) {
+        const u64 result = jit.GetRegister(0);
+        if (thread != impl->frame_thread || jit.GetSP() != impl->teleport_stack ||
+            !backend.Restore(*impl->teleport_saved)) {
+            log(fmt::format("OoT co-op: teleport sentinel refused thread={} pc={:#x}", thread, pc));
+            return false;
+        }
+        impl->teleport_saved.reset();
+        std::scoped_lock lock{impl->mutex};
+        impl->teleport->Returned(result, impl->TeleportLog());
+        return true;
+    }
+    if (impl->teleport_saved) return false;
     if (binding.sentinel && pc == binding.sentinel && impl->cleanup_saved && impl->cleanup_call) {
         const u64 result = jit.GetRegister(0);
         if (thread != impl->frame_thread || jit.GetSP() != impl->cleanup_stack ||
@@ -2216,6 +2309,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             OotGameDataTrace::Detail::Read64(memory, binding.base + profile->manager_cell);
         if (impl->equipment) impl->equipment->Invalidate();
         if (impl->ghost) impl->ghost->DropAll(log, "save or title: GameData moved");
+        impl->InvalidateTeleport("GameData moved");
         if (runtime.Rebind(backend, log)) {
             impl->stable_frame = false;
             impl->key_watch.clear(); // a new save epoch: re-baseline the key counts
@@ -2240,6 +2334,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     if (binding.invalid || (!bound && impl->stable_frame)) {
         if (impl->equipment) impl->equipment->Invalidate();
         if (impl->ghost) impl->ghost->DropAll(log, "GameData binding lost");
+        impl->InvalidateTeleport("binding lost");
         runtime.Invalidate();
         runtime.Frame(backend, {thread, 1, impl->tick, true}, [](Change, bool) {}, log);
         return false;
@@ -2488,7 +2583,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     }
     const bool cleaning = !runtime.Calling() && FrameCleanup(backend, memory, log);
     if (impl->pose_enabled) FramePose(backend, memory, log, runtime.Calling() || cleaning);
-    return runtime.Calling() || cleaning || (impl->ghost && impl->ghost->Calling()) ||
+    return runtime.Calling() || cleaning || impl->teleport_saved.has_value() || (impl->ghost && impl->ghost->Calling()) ||
            (impl->equipment && impl->equipment->Calling());
 }
 
@@ -2629,6 +2724,20 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
                                  peer.pose->pos}); // name: the origin, resolved by the session
         }
         impl->ux.Frame(memory, base, local.banc, local.loading, std::move(tag_peers), log);
+    }
+    if (impl->teleport) {
+        const auto sample = Teleport::ReadSample(memory, base, impl->binding.manager, *profile);
+        Teleport::Port teleport_port{
+            [&](const Player::Resident& resident) { return Player::Validate(memory, base, resident, *profile->anim->player); },
+            [&](const Player::Resident& resident, const Teleport::Packet& destination) {
+                static_assert(ItemFrame == 0x100);
+                return Teleport::Issue(memory, backend, *profile, base, impl->binding.stack,
+                    impl->binding.sentinel, resident, destination, impl->teleport_saved, impl->teleport_stack);
+            }, impl->TeleportLog()};
+        std::scoped_lock lock{impl->mutex};
+        const bool can_call = !grant_calling && !impl->cleanup_saved && !impl->ghost->Calling() &&
+            (!impl->equipment || !impl->equipment->Calling()) && !impl->teleport_saved;
+        if (impl->teleport->Frame(sample, now, can_call, teleport_port)) return;
     }
     // Grants keep priority: the one call slot of this frame is theirs when they used it.
     if (grant_calling) return;

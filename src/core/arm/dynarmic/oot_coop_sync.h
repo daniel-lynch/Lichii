@@ -133,6 +133,7 @@ struct Hello {
     std::optional<World::Wallet> world_wallet;
     std::string animation_hash; // nonempty: protocol v4, animation revision 1
     bool ghost_equipment_v2{};
+    bool teleport{};
 };
 [[nodiscard]] nlohmann::json EncodeHello(const Hello& hello);
 [[nodiscard]] bool MatchesHello(const nlohmann::json& packet, const Hello& hello);

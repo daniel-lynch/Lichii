@@ -27,6 +27,7 @@ namespace Core::OotCoop::Anim {
 struct Keys;
 }
 namespace Core::OotCoop::Equip { struct Keys; }
+namespace Core::OotCoop::Teleport { struct Keys; }
 
 namespace Kernel {
 class KProcess;
@@ -201,6 +202,7 @@ struct Profile {
     std::shared_ptr<const OotCoop::Anim::Keys> anim;
     GhostOffsets ghost; ///< Empty unless the profile has a "ghost" object
     std::shared_ptr<const OotCoop::Equip::Keys> equip;
+    std::shared_ptr<const OotCoop::Teleport::Keys> teleport;
 
     u64 SiteOffset(Point point) const {
         for (const Site& site : sites) {

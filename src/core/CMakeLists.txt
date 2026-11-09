@@ -19,6 +19,8 @@ add_library(core STATIC
     arm/dynarmic/oot_coop_player.h
     arm/dynarmic/oot_coop_equip.cpp
     arm/dynarmic/oot_coop_equip.h
+    arm/dynarmic/oot_coop_teleport.cpp
+    arm/dynarmic/oot_coop_teleport.h
     arm/dynarmic/oot_coop_ux.cpp
     arm/dynarmic/oot_coop_chest.cpp
     arm/dynarmic/oot_coop_world.cpp

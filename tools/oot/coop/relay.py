@@ -160,11 +160,13 @@ def collectible_origin(packet):
 
 def validate_hello(packet):
     fields(packet, ("type", "version", "build_id", "seed_hash", "room", "team", "client_id", "name", "policy_id"),
-           ("world_wallet", "animation", "ghost_equipment_v2"))
+           ("world_wallet", "animation", "ghost_equipment_v2", "teleport"))
     if "ghost_equipment_v2" in packet and type(packet["ghost_equipment_v2"]) is not bool:
         raise ProtocolError("expected equipment capability boolean")
     if packet["type"] != "hello" or type(packet["version"]) is not int or packet["version"] not in (LEGACY_VERSION, VERSION):
         raise ProtocolError("protocol version mismatch")
+    if "teleport" in packet:
+        integer(packet["teleport"], 1, 1)
     if "animation" in packet:
         if packet["version"] != VERSION:
             raise ProtocolError("animation needs protocol v4")
@@ -306,6 +308,42 @@ def validate_pose(packet, size=None):
         integer(packet["eqseq"], 0, (1 << 16) - 1)
     if (len(encode(packet)) - 4 if size is None else size) > MAX_POSE_FRAME:
         raise ProtocolError("pose too large")
+
+
+TELEPORT_REASONS = {"loading", "event", "pause", "state", "airborne", "scene", "busy",
+                    "unready", "disabled", "unavailable", "rate", "age"}
+
+
+def validate_teleport(packet, size=None):
+    common = ("type", "target", "request_id")
+    if packet.get("type") == "teleport_request":
+        fields(packet, common)
+    elif packet.get("type") == "teleport_to":
+        if packet.get("status") == "denied":
+            fields(packet, common + ("status", "reason"))
+            if not isinstance(packet["reason"], str) or packet["reason"] not in TELEPORT_REASONS:
+                raise ProtocolError("invalid teleport reason")
+        elif packet.get("status") == "ok":
+            fields(packet, common + ("status", "banc", "room", "pos", "yaw", "age"))
+            if not isinstance(packet["banc"], str) or not re.fullmatch(r"[A-Za-z0-9_]{1,63}", packet["banc"]):
+                raise ProtocolError("invalid teleport banc")
+            if packet["room"] is not None:
+                integer(packet["room"], 0, 255)
+            if type(packet["pos"]) is not list or len(packet["pos"]) != 3:
+                raise ProtocolError("invalid teleport position")
+            for value in packet["pos"]:
+                finite(value, MAX_POSE_COORD)
+            finite(packet["yaw"], 360)
+            if packet["age"] not in ("child", "adult"):
+                raise ProtocolError("invalid teleport age")
+        else:
+            raise ProtocolError("invalid teleport status")
+    else:
+        raise ProtocolError("invalid teleport type")
+    identifier(packet["target"])
+    integer(packet["request_id"], 1, MAX_SEQ)
+    if (size if size is not None else len(encode(packet)) - 4) > 512:
+        raise ProtocolError("teleport frame too large")
 
 
 def state_key(packet):
@@ -535,6 +573,11 @@ class Relay:
             raise ProtocolError("sender capacity reached")
         team.seen.setdefault(client_id, 0)
         client.client_id, client.room, client.team = client_id, room, team
+        client.teleport = packet.get("teleport") == 1
+        client.teleport_times = deque()
+        client.teleport_pending = {}  # id -> (target connection, creation time)
+        client.teleport_last = 0
+        client.teleport_dropped = 0
         client.version = packet["version"]
         client.animation = packet.get("animation")
         client.ghost_equipment_v2 = packet.get("ghost_equipment_v2", False)
@@ -549,6 +592,8 @@ class Relay:
             ack["animation"] = client.animation
         if "ghost_equipment_v2" in packet:
             ack["ghost_equipment_v2"] = client.ghost_equipment_v2
+        if client.teleport:
+            ack["teleport"] = 1
         client.send(ack)
         client.send(team.snapshot())
         for peer in team.clients.values():
@@ -558,9 +603,11 @@ class Relay:
 
     @staticmethod
     def send_presence(source, recipient):
-        state = {key: value for key, value in source.state.items() if key != "animation"}
+        state = {key: value for key, value in source.state.items() if key not in ("animation", "teleport")}
         if recipient.version == VERSION and source.animation is not None:
             state["animation"] = source.animation
+        if recipient.teleport and source.teleport:
+            state["teleport"] = 1
         recipient.send({"type": "client_state", "origin": source.client_id, "state": state})
 
     @staticmethod
@@ -573,6 +620,8 @@ class Relay:
         kind = packet["type"]
         if kind == "pose":
             self.pose(client, packet, size)
+        elif kind in ("teleport_request", "teleport_to"):
+            self.teleport(client, packet, size)
         elif kind in CHANGE_TYPES:
             validate_change(packet, client.client_id)
             event = client.team.accept(packet, self.deny_list)
@@ -607,6 +656,51 @@ class Relay:
                     self.send_presence(client, peer)
         else:
             raise ProtocolError("unsupported message type")
+
+    @staticmethod
+    def teleport(client, packet, size=None):
+        if not client.teleport:
+            raise ProtocolError("teleport not negotiated")
+        validate_teleport(packet, size)
+        now = asyncio.get_running_loop().time()
+        # Prune on every packet; each sender can retain at most four entries.
+        for peer in client.team.clients.values():
+            peer.teleport_pending = {n: row for n, row in peer.teleport_pending.items()
+                                     if now - row[1] < 10 and not getattr(row[0], "failed", False)
+                                     and client.team.clients.get(row[0].client_id) is row[0]}
+        n, target = packet["request_id"], packet["target"]
+        if packet["type"] == "teleport_request":
+            def deny(reason):
+                client.send({"type": "teleport_to", "origin": target, "request_id": n,
+                             "status": "denied", "reason": reason})
+            if n <= client.teleport_last:
+                client.teleport_dropped += 1
+                return
+            client.teleport_last = n
+            while client.teleport_times and now - client.teleport_times[0] >= 10:
+                client.teleport_times.popleft()
+            if len(client.teleport_times) >= 4:
+                deny("rate")
+                return
+            client.teleport_times.append(now)
+            peer = client.team.clients.get(target)
+            if peer is None or peer is client or not peer.teleport or getattr(peer, "failed", False):
+                deny("unavailable")
+                return
+            client.teleport_pending[n] = (peer, now)
+            peer.send({"type": "teleport_request", "origin": client.client_id, "request_id": n})
+        else:
+            peer = client.team.clients.get(target)
+            pending = peer.teleport_pending.get(n) if peer and peer.teleport else None
+            if pending is None or pending[0] is not client or now - pending[1] >= 10:
+                client.teleport_dropped += 1
+                return
+            forwarded = {k: v for k, v in packet.items() if k != "target"}
+            forwarded["origin"] = client.client_id
+            if len(encode(forwarded)) - 4 > 512:
+                raise ProtocolError("teleport frame too large")
+            del peer.teleport_pending[n]
+            peer.send(forwarded)
 
     @staticmethod
     def pose(client, packet, size=None):

@@ -39,7 +39,8 @@ semantics from omitted capabilities:
 | `UPDATE_ROOM_STATE` | Drop mutable owner settings. Room build, seed and policy are fixed by first join. No mid-session team migration. |
 | `PLAYER_UPDATE` | `pose` (v3): position, facing, scene (`banc`), age, loading and animation hints, plus optional negotiated equipment; best effort, forwarded to the team, never state. Joints are dropped. Like `Ship/Packets/PlayerUpdate.cpp` it is drawn only for same-scene peers. |
 | Dummy player creation/update/destruction | No packet. With class `pose` allowed, each same-scene peer is a "statue" ghost: a Link-shaped puppet actor created through the game's own actor manager and moved only by the actor's own set-transform call (no joints, animation, collision or equipment). It is parked below the map, not destroyed, when the peer leaves the scene or disconnects. `Ship/Anchor.cpp:199` refreshes remote actors; `Ship/DummyPlayer.cpp:115` gates updates on scene, online and save-loaded state. |
-| `PLAYER_SFX`, `OCARINA_SFX`, `DAMAGE_PLAYER`, `REQUEST_TELEPORT`, `TELEPORT_TO` | Drop audio, PvP and teleportation. |
+| `PLAYER_SFX`, `OCARINA_SFX`, `DAMAGE_PLAYER` | Drop audio and PvP. |
+| `REQUEST_TELEPORT`, `TELEPORT_TO` | Separate opt-in request/reply exchange; see Teleport below. |
 | `HEARTBEAT` | `heartbeat`/`heartbeat_ack`, same liveness purpose, new schema. |
 | `DISABLE_ANCHOR`, disconnect, unload | No remote disable command. Socket closure broadcasts `client_state` with `online:false`. Local session teardown cancels transport and pending applications; ghost actors are parked below the map. Anchor's `Disable()` clears clients and refreshes actors (`Ship/Anchor.cpp:23`). |
 
@@ -511,3 +512,70 @@ rejection, malformed JSON/length, split/coalesced frames, deny-list enforcement,
 pose routing without ack, malformed and oversized poses, the pose rate cap, and the fake peer's
 pose commands. Pose coalescing and the stalled-receiver drop are pure tests.
 A pure-test pass is not evidence that these real-socket tests passed.
+
+## Teleport (capability teleport=1)
+
+A client explicitly enabled by its private profile adds integer `"teleport":1` to its
+existing v3 or v4 hello. The relay echoes it in `hello_ack`; a client that asked for it
+requires the exact integer echo. The default client adds nothing. **A teleport-enabled
+client needs the updated relay:** the deployed a2dc27f27b relay rejects unknown hello
+fields. Existing v3/v4 clients without the capability continue using the same protocol.
+No baseline, grant, pose, replay, or persistent state semantics change.
+
+Client forms (identifiers and scene names here are placeholders):
+
+```json
+{"type":"teleport_request","target":"peer-b","request_id":1}
+{"type":"teleport_to","target":"peer-a","request_id":1,"status":"ok","banc":"Scene_A","room":null,"pos":[1,2,3],"yaw":90,"age":"child"}
+{"type":"teleport_to","target":"peer-a","request_id":1,"status":"denied","reason":"event"}
+```
+
+The relay replaces `target` with authenticated `origin`. Clients never supply `origin`.
+Each payload is at most 512 bytes, including when forwarded. Fields are exact: unknown,
+missing, and wrong-type fields reject. IDs are integers 1..2^53-1, increasing per sender
+connection; duplicate/older requests are dropped and counted. Targets use the ordinary
+client identifier syntax. A destination has a nonempty pose-style BancName (1..63 ASCII
+letters, digits, underscores), three finite coordinates with magnitude at most 100000,
+and finite yaw in degrees with magnitude at most 360. `age` is `child` or `adult`.
+`room` is null in this implementation; the wire reserves integers 0..255, which the
+same-scene client refuses to apply. Booleans are not integers or coordinates.
+
+Denial reasons are `loading`, `event`, `pause`, `state`, `airborne`, `scene`, `busy`,
+`unready`, `disabled`, `unavailable`, `rate`, and `age`. An unnegotiated sender's teleport
+packet is a protocol error. A request can target only another online, teleport-capable
+client on the same team in the same room. Self, absent, disconnected, other-team and
+unnegotiated targets receive a relay-generated `teleport_to` denial with `origin` set
+to the requested target and reason `unavailable`. At most four requests per sender per
+sliding ten-second window are admitted; additional requests receive `rate`.
+
+The relay records `(requester connection, target connection, request_id, time)` and
+forwards the request **only to the target**. An answer reaches the requester only if
+it matches that pending entry, is sent by that exact target connection, and is less
+than ten seconds old. Forwarding removes the entry. Well-formed unsolicited, expired,
+duplicate, wrong-sender, wrong-target and wrong-ID answers are silently dropped and
+counted (`client.teleport_dropped`), never broadcast or treated as a disconnect.
+This prevents pushing destinations to clients that have not requested them.
+
+Negotiated peers are advertised with `teleport:1` in `client_state.state` only to
+teleport-capable recipients. This field comes from the relay's hello negotiation,
+not a client's mutable presence. Legacy recipients never receive teleport packets.
+
+The client queues incoming requests and answers under the session mutex. Its frame
+drain samples the current native position, facing, age, scene, resident identity,
+controller command, event and pause state. Answers never use cached transmitted poses.
+Requests older than two seconds at the drain receive `unready`; queue overflow drops
+requests. Answers require the same conservative readiness gates as local warps, with
+separate command allowlists. Received malformed teleport packets are ignored and logged
+once by the emulator, like malformed poses.
+
+For this experimental pass, `EDEN_NX2_OOT_COOP_TELEPORT_TRIGGER=<file>` polls an append-only
+file at about 4 Hz. Append `teleport <display name>`, `teleport <client-id prefix>` (at
+least four characters), or `teleport any` (exactly one known capable peer). Names may
+contain spaces; ambiguity refuses. Existing contents at session creation are skipped;
+only complete newly appended lines are processed, with bounded reads and line lengths.
+One request may be active; another trigger logs `busy`. There is no reconnect replay.
+The requester binds a response to the requested origin/ID and a local monotonic deadline.
+A fresh destination is used once, only for the same scene and age and a reviewed local
+readiness predicate. Guest call return values are diagnostic only: arrival requires both
+native position views to converge. No cross-scene load or continuous position tracking
+is implemented.
