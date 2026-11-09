@@ -131,7 +131,7 @@ struct ControllerFixture {
                              {"actor_record", 0x110}, {"actor_id", 0x118},
                              {"model", 0x18}, {"bookkeeping", 0x200}, {"bookkeeping_stride", 8},
                              {"request_bits", 0x700}, {"error_flags", 0x704}, {"error_mask", 1},
-                             {"player_system", 0x800}});
+                             {"user_cell", 0x800}, {"user_equipment", 0x8}});
         keys->fields["actor_name"] = 0x120;
         keys->fields["lifecycle"] = 0x130;
         keys->dynamic.offset = CreateEntry;
@@ -673,4 +673,50 @@ TEST_CASE("Equipment forgets a retired owner once the game deleted it", "[core][
     REQUIRE(std::none_of(fixture.logs.begin(), fixture.logs.end(), [](const std::string& line) {
         return line.find("budget") != std::string::npos;
     }));
+}
+
+TEST_CASE("Equipment sender finds the resident player by reads and reports settled base appearance", "[core][oot_coop][equip]") {
+    ControllerFixture fixture;
+    auto& memory = fixture.memory;
+    constexpr u64 Q = 0x20000, Player = 0x21000, Holder = 0x22000, E = 0x23000, Record = 0x24000, Name = 0x25000;
+    memory.Write(ControllerFixture::Base + 0x800, Q, 8);
+    memory.Write(Q + 8, E, 8);
+    memory.Write(E + 0x28, Player, 8);
+    memory.Write(Player + 0x100, Holder, 8);
+    memory.Write(Holder + 0x20, E, 8);
+    memory.Write(Player + 0x110, Record, 8);
+    memory.Write(Player + 0x118, 0x77, 4);
+    memory.Write(Player + 0x120, Name, 8);
+    memory.Write(Player + 0x130, 4, 4);
+    memory.Write(Record, Player, 8);
+    memory.Write(Record + 8, 0x77, 4);
+    memory.Text(Name, "SyntheticYoung");
+    for (const auto& slot : fixture.keys->slots) {
+        memory.Write(E + slot.link, 0, 8);
+        memory.Write(E + slot.link + 8, 0xffffffff, 4);
+        memory.Write(E + slot.handle, 0, 8);
+        memory.Write(E + 0x200 + slot.create * 8, 0, 8);
+    }
+    memory.Write(E + 0x700, 0, 4);
+    memory.Write(E + 0x704, 0, 4);
+    fixture.root.desired.reset(); // no ghost work: only the sender runs
+    const auto frame = [&](bool send) {
+        if (fixture.controller->Frame(fixture.port, {fixture.root}, fixture.root.token.scene, true, send, true))
+            fixture.controller->Returned(fixture.port, 2);
+    };
+    for (unsigned i = 0; i < 200; ++i) frame(false);
+    REQUIRE_FALSE(fixture.controller->Local(true)); // never sampled before negotiation
+    REQUIRE(fixture.calls.empty());
+    for (unsigned i = 0; i < 200; ++i) frame(true);
+    REQUIRE(fixture.calls.empty()); // no weapon children: no native state query, pure reads only
+    const auto packet = fixture.controller->Local(true);
+    REQUIRE(packet);
+    REQUIRE(packet->word == 0x10000000U); // none/none, base clothes, default head, child
+    REQUIRE_FALSE(fixture.controller->Local(false)); // contradicts the outer age
+    REQUIRE(std::count_if(fixture.logs.begin(), fixture.logs.end(), [](const std::string& line) {
+        return line.find("local player") != std::string::npos;
+    }) == 1);
+    memory.Text(Name, "SomeoneElse");
+    for (unsigned i = 0; i < 100; ++i) frame(true);
+    REQUIRE_FALSE(fixture.controller->Local(true));
 }

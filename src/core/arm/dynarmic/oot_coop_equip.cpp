@@ -82,7 +82,7 @@ constexpr std::string_view Fields[] = {
     "lifecycle_lo", "lifecycle_hi", "request_bits", "bookkeeping", "bookkeeping_stride", "error_flags",
     "error_mask", "manager_cell", "ring_indices", "ring_capacity", "ring_start", "ring_count",
     "pair_count", "pairs", "pair_stride", "pair_child", "guard", "guard_mask",
-    "player_system", "registry", "registry_count", "registry_min", "managers", "resident"};
+    "user_cell", "user_equipment"};
 }
 
 std::optional<u32> Pack(const Appearance& value) {
@@ -160,9 +160,9 @@ std::shared_ptr<const Keys> DecodeKeys(const Json& j) {
             out = {*l, *h, static_cast<u32>(*c), static_cast<u32>(*d), static_cast<u32>(*m)};
         }
         const auto& entries = j.at("entries");
-        if (!entries.is_object() || entries.size() != 6) return {};
+        if (!entries.is_object() || entries.size() != 5) return {};
         for (auto [name, entry] : {std::pair{"dynamic", &k->dynamic}, {"static", &k->statik},
-             {"draw", &k->draw}, {"sheathe", &k->sheathe}, {"state", &k->state}, {"select_player", &k->select_player}}) {
+             {"draw", &k->draw}, {"sheathe", &k->sheathe}, {"state", &k->state}}) {
             const auto& e = entries.at(name);
             const auto at = Number(e.at("at"), 0x10000000);
             const auto& words = e.at("words");
@@ -195,7 +195,9 @@ std::optional<Names> DecodeNames(const Json& j) {
     try {
         Names n;
         if (j.at("schema") != 1 || !j.at("rows").is_array() || j.at("rows").size() > 64) return {};
-        for (size_t i = 0; i < 2; ++i) { n.players[i] = j.at("players").at(i).get<std::string>(); if (!SafeName(n.players[i])) return {}; }
+        const auto& players = j.at("players");
+        if (!players.is_array() || players.empty() || players.size() > 2) return {};
+        for (const auto& name : players) { n.players.push_back(name.get<std::string>()); if (!SafeName(n.players.back())) return {}; }
         std::set<std::tuple<Slot, u8, u8>> seen;
         for (const auto& row : j.at("rows")) {
             const auto s = SlotByName(row.at("slot").get<std::string>());
@@ -497,9 +499,11 @@ std::optional<Packet> Controller::Local(bool child) const {
     return local_packet;
 }
 
-bool Controller::Frame(Port& p, const std::vector<Root>& roots, std::string_view scene_, bool eligible, bool send) {
+bool Controller::Frame(Port& p, const std::vector<Root>& roots, std::string_view scene_, bool eligible, bool send,
+                       std::optional<bool> child) {
     if (Calling() || !keys->enabled) return false;
     ++tick;
+    local_child = child;
     if (scene != scene_) { Invalidate(); scene = scene_; }
     if (!eligible || !send) { player.reset(); local_packet.reset(); local_stage = 0; }
     const auto root_of = [&](const Tree& tree) -> const Root* {
@@ -624,32 +628,46 @@ bool Controller::park(Port& p) {
     return false;
 }
 
+// The resident player is found by pure reads: the pouch manager's registered EquipmentUser and its
+// owner backlink, validated like any actor (record backlink, generation, lifecycle, holder -> E).
+std::optional<Child> Controller::resident(const Port& p) const {
+    const auto& k = *keys;
+    const auto q = p.r64(base + k.Get("user_cell"));
+    const auto e = q && *q ? p.r64(*q + k.Get("user_equipment")) : std::nullopt;
+    const auto actor = e && *e ? p.r64(*e + k.Get("owner")) : std::nullopt;
+    if (!actor || !*actor || equipment(p, *actor, false) != e) return {};
+    const auto record = p.r64(*actor + k.Get("actor_record"));
+    const auto generation = p.r32(*actor + k.Get("actor_id"));
+    const auto life = p.r32(*actor + k.Get("lifecycle"));
+    const auto np = p.r64(*actor + k.Get("actor_name"));
+    if (!record || !*record || !generation || p.r64(*record + k.Get("record_actor")) != actor ||
+        p.r32(*record + k.Get("record_id")) != generation || !life ||
+        (*life >= k.Get("lifecycle_lo") && *life <= k.Get("lifecycle_hi")) || !np) return {};
+    const auto name = Text(p, *np);
+    if (!name || std::none_of(names.players.begin(), names.players.end(), [&](const std::string& n) { return *name == n; }))
+        return {};
+    return Child{0, *record, *actor, *np, *generation, *name};
+}
 bool Controller::sender(Port& p) {
     const auto& k = *keys;
-    if (local_stage && (!player || ReadLink(p, k, player->link, &*player) != player ||
-                        equipment(p, player->actor, false) != player_equipment)) {
+    if (local_stage && (!player || resident(p) != player || equipment(p, player->actor, false) != player_equipment)) {
         local_stage = 0; player.reset(); local_packet.reset(); absent_samples = {};
     }
     if (!local_stage) {
         if (tick - local_tick < SampleEvery) return false;
         local_tick = tick;
-        // The resident player link stays valid while its record/generation/name hold: select it
-        // natively only when that check fails, and refresh it every Reselect updates.
-        if (player && tick - select_tick < Reselect && ReadLink(p, k, player->link, &*player) == player &&
-            equipment(p, player->actor, false) == player_equipment) {
-            snapshot(p);
-            return false;
+        const auto found = resident(p);
+        const auto e = found ? equipment(p, found->actor, false) : std::nullopt;
+        if (!found || !e) { player.reset(); local_packet.reset(); return false; }
+        if (player != found || player_equipment != *e) {
+            absent_samples = {}; local_children = {};
+            p.log(fmt::format("OoT co-op: equipment local player actor={:#x} id={:#x} name={} E={:#x}",
+                found->actor, found->generation, std::string_view{found->name}, *e));
         }
-        const auto system = p.r64(base + k.Get("player_system"));
-        const auto registry = system && *system ? p.r64(*system + k.Get("registry")) : std::nullopt;
-        const auto count = registry && *registry ? p.r32(*registry + k.Get("registry_count")) : std::nullopt;
-        const auto managers = registry && *registry ? p.r64(*registry + k.Get("managers")) : std::nullopt;
-        const auto resident = managers && *managers ? p.r64(*managers + k.Get("resident")) : std::nullopt;
-        if (!count || *count < k.Get("registry_min") || *count > 4096 || !resident || !*resident) {
-            local_packet.reset(); return false;
-        }
-        select_tick = tick;
-        return start(p, k.select_player, {*resident}, {Call::Select});
+        player = found;
+        player_equipment = *e;
+        snapshot(p);
+        return false;
     }
     if (local_stage <= 2) {
         const size_t si = local_stage - 1;
@@ -657,7 +675,7 @@ bool Controller::sender(Port& p) {
         return start(p, k.state, {player_equipment, k.slots[si].dynamic},
                      {Call::LocalState, 0, si, {}, {}, local_children[si]});
     }
-    bool consistent = player && ReadLink(p, k, player->link) == player;
+    bool consistent = player && resident(p) == player;
     for (size_t i = 0; i < SlotCount; ++i) {
         if (ReadLink(p, k, player_equipment + k.slots[i].link) != local_children[i]) consistent = false;
     }
@@ -669,7 +687,8 @@ bool Controller::sender(Port& p) {
 }
 void Controller::snapshot(Port& p) {
     const auto& k = *keys;
-    local = {}; local.age = player->name == names.players[0] ? 0 : 1;
+    // The actor name does not encode age on this build; the age is the local pose's (GameData) one.
+    local = {}; local.age = local_child ? (*local_child ? 0 : 1) : 3;
     Token token; token.actor = player->actor; token.equipment = player_equipment;
     std::array<u8*, 5> ids{&local.sword, &local.shield, &local.tunic, &local.boots, &local.mask};
     for (size_t i = 0; i < SlotCount; ++i) {
@@ -713,28 +732,11 @@ void Controller::Returned(Port& p, u64 result) {
     const auto& k = *keys;
     if (done.call == Call::Park) return;
     if (!done.accept) {
-        if (done.call == Call::Select || done.call == Call::LocalState) { local_packet.reset(); local_stage = 0; }
+        if (done.call == Call::LocalState) { local_packet.reset(); local_stage = 0; }
         return; // a work result is never accepted out of context; the next observation re-reads E
     }
-    if (done.call == Call::Select) {
-        const auto found = ReadLink(p, k, result);
-        if (!found || (found->name != names.players[0] && found->name != names.players[1])) {
-            player.reset(); local_packet.reset(); return;
-        }
-        const auto e = equipment(p, found->actor, false);
-        if (!e) { player.reset(); local_packet.reset(); return; }
-        if (player != found || player_equipment != *e) {
-            absent_samples = {}; local_children = {};
-            p.log(fmt::format("OoT co-op: equipment local player actor={:#x} id={:#x} name={} E={:#x}",
-                found->actor, found->generation, std::string_view{found->name}, *e));
-        }
-        player = found;
-        player_equipment = *e;
-        snapshot(p);
-        return;
-    }
     if (done.call == Call::LocalState) {
-        if (!player || ReadLink(p, k, player->link) != player ||
+        if (!player || resident(p) != player ||
             equipment(p, player->actor, false) != player_equipment || !done.child ||
             ReadLink(p, k, done.child->link) != done.child ||
             !Related(p, k, base, player->actor, done.child->actor)) {

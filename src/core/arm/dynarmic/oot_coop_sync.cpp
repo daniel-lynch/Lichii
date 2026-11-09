@@ -1836,7 +1836,8 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
         }
         auto equipment_port = port.EquipmentPort();
         const bool called = impl->equipment->Frame(equipment_port, roots, local.banc,
-            !local.loading && !local.banc.empty(), impl->equipment_negotiated);
+            !local.loading && !local.banc.empty(), impl->equipment_negotiated,
+            local.banc.empty() ? std::nullopt : std::optional<bool>{local.child});
         for (const auto& slot : impl->ghost->Slots()) {
             if (slot.actor && impl->equipment->Blocked(slot.actor, slot.generation))
                 impl->ghost->RetireEquipment(slot.actor, impl->equipment->Recreate(slot.actor, slot.generation));

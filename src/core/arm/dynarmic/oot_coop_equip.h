@@ -43,7 +43,7 @@ struct SlotKeys { u64 link{}, handle{}; u32 create{}, dynamic{}, request_mask{};
 struct Keys {
     std::map<std::string, u64, std::less<>> fields;
     std::array<SlotKeys, SlotCount> slots;
-    OotGameDataTrace::Entry dynamic, statik, draw, sheathe, state, select_player;
+    OotGameDataTrace::Entry dynamic, statik, draw, sheathe, state;
     bool enabled{}, recreate_none{};
     std::array<u64, 5> dynamic_arguments{}, static_arguments{};
     u64 Get(std::string_view field) const { return fields.at(std::string{field}); }
@@ -55,7 +55,7 @@ struct Name {
     std::string source, target, sheath;
 };
 struct Names {
-    std::array<std::string, 2> players;
+    std::vector<std::string> players; ///< accepted resident player actor names
     std::vector<Name> rows;
     const Name* Find(Slot slot, u8 id, u8 age) const;
     u8 Identify(Slot slot, std::string_view name, u8 age) const;
@@ -156,7 +156,6 @@ inline constexpr size_t MaxTrees = 8;        ///< Live plus recently retired own
 inline constexpr u64 RetireWindow = 600;     ///< Eligible updates a retired owner's children are parked
 inline constexpr size_t MaxChildren = 16;    ///< Validated children remembered per owner
 inline constexpr u64 SampleEvery = 8;        ///< Updates between local appearance samples
-inline constexpr u64 Reselect = 600;         ///< Updates before the resident player is selected again
 class Controller {
 public:
     Controller(std::shared_ptr<const Keys> keys, Names names, OotGameDataTrace::GhostOffsets ghost,
@@ -165,7 +164,7 @@ public:
     /// One update. `eligible`: the local scene is ready. `send`: the relay negotiated the
     /// capability (the local player is sampled only then). True when a call was started.
     bool Frame(Port& port, const std::vector<Root>& roots, std::string_view scene, bool eligible,
-               bool send = true);
+               bool send = true, std::optional<bool> child = {});
     void Returned(Port& port, u64 result);
     void CheckContext(const std::vector<Root>& roots, std::string_view scene, bool eligible);
     std::optional<Packet> Local(bool child) const;
@@ -186,7 +185,7 @@ private:
         bool retired{}, recreate{}, none_logged{}, boots_logged{};
         u64 retired_tick{};
     };
-    enum class Call { None, Select, LocalState, Work, Park };
+    enum class Call { None, LocalState, Work, Park };
     struct Pending {
         Call call{};
         u64 tree{};
@@ -200,7 +199,8 @@ private:
     Names names;
     OotGameDataTrace::GhostOffsets ghost;
     NameTable table;
-    u64 base{}, epoch{1}, tick{}, local_tick{}, select_tick{}, next_tree{1};
+    u64 base{}, epoch{1}, tick{}, local_tick{}, next_tree{1};
+    std::optional<bool> local_child;
     std::string scene;
     std::vector<Tree> trees;
     bool budget_logged{};
@@ -222,6 +222,7 @@ private:
     void retire(Port& port, Tree& tree, bool recreate, std::string_view reason);
     void remember(Tree& tree, const Child& child);
     bool park(Port& port);
+    std::optional<Child> resident(const Port& port) const;
     bool sender(Port& port);
     void snapshot(Port& port);
     void dump(Port& port, const Tree& tree, std::string_view reason) const;
