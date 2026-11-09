@@ -91,7 +91,8 @@ class ClientSim:
             await self.close()
             raise ValueError(self.ack.get("reason", "handshake refused"))
         if (self.ack.get("version") != self.hello["version"] or
-                self.ack.get("animation") != self.hello.get("animation")):
+                self.ack.get("animation") != self.hello.get("animation") or
+                ("teleport" in self.hello and (type(self.ack.get("teleport")) is not int or self.ack["teleport"] != 1))):
             await self.close()
             raise ValueError("animation handshake mismatch")
         if self.hello.get("quest") == 1 and (type(self.ack.get("quest")) is not int or self.ack["quest"] != 1):

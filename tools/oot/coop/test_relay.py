@@ -1891,5 +1891,238 @@ class LedgerTCPTests(unittest.IsolatedAsyncioTestCase):
             await peer.close()
 
 
+class TeleportTests(unittest.TestCase):
+    memory_server = ProtocolTests.memory_server
+    queued = staticmethod(ProtocolTests.queued)
+    drain = staticmethod(ProtocolTests.drain)
+
+    def setUp(self):
+        self.server = self.memory_server()
+        self.a = self.peer("aaaa", teleport=True)
+        self.b = self.peer("bbbb", teleport=True)
+        self.c = self.peer("cccc", teleport=True)
+        self.legacy = self.peer("dddd", teleport=False)
+        self.clear()
+
+    def peer(self, name, teleport=True, **kwargs):
+        p = relay.Client(None, SimpleNamespace(close=lambda: None))
+        hello = client_sim.ClientSim(name, **kwargs).hello
+        if teleport:
+            hello["teleport"] = 1
+        self.server.join(p, hello)
+        return p
+
+    def clear(self):
+        for p in (self.a, self.b, self.c, self.legacy):
+            self.drain(p)
+
+    def request(self, n=1, target="bbbb", sender=None):
+        self.server.receive(sender or self.a, {"type": "teleport_request", "target": target, "request_id": n})
+
+    @staticmethod
+    def answer(n=1, **changes):
+        return dict({"type": "teleport_to", "target": "aaaa", "request_id": n, "status": "ok",
+                     "banc": "Field_A", "room": None, "pos": [1, 2, 3], "yaw": 90, "age": "child"}, **changes)
+
+    def test_negotiation_echo_and_strict_revision(self):
+        p = self.peer("eeee")
+        self.assertEqual(self.queued(p)[0]["teleport"], 1)
+        p = self.peer("ffff", teleport=False)
+        self.assertNotIn("teleport", self.queued(p)[0])
+        for bad in (True, False, 0, 2, "1", 1.0, None):
+            h = client_sim.ClientSim("gggg").hello
+            h["teleport"] = bad
+            with self.subTest(bad=bad), self.assertRaises(relay.ProtocolError):
+                relay.validate_hello(h)
+
+    def test_unnegotiated_both_packets_error(self):
+        for packet in ({"type": "teleport_request", "target": "bbbb", "request_id": 1}, self.answer()):
+            with self.assertRaisesRegex(relay.ProtocolError, "teleport not negotiated"):
+                self.server.receive(self.legacy, packet)
+
+    def test_request_and_answer_only_to_addressed_clients(self):
+        self.request()
+        self.assertEqual(self.queued(self.b), [{"type": "teleport_request", "origin": "aaaa", "request_id": 1}])
+        for p in (self.a, self.c, self.legacy):
+            self.assertEqual(self.queued(p), [])
+        self.clear()
+        self.server.receive(self.b, self.answer())
+        expected = self.answer(); del expected["target"]; expected["origin"] = "bbbb"
+        self.assertEqual(self.queued(self.a), [expected])
+        for p in (self.b, self.c, self.legacy):
+            self.assertEqual(self.queued(p), [])
+
+    def test_unavailable_self_offline_other_team_and_unnegotiated(self):
+        self.peer("other", team="elsewhere")
+        for n, target in enumerate(("aaaa", "missing", "other", "dddd"), 1):
+            self.request(n, target)
+            self.assertEqual(self.drain(self.a), [{"type": "teleport_to", "origin": target,
+                "request_id": n, "status": "denied", "reason": "unavailable"}])
+        self.assertEqual(self.queued(self.legacy), [])
+
+    def test_rate_limit_and_window(self):
+        for n in range(1, 6):
+            self.request(n)
+        self.assertEqual(len(self.queued(self.b)), 4)
+        self.assertEqual(self.queued(self.a)[0]["reason"], "rate")
+        self.now = 10
+        self.clear(); self.request(6)
+        self.assertEqual(len(self.queued(self.b)), 1)
+        self.assertEqual(len(self.a.teleport_pending), 1)
+
+    def test_unsolicited_expired_duplicate_wrong_sender_dropped(self):
+        self.server.receive(self.b, self.answer())
+        self.assertEqual(self.b.teleport_dropped, 1)
+        self.request(); self.clear()
+        self.server.receive(self.c, self.answer())
+        self.server.receive(self.b, self.answer(target="cccc"))
+        self.server.receive(self.b, self.answer(n=2))
+        self.assertEqual(self.queued(self.a), [])
+        self.server.receive(self.b, self.answer())
+        self.assertEqual(len(self.drain(self.a)), 1)
+        self.server.receive(self.b, self.answer())
+        self.assertEqual(self.queued(self.a), [])
+        self.request(2); self.clear(); self.now = 10
+        self.server.receive(self.b, self.answer(2))
+        self.assertEqual(self.queued(self.a), [])
+        self.assertEqual(self.b.teleport_dropped, 5)
+        self.assertFalse(self.b.failed)
+
+    def test_denied_answer_forwarded_once(self):
+        self.request(); self.clear()
+        packet = {"type": "teleport_to", "target": "aaaa", "request_id": 1,
+                  "status": "denied", "reason": "event"}
+        self.server.receive(self.b, packet); self.server.receive(self.b, packet)
+        replies = self.queued(self.a)
+        self.assertEqual(len(replies), 1); self.assertEqual(replies[0]["reason"], "event")
+        self.assertEqual(replies[0]["origin"], "bbbb"); self.assertNotIn("target", replies[0])
+
+    def test_pending_bound_to_connection_and_team(self):
+        self.request(); self.clear()
+        old = self.b
+        self.a.team.clients.pop("bbbb")
+        self.b = self.peer("bbbb")
+        self.clear(); self.server.receive(self.b, self.answer())
+        self.assertEqual(self.queued(self.a), [])
+        other = self.peer("bbbb", team="elsewhere")
+        self.server.receive(other, self.answer())
+        self.assertEqual(self.queued(self.a), [])
+        self.assertEqual(old.teleport_dropped, 0)
+
+    def test_duplicate_request_does_not_replace_pending(self):
+        self.request(); self.request(target="cccc")
+        self.assertEqual(len(self.queued(self.b)), 1); self.assertEqual(self.queued(self.c), [])
+        self.assertEqual(self.a.teleport_dropped, 1)
+
+    def test_malformed_fields_rejected(self):
+        good = self.answer()
+        bads = ({"origin": "forged"}, {"target": "bad id"}, {"target": ""}, {"target": 1},
+                {"request_id": 0}, {"request_id": 1 << 53}, {"request_id": True}, {"request_id": 1.0},
+                {"status": "other"}, {"status": []}, {"banc": "bad/path"}, {"banc": ""},
+                {"banc": "a" * 64}, {"banc": None}, {"room": -1}, {"room": 256}, {"room": True},
+                {"room": 1.0}, {"pos": [1, 2]}, {"pos": [True, 2, 3]}, {"pos": [math.nan, 0, 0]},
+                {"pos": [100001, 0, 0]}, {"yaw": 361}, {"yaw": math.inf}, {"yaw": False},
+                {"age": "other"}, {"age": None}, {"extra": 1})
+        for delta in bads:
+            with self.subTest(delta=delta), self.assertRaises(relay.ProtocolError):
+                relay.validate_teleport(dict(good, **delta))
+        for field in good:
+            bad = dict(good); del bad[field]
+            with self.subTest(field=field), self.assertRaises(relay.ProtocolError):
+                relay.validate_teleport(bad)
+        with self.assertRaises(relay.ProtocolError):
+            relay.validate_teleport(good, 513)
+        for reason in ("other", [], None, 5):
+            with self.assertRaises(relay.ProtocolError):
+                relay.validate_teleport({"type": "teleport_to", "target": "aaaa", "request_id": 1,
+                                        "status": "denied", "reason": reason})
+        relay.validate_teleport(self.answer(room=0))
+        relay.validate_teleport(self.answer(room=255))
+        relay.validate_teleport(self.answer(n=relay.MAX_SEQ))
+
+    def test_request_fields_and_disabled_target_connection(self):
+        good = {"type": "teleport_request", "target": "bbbb", "request_id": 1}
+        for delta in ({"origin": "forged"}, {"target": None}, {"request_id": 0}, {"status": "ok"}):
+            with self.assertRaises(relay.ProtocolError):
+                relay.validate_teleport(dict(good, **delta))
+        for field in good:
+            bad = dict(good); del bad[field]
+            with self.assertRaises(relay.ProtocolError):
+                relay.validate_teleport(bad)
+        self.b.failed = True
+        self.request()
+        self.assertEqual(self.queued(self.a)[0]["reason"], "unavailable")
+
+    def test_capability_is_authenticated_and_not_leaked_to_legacy(self):
+        self.server.receive(self.legacy, {"type": "client_state", "state": {"name": "Legacy", "teleport": 1}})
+        self.assertNotIn("teleport", self.queued(self.a)[-1]["state"])
+        self.clear()
+        self.server.receive(self.a, {"type": "client_state", "state": {"name": "A", "teleport": 0}})
+        self.assertEqual(self.queued(self.b)[-1]["state"]["teleport"], 1)
+        self.assertNotIn("teleport", self.queued(self.legacy)[-1]["state"])
+        v4 = self.peer("v444", teleport=False, animation={"av": 1, "table_sha256": "a" * 64})
+        self.clear(); self.drain(v4)
+        self.request(); self.server.receive(self.b, self.answer())
+        self.assertEqual(self.queued(v4), [])
+        self.assertEqual(self.queued(self.legacy), [])
+
+
+class TeleportPeerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_answers_last_sent_pose_silent_denied_and_no_pose(self):
+        peer = fake_peer.FakePeer(teleport=True)
+        sent, inbound = [], asyncio.Queue()
+        async def send(packet):
+            sent.append(packet)
+        async def receive(timeout=0):
+            return await inbound.get()
+        peer.client.send, peer.client.receive = send, receive
+        task = asyncio.create_task(peer.listen())
+        async def request(n):
+            await inbound.put({"type": "teleport_request", "origin": "aaaa", "request_id": n})
+            await asyncio.sleep(0)
+        try:
+            await request(1)
+            self.assertEqual(sent[-1]["reason"], "unready")
+            await peer.send_pose("Field_A", True, [1, 2, 3], 45)
+            await peer.send_pose("Field_A", False, [4, 5, 6], -90)
+            await request(2)
+            self.assertEqual(sent[-1]["pos"], [4, 5, 6]); self.assertEqual(sent[-1]["yaw"], -90)
+            self.assertEqual(sent[-1]["age"], "adult")
+            await peer.send_pose("Field_A", False, [4, 5, 6], -90, loading=True)
+            await request(3)
+            self.assertEqual(sent[-1]["reason"], "loading")
+            await peer.command("tp-answer deny event"); await request(4)
+            self.assertEqual(sent[-1]["reason"], "event")
+            await peer.command("tp-answer silent"); count = len(sent); await request(5)
+            self.assertEqual(len(sent), count)
+            await peer.command("tp-answer ok"); await request(5)
+            self.assertEqual(len(sent), count)  # duplicate suppressed even after silent mode
+            self.assertTrue((await peer.command("tp-log"))["teleport_log"])
+            self.assertNotIn("teleport", fake_peer.FakePeer().client.hello)
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+    async def test_request_result_and_timeout(self):
+        peer = fake_peer.FakePeer(teleport=True)
+        sent = []
+        async def send(packet):
+            sent.append(packet)
+        async def wait(match, timeout, since):
+            answer = {"type": "teleport_to", "origin": "aaaa", "request_id": peer.tp_seq,
+                      "status": "denied", "reason": "event"}
+            self.assertTrue(match(answer)); self.assertEqual(timeout, 5)
+            return answer
+        peer.client.send, peer.wait = send, wait
+        result = await peer.command("tp-request aaaa")
+        self.assertEqual(result["teleport_to"]["reason"], "event")
+        async def expired(*args):
+            raise TimeoutError
+        peer.wait = expired
+        self.assertEqual(await peer.command("tp-request aaaa"), {"teleport_to": "timeout"})
+        self.assertEqual([p["request_id"] for p in sent], [1, 2])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
