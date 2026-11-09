@@ -204,6 +204,15 @@ frame drain. The ghost is parked below the map when the peer leaves the scene or
 (`client_state` with `online:false`). Grants keep priority in the drain's one guest call per
 frame; a pose only ever moves a ghost and never changes a save.
 
+Reconnects: a dropped or refused relay connection is logged with its reason (`relay connection
+lost (<why>; N peer(s) dropped); reconnecting in S s (attempt N)`), retried after 1, 2, 4 .. 30 s
+(reset once a connection is ready), and a successful one logs `relay reconnected (#N)`. Every new
+connection repeats the handshake, the `team_state` baseline and the unacknowledged outgoing
+changes, exactly like the first one. Peers' ghosts park while the relay is gone and return with
+their next pose. Peer presence is logged: `peer <id> online (first pose ...)` and `peer <id>
+offline (relay)`. The relay refuses a client id that it still holds open, so after a half-open
+drop the reconnect succeeds once the relay's idle timeout (90 s) has closed the old connection.
+
 ## Pre-existing saves and restart reconciliation
 
 The desired baseline is the **union of verified permanent true flags**, never one

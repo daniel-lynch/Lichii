@@ -270,7 +270,7 @@ struct PeerView {
     std::optional<Pose> pose;
 };
 
-enum class GhostOp { None, Create, Get, Release, Move, Play, Alpha };
+enum class GhostOp { None, Create, Get, Release, Move, Play, Alpha, Tint };
 
 /// Per-peer puppet state machine. One synthetic call at most per frame, and only when the grant
 /// drain has not started one. Port:
@@ -296,6 +296,13 @@ public:
         bool adult_fallback{}; ///< Adult peer, child puppet (no adult puppet in the profile)
         bool fallback{};       ///< The primary puppet's create failed: the fallback is in use
         bool alpha_done{};
+        bool tint_done{};
+        bool placed{};         ///< At least one set-transform since it went live
+        bool abandon{};        ///< The watchdog gave up on it: park it once, then re-create
+        u32 abandons{};        ///< Watchdog re-creates in this scene (bounded)
+        u32 watch_bad{}, hide_bad{};
+        u64 watch_tick{}, absent_since{};
+        std::optional<u32> hide_seen; ///< Last hide-reason byte logged
         std::string played;    ///< Pose category whose command was last played ("" = none yet)
         u32 played_seq{};
         bool play_logged{};
@@ -303,6 +310,12 @@ public:
     static constexpr u64 SlotSize = 0x200;
     static constexpr u64 CreateRetry = 1800; ///< frames after a refused/failed create
     static constexpr float ParkY = -10000.0f;
+    static constexpr u64 StatusEvery = 1800;  ///< frames between status lines per ghost
+    static constexpr u64 WatchEvery = 30;     ///< frames between watchdog reads
+    static constexpr u32 WatchStrikes = 3;    ///< consecutive bad reads before a re-create
+    static constexpr u32 AbandonLimit = 4;    ///< watchdog re-creates per slot per scene
+    static constexpr float WatchFar = 2.0f;   ///< metres between drawn and read-back position
+    static constexpr u64 OrphanAfter = 600;   ///< frames a slot's peer is gone before reuse
 
     GhostDriver(const OotGameDataTrace::GhostOffsets& g_, u64 base_) : g{g_}, base{base_} {}
 
@@ -326,13 +339,40 @@ public:
         if (Calling() || !block) return false;
         ++tick;
         const bool ready = !local.banc.empty() && !local.loading;
-        // Assign slots to peers with a pose; a peer keeps its slot while it is listed.
+        // How long each slot's peer has been missing from the list (relay gone, peer offline).
+        for (auto& slot : slots) {
+            if (slot.origin.empty()) continue;
+            const bool listed = std::any_of(peers.begin(), peers.end(),
+                                            [&](const PeerView& p) { return p.origin == slot.origin; });
+            if (listed) slot.absent_since = 0;
+            else if (!slot.absent_since) slot.absent_since = tick;
+        }
+        // Assign slots to peers with a pose; a peer keeps its slot while it is listed. A peer
+        // with no slot takes a free one, else a live ghost whose peer has been gone a while (a
+        // peer that came back with a new identity, e.g. after restarting): the actor is kept.
         for (const auto& peer : peers) {
             if (!peer.pose || Find(peer.origin)) continue;
+            Slot* free = nullptr;
             for (auto& slot : slots) {
                 if (slot.origin.empty()) {
-                    slot = Slot{};
+                    free = &slot;
+                    break;
+                }
+            }
+            if (free) {
+                *free = Slot{};
+                free->origin = peer.origin;
+                Line(log, *free, "assigned (new peer)");
+                continue;
+            }
+            for (auto& slot : slots) {
+                if (slot.state == State::Live && slot.absent_since && tick - slot.absent_since >= OrphanAfter) {
+                    Line(log, slot, fmt::format("reassigned to peer {} (its peer is gone; actor kept)",
+                                                peer.origin.substr(0, 8)));
                     slot.origin = peer.origin;
+                    slot.absent_since = 0;
+                    slot.played.clear();
+                    slot.play_logged = false;
                     break;
                 }
             }
@@ -345,10 +385,14 @@ public:
                                             local.loading ? "loading" : "changed"));
                 slot.state = State::None;
                 slot.actor = 0;
+                slot.abandons = 0; // a new scene: the watchdog may re-create again
             } else if (const auto why = Dead(port, slot)) {
                 Drop(log, slot, *why);
+            } else {
+                Watch(port, slot, log);
             }
         }
+        if (tick % StatusEvery == 0) Status(port, local, peers, log);
         for (size_t n = 0; n < GhostSlots; ++n) {
             const size_t i = (next + n) % GhostSlots;
             auto& slot = slots[i];
@@ -391,11 +435,29 @@ public:
             }
             // Live
             std::array<float, 4> target;
+            if (slot.abandon) {
+                // The watchdog gave up on this actor: park it out of sight once, then forget it.
+                if (const auto why = Dead(port, slot)) {
+                    Drop(log, slot, *why);
+                    continue;
+                }
+                const std::array<float, 4> park{slot.drawn[0], ParkY, slot.drawn[2], slot.drawn[3]};
+                const auto m = YawMatrix({park[0], park[1], park[2]}, park[3]);
+                if (port.Write(at + 0x10, m.data(), sizeof(m)) &&
+                    Start(port, g.set_mtx, {slot.actor, at + 0x10, 0}, i, GhostOp::Move))
+                    return true;
+                Abandoned(log, slot);
+                continue;
+            }
+            if (visible && !slot.parked && g.alpha_set && !slot.fallback && !slot.alpha_done &&
+                g.alpha_percent >= 100) {
+                slot.alpha_done = true; // opaque: the puppet's own alpha is already 1
+                Line(log, slot, "alpha 100% (opaque, no call)");
+            }
             if (visible && !slot.parked && g.alpha_set && !slot.fallback && !slot.alpha_done) {
                 slot.alpha_done = true; // once per puppet, whatever the result
-                const auto holder = port.R64(slot.actor + g.alpha_chain[0]);
-                const auto model = holder && *holder ? port.R64(*holder + g.alpha_chain[1]) : std::nullopt;
-                if (model && *model) {
+                const auto model = Model(port, slot);
+                if (model) {
                     if (const auto why = Dead(port, slot)) {
                         Drop(log, slot, *why);
                         continue;
@@ -405,6 +467,24 @@ public:
                         return true;
                 } else {
                     Line(log, slot, "alpha skipped (no model component)");
+                }
+                continue;
+            }
+            if (visible && !slot.parked && g.tint_set && !g.tint_colors.empty() && !slot.fallback &&
+                !slot.tint_done) {
+                slot.tint_done = true; // once per puppet, whatever the result
+                const auto model = Model(port, slot);
+                const auto& rgba = g.tint_colors[i % g.tint_colors.size()];
+                if (model) {
+                    if (const auto why = Dead(port, slot)) {
+                        Drop(log, slot, *why);
+                        continue;
+                    }
+                    if (port.Write(at + TintAt, rgba.data(), sizeof(rgba)) &&
+                        Start(port, g.tint_set, {*model, at + TintAt}, i, GhostOp::Tint))
+                        return true;
+                } else {
+                    Line(log, slot, "tint skipped (no model component)");
                 }
                 continue;
             }
@@ -448,13 +528,22 @@ public:
                                    std::fabs(target[2] - slot.drawn[2]) > 0.01f ||
                                    std::fabs(target[3] - slot.drawn[3]) > 0.5f;
                 if (!moved) continue;
-                if (slot.parked) Line(log, slot, "shown");
+                if (slot.parked)
+                    Line(log, slot, fmt::format("shown (peer in {} at ({:.2f}, {:.2f}, {:.2f}))", p.banc, p.pos[0],
+                                                p.pos[1], p.pos[2]));
                 slot.parked = false;
             } else {
                 if (slot.parked) continue;
                 target = {slot.drawn[0], ParkY, slot.drawn[2], slot.drawn[3]};
-                Line(log, slot, fmt::format("parked ({})", !peer ? "peer gone" : !peer->pose ? "peer stale"
-                                                              : peer->pose->loading ? "peer loading" : "peer elsewhere"));
+                const std::string why =
+                    !peer         ? std::string{"peer gone"}
+                    : !peer->pose ? std::string{"peer stale"}
+                    : !ready      ? fmt::format("local scene {} not ready", local.banc.empty() ? "-" : local.banc)
+                    : peer->pose->loading
+                        ? fmt::format("peer loading {}", peer->pose->banc.empty() ? "-" : peer->pose->banc)
+                        : fmt::format("peer elsewhere: peer in {}, we are in {}",
+                                      peer->pose->banc.empty() ? "-" : peer->pose->banc, local.banc);
+                Line(log, slot, fmt::format("parked ({})", why));
                 slot.parked = true;
             }
             // Re-check right before the call: the checks above ran for every slot first. This is
@@ -468,6 +557,7 @@ public:
             if (!port.Write(at + 0x10, m.data(), sizeof(m))) continue;
             if (Start(port, g.set_mtx, {slot.actor, at + 0x10, 0}, i, GhostOp::Move)) {
                 slot.drawn = target;
+                slot.placed = true;
                 ++moves;
                 return true;
             }
@@ -527,6 +617,12 @@ public:
             slot.played.clear();
             slot.play_logged = false;
             slot.alpha_done = false;
+            slot.tint_done = false;
+            slot.placed = false;
+            slot.abandon = false;
+            slot.watch_bad = slot.hide_bad = 0;
+            slot.watch_tick = tick;
+            slot.hide_seen.reset();
             Line(log, slot, fmt::format("live actor={:#x} generation={:#x}", x0, *generation));
             break;
         }
@@ -538,6 +634,12 @@ public:
         case GhostOp::Alpha:
             Line(log, slot, fmt::format("alpha {}%", g.alpha_percent));
             break;
+        case GhostOp::Tint: {
+            const auto& c = g.tint_colors[active % g.tint_colors.size()];
+            Line(log, slot, fmt::format("tint ({:.2f}, {:.2f}, {:.2f}, {:.2f}) set (C10: reaches the eyes only)",
+                                        c[0], c[1], c[2], c[3]));
+            break;
+        }
         case GhostOp::Play:
             if (!(x0 & 1) || !slot.play_logged) {
                 Line(log, slot, fmt::format("anim {} -> {} w0={}", slot.played, slot_name, x0 & 1));
@@ -545,6 +647,8 @@ public:
             }
             break;
         case GhostOp::Move:
+            if (slot.abandon) Abandoned(log, slot);
+            break;
         case GhostOp::None:
             break;
         }
@@ -553,6 +657,118 @@ public:
     u64 Moves() const { return moves; }
 
 private:
+    static constexpr u64 TintAt = 0x1E0; ///< 16 bytes of RGBA in the slot
+
+    std::optional<u64> Model(Port& port, const Slot& slot) {
+        if (!g.alpha_chain[0]) return {};
+        const auto holder = port.R64(slot.actor + g.alpha_chain[0]);
+        const auto model = holder && *holder ? port.R64(*holder + g.alpha_chain[1]) : std::nullopt;
+        return model && *model ? model : std::nullopt;
+    }
+    std::optional<std::array<float, 3>> ActorPos(Port& port, const Slot& slot) {
+        if (!g.watch_pos) return {};
+        std::array<float, 3> p{};
+        for (size_t k = 0; k < 3; ++k) {
+            const auto bits = port.R32(slot.actor + g.watch_pos + k * 4);
+            if (!bits) return {};
+            p[k] = GhostDetail::Float(*bits);
+            if (!std::isfinite(p[k])) return {};
+        }
+        return p;
+    }
+    std::optional<u32> HideByte(Port& port, const Slot& slot) {
+        if (!g.watch_hide) return {};
+        const auto model = Model(port, slot);
+        const auto word = model ? port.R32(*model + (g.watch_hide & ~u64{3})) : std::nullopt;
+        if (!word) return {};
+        return (*word >> ((g.watch_hide & 3) * 8)) & 0xFF;
+    }
+    /// Pure reads on a validated live actor: does it still follow set-transform, is the game
+    /// hiding it while we show it? Three strikes in a row abandon it (park, then re-create).
+    template <typename Log>
+    void Watch(Port& port, Slot& slot, Log log) {
+        if (slot.abandon || slot.abandons >= AbandonLimit || tick - slot.watch_tick < WatchEvery) return;
+        slot.watch_tick = tick;
+        if (const auto hide = HideByte(port, slot);
+            hide && (slot.hide_seen ? *slot.hide_seen != *hide : *hide != 0)) {
+            Line(log, slot, fmt::format("hide byte {:#04x} -> {:#04x}{}", slot.hide_seen.value_or(0), *hide,
+                                        slot.parked ? " (parked)" : ""));
+            slot.hide_seen = *hide;
+        } else if (hide) {
+            slot.hide_seen = *hide;
+        }
+        if (slot.parked || !slot.placed) {
+            slot.watch_bad = slot.hide_bad = 0;
+            return;
+        }
+        if (const auto p = ActorPos(port, slot)) {
+            const float dx = (*p)[0] - slot.drawn[0], dy = (*p)[1] - slot.drawn[1], dz = (*p)[2] - slot.drawn[2];
+            slot.watch_bad = std::sqrt(dx * dx + dy * dy + dz * dz) > WatchFar ? slot.watch_bad + 1 : 0;
+            if (slot.watch_bad >= WatchStrikes) {
+                Abandon(log, slot, fmt::format("actor at ({:.2f}, {:.2f}, {:.2f}) but drawn at ({:.2f}, {:.2f}, "
+                                               "{:.2f}): it stopped following set-transform",
+                                               (*p)[0], (*p)[1], (*p)[2], slot.drawn[0], slot.drawn[1],
+                                               slot.drawn[2]));
+                return;
+            }
+        }
+        if (const auto hide = HideByte(port, slot)) {
+            slot.hide_bad = *hide ? slot.hide_bad + 1 : 0;
+            if (slot.hide_bad >= WatchStrikes)
+                Abandon(log, slot, fmt::format("the game hides it (hide byte {:#04x}) while it should show", *hide));
+        }
+    }
+    template <typename Log>
+    void Abandon(Log log, Slot& slot, std::string_view why) {
+        ++slot.abandons;
+        Line(log, slot, fmt::format("watchdog: {}; parking it and re-creating ({} of {})", why, slot.abandons,
+                                    AbandonLimit));
+        slot.abandon = true;
+    }
+    template <typename Log>
+    void Abandoned(Log log, Slot& slot) {
+        Line(log, slot, "abandoned (parked); re-creating");
+        slot.state = State::None;
+        slot.actor = 0;
+        slot.abandon = false;
+        slot.retry_tick = tick + 30;
+    }
+    template <typename Log>
+    void Status(Port& port, const Pose& local, const std::vector<PeerView>& peers, Log log) {
+        for (auto& slot : slots) {
+            if (slot.origin.empty() || status_lines >= 2000) continue;
+            ++status_lines;
+            const PeerView* peer = nullptr;
+            for (const auto& p : peers) if (p.origin == slot.origin) peer = &p;
+            std::string peer_text = !peer ? "gone" : !peer->pose ? "stale" : "";
+            if (peer && peer->pose) {
+                const auto& p = *peer->pose;
+                const float dx = p.pos[0] - local.pos[0], dz = p.pos[2] - local.pos[2];
+                peer_text = fmt::format("{}{} ({:.2f}, {:.2f}, {:.2f}) {} dist={:.1f}", p.banc.empty() ? "-" : p.banc,
+                                        p.loading ? " loading" : "", p.pos[0], p.pos[1], p.pos[2], p.anim,
+                                        std::sqrt(dx * dx + dz * dz));
+            }
+            std::string actor_text;
+            if (slot.state == State::Live) {
+                const auto p = ActorPos(port, slot);
+                const auto hide = HideByte(port, slot);
+                const auto life = g.lifecycle ? port.R32(slot.actor + g.lifecycle) : std::nullopt;
+                actor_text = fmt::format(" drawn=({:.2f}, {:.2f}, {:.2f}){}{}{}{}", slot.drawn[0], slot.drawn[1],
+                                         slot.drawn[2],
+                                         p ? fmt::format(" actor=({:.2f}, {:.2f}, {:.2f})", (*p)[0], (*p)[1], (*p)[2])
+                                           : std::string{},
+                                         hide ? fmt::format(" hide={:#04x}", *hide) : std::string{},
+                                         life ? fmt::format(" lifecycle={}", *life) : std::string{},
+                                         slot.parked ? " parked" : " shown");
+            }
+            Line(log, slot, fmt::format("status peer={} local={}{} state={}{}", peer_text,
+                                        local.banc.empty() ? "-" : local.banc, local.loading ? " loading" : "",
+                                        slot.state == State::Live ? "live" : slot.state == State::Pending ? "pending"
+                                                                                                         : "none",
+                                        actor_text),
+                 true);
+        }
+    }
     Slot* Find(std::string_view origin) {
         for (auto& slot : slots) if (slot.origin == origin) return &slot;
         return nullptr;
@@ -640,18 +856,24 @@ private:
         return true;
     }
     template <typename Log>
-    void Line(Log log, const Slot& slot, std::string_view what) {
-        if (lines >= 512) return;
-        ++lines;
+    void Line(Log log, const Slot& slot, std::string_view what, bool status = false) {
+        if (!status) {
+            if (lines >= LineLimit) return;
+            if (++lines == LineLimit) {
+                log("OoT co-op: ghost log cap reached; later transitions are not logged");
+                return;
+            }
+        }
         log(fmt::format("OoT co-op: ghost {} {}", slot.origin.substr(0, 8), what));
     }
+    static constexpr u64 LineLimit = 4096;
 
     const OotGameDataTrace::GhostOffsets& g;
     const u64 base;
     std::array<Slot, GhostSlots> slots{};
     GhostOp op{GhostOp::None};
     size_t active{}, next{};
-    u64 tick{}, moves{}, lines{};
+    u64 tick{}, moves{}, lines{}, status_lines{};
     std::string slot_name;
 };
 

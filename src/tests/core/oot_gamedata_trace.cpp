@@ -12,6 +12,7 @@
 #include "common/nx2_event_trace.h"
 #include "core/arm/dynarmic/oot_gamedata_trace.h"
 #include "core/arm/dynarmic/oot_coop_runtime.h"
+#include "core/arm/dynarmic/oot_coop_sync.h"
 #include "tests/core/oot_test_profile.h"
 #include "dynarmic/interface/A64/a64.h"
 
@@ -943,4 +944,42 @@ TEST_CASE("OoT co-op reads the opener's give call and forwards only reviewed cal
     REQUIRE_FALSE(Coop::ReadItemCall(jit, env, Base, P::Get(), sentinel, true).forward);
     REQUIRE(Trace::CoopPoint(Point::ItemGive));
     REQUIRE(Trace::Identify(P::Get(), Base, Base + P::ItemEntry, Trace::Pacibsp) == Point::ItemGive);
+
+    // World pickups: a second caller, forwarded only for the profile's shared names.
+    auto profile = P::Get();
+    const u64 pickup = P::ItemCaller + 0x80;
+    profile.pickup_callers = {pickup};
+    profile.pickup_names = {"Item_Test_Bomb"};
+    jit.SetRegister(3, 1);
+    jit.SetRegister(30, Base + pickup);
+    call = Coop::ReadItemCall(jit, env, Base, profile, sentinel, true);
+    REQUIRE(call.forward);
+    REQUIRE(call.pickup);
+    REQUIRE(call.line.find("item-give observed (pickup) name=Item_Test_Bomb") != std::string::npos);
+    REQUIRE_FALSE(Coop::ReadItemCall(jit, env, Base, profile, sentinel, false).forward);
+    // A per-player pickup (a heart, an ammo drop): logged, never forwarded.
+    profile.pickup_names = {"Obj_Shared_Only"};
+    call = Coop::ReadItemCall(jit, env, Base, profile, sentinel, true);
+    REQUIRE_FALSE(call.forward);
+    REQUIRE(call.line.find("item-give seen (pickup, per-player)") != std::string::npos);
+    // The shared names apply to the pickup callers only, never to an arbitrary caller.
+    profile.pickup_names = {"Item_Test_Bomb"};
+    jit.SetRegister(30, Base + pickup + 4);
+    REQUIRE_FALSE(Coop::ReadItemCall(jit, env, Base, profile, sentinel, true).forward);
+    // Key file: {"pickup": {"callers": [...], "names": [...]}}, both required and bounded.
+    const auto load = [](const nlohmann::json& pickup_object) {
+        return Coop::DecodeProfile(
+            nlohmann::json{{"offsets", {{"0123456789ABCDEF0123456789ABCDEF01234567",
+                                         {{"manager_cell", "0x200000"}, {"pickup", pickup_object}}}}}},
+            "0123456789ABCDEF0123456789ABCDEF01234567");
+    };
+    const auto loaded = load({{"callers", {"0xC6F7E8"}}, {"names", {"Obj_Rupee_Green"}}});
+    REQUIRE(loaded);
+    REQUIRE(loaded->pickup_callers == std::vector<u64>{0xC6F7E8});
+    REQUIRE(loaded->pickup_names == std::vector<std::string>{"Obj_Rupee_Green"});
+    REQUIRE_FALSE(load({{"callers", {"0xC6F7E8"}}}));
+    REQUIRE_FALSE(load({{"callers", nlohmann::json::array()}, {"names", {"Obj_Rupee_Green"}}}));
+    REQUIRE_FALSE(load({{"callers", {"0xC6F7E9"}}, {"names", {"Obj_Rupee_Green"}}}));
+    REQUIRE_FALSE(load({{"callers", {"0xC6F7E8"}}, {"names", {"../x"}}}));
+    REQUIRE_FALSE(load({{"callers", {"0xC6F7E8"}}, {"names", {"Obj_Rupee_Green"}}, {"extra", 1}}));
 }

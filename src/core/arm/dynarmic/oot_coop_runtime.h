@@ -40,6 +40,7 @@ struct GuestBinding {
 struct ItemCall {
     Change change;
     bool forward{}; ///< A give from a reviewed caller (a chest's event flow), well formed
+    bool pickup{};  ///< From a world-pickup caller (forwarded only for the profile's names)
     bool replay{};  ///< Our own synthetic call (returns to the sentinel): never forwarded
     std::string line;
 };
@@ -75,12 +76,23 @@ ItemCall ReadItemCall(Jit& jit, Memory& memory, u64 base, const OotGameDataTrace
     call.replay = sentinel && lr == sentinel;
     const bool reviewed = std::find(profile.item_callers.begin(), profile.item_callers.end(), caller) !=
                           profile.item_callers.end();
+    // World pickups: the collect path's give, forwarded only for the names that are shared
+    // (rupees, permanent items); hearts, magic and ammo drops stay per-player.
+    call.pickup = std::find(profile.pickup_callers.begin(), profile.pickup_callers.end(), caller) !=
+                  profile.pickup_callers.end();
+    const bool shared_pickup = call.pickup && std::find(profile.pickup_names.begin(),
+                                                        profile.pickup_names.end(), name) !=
+                                                  profile.pickup_names.end();
     // Only calls whose small arguments survive the packing are forwarded.
     const bool valid = ValidItem(call.change) && w2 < 16 && x4 < 16 && w5 <= 0xFF && w6 <= 0xFF &&
                        w7 <= 0xFF && stack.has_value();
-    call.forward = item_class && !call.replay && reviewed && valid;
-    call.line = fmt::format("item-give {} name={} category={} count={} get={} flags={},{},{},{} lr={}",
+    call.forward = item_class && !call.replay && (reviewed || shared_pickup) && valid;
+    call.line = fmt::format("item-give {}{} name={} category={} count={} get={} flags={},{},{},{} lr={}",
                             call.replay ? "replayed" : call.forward ? "observed" : "seen",
+                            !call.pickup || call.replay ? ""
+                            : call.forward              ? " (pickup)"
+                            : shared_pickup             ? " (pickup, not forwarded)"
+                                                        : " (pickup, per-player)",
                             name.empty() ? "?" : name, w2, static_cast<s32>(jit.GetRegister(3)), x4,
                             w5, w6, w7, args.flags[3],
                             call.replay ? std::string{"sentinel"} : fmt::format("main+{:#x}", caller));

@@ -447,6 +447,22 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                     if (!at) return std::nullopt;
                     profile.item_callers.push_back(*at);
                 }
+            } else if (field == "pickup") {
+                // World pickups: {"callers": [return offsets], "names": [exact item names]}.
+                if (!value.is_object() || value.size() != 2 || !value.contains("callers") ||
+                    !value.contains("names") || !value.at("callers").is_array() ||
+                    !value.at("names").is_array() || value.at("callers").empty() ||
+                    value.at("callers").size() > 8 || value.at("names").empty() ||
+                    value.at("names").size() > 32) return std::nullopt;
+                for (const auto& item : value.at("callers")) {
+                    const auto at = offset(item);
+                    if (!at) return std::nullopt;
+                    profile.pickup_callers.push_back(*at);
+                }
+                for (const auto& item : value.at("names")) {
+                    if (!item.is_string() || !ItemName(item.get<std::string>())) return std::nullopt;
+                    profile.pickup_names.push_back(item.get<std::string>());
+                }
             } else if (field == "event_got") {
                 const auto cell = Number(value, MaxModuleOffset);
                 if (!cell || !*cell || (*cell & 7)) return std::nullopt;
@@ -544,6 +560,35 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                             }
                         }
                         if (!ghost.alpha_set || !ghost.alpha_chain[0] || !ghost.alpha_percent) return std::nullopt;
+                    } else if (name == "tint") {
+                        // {"set": entry, "colors": [[r, g, b, a], ...]}: one colour per slot.
+                        if (!item.is_object() || item.size() != 2 || !item.contains("set") ||
+                            !item.contains("colors") || !item.at("colors").is_array() ||
+                            item.at("colors").empty() || item.at("colors").size() > GhostSlots)
+                            return std::nullopt;
+                        const auto decoded = entry(item.at("set"));
+                        if (!decoded) return std::nullopt;
+                        ghost.tint_set = *decoded;
+                        for (const auto& color : item.at("colors")) {
+                            if (!color.is_array() || color.size() != 4) return std::nullopt;
+                            std::array<float, 4> rgba{};
+                            for (size_t i = 0; i < 4; ++i) {
+                                if (!color[i].is_number()) return std::nullopt;
+                                const double v = color[i].get<double>();
+                                if (!(v >= 0.0 && v <= 1.0)) return std::nullopt;
+                                rgba[i] = static_cast<float>(v);
+                            }
+                            ghost.tint_colors.push_back(rgba);
+                        }
+                    } else if (name == "watch") {
+                        // {"pos": actor field, "hide": model component byte}; either may be absent.
+                        if (!item.is_object() || item.empty()) return std::nullopt;
+                        for (const auto& [key, part] : item.items()) {
+                            const auto number = Number(part, 0xFFFF);
+                            if ((key != "pos" && key != "hide") || !number || !*number) return std::nullopt;
+                            if (key == "pos" && (*number & 3)) return std::nullopt;
+                            (key == "pos" ? ghost.watch_pos : ghost.watch_hide) = *number;
+                        }
                     } else if (name == "anim") {
                         if (!item.is_object()) return std::nullopt;
                         for (const auto& [key, part] : item.items()) {
@@ -569,6 +614,8 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                     }
                 }
                 if (!ghost.Valid()) return std::nullopt;
+                // The tint and the hide read go through the model component the alpha chain names.
+                if ((ghost.tint_set || ghost.watch_hide) && !ghost.alpha_chain[0]) return std::nullopt;
             } else {
                 return std::nullopt;
             }
@@ -802,9 +849,18 @@ struct Session::Impl {
     std::optional<Backend::Context> ghost_saved;
     u64 ghost_stack{}, poses_in{}, poses_out{};
     bool logged_bad_pose{};
+    // Relay connection attempts: the delay doubles per failed attempt (1 s .. 30 s) and resets
+    // once a connection is ready. Network thread only.
+    u32 attempts{}, reconnects{};
+    bool ever_ready{};
+    std::chrono::seconds backoff{1};
     void OnPose(std::string origin, Pose pose) {
         std::scoped_lock lock{mutex};
-        if (!peers.contains(origin) && peers.size() >= 16) return;
+        if (!peers.contains(origin)) {
+            if (peers.size() >= 16) return;
+            LOG_INFO(Core_ARM, "OoT co-op: peer {} online (first pose: banc={} loading={})", origin.substr(0, 8),
+                     pose.banc.empty() ? "-" : pose.banc, pose.loading);
+        }
         auto& track = peers[origin];
         track.online = true;
         track.Add(static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -826,29 +882,39 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
         resolver.async_resolve(owner.endpoint.host, std::to_string(owner.endpoint.port),
             [self = shared_from_this()](auto error, tcp::resolver::results_type endpoints) {
                 if (self->failed) return;
-                if (error) return self->Fail();
+                if (error) return self->Fail("resolve: " + error.message());
                 boost::asio::async_connect(self->socket, endpoints,
                     [self](auto connect_error, const tcp::endpoint&) {
                         if (self->failed) return;
-                        if (connect_error) return self->Fail();
+                        if (connect_error) return self->Fail("connect: " + connect_error.message());
                         self->Send(EncodeHello(self->owner.hello));
                         self->Read();
                     });
             });
     }
 
-    void Fail() {
+    void Fail(std::string_view why = "connection error") {
         if (std::exchange(failed, true)) return;
+        size_t dropped = 0;
         {
             // No relay, no live peers: their ghosts park until poses arrive again.
             std::scoped_lock lock{owner.mutex};
+            dropped = owner.peers.size();
             owner.peers.clear();
         }
         resolver.cancel();
         boost::system::error_code ignored;
         socket.close(ignored);
         timer.cancel();
-        owner.retry.expires_after(2s);
+        if (owner.stopped) return;
+        const auto delay = owner.backoff;
+        ++owner.attempts;
+        if (owner.attempts <= 64 || owner.attempts % 100 == 0) {
+            LOG_WARNING(Core_ARM, "OoT co-op: relay {} ({}; {} peer(s) dropped); reconnecting in {} s (attempt {})",
+                        ready ? "connection lost" : "connect failed", why, dropped, delay.count(), owner.attempts);
+        }
+        owner.backoff = std::min(owner.backoff * 2, std::chrono::seconds{30});
+        owner.retry.expires_after(delay);
         owner.retry.async_wait([self = shared_from_this()](auto error) {
             if (!error && !self->owner.stopped) self->owner.Connect();
         });
@@ -859,7 +925,8 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
         timer.async_wait([self = shared_from_this()](auto error) {
             if (error || self->failed) return;
             const auto now = Clock::now();
-            if (now - self->last_receive > (self->ready ? 90s : 10s)) return self->Fail();
+            if (now - self->last_receive > (self->ready ? 90s : 10s))
+                return self->Fail(self->ready ? "nothing received for 90 s" : "no handshake within 10 s");
             if (self->ready) {
                 std::vector<Change> changes;
                 {
@@ -901,7 +968,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
 
     void Send(const Json& packet) {
         if (failed) return;
-        if (output.size() >= QueueLimit) return Fail();
+        if (output.size() >= QueueLimit) return Fail("send queue full");
         const bool writing = !output.empty();
         output.push_back(EncodeFrame(packet));
         if (!writing) Write();
@@ -911,7 +978,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
         boost::asio::async_write(socket, boost::asio::buffer(output.front()),
             [self = shared_from_this()](auto error, size_t) {
                 if (self->failed) return;
-                if (error) return self->Fail();
+                if (error) return self->Fail("write: " + error.message());
                 self->output.pop_front();
                 if (!self->output.empty()) self->Write();
             });
@@ -921,9 +988,9 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
         boost::asio::async_read(socket, boost::asio::buffer(header),
             [self = shared_from_this()](auto error, size_t) {
                 if (self->failed) return;
-                if (error) return self->Fail();
+                if (error) return self->Fail("read: " + error.message());
                 const auto length = FrameLength({self->header.data(), self->header.size()});
-                if (!length) return self->Fail();
+                if (!length) return self->Fail("bad frame length");
                 self->input.resize(*length);
                 self->ReadPayload();
             });
@@ -933,16 +1000,19 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
         boost::asio::async_read(socket, boost::asio::buffer(input),
             [self = shared_from_this()](auto error, size_t) {
                 if (self->failed) return;
-                if (error) return self->Fail();
+                if (error) return self->Fail("read: " + error.message());
                 const auto packet = DecodeLine(self->input);
-                if (!packet) return self->Fail();
+                if (!packet) return self->Fail("malformed packet");
                 try {
                     self->last_receive = Clock::now();
                     const auto type = packet->at("type").get<std::string>();
                     if (!self->handshaken) {
                         if (!MatchesHello(*packet, self->owner.hello)) {
                             LOG_WARNING(Core_ARM, "OoT co-op: handshake refused or mismatched");
-                            return self->Fail();
+                            return self->Fail(type == "error" && packet->contains("reason") &&
+                                                      packet->at("reason").is_string()
+                                                  ? "handshake: " + packet->at("reason").get<std::string>().substr(0, 80)
+                                                  : std::string{"handshake mismatch"});
                         }
                         self->handshaken = true;
                     } else if (type == "heartbeat") {
@@ -963,17 +1033,19 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                         if (packet->contains("origin") && packet->at("origin").is_string() &&
                             state.is_object() && state.contains("online") &&
                             state.at("online") == false) {
+                            const auto origin = packet->at("origin").get<std::string>();
                             std::scoped_lock lock{self->owner.mutex};
-                            self->owner.peers.erase(packet->at("origin").get<std::string>());
+                            if (self->owner.peers.erase(origin))
+                                LOG_INFO(Core_ARM, "OoT co-op: peer {} offline (relay)", origin.substr(0, 8));
                         }
                     } else if (type == "heartbeat_ack") {
                         // Liveness only.
                     } else if (type == "error") {
                         LOG_WARNING(Core_ARM, "OoT co-op: relay rejected a packet");
-                        return self->Fail();
+                        return self->Fail("relay error");
                     } else {
-                        if (!self->ready && type != "team_state") return self->Fail();
-                        if (!self->owner.Receive(*packet)) return self->Fail();
+                        if (!self->ready && type != "team_state") return self->Fail("no baseline first");
+                        if (!self->owner.Receive(*packet)) return self->Fail("rejected " + type);
                         if (self->baseline_requested && type == "team_state") {
                             LOG_INFO(Core_ARM, "OoT co-op: baseline exchanged");
                         }
@@ -981,11 +1053,21 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
                             self->ready = true;
                             self->Send({{"type", "client_state"},
                                         {"state", {{"apply_enabled", !self->owner.allowed_classes.empty()}}}});
-                            LOG_INFO(Core_ARM, "OoT co-op: relay connected; frame drain class-gated");
+                            const bool again = std::exchange(self->owner.ever_ready, true);
+                            if (again) ++self->owner.reconnects;
+                            self->owner.attempts = 0;
+                            self->owner.backoff = std::chrono::seconds{1};
+                            if (again) {
+                                LOG_INFO(Core_ARM, "OoT co-op: relay reconnected (#{}); baseline re-exchanged, "
+                                                   "ghosts return with the peers' next poses",
+                                         self->owner.reconnects);
+                            } else {
+                                LOG_INFO(Core_ARM, "OoT co-op: relay connected; frame drain class-gated");
+                            }
                         }
                     }
                 } catch (const std::exception&) {
-                    return self->Fail();
+                    return self->Fail("bad packet");
                 }
                 self->Read();
             });
