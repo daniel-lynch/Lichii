@@ -7,6 +7,7 @@
 #include <iterator>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QFileDialog>
 #include <QFormLayout>
@@ -145,6 +146,12 @@ ConfigureCoop::ConfigureCoop(u64 title_id_, QtConfig* config_, QWidget* parent)
                 const QDir dir(shots);
                 window()->grab().save(dir.filePath(QStringLiteral("page-dialog.png")));
                 page->grab().save(dir.filePath(QStringLiteral("page-full.png")));
+                // EDEN_NX2_OOT_COOP_GUI_APPLY=<room>: type a room and press OK (persistence probe).
+                const auto apply = qEnvironmentVariable("EDEN_NX2_OOT_COOP_GUI_APPLY");
+                if (apply.isEmpty()) return;
+                room->setText(apply);
+                if (auto* box = window()->findChild<QDialogButtonBox*>())
+                    if (auto* ok = box->button(QDialogButtonBox::Ok)) ok->click();
             });
         });
     }

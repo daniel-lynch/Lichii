@@ -35,7 +35,9 @@ void ApplyCoopEnvironment(u64 title_id, const Config& per_game) {
     if (!external_names) {
         external_names.emplace();
         for (const auto& key : QProcessEnvironment::systemEnvironment().keys()) {
-            if (key.startsWith(QStringLiteral("EDEN_NX2_OOT_COOP")))
+            // The GUI's own field-test hooks are not runtime settings.
+            if (key.startsWith(QStringLiteral("EDEN_NX2_OOT_COOP")) &&
+                !key.startsWith(QStringLiteral("EDEN_NX2_OOT_COOP_GUI_")))
                 external_names->insert(key.toStdString());
         }
     }
