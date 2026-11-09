@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/present/frame_gen.h"
 #endif
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
+#include "video_core/renderer_vulkan/vk_coop_overlay.h"
 #include "video_core/renderer_vulkan/vk_flash_detector.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -124,6 +125,8 @@ private:
 
     Frame applet_frame;
     std::unique_ptr<FlashDetector> flash_detector;
+    std::unique_ptr<CoopOverlay> coop_overlay; ///< OoT co-op toasts and name tags
+    void DrawCoopOverlay(Frame* frame);
 };
 
 } // namespace Vulkan
