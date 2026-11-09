@@ -20,6 +20,10 @@
 #include "common/common_types.h"
 #include "common/nx2_event_trace.h"
 
+namespace Core::OotCoop::Anim {
+struct Keys;
+}
+
 namespace Kernel {
 class KProcess;
 }
@@ -181,6 +185,7 @@ struct Profile {
     u64 event_got{};                ///< Module offset of the GOT slot of the event manager's cell
     /// {cell, field}: *(*(main + cell) + field) must be non-zero before a give is replayed.
     std::vector<std::pair<u64, u64>> item_guards;
+    std::shared_ptr<const OotCoop::Anim::Keys> anim;
     GhostOffsets ghost; ///< Empty unless the profile has a "ghost" object
 
     u64 SiteOffset(Point point) const {

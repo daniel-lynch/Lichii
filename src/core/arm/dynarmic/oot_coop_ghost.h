@@ -3,9 +3,8 @@
 
 #pragma once
 
-// Co-op "ghost" (class "pose", protocol v3): each player's game sends its own pose; every peer in
-// the same scene is drawn as a statue puppet created through the game's own actor manager and
-// moved with the actor's own set-transform call from the frame drain. No joints, no animation.
+// Co-op ghost: peers in the same scene use native actor creation and frame-drain transforms.
+// Legacy categories and negotiated table IDs share the same actor lifetime and call lane.
 // Everything game-derived (offsets, keys, entry words, actor names) comes from the private profile.
 
 #include <algorithm>
@@ -22,6 +21,7 @@
 #include <nlohmann/json.hpp>
 
 #include "core/arm/dynarmic/oot_gamedata_trace.h"
+#include "core/arm/dynarmic/oot_coop_anim.h"
 
 namespace Core::OotCoop {
 
@@ -32,17 +32,18 @@ struct Pose {
     bool loading{};   ///< Scene loading, or the position has not settled since the scene changed
     std::array<float, 3> pos{};
     float yaw{};      ///< Degrees; facing = atan2(m02, m22) of the rotation
-    // Animation hint for a later animated receiver (v1 draws a statue and ignores it). Inferred
-    // from the sender's speed: the game's own command table says "Move" for both walk and run.
+    // Legacy animation hints remain available to peers without a matching animation table.
+    // The shared locomotion command needs the existing speed-based walk/run distinction.
     std::string anim{"idle"}; ///< "idle", "walk" or "run"
     u32 anim_seq{};           ///< Bumped on every category change: a receiver restarts only then
     float rate{};             ///< Speed relative to the category's nominal speed, 0..10
     float phase{};            ///< Cycle position in [0, 1): distance (or time when idle) per stride
+    std::optional<Anim::State> animation;
     bool operator==(const Pose&) const = default;
 };
 [[nodiscard]] bool AnimName(std::string_view name);
 
-inline constexpr size_t PoseFrameLimit = 256;
+inline constexpr size_t PoseFrameLimit = 512;
 inline constexpr float PoseCoordinateLimit = 100000.0f;
 inline constexpr size_t GhostSlots = 4; ///< Peers drawn at once
 
@@ -69,8 +70,10 @@ struct PeerTrack {
     std::deque<std::pair<u64, Pose>> samples; ///< (arrival ms, pose)
     u64 last_ms{};
     bool online{true};
+    u64 session{};
 
     void Add(u64 now_ms, Pose pose) {
+        if (!samples.empty() && !Anim::Newer(pose.t, samples.back().second.t)) return;
         samples.emplace_back(now_ms, std::move(pose));
         while (samples.size() > 8) samples.pop_front();
         last_ms = now_ms;
@@ -85,7 +88,8 @@ struct PeerTrack {
             const auto& [ta, a] = samples[i - 1];
             const auto& [tb, b] = samples[i];
             if (render > tb) continue;
-            if (a.banc != b.banc || a.loading != b.loading || a.child != b.child || tb <= ta) return b;
+            if (a.banc != b.banc || a.loading != b.loading || a.child != b.child || tb <= ta)
+                return render < tb ? a : b;
             return Blend(a, b, static_cast<float>(render - ta) / static_cast<float>(tb - ta));
         }
         return samples.back().second;
@@ -188,8 +192,10 @@ Pose ReadLocalPose(Memory& memory, u64 base, u64 manager, const OotGameDataTrace
 class PoseSender {
 public:
     /// The pose to send now, if any. `now_ms` is a host clock.
-    std::optional<Pose> Sample(Pose pose, u64 now_ms) {
+    template <typename Observe>
+    std::optional<Pose> Sample(Pose pose, u64 now_ms, Observe observe) {
         Animate(pose, now_ms);
+        observe(pose);
         if (pose.banc != scene) {
             scene = pose.banc;
             settling = true;
@@ -203,7 +209,7 @@ public:
         if (settling && !pose.banc.empty()) pose.loading = true;
         if (sent && now_ms - sent_ms < 66) return {};
         const bool changed = !sent || pose.banc != last.banc || pose.child != last.child ||
-                             pose.anim_seq != last.anim_seq ||
+                             pose.anim_seq != last.anim_seq || pose.animation != last.animation ||
                              pose.loading != last.loading || Far(pose.pos, last.pos, 0.01f) ||
                              std::fabs(pose.yaw - last.yaw) > 0.5f;
         if (!changed && now_ms - sent_ms < 1000) return {};
@@ -211,6 +217,10 @@ public:
         sent_ms = now_ms;
         last = pose;
         return pose;
+    }
+
+    std::optional<Pose> Sample(Pose pose, u64 now_ms) {
+        return Sample(std::move(pose), now_ms, [](Pose&) {});
     }
 
     static constexpr float IdleBelow = 0.3f, RunFrom = 2.6f; ///< metres per second
@@ -268,9 +278,10 @@ private:
 struct PeerView {
     std::string origin;
     std::optional<Pose> pose;
+    u64 session{};
 };
 
-enum class GhostOp { None, Create, Get, Release, Move, Play, Alpha, Tint };
+enum class GhostOp { None, Create, Get, Release, Move, Play, Alpha, Tint, Animation };
 
 /// Per-peer puppet state machine. One synthetic call at most per frame, and only when the grant
 /// drain has not started one. Port:
@@ -306,6 +317,11 @@ public:
         std::string played;    ///< Pose category whose command was last played ("" = none yet)
         u32 played_seq{};
         bool play_logged{};
+        bool child{};
+        u64 session{};
+        Anim::Receiver animation;
+        std::optional<Anim::Operation> animation_call;
+        bool animation_failed_logged{};
     };
     static constexpr u64 SlotSize = 0x200;
     static constexpr u64 CreateRetry = 1800; ///< frames after a refused/failed create
@@ -317,7 +333,10 @@ public:
     static constexpr float WatchFar = 2.0f;   ///< metres between drawn and read-back position
     static constexpr u64 OrphanAfter = 600;   ///< frames a slot's peer is gone before reuse
 
-    GhostDriver(const OotGameDataTrace::GhostOffsets& g_, u64 base_) : g{g_}, base{base_} {}
+    GhostDriver(const OotGameDataTrace::GhostOffsets& g_, u64 base_,
+                std::shared_ptr<const Anim::Keys> anim_keys_ = {},
+                std::shared_ptr<const Anim::Table> anim_table_ = {})
+        : g{g_}, base{base_}, anim_keys{std::move(anim_keys_)}, anim_table{std::move(anim_table_)} {}
 
     bool Calling() const { return op != GhostOp::None; }
     const std::array<Slot, GhostSlots>& Slots() const { return slots; }
@@ -329,16 +348,25 @@ public:
             if (slot.state == State::Live) Line(log, slot, fmt::format("dropped ({})", why));
             if (slot.state != State::Pending) slot.state = State::None;
             slot.actor = 0;
+            slot.animation.Reset();
         }
     }
 
     /// `block`: GhostSlots * SlotSize bytes of persistent guest memory we own. Returns true when
     /// a call was started (the caller must not run anything else on this thread this frame).
     template <typename Log>
-    bool Frame(Port& port, u64 block, const Pose& local, const std::vector<PeerView>& peers, Log log) {
+    bool Frame(Port& port, u64 block, const Pose& local, const std::vector<PeerView>& peers, Log log,
+               u64 now_ms = 0) {
         if (Calling() || !block) return false;
         ++tick;
+        animation_ms = now_ms ? now_ms : tick;
         const bool ready = !local.banc.empty() && !local.loading;
+        if (scene != local.banc || scene_ready != ready) {
+            scene = local.banc;
+            scene_ready = ready;
+            ++scene_epoch;
+            for (auto& slot : slots) slot.animation.Reset();
+        }
         // How long each slot's peer has been missing from the list (relay gone, peer offline).
         for (auto& slot : slots) {
             if (slot.origin.empty()) continue;
@@ -373,6 +401,7 @@ public:
                     slot.absent_since = 0;
                     slot.played.clear();
                     slot.play_logged = false;
+                    slot.animation.Reset();
                     break;
                 }
             }
@@ -434,6 +463,16 @@ public:
                 continue;
             }
             // Live
+            if (peer && slot.session != peer->session) {
+                slot.session = peer->session;
+                slot.animation.Reset();
+                slot.played.clear();
+            }
+            if (!visible) slot.animation.Reset();
+            if (visible && slot.child != (peer->pose->child || g.actor_adult.empty())) {
+                slot.animation.Reset();
+                slot.abandon = true; // park the old pack before creating the new age
+            }
             std::array<float, 4> target;
             if (slot.abandon) {
                 // The watchdog gave up on this actor: park it out of sight once, then forget it.
@@ -488,7 +527,84 @@ public:
                 }
                 continue;
             }
-            if (visible && !slot.parked && g.anim_play && !slot.fallback) {
+            bool full_animation = false, exhausted = false;
+            if (visible && !slot.parked && !slot.fallback && !slot.adult_fallback &&
+                anim_keys && anim_keys->receiver_enabled && anim_table && peer->pose->animation) {
+                const auto& p = *peer->pose;
+                const auto* entry = anim_table->Find(slot.child, p.animation->aid);
+                full_animation = entry && entry->root_zero_verified;
+                if (full_animation) {
+                    const auto lifetime = AnimationLifetime(slot);
+                    slot.animation.Queue(*p.animation, p.t, lifetime, *anim_table, true);
+                    if constexpr (requires { port.AnimationFrame(slot.actor, *anim_keys); }) {
+                        if (const auto frame = port.AnimationFrame(slot.actor, *anim_keys))
+                            slot.animation.ObserveFrame(*frame, anim_keys->endpoint_inclusive);
+                    }
+                    if (const auto operation = slot.animation.Next(animation_ms, lifetime)) {
+                        if (const auto why = Dead(port, slot)) {
+                            slot.animation.Reset();
+                            Drop(log, slot, *why);
+                            continue;
+                        }
+                        bool started = false;
+                        switch (operation->stage) {
+                        case Anim::Stage::Play: {
+                            const auto& committed = slot.animation.Committed();
+                            if (committed && committed->aid != operation->state.aid &&
+                                committed->aseq == operation->state.aseq)
+                                AnimLine(log, "sender changed aid without advancing aseq");
+                            const u64 string_at = at + 0x180;
+                            const auto request = Anim::BuildPlayRequest(slot.actor, string_at);
+                            std::array<char, 64> command{};
+                            std::copy(operation->entry.clip.begin(), operation->entry.clip.end(), command.begin());
+                            started = port.Write(at + 0x140, request.data(), request.size()) &&
+                                      port.Write(string_at, command.data(), command.size()) &&
+                                      Start(port, anim_keys->play_wrapper, {at + 0x140}, i, GhostOp::Animation);
+                            if (started) slot.played.clear();
+                            break;
+                        }
+                        case Anim::Stage::Frame:
+                            started = Start(port, anim_keys->frame_setter, {slot.actor, 0, 0}, i,
+                                            GhostOp::Animation, operation->state.af.value_or(0.0f));
+                            break;
+                        case Anim::Stage::Rate:
+                            started = Start(port, anim_keys->rate_setter, {slot.actor, 0}, i,
+                                            GhostOp::Animation, operation->state.ar);
+                            break;
+                        case Anim::Stage::Anchor: {
+                            const auto matrix = YawMatrix(p.pos, p.yaw);
+                            started = port.Write(at + 0x10, matrix.data(), sizeof(matrix)) &&
+                                      Start(port, g.set_mtx, {slot.actor, at + 0x10, 0}, i, GhostOp::Animation);
+                            if (started) {
+                                slot.drawn = {p.pos[0], p.pos[1], p.pos[2], p.yaw};
+                                slot.placed = true;
+                                ++moves;
+                            }
+                            break;
+                        }
+                        }
+                        if (started) {
+                            slot.animation_call = *operation;
+                            return true;
+                        }
+                        slot.animation.Complete(*operation, false, animation_ms, lifetime);
+                    }
+                    if (slot.animation.Exhausted()) {
+                        // Bounded retries failed: draw the legacy category, and keep the failed
+                        // transition so it is not replayed until the sender starts a new one.
+                        if (!slot.animation_failed_logged)
+                            AnimLine(log, fmt::format("aid={} aseq={} failed; legacy category",
+                                                      p.animation->aid, p.animation->aseq));
+                        slot.animation_failed_logged = true;
+                        full_animation = false;
+                        exhausted = true;
+                    } else {
+                        slot.animation_failed_logged = false;
+                    }
+                }
+            }
+            if (!full_animation && !exhausted) slot.animation.Reset();
+            if (!full_animation && visible && !slot.parked && g.anim_play && !slot.fallback) {
                 // Animation category path: play the category's command once per change (the
                 // play call restarts the clip; it is never re-issued per packet).
                 const auto& p = *peer->pose;
@@ -567,11 +683,33 @@ public:
 
     /// The call returned to the sentinel (the context is already restored); x0 is its result.
     template <typename Log>
-    void Returned(Port& port, u64 block, u64 x0, Log log) {
+    void Returned(Port& port, u64 block, u64 x0, Log log,
+                  const Pose* local = nullptr, const std::vector<PeerView>* peers = nullptr) {
         const GhostOp done = std::exchange(op, GhostOp::None);
         auto& slot = slots[active];
         const u64 at = block + active * SlotSize;
         switch (done) {
+        case GhostOp::Animation: {
+            const auto operation = std::exchange(slot.animation_call, std::nullopt);
+            const PeerView* peer = nullptr;
+            if (peers) for (const auto& p : *peers) if (p.origin == slot.origin) peer = &p;
+            const bool valid = operation && local && !local->loading && local->banc == slot.banc &&
+                peer && peer->session == slot.session && peer->pose && !peer->pose->loading &&
+                peer->pose->banc == slot.banc && peer->pose->child == slot.child && !Dead(port, slot);
+            if (!valid) {
+                slot.animation.Reset();
+                break;
+            }
+            const bool ok = operation->stage != Anim::Stage::Play || (x0 & 1);
+            const auto before = slot.animation.Committed();
+            slot.animation.Complete(*operation, ok, animation_ms, AnimationLifetime(slot));
+            if (slot.animation.Committed() && slot.animation.Committed() != before) {
+                const auto& state = *slot.animation.Committed();
+                AnimLine(log, fmt::format("aid={} aseq={} clip={} frames={} rate={}", state.aid, state.aseq,
+                                          operation->entry.clip, operation->entry.frames, state.ar));
+            }
+            break;
+        }
         case GhostOp::Create: {
             const auto handle = port.R64(at);
             if (!(x0 & 1) || !handle || !*handle) {
@@ -616,6 +754,7 @@ public:
             slot.parked = true; // the next visible frame moves it into place
             slot.played.clear();
             slot.play_logged = false;
+            slot.animation.Reset();
             slot.alpha_done = false;
             slot.tint_done = false;
             slot.placed = false;
@@ -657,6 +796,10 @@ public:
     u64 Moves() const { return moves; }
 
 private:
+    Anim::Lifetime AnimationLifetime(const Slot& slot) const {
+        return {fmt::format("{}:{}", slot.origin, slot.session), slot.banc, slot.actor,
+                slot.generation, scene_epoch, slot.child};
+    }
     static constexpr u64 TintAt = 0x1E0; ///< 16 bytes of RGBA in the slot
 
     std::optional<u64> Model(Port& port, const Slot& slot) {
@@ -851,6 +994,7 @@ private:
         // x0 manager, x1 &namePtr, x2 &argument, x3 &handle, w4 1; three zero stack arguments.
         if (!port.Call(*entry, {*manager, at + 8, at + 0x40, at, 1, 0, 0, 0})) return false;
         slot.banc = banc;
+        slot.child = peer.child || g.actor_adult.empty();
         slot_name = name;
         (void)log;
         return true;
@@ -867,9 +1011,26 @@ private:
         log(fmt::format("OoT co-op: ghost {} {}", slot.origin.substr(0, 8), what));
     }
     static constexpr u64 LineLimit = 4096;
+    /// Animation transitions have their own cap so a busy peer cannot starve the lifecycle lines.
+    template <typename Log>
+    void AnimLine(Log log, std::string_view what) {
+        if (anim_lines >= AnimLineLimit) return;
+        if (++anim_lines == AnimLineLimit) {
+            log("OoT co-op: ghost anim log cap reached; later transitions are not logged");
+            return;
+        }
+        log(fmt::format("OoT co-op: ghost anim {}", what));
+    }
+    static constexpr u64 AnimLineLimit = 1024;
+    u64 anim_lines{};
 
     const OotGameDataTrace::GhostOffsets& g;
     const u64 base;
+    std::shared_ptr<const Anim::Keys> anim_keys;
+    std::shared_ptr<const Anim::Table> anim_table;
+    std::string scene;
+    u64 scene_epoch{}, animation_ms{};
+    bool scene_ready{};
     std::array<Slot, GhostSlots> slots{};
     GhostOp op{GhostOp::None};
     size_t active{}, next{};

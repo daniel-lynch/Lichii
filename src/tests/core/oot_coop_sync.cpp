@@ -923,3 +923,21 @@ TEST_CASE("OoT co-op item give origin key: wire and queued-give removal", "[core
     REQUIRE_FALSE(load(Json::array({Json::array({"0x11", "0xC1"}), Json::array({"0x11", "0xC3"})})));
     REQUIRE_FALSE(load(Json::array({Json::array({0, 1})})));
 }
+
+TEST_CASE("OoT co-op animation hello requires the exact table hash", "[core][oot_coop]") {
+    Coop::Hello hello;
+    hello.client_id = "synthetic";
+    hello.animation_hash = std::string(64, 'a');
+    auto packet = Coop::EncodeHello(hello);
+    REQUIRE(packet.at("version") == 4);
+    REQUIRE(packet.at("animation").at("av") == 1);
+    packet["type"] = "hello_ack";
+    REQUIRE(Coop::MatchesHello(packet, hello));
+    packet["animation"]["av"] = 1.0;
+    REQUIRE_FALSE(Coop::MatchesHello(packet, hello));
+    packet["animation"]["av"] = 1;
+    packet["animation"]["table_sha256"] = std::string(64, 'b');
+    REQUIRE_FALSE(Coop::MatchesHello(packet, hello));
+    packet.erase("animation");
+    REQUIRE_FALSE(Coop::MatchesHello(packet, hello));
+}
