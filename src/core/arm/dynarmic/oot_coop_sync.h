@@ -152,10 +152,16 @@ inline constexpr size_t DenyLimit = 16384;
 [[nodiscard]] std::optional<KeyExtras> DecodeKeyExtras(const nlohmann::json& document);
 
 /// Small-key observation for one dungeon: a gain is the larger rise of its total and its count
-/// since the last frame, minus what our own applied key_add events explain (the credit).
+/// since the last frame, after what our own applied key_add events explain. The credit is kept per
+/// Int: a received gain is applied as two GameData adds that may commit in different frames, so a
+/// single shared credit was spent on the first and the second was sent back as a new gain (C14).
 struct KeyWatch {
     std::optional<s32> total, count;
-    s64 credit{};
+    s64 credit_total{}, credit_count{};
+    void Credit(s64 value) {
+        credit_total += value;
+        credit_count += value;
+    }
     /// The gain to forward now (0: none). Unreadable values reset the watch (no forward).
     s64 Step(std::optional<s32> new_total, std::optional<s32> new_count) {
         if (!new_total || !new_count) {
@@ -163,15 +169,18 @@ struct KeyWatch {
             count.reset();
             return 0;
         }
-        s64 gain = 0;
+        s64 rise_total = 0, rise_count = 0;
         if (total && count) {
-            gain = std::max<s64>({0, s64{*new_total} - *total, s64{*new_count} - *count});
+            rise_total = std::max<s64>(0, s64{*new_total} - *total);
+            rise_count = std::max<s64>(0, s64{*new_count} - *count);
         }
         total = new_total;
         count = new_count;
-        const s64 explained = std::min(gain, credit);
-        credit -= explained;
-        return gain - explained;
+        const s64 explained_total = std::min(rise_total, credit_total);
+        const s64 explained_count = std::min(rise_count, credit_count);
+        credit_total -= explained_total;
+        credit_count -= explained_count;
+        return std::max(rise_total - explained_total, rise_count - explained_count);
     }
 };
 

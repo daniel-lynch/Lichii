@@ -775,10 +775,16 @@ TEST_CASE("OoT co-op key watch forwards gains, never spends or our own credit", 
     REQUIRE(watch.Step(3, 1) == 0);      // a key spent on a door: per-player, nothing sent
     REQUIRE(watch.Step(4, 1) == 1);      // a gain seen only in the total (count unchanged frame)
     REQUIRE(watch.Step(4, 2) == 1);      // a gain seen only in the count (total not maintained)
-    watch.credit = 2;                    // two received gains applied here
+    watch.Credit(2);                     // two received gains applied here
     REQUIRE(watch.Step(5, 3) == 0);      // the first one shows up: explained by the credit
     REQUIRE(watch.Step(7, 5) == 1);      // the second plus a real local pickup in the same frame
-    REQUIRE(watch.credit == 0);
+    REQUIRE(watch.credit_total == 0);
+    REQUIRE(watch.credit_count == 0);
+    // C14 field: one received gain whose two adds commit in different frames is never sent back.
+    watch.Credit(1);
+    REQUIRE(watch.Step(8, 5) == 0);      // the total add lands first
+    REQUIRE(watch.Step(8, 6) == 0);      // the count add a frame later: still our own apply
+    REQUIRE(watch.Step(9, 7) == 1);      // a real pickup afterwards is forwarded
     REQUIRE(watch.Step(std::nullopt, 5) == 0); // unreadable: reset, no forward
     REQUIRE_FALSE(watch.total);
     REQUIRE(watch.Step(9, 6) == 0);      // a fresh baseline after the reset
