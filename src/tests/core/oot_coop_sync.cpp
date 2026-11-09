@@ -889,3 +889,23 @@ TEST_CASE("OoT co-op item give origin key: wire and queued-give removal", "[core
     REQUIRE_FALSE(load(Json::array({Json::array({"0x11", "0xC1"}), Json::array({"0x11", "0xC3"})})));
     REQUIRE_FALSE(load(Json::array({Json::array({0, 1})})));
 }
+
+TEST_CASE("OoT chest transaction codec preserves part receipts", "[core][oot_coop]") {
+    Change give{Kind::Item, "peer", 7, Coop::PackItem({2, 0, {0, 0, 0, 0}}), 1};
+    give.name = "Test_Reward";
+    give.source = Coop::World::Origin::Chest(101);
+    give.chest_transaction = 51;
+    give.chest_part = 1;
+    give.chest_final = true;
+    auto packet = Coop::EncodeChange(give);
+    REQUIRE(Coop::DecodeChange(packet) == give);
+    for (const auto* field : {"chest_transaction", "chest_part", "chest_final", "origin_key"}) {
+        auto bad = packet;
+        bad.erase(field);
+        REQUIRE_FALSE(Coop::DecodeChange(bad));
+    }
+    packet["chest_part"] = Coop::Chest::Claims::PartLimit;
+    REQUIRE_FALSE(Coop::DecodeChange(packet));
+    packet["chest_part"] = false;
+    REQUIRE_FALSE(Coop::DecodeChange(packet));
+}

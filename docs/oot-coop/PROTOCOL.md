@@ -160,11 +160,37 @@ or derive them from the guest. Guest scene/save-loaded discovery remains unimple
 A disconnect sends `state:{"online":false}`. Presence is scoped to the team, not the
 entire room. `heartbeat` and `heartbeat_ack` have only `type`.
 
-## Same-chest race (C13)
+## Same-chest interaction guard
 
-`item_give` may carry `"origin_key": <chest Bool>` (1..2^32-1). Receivers apply one chest's gives
-from one opener only (themselves, or the first claimant); see HOOKS.md `chest_members`. Old relays
-reject the field: update the relay before running a C13 client with `chest_members`.
+`item_give` with a chest source carries its ordinary chest Bool as `origin_key` and, from a
+guarded client, three transaction fields, all or none:
+
+| Field | Range | Meaning |
+|---|---|---|
+| `chest_transaction` | 1..2^53-1 | The sender's open attempt; every outer give of that open shares it |
+| `chest_part` | 0..63 | Outer give index within the transaction (bag, then its ammo, ...) |
+| `chest_final` | boolean | True on the last part |
+
+The relay validates the shape only (a chest source, all three fields); it does not arbitrate.
+A chest `item_give` without the fields (a legacy sender, the fake peer's `itemk`) is a
+one-part transaction.
+
+A private `chest` profile section enables the traps: the treasure box's accepted-open
+interaction (Begin), its opening event (Bind), the give entry (Gate, before its first
+instruction) and the give's return. The local chest-struct setter or the observed end of the
+event completes the open. Ownership is per receiver: the first source this client sees wins,
+either its own Begin or a peer's live chest Bool / tagged give. A peer-owned or already paid
+chest returns success from the local give without running it; a peer copy of a chest this
+client owns is dropped, at receipt and again at issue time. Two clients that start the same
+chest before either hears of the other each keep their own copy (+1 each, never +2): this is
+not a global winner election. An originless baseline Bool is history, never a payable owner.
+Receipts (per chest: source, transaction, applied parts) live for the session.
+
+Limits: unknown attribution (no attempt, conflicting actor/event) leaves the give on the
+ordinary untagged path and is logged; an open no event ever confirmed is released after 1800
+frames when nothing was paid; a save change turns the guard off for the session (ordinary
+gives, logged); dungeon Bool/Int rewards bypass the give entry and are not covered;
+`chest.enforce=false` observes and logs without skipping or dropping.
 
 ## Collectible transactions and wallet baselines (C14)
 
@@ -187,7 +213,7 @@ the revised relay and use a matching policy ID on both clients before enabling t
 The relay deduplicates all events by sender/sequence. It also keeps a team-lifetime
 receipt for each bit/token benefit, independent of sequence or sender and of replay-window
 eviction. Flags do not consume benefit receipts. Chest sources are not relay receipts: the
-clients' C13 chest claims keep one opener's (possibly several) gives. The receipt limit is
+clients' chest records select one opener and retain benefit receipts. The receipt limit is
 4096; overflow rejects the event before changing team state.
 This storage is in memory, not durable across relay restart or room expiration.
 
@@ -256,9 +282,9 @@ inline clipping and durable baseline revisions still require a later ordered-wal
   loses a key when two players pick up (or one picks up while the other spends) within a round trip.
   Here the door state of a dungeon is a per-actor flag that is not in the reviewed list, so a shared
   spend would leave the other player's door locked with one key fewer: a soft lock. A shared gain is
-  safe either way: a chest's key is taken once by the team (its chest Bool is shared), so the other
-  player must be credited, and a surplus key can never block progress. Each gain is exact under
-  concurrency because it is a delta with its own origin/sequence. Cost: a player whose door was
+  forwarded as a delta with its own origin/sequence. Sharing the chest Bool does not prevent a
+  simultaneous native small-key grant: dungeon Bool/Int grants bypass the item entry guard and
+  still need separate race coverage. Cost: a player whose door was
   opened by the peer (if door flags are ever shared) keeps an extra key; a late joiner gets no
   earlier gains (the same gap as item gives).
 - Map, compass and boss key are Bools (`bool_set`, OR). The give path never carries them (the key

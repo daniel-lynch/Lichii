@@ -123,6 +123,11 @@ Json EncodeChange(const Change& change) {
         packet["get"] = args.get;
         packet["flags"] = Json::array({args.flags[0], args.flags[1], args.flags[2], args.flags[3]});
         World::EncodeOrigin(packet, change.source);
+        if (change.chest_transaction) {
+            packet["chest_transaction"] = change.chest_transaction;
+            packet["chest_part"] = change.chest_part;
+            packet["chest_final"] = change.chest_final;
+        }
         return packet;
     }
     if (change.kind == Kind::Bit) World::EncodeOrigin(packet, change.source);
@@ -183,12 +188,26 @@ std::optional<Change> DecodeChange(const Json& packet, bool snapshot) {
         if (!source || (*source && change.kind != Kind::Item && change.kind != Kind::Bit) ||
             (change.kind == Kind::Bit && source->kind == World::OriginKind::Chest)) return {};
         change.source = *source;
+        const bool receipt = packet.contains("chest_transaction") || packet.contains("chest_part") ||
+                             packet.contains("chest_final");
+        if (receipt) {
+            if (change.kind != Kind::Item || change.source.kind != World::OriginKind::Chest ||
+                !packet.contains("chest_transaction") || !packet.contains("chest_part") ||
+                !packet.contains("chest_final") || !Unsigned(packet.at("chest_transaction"), MaxSequence) ||
+                packet.at("chest_transaction") == 0 ||
+                !Unsigned(packet.at("chest_part"), Chest::Claims::PartLimit - 1) ||
+                !packet.at("chest_final").is_boolean()) return {};
+            change.chest_transaction = packet.at("chest_transaction").get<u64>();
+            change.chest_part = packet.at("chest_part").get<u32>();
+            change.chest_final = packet.at("chest_final").get<bool>();
+        }
         if (change.kind == Kind::Item) {
             for (const auto& [field, value] : packet.items()) {
                 if (field == "type" || field == "origin" || field == "seq" || field == "name" ||
                     field == "category" || field == "count" || field == "get" || field == "flags")
                     continue;
-                if (World::OriginField(field)) continue;
+                if (World::OriginField(field) || field == "chest_transaction" || field == "chest_part" ||
+                    field == "chest_final") continue;
                 if (field == "rev" && Unsigned(value, MaxSequence) && value != 0) continue;
                 return std::nullopt;
             }
@@ -1037,7 +1056,6 @@ struct Session::Impl {
     struct HeldGive {
         Change change;
         u64 attempt{}, tick{};
-        bool wire_wait_logged{};
     };
     std::vector<HeldGive> held_gives;
     std::set<u32> chest_bools; // the backing Bools of profile->chest_members
@@ -2186,14 +2204,6 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             if (!attempt || !record || (!attempt->ended && (attempt->event || !record->closed)) ||
                 attempt->unresolved || record->unresolved ||
                 !record->final_part || !attempt->applying.empty()) continue;
-            // The current relay rejects transaction fields. Never serialize a multi-part reward
-            // as unrelated legacy gives: its receiver would retain only the first part.
-            if (*record->final_part != 0) {
-                if (!std::exchange(held.wire_wait_logged, true) && impl->race_lines++ < 256)
-                    log(fmt::format("OoT co-op: chest transaction unresolved key={:08x} attempt={} (multipart wire support required)",
-                        held.change.source.key, held.attempt));
-                continue;
-            }
             held.change.chest_final = held.change.chest_part == *record->final_part;
             if (impl->race_lines++ < 256)
                 log(fmt::format("OoT co-op: item give sent after its event name={} chest={:08x} transaction={} part={} final={}",

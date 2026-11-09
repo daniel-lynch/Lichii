@@ -330,11 +330,27 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(team.benefit_receipts, set())
         self.assertEqual(team.current, {})
 
-    def test_chest_transaction_fields_require_relay_extension(self):
-        for fields in ({"chest_transaction": 51}, {"chest_part": 0}, {"chest_final": True},
-                       {"chest_transaction": 51, "chest_part": 0, "chest_final": True}):
-            with self.subTest(fields=fields), self.assertRaises(relay.ProtocolError):
-                relay.validate_change(item(origin_key=17, **fields), "a")
+    def test_chest_transactions_preserve_parts_and_reject_bad_metadata(self):
+        team = relay.Team()
+        base = item(origin_key=17, chest_transaction=51, chest_part=0, chest_final=False)
+        first = team.accept(base, set())
+        last = team.accept(dict(base, seq=2, chest_part=1, chest_final=True), set())
+        self.assertEqual(first["chest_transaction"], last["chest_transaction"])
+        self.assertEqual([p["chest_part"] for p in team.replay], [0, 1])
+        self.assertEqual([p["chest_final"] for p in team.replay], [False, True])
+        self.assertIsNone(team.accept(base, set()))
+        self.assertEqual(team.benefit_receipts, set())
+        self.assertEqual(team.current, {})
+        for field, bad in (("chest_transaction", 0), ("chest_transaction", True),
+                           ("chest_transaction", relay.MAX_SEQ + 1), ("chest_part", -1),
+                           ("chest_part", 64), ("chest_part", True), ("chest_final", 1)):
+            with self.subTest(field=field, bad=bad), self.assertRaises(relay.ProtocolError):
+                relay.validate_change(dict(base, **{field: bad}), "a")
+        for field in ("chest_transaction", "chest_part", "chest_final", "origin_key"):
+            bad = dict(base)
+            del bad[field]
+            with self.subTest(missing=field), self.assertRaises(relay.ProtocolError):
+                relay.validate_change(bad, "a")
 
     def test_world_token_flags_share_origin_but_not_benefit_receipt(self):
         source = {"origin_kind": "token", "origin_key64": (1 << 63) + 9,

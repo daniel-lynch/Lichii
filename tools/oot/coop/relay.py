@@ -180,8 +180,19 @@ def validate_change(packet, origin):
         raise ProtocolError("unsupported grant class")
     extra = {"bool_set": ("hash", "value"), "bit_set": ("actor", "value"), "rupee_add": ("hash", "delta"),
              "item_give": ("name", "category", "count", "get", "flags"), "key_add": ("hash", "delta")}[kind]
-    fields(packet, common + extra, ORIGIN_FIELDS if kind in ("item_give", "bit_set") else ())
+    chest_fields = ("chest_transaction", "chest_part", "chest_final")
+    optional = ORIGIN_FIELDS if kind in ("item_give", "bit_set") else ()
+    if kind == "item_give":
+        optional += chest_fields
+    fields(packet, common + extra, optional)
     source = collectible_origin(packet)
+    if any(field in packet for field in chest_fields):
+        if source is None or source[0] != "chest" or not all(field in packet for field in chest_fields):
+            raise ProtocolError("chest receipt requires a chest and all transaction fields")
+        integer(packet["chest_transaction"], 1, MAX_SEQ)
+        integer(packet["chest_part"], 0, 63)
+        if type(packet["chest_final"]) is not bool:
+            raise ProtocolError("chest completion must be boolean")
     if packet["origin"] != origin:
         raise ProtocolError("origin mismatch")
     integer(packet["seq"], 1, MAX_SEQ)
