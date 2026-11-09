@@ -288,6 +288,7 @@ public:
     /// commands after it are fetched.
     void NoteSync() {
         last_sync_position = write_position;
+        synced_writer_position = last_writer_position;
     }
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
     /// of it was still queued.
@@ -398,6 +399,7 @@ private:
     std::array<PendingWrite, 8192> pending_writes{};
     u64 pending_write_count{};
     u64 last_sync_position{};
+    u64 synced_writer_position{}; ///< last_writer_position at the last NoteSync
     u64 last_memory_write_position{};
     u64 published_local{};
     u64 consumed_cache{};

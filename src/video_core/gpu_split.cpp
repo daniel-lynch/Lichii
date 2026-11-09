@@ -152,6 +152,7 @@ void GpuSplit::Stop() {
     report_pages.clear();
     last_sync_position = 0;
     last_memory_write_position = 0;
+    synced_writer_position = 0;
     published_local = 0;
     consumed_cache = 0;
     publish_every = PublishEvery;
@@ -324,8 +325,7 @@ bool GpuSplit::WaitForMemoryWriters(DrainSite site) {
 }
 
 bool GpuSplit::WaitForSyncedWriters() {
-    return WaitFor(std::min({last_writer_position, last_sync_position, write_position}),
-                   DrainSite::ListWriters);
+    return WaitFor(std::min(synced_writer_position, write_position), DrainSite::ListWriters);
 }
 
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {

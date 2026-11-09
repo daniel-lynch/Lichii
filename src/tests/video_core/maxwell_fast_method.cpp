@@ -869,6 +869,43 @@ TEST_CASE("Split command list fetches wait only for the writers before the last 
     REQUIRE_FALSE(split.WaitForSyncedWriters());
     release[2] = true;
     split.Drain(VideoCommon::DrainSite::Other);
+
+    // Nor for other work between the last writer before the wait and the wait, when another
+    // writer follows the wait.
+    std::atomic<bool> other{};
+    std::atomic<bool> later{};
+    std::atomic<bool> other_done{};
+    bool other_waited{true};
+    std::thread other_waiter;
+    SCOPE_EXIT {
+        other = true;
+        later = true;
+        if (other_waiter.joinable()) {
+            other_waiter.join();
+        }
+    };
+    split.Defer([] {});
+    split.NoteWriter();
+    split.Drain(VideoCommon::DrainSite::Other);
+    blocking(other);
+    split.NoteSync();
+    blocking(later);
+    split.NoteWriter();
+    split.Publish();
+    other_waiter = std::thread([&] {
+        other_waited = split.WaitForSyncedWriters();
+        other_done = true;
+    });
+    const auto other_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (!other_done.load() && std::chrono::steady_clock::now() < other_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    REQUIRE(other_done.load());
+    other_waiter.join();
+    REQUIRE_FALSE(other_waited);
+    other = true;
+    later = true;
+    split.Drain(VideoCommon::DrainSite::Other);
 }
 
 TEST_CASE("Split restart resets writer positions without replaying old releases",
