@@ -77,7 +77,7 @@ CoopPanel::CoopPanel(Core::System& system_, QWidget* parent)
         Refresh();
     });
     auto* connection = new QHBoxLayout;
-    auto* reconnect = new QPushButton(tr("Reconnect with page settings"), this);
+    auto* reconnect = reconnect_button = new QPushButton(tr("Reconnect with page settings"), this);
     reconnect->setToolTip(tr("Restarts the game after confirmation. Launcher values still win. "
                            "Changing co-op enablement requires closing and reopening the application."));
     connect(reconnect, &QPushButton::clicked, this, &CoopPanel::ReconnectRequested);
@@ -234,6 +234,7 @@ void CoopPanel::Refresh() {
         // A stale publisher cannot confirm online peers; do not send requests based on stale rows.
         peers->cellWidget(row, 5)->setEnabled(live && peer.online && status.teleport && !trigger.empty());
     }
+    reconnect_button->setEnabled(system.IsPoweredOn()); // restarting needs a running game
     const auto room_path = Gui::RoomTrigger(Env);
     const QSignalBlocker block(room_window);
     room_window->setEnabled(!room_path.empty());
