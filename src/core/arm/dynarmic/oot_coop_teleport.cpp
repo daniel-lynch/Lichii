@@ -5,6 +5,7 @@
 #include <charconv>
 #include <fstream>
 #include <filesystem>
+#include <numbers>
 #include <fmt/format.h>
 
 namespace Core::OotCoop::Teleport {
@@ -123,7 +124,11 @@ std::optional<Keys> DecodeKeys(const Json& v) {
             const auto mode = c.at("mode").get<std::string>();
             if (mode != "startpos" && mode != "explicit") return {};
             x.explicit_position = mode == "explicit";
-            if (c.size() != (x.explicit_position ? 21 : 19)) return {};
+            if (c.size() != (x.explicit_position ? size_t{22} + (c.contains("correct_heading") ? 1U : 0U) : size_t{19})) return {};
+            if (c.contains("correct_heading")) {
+                if (!x.explicit_position || !c.at("correct_heading").is_boolean()) return {};
+                x.correct_heading = c.at("correct_heading").get<bool>();
+            }
             for (auto [name, member] : {std::pair{"string64", &CrossKeys::string64}, {"enum", &CrossKeys::enumeration},
                     {"request_ctor", &CrossKeys::request_ctor}, {"request_event", &CrossKeys::request_event},
                     {"vector3", &CrossKeys::vector3}}) {
@@ -143,10 +148,11 @@ std::optional<Keys> DecodeKeys(const Json& v) {
                     {"request_name_ptr", &CrossKeys::request_name_ptr}, {"request_name_cap", &CrossKeys::request_name_cap},
                     {"reserved_banc", &CrossKeys::reserved_banc}, {"reserved_start", &CrossKeys::reserved_start},
                     {"reserved_position", &CrossKeys::reserved_position}, {"fade_key", &CrossKeys::fade_key},
+                    {"reserved_rotation", &CrossKeys::reserved_rotation},
                     {"fade_value", &CrossKeys::fade_value}, {"control_key", &CrossKeys::control_key},
                     {"control_value", &CrossKeys::control_value}, {"load_timeout_ms", &CrossKeys::load_timeout_ms},
                     {"arrive_frames", &CrossKeys::arrive_frames}}) {
-                if (member == &CrossKeys::reserved_position && !x.explicit_position) continue;
+                if ((member == &CrossKeys::reserved_position || member == &CrossKeys::reserved_rotation) && !x.explicit_position) continue;
                 const auto n = Number(c.at(name), UINT32_MAX);
                 if (!n || !*n) return {};
                 x.*member = static_cast<u32>(*n);
@@ -240,14 +246,23 @@ std::optional<Packet> DecodePacket(const Json& j, bool server) {
 bool Within(const Vec& a, const Vec& b, const std::array<float, 2>& t) {
     return Position(a) && Position(b) && std::hypot(a[0] - b[0], a[2] - b[2]) <= t[0] && std::abs(a[1] - b[1]) <= t[1];
 }
+std::array<float, 3> ReservedRotation(float yaw_degrees) {
+    return {0.0f, static_cast<float>(double(yaw_degrees) * std::numbers::pi / 180.0), 0.0f};
+}
+float HeadingError(float actual_deg, float requested_deg) {
+    if (!std::isfinite(actual_deg) || !std::isfinite(requested_deg)) return std::numeric_limits<float>::infinity();
+    return static_cast<float>(std::abs(std::remainder(double(actual_deg) - double(requested_deg), 360.0)));
+}
 void History::Step(const Sample& s, const Keys& k) {
     const bool clear = !s.loading && !s.banc.empty() && s.resident && s.actor_pos &&
         s.event_running == 0 && s.block_bools_ok == true && s.command &&
         (Contains(k.requester_commands, *s.command) || Contains(k.answer_commands, *s.command)) &&
         Within(s.info_pos, *s.actor_pos, {k.agree_epsilon, k.agree_epsilon});
     if (!clear) { Reset(); return; }
-    if (!previous || previous->resident != s.resident || previous->banc != s.banc || previous->child != s.child ||
-        std::abs(anchor[1] - s.info_pos[1]) > k.settle_epsilon) {
+    const bool changed = !previous || previous->resident != s.resident || previous->banc != s.banc || previous->child != s.child;
+    if (changed) ground = 0;
+    ground = Contains(k.requester_commands, *s.command) ? std::min(ground + 1, k.settle_frames) : 0;
+    if (changed || std::abs(anchor[1] - s.info_pos[1]) > k.settle_epsilon) {
         // Vertical only: a target walking on level ground settles; a fall or a jump does not.
         frames = 1; anchor = s.info_pos;
     } else frames = std::min(frames + 1, k.settle_frames);
@@ -265,7 +280,7 @@ std::string Ready(const Sample& s, const History& h, const Keys& k, bool answer,
         (!Contains(k.allow_bancs, s.banc) || Contains(k.deny_bancs, s.banc))) return "scene";
     if (!Contains(answer ? k.answer_commands : k.requester_commands, *s.command)) return "state";
     if (!Within(s.info_pos, *s.actor_pos, {k.agree_epsilon, k.agree_epsilon})) return "unready";
-    if (h.frames < k.settle_frames) return "airborne";
+    if ((answer ? h.frames : h.ground) < k.settle_frames) return "airborne";
     return {};
 }
 ApplyTarget MatrixCall(u64 entry, u64 sentinel, u64 sp, u64 actor, const Packet& p) {
@@ -419,11 +434,15 @@ bool Controller::Frame(const Sample& s, u64 now, bool can_call, Port& port) {
         std::string failure;
         if (!resident || s.resident != resident || !port.validate(*resident)) failure = "actor changed";
         else if (s.banc != scene || s.child != child || s.loading) failure = "scene/age/loading changed";
-        const bool arrived = failure.empty() && s.actor_pos && Within(*s.actor_pos, destination.pos, keys.tolerance) && Within(s.info_pos, destination.pos, keys.tolerance);
-        if (failure.empty() && !arrived && frame - verify_start >= keys.verify_frames) failure = "verification timeout";
+        const bool position_arrived = failure.empty() && s.actor_pos && Within(*s.actor_pos, destination.pos, keys.tolerance) && Within(s.info_pos, destination.pos, keys.tolerance);
+        const float heading_error = HeadingError(s.yaw, destination.yaw);
+        const bool heading_failed = cross_active && keys.cross->explicit_position && heading_error > 2.0f;
+        const bool arrived = position_arrived && !heading_failed;
+        if (failure.empty() && !arrived && frame - verify_start >= keys.verify_frames)
+            failure = position_arrived && heading_failed ? "heading" : "verification timeout";
         if (arrived || !failure.empty()) {
-            port.log(fmt::format("OoT co-op: teleport {}{} id={} frames={} error=({},{},{}) reason={} {}", cross_active ? "cross " : "", arrived ? "arrived" : "failed", destination.id,
-                frame - issued_frame, s.info_pos[0] - destination.pos[0], s.info_pos[1] - destination.pos[1], s.info_pos[2] - destination.pos[2], failure, Details(s)));
+            port.log(fmt::format("OoT co-op: teleport {}{} id={} frames={} error=({},{},{}) reason={} {} yaw={} heading_error={}", cross_active ? "cross " : "", arrived ? "arrived" : "failed", destination.id,
+                frame - issued_frame, s.info_pos[0] - destination.pos[0], s.info_pos[1] - destination.pos[1], s.info_pos[2] - destination.pos[2], failure, Details(s), s.yaw, heading_error));
             if (arrived) checkpoint = Checkpoint{destination, *resident, frame, 0};
             phase = Phase::Idle; resident.reset(); history.Reset();
             if (arrived && port.arrived) port.arrived();
@@ -433,17 +452,19 @@ bool Controller::Frame(const Sample& s, u64 now, bool can_call, Port& port) {
 }
 void Controller::Returned(u64 result, const Log& log) {
     if (phase == Phase::CrossCalling) {
-        static constexpr std::array names{"reserve banc", "reserve start", "reserve position", "reserve fade",
+        static constexpr std::array names{"reserve banc", "reserve start", "reserve position", "reserve rotation", "reserve fade",
             "reserve control", "event ctor", "event request", "event live re-assertion"};
-        log(fmt::format("OoT co-op: teleport cross {} id={} w0={:#x} name={}", names[static_cast<size_t>(cross_step)],
+        const auto receipt = fmt::format("OoT co-op: teleport cross {} id={} w0={:#x} name={}", names[static_cast<size_t>(cross_step)],
             destination.id, static_cast<u32>(result),
-            cross_step == CrossStep::Constructor || cross_step == CrossStep::Event ? keys.cross->events[event_index] : ""));
+            cross_step == CrossStep::Constructor || cross_step == CrossStep::Event ? keys.cross->events[event_index] : "");
+        log(cross_step == CrossStep::Rotation ? receipt + fmt::format(" yaw={} rad={}", destination.yaw, ReservedRotation(destination.yaw)[1]) : receipt);
         if (abandoned) { phase = Phase::Idle; resident.reset(); return; }
         phase = Phase::Reserve;
         switch (cross_step) {
         case CrossStep::Banc: cross_step = CrossStep::Start; break;
         case CrossStep::Start: cross_step = keys.cross->explicit_position ? CrossStep::Position : CrossStep::Fade; break;
-        case CrossStep::Position: cross_step = CrossStep::Fade; break;
+        case CrossStep::Position: cross_step = CrossStep::Rotation; break;
+        case CrossStep::Rotation: cross_step = CrossStep::Fade; break;
         case CrossStep::Fade: cross_step = CrossStep::Control; break;
         case CrossStep::Control: cross_step = CrossStep::Constructor; break;
         case CrossStep::Constructor: cross_step = CrossStep::Event; break;
@@ -534,10 +555,10 @@ bool Controller::CrossFrame(const Sample& s, u64 now, bool can_call, Port& port)
         CrossFail(port.log, "arrival resident changed"); return false;
     }
     if (!new_resident) {
-        new_resident = s.resident; arrival_frames = 0;
-        port.log(fmt::format("OoT co-op: teleport cross arrival resident id={} actor={:#x} generation={:#x} ({})",
+        new_resident = s.resident; arrival_frames = 0; first_ready_yaw = s.yaw;
+        port.log(fmt::format("OoT co-op: teleport cross arrival resident id={} actor={:#x} generation={:#x} ({}) yaw={}",
             destination.id, s.resident->actor, s.resident->generation,
-            resident && *resident == *s.resident ? "kept across the load" : "new"));
+            resident && *resident == *s.resident ? "kept across the load" : "new", first_ready_yaw));
     }
     if (arrival_frames < keys.cross->arrive_frames) ++arrival_frames;
     if (arrival_frames < keys.cross->arrive_frames || !can_call) return false;
@@ -545,11 +566,21 @@ bool Controller::CrossFrame(const Sample& s, u64 now, bool can_call, Port& port)
     resident = s.resident; scene = destination.banc;
     if (keys.cross->explicit_position && Within(s.info_pos, destination.pos, keys.tolerance) &&
         Within(*s.actor_pos, destination.pos, keys.tolerance)) {
-        receipt("arrived (no correction)");
-        checkpoint = Checkpoint{destination, *resident, frame, 0};
-        phase = Phase::Idle; resident.reset(); history.Reset();
-        if (port.arrived) port.arrived();
-        return false;
+        const float error = HeadingError(first_ready_yaw, destination.yaw);
+        if (error <= 2.0f || !keys.cross->correct_heading) {
+            checkpoint = Checkpoint{destination, *resident, frame, 0};
+            if (error <= 2.0f)
+                receipt(fmt::format("arrived (no correction) yaw={} now={} requested={} heading_error={}", first_ready_yaw, s.yaw, destination.yaw, error));
+            else CrossFail(port.log, fmt::format("heading yaw={} requested={} heading_error={}", first_ready_yaw, destination.yaw, error));
+            phase = Phase::Idle; resident.reset(); history.Reset();
+            // C17 merge: questdefer's arrival callback on a clean arrival (as the Verify path: heading within 2 deg).
+            if (error <= 2.0f && port.arrived) port.arrived();
+            return false;
+        }
+        if (!port.call(*resident, destination)) { CrossFail(port.log, "correction unavailable or actor changed"); return false; }
+        phase = Phase::Calling; issued_frame = frame;
+        receipt(fmt::format("heading correction issued yaw={} requested={} heading_error={}", first_ready_yaw, destination.yaw, error));
+        return true;
     }
     if (!port.call(*resident, destination)) { CrossFail(port.log, "correction unavailable or actor changed"); return false; }
     phase = Phase::Calling; issued_frame = frame;
