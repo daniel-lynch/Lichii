@@ -138,6 +138,8 @@ add_library(
     nx2_sample_profile.h
     thread_cpu_clock.cpp
     thread_cpu_clock.h
+    driver_shader_cache.cpp
+    driver_shader_cache.h
     adpf.cpp
     adpf.h
     thread_queue_list.h

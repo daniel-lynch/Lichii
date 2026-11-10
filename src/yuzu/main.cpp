@@ -3,6 +3,7 @@
 
 #include <QApplication>
 
+#include "common/driver_shader_cache.h"
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
 #include "nx2_switches.h"
@@ -83,6 +84,8 @@ static Qt::HighDpiScaleFactorRoundingPolicy GetHighDpiRoundingPolicy() {
 
 int main(int argc, char* argv[]) {
     LoadNx2Switches(argv[0]);
+    // Before StartupChecks: its Vulkan check is the first thing to load a GPU driver.
+    Common::ConfigureDriverShaderCache();
 #if YUZU_ROOM
     bool launch_room = false;
     for (int i = 1; i < argc; i++) {

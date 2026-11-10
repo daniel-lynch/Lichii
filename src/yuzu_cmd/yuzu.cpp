@@ -33,6 +33,7 @@
 
 #include <fmt/ostream.h>
 
+#include "common/driver_shader_cache.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -560,6 +561,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #ifdef _WIN32
     SetUnhandledExceptionFilter(WriteCrashDump);
 #endif
+    Common::ConfigureDriverShaderCache();
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
     // input; 240 Hz is plenty for input and the key script.
     SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "240");
