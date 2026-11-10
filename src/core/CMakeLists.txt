@@ -25,6 +25,8 @@ add_library(core STATIC
     arm/dynarmic/oot_coop_quest.h
     arm/dynarmic/oot_coop_questdefer.cpp
     arm/dynarmic/oot_coop_questdefer.h
+    arm/dynarmic/oot_coop_colour.cpp
+    arm/dynarmic/oot_coop_colour.h
     arm/dynarmic/oot_coop_teleport.cpp
     arm/dynarmic/oot_coop_teleport.h
     arm/dynarmic/oot_coop_ux.cpp

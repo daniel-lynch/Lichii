@@ -47,6 +47,7 @@ add_executable(tests
     core/oot_coop_room.cpp
     core/oot_coop_quest.cpp
     core/oot_coop_questdefer.cpp
+    core/oot_coop_colour.cpp
     core/oot_coop_teleport.cpp
     core/oot_coop_ux.cpp
     core/oot_coop_ledger.cpp
