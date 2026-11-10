@@ -218,8 +218,10 @@ TEST_CASE("OotCoopChecks: narrow spoiler rows are cut to width", "[oot_coop]") {
                                    {"items", {{"c:2", "Item With A Rather Long Name"}}}}, s));
     Checks::Model m{s};
     const auto rows = m.Rows("Alpha_Child", false, {false, true, false, false});
-    CHECK(rows[1].text.size() == 36);
-    CHECK(rows[1].text.starts_with("[ ] Chest two - Item"));
+    REQUIRE(rows.size() == 4); // title, Chest one, Chest two, Npc gift
+    CHECK(rows[1].text == "[ ] Chest one");
+    CHECK(rows[2].text.size() == 36);
+    CHECK(rows[2].text.starts_with("[ ] Chest two - Item"));
 }
 
 TEST_CASE("OotCoopChecks: published panel reaches the overlay frame", "[oot_coop]") {
