@@ -68,7 +68,8 @@ struct History {
     void Step(const Sample& sample, const Keys& keys);
     void Reset() { previous.reset(); frames = 0; }
 };
-[[nodiscard]] std::string Ready(const Sample& sample, const History& history, const Keys& keys, bool answer);
+[[nodiscard]] std::string Ready(const Sample& sample, const History& history, const Keys& keys, bool answer,
+                                const std::vector<std::string>& exempt_bancs = {});
 [[nodiscard]] bool Within(const Vec& a, const Vec& b, const std::array<float, 2>& tolerance);
 [[nodiscard]] ApplyTarget MatrixCall(u64 entry, u64 sentinel, u64 sp, u64 actor, const Packet& packet);
 
@@ -249,6 +250,7 @@ struct Port {
     std::function<bool(const Player::Resident&, const Packet&)> call;
     Log log;
     std::function<bool(CrossStep, size_t, const Packet&)> cross_call;
+    std::function<void()> arrived;
 };
 struct Peer { std::string id, name; };
 [[nodiscard]] std::optional<std::string> ResolveTrigger(std::string_view line, const std::vector<Peer>& peers);
@@ -266,6 +268,7 @@ private:
 class Controller {
 public:
     explicit Controller(Keys keys_) : keys{std::move(keys_)} {}
+    void SetExemptBancs(std::vector<std::string> bancs) { exempt_bancs = std::move(bancs); }
     bool Trigger(std::string target, u64 now, const Log& log);
     void Receive(const Packet& packet, u64 now, const Log& log);
     void Tick(u64 now, const Log& log);
@@ -294,6 +297,7 @@ private:
     std::optional<Player::Resident> new_resident;
     Vec cross_from{}; ///< PlayingInfo position when the cross teleport started
     Keys keys;
+    std::vector<std::string> exempt_bancs;
     History history;
     Phase phase{Phase::Idle};
     Packet destination;

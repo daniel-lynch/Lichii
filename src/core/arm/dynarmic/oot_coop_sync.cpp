@@ -22,6 +22,7 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/thread.h"
+#include "core/arm/dynarmic/oot_coop_questdefer.h"
 #include "core/arm/dynarmic/oot_coop_ledger.h"
 #include "core/arm/dynarmic/oot_coop_sync.h"
 #include "core/arm/dynarmic/oot_coop_teleport.h"
@@ -993,13 +994,17 @@ struct Session::Impl {
     struct Connection;
     struct GhostPort;
     Impl(Endpoint endpoint_, Hello hello_, std::set<u64> denied_, std::set<Kind> allowed_,
-         std::set<std::pair<Kind, u64>> keys, u64 wallet, const World::Config& world, bool quest_enabled)
+         std::set<std::pair<Kind, u64>> keys, u64 wallet, const World::Config& world, bool quest_enabled,
+         const QuestDefer::Config* bundles)
         : endpoint{std::move(endpoint_)}, hello{std::move(hello_)}, denied{std::move(denied_)},
           local{denied}, remote{denied}, allowed_classes{std::move(allowed_)}, retry{io} {
         if (!quest_enabled) allowed_classes.erase(Kind::Quest);
+        if (bundles) for (const auto& boss : bundles->bosses)
+            bundle_bools.insert(boss.bools.begin(), boss.bools.end());
         ApplyPolicy policy{true, allowed_classes, {}, wallet};
         for (const auto& [kind, key] : keys) {
-            if (!denied.contains(key) && (kind != Kind::Bit || world.families.empty() || world.AdmitsFlag(key)))
+            if (!(kind == Kind::Bool && bundle_bools.contains(key)) && !denied.contains(key) &&
+                (kind != Kind::Bit || world.families.empty() || world.AdmitsFlag(key)))
                 policy.keys.emplace(kind, key);
         }
         for (const auto& [kind, key] : policy.keys) {
@@ -1110,6 +1115,10 @@ struct Session::Impl {
     };
     std::optional<CleanupCall> cleanup_call;
     u64 cleanup_stack{};
+    std::set<u64> bundle_bools; // local bundle-only flags, never ordinary grants or observations
+    QuestDefer::Observation quest_observation;
+    bool quest_death_unavailable{};
+    u64 quest_toasts{};
     std::unique_ptr<Quest::Controller> quest;
     std::optional<Backend::Context> quest_saved;
     u64 quest_stack{};
@@ -2008,7 +2017,8 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
     : owner{owner_}, base{base_}, profile{std::move(profile_)},
       impl{std::make_unique<Impl>(std::move(endpoint), std::move(hello), std::move(denied),
                                    std::move(allowed_classes), std::move(allowed_keys),
-                                   profile->wallet_hash, profile->world, profile->quest && profile->quest->enabled)} {
+                                   profile->wallet_hash, profile->world, profile->quest && profile->quest->enabled,
+                                   profile->quest ? profile->quest->defer.get() : nullptr)} {
     impl->binding.base = base;
     impl->hello.quest = false;
     impl->mod_label = impl->hello.mod_hash.empty() ? impl->hello.policy_id : impl->hello.mod_hash;
@@ -2180,7 +2190,8 @@ Quest::Port Session::QuestPort(Memory::Memory& memory) {
 
 bool Session::Observe(Change change) {
     // Wallet deltas are observed only at the wallet entry's listed callers (ObserveRupee).
-    if (impl->stopped || !WireKind(change.kind)) return false;
+    if (impl->stopped || !WireKind(change.kind) ||
+        (change.kind == Kind::Bool && impl->bundle_bools.contains(change.key))) return false;
     if (change.kind == Kind::Item && !ValidItem(change)) return false;
     std::scoped_lock lock{impl->mutex};
     if (impl->outgoing.size() >= QueueLimit || impl->next_seq > MaxSequence) {
@@ -2658,6 +2669,51 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     if (!impl->frame_thread) impl->frame_thread = thread;
     if (impl->frame_thread != thread) return false;
     ++impl->tick;
+    bool quest_save_closed = false;
+    if (impl->quest) {
+        // The title screen runs on a bound, stable GameData manager with default data and a live
+        // challenge manager (field, C16 s2: a late-join target applied there, then the save load
+        // restored over it). A save is loaded once the wallet capacity Int is non-zero (the world
+        // class's signal: 0 at boot and title, the bag size in game). No capacity key: no gate.
+        bool loaded = true;
+        if (profile->world.capacity_hash) {
+            const auto capacity = backend.ReadInt(profile->world.capacity_hash);
+            loaded = capacity && *capacity > 0;
+        }
+        if (loaded != impl->quest_save_loaded) {
+            quest_save_closed = !loaded;
+            impl->quest_save_loaded = loaded;
+            if (impl->quest_gate_lines++ < 16)
+                log(loaded ? "OoT co-op: quest save gate open (wallet capacity non-zero)"
+                           : "OoT co-op: quest save gate closed (no loaded save: title or boot)");
+        }
+    }
+    if (impl->quest && impl->quest->Defer().Watching()) {
+        auto& o = impl->quest_observation;
+        o = {};
+        const auto manager = OotGameDataTrace::Detail::Read64(memory, base + profile->manager_cell);
+        if (manager && *manager) {
+            const auto pose = ReadLocalPose(memory, base, *manager, profile->ghost, 0);
+            if (!pose.banc.empty()) o.banc = pose.banc;
+            o.loading = GhostDetail::Flag(memory, *manager, profile->ghost.loading_hash);
+            o.boss = GhostDetail::Flag(memory, *manager, profile->quest->defer->boss_bool);
+            if (profile->teleport && profile->anim) {
+                const auto sample = Teleport::ReadSample(memory, base, *manager, *profile);
+                o.command = sample.command;
+                if (sample.event_running) o.event = *sample.event_running != 0;
+            } else {
+                // ItemReady is conservative: other unreadable guard objects also mean in activity.
+                o.event = !backend.ItemReady();
+                if (!std::exchange(impl->quest_death_unavailable, true))
+                    log("OoT co-op: questdefer death detection off: no teleport controller keys");
+            }
+        }
+        o.stable = impl->stable_frame && o.banc.has_value();
+        o.save_loaded = impl->quest_save_loaded;
+        QuestDefer::Port observation_port; observation_port.log = log;
+        impl->quest->Defer().Observe(o, impl->tick, observation_port);
+    }
+    if (quest_save_closed) impl->quest->Reset();
     if (profile->chest.interaction_pc) {
         impl->SampleChestEvent(EventContext(memory));
         for (const u32 key : impl->claims.MissingBenefits(impl->tick)) {
@@ -2820,6 +2876,7 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             impl->book.End(end->transaction);
         } else {
             const auto& change = std::get<Change>(entry);
+            if (change.kind == Kind::Bool && impl->bundle_bools.contains(change.key)) continue;
             if (change.kind == Kind::Quest) {
                 if (!change.origin.empty() && !impl->remote.AdoptSeen({{change.origin, change.seq}})) continue;
                 if (impl->quest) impl->quest->Queue({static_cast<u32>(change.key), change.step,
@@ -3113,23 +3170,29 @@ bool Session::FrameQuest(Backend& backend, Memory::Memory& memory, Log log, bool
     };
     available = available && !impl->cleanup_saved && !impl->ghost_saved && !impl->teleport_saved &&
         !(impl->ghost && impl->ghost->Calling()) && !(impl->equipment && impl->equipment->Calling());
-    // The title screen runs on a bound, stable GameData manager with default data and a live
-    // challenge manager (field, C16 s2: a late-join target applied there, then the save load
-    // restored over it). A save is loaded once the wallet capacity Int is non-zero (the world
-    // class's signal: 0 at boot and title, the bag size in game). No capacity key: no gate.
-    bool loaded = true;
-    if (profile->world.capacity_hash) {
-        const auto capacity = backend.ReadInt(profile->world.capacity_hash);
-        loaded = capacity && *capacity > 0;
-    }
-    if (loaded != impl->quest_save_loaded) {
-        impl->quest_save_loaded = loaded;
-        if (impl->quest_gate_lines++ < 16)
-            log(loaded ? "OoT co-op: quest save gate open (wallet capacity non-zero)"
-                       : "OoT co-op: quest save gate closed (no loaded save: title or boot)");
-    }
+    const bool loaded = impl->quest_save_loaded;
+    impl->quest->Defer().Gates(impl->stable_frame && impl->runtime->BaselineReady(), loaded);
+    QuestDefer::Port bundles;
+    bundles.log = log;
+    bundles.peer = [&](std::string_view origin) { return impl->ux.Name(origin); };
+    bundles.toast = [&](std::string_view text) {
+        Ux::Notify(fmt::format("questdefer:{}:{}", impl->hello.client_id, ++impl->quest_toasts), std::string{text});
+    };
+    bundles.read_bool = [&](u32 hash) { return backend.ReadFlag(Change{Kind::Bool, {}, 0, hash, 1}); };
+    bundles.grant_bool = [&](u32 hash) {
+        if (!impl->bundle_bools.contains(hash) || impl->denied.contains(hash) || !port.ready()) return false;
+        auto target = backend.Resolve(Change{Kind::Bool, {}, 0, hash, 1});
+        if (!target) return false;
+        auto saved = backend.Capture();
+        if (!saved) return false;
+        target->stack = impl->binding.stack - ItemFrame;
+        target->stores = {{target->stack, 0}, {target->stack + 8, 0}, {target->stack + 0x10, 0}, {target->stack + 0x18, 0}};
+        if (!backend.Redirect(*target)) return false;
+        impl->quest_saved = std::move(saved); impl->quest_stack = target->stack;
+        return true;
+    };
     return impl->quest->Frame(port, impl->tick, impl->rebinds,
-        impl->stable_frame && impl->runtime->BaselineReady() && loaded, impl->quest_negotiated, available);
+        impl->stable_frame && impl->runtime->BaselineReady() && loaded, impl->quest_negotiated, available, &bundles);
 }
 
 void Session::QueueCleanup(u64 key) {
@@ -3304,8 +3367,9 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
             [&](Teleport::CrossStep step, size_t event, const Teleport::Packet& destination) {
                 return Teleport::IssueCross(memory, backend, *profile, base, impl->binding.stack,
                     impl->binding.sentinel, step, event, destination, impl->teleport_saved, impl->teleport_stack);
-            }};
+            }, [&] { if (impl->quest) impl->quest->Defer().Arrival(); }};
         std::scoped_lock lock{impl->mutex};
+        if (impl->quest) impl->teleport->SetExemptBancs(impl->quest->Defer().ExemptBancs());
         const bool can_call = !grant_calling && !impl->cleanup_saved && !impl->ghost->Calling() &&
             (!impl->equipment || !impl->equipment->Calling()) && !impl->teleport_saved;
         const bool cross_active = impl->teleport->CrossActive();

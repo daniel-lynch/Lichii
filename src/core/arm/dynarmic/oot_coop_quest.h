@@ -14,6 +14,8 @@
 #include <nlohmann/json.hpp>
 #include "common/common_types.h"
 
+namespace Core::OotCoop::QuestDefer { struct Config; class Machine; struct Port; struct Observation; }
+
 namespace Core::OotCoop::Quest {
 struct Entry {
     u64 offset{};
@@ -25,6 +27,7 @@ struct Table {
 };
 struct Keys {
     bool enabled{};
+    std::shared_ptr<const QuestDefer::Config> defer;
     u32 notready_hash{}, complete_hash{}, ready_hash{};
     u64 settle_frames{300}, apply_timeout{600};
     std::map<std::string, u64, std::less<>> manager, layout;
@@ -79,7 +82,7 @@ std::optional<Record> ReadRecord(const Port& port, const Keys& keys, const Manag
 bool Restoring(const Keys& keys, const Manager& manager, const Record& record);
 bool CanApply(const Keys& keys, const Manager& manager, const Record& record, const Target& target);
 /// Why a target may not be issued now (empty: it may). Diagnostics for the bounded quest log.
-std::string_view ApplyBlock(const Keys& keys, const Manager& manager, const Record& record, const Target& target);
+std::string_view ApplyBlock(const Keys& keys, const Manager& manager, const Record& record, const Target& target, const QuestDefer::Machine* defer = nullptr);
 
 // No guest addresses: remote raw targets survive save epochs and are revalidated against each save.
 class Book {
@@ -111,11 +114,13 @@ private:
 class Controller {
 public:
     Controller(std::shared_ptr<const Keys> keys, std::set<u64> denied, u64 base);
+    ~Controller();
+    QuestDefer::Machine& Defer() { return *defer; }
     void Queue(Target target);
     void Dirty(const Port& port, u64 state, u64 pc);
-    bool Frame(Port& port, u64 frame, u64 bind_epoch, bool stable, bool negotiated, bool available);
+    bool Frame(Port& port, u64 frame, u64 bind_epoch, bool stable, bool negotiated, bool available, QuestDefer::Port* bundles = nullptr);
     void Returned(Port& port, u64 result);
-    bool Calling() const { return flight && !flight->returned; }
+    bool Calling() const;
     void Log(const Port& port, std::string_view line);
     void Reset();
     void Rebaseline() { baseline_sent.clear(); }
@@ -124,6 +129,7 @@ private:
     struct Flight { Target target; u32 from{}; u64 frame{}; bool returned{}; };
     std::shared_ptr<const Keys> keys;
     Book book;
+    std::unique_ptr<QuestDefer::Machine> defer;
     u64 base{}, tick{}, epoch{}, settle_until{};
     std::optional<Manager> manager;
     std::optional<Flight> flight;
