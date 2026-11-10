@@ -1850,16 +1850,16 @@ class LedgerUnitTests(unittest.TestCase):
                 path = title / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(data)
-            text = hashing.canonical_text(keys, title)
+            text = hashing.canonical_text(keys, title, hash_version=1)
             self.assertEqual(hashlib.sha256(text.encode()).hexdigest(), '2d664dfd842f28a77e40468dbc1b732493b854d9f52fb91945fc4f09e240867e')
             self.assertEqual(len(text.splitlines()), 8)
             (title / 'Alpha').rename(title / 'Renamed')
-            self.assertEqual(text, hashing.canonical_text(keys, title))
+            self.assertEqual(text, hashing.canonical_text(keys, title, hash_version=1))
             (title / 'Renamed/romfs/link.bin').symlink_to('a.bin')
-            self.assertIn('mod romfs/link.bin 3 ', hashing.canonical_text(keys, title))
+            self.assertIn('mod romfs/link.bin 3 ', hashing.canonical_text(keys, title, hash_version=1))
             (title / 'Renamed/romfs/cycle').symlink_to('.', target_is_directory=True)
             with self.assertRaisesRegex(ValueError, 'cycle'):
-                hashing.canonical_text(keys, title)
+                hashing.canonical_text(keys, title, hash_version=1)
 
 
 class LedgerTCPTests(unittest.IsolatedAsyncioTestCase):

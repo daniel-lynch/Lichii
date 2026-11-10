@@ -23,6 +23,7 @@
 #include "common/fs/path_util.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/oot_coop_gui.h"
+#include "core/arm/dynarmic/oot_coop_ledger.h"
 #include "core/core.h"
 
 namespace {
@@ -78,14 +79,26 @@ CoopPanel::CoopPanel(Core::System& system_, QWidget* parent)
     });
     auto* connection = new QHBoxLayout;
     auto* reconnect = reconnect_button = new QPushButton(tr("Reconnect with page settings"), this);
-    reconnect->setToolTip(tr("Restarts the game after confirmation. Launcher values still win. "
-                           "Changing co-op enablement requires closing and reopening the application."));
-    connect(reconnect, &QPushButton::clicked, this, &CoopPanel::ReconnectRequested);
+    reconnect->setToolTip(tr("Restarts the game after confirmation. Launcher values still win."));
+    connect(reconnect, &QPushButton::clicked, this, [this] {
+        message->setText(tr("Restart with page settings requested"));
+        emit ReconnectRequested();
+    });
     connection->addWidget(reconnect);
-    auto* disconnect = new QPushButton(tr("Disconnect"), this);
-    disconnect->setEnabled(false);
-    disconnect->setToolTip(tr("Needs core support: the runtime has no stop-transport switch yet"));
-    connection->addWidget(disconnect);
+    disconnect_button = new QPushButton(tr("Disconnect"), this);
+    connect_button = new QPushButton(tr("Connect"), this);
+    connection->addWidget(disconnect_button);
+    connection->addWidget(connect_button);
+    connect(disconnect_button, &QPushButton::clicked, this, [this] {
+        message->setText(Gui::RequestDisconnect(Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir)) ?
+            tr("Relay disconnect requested") : tr("Could not write disconnect request"));
+        Refresh();
+    });
+    connect(connect_button, &QPushButton::clicked, this, [this] {
+        message->setText(Gui::RequestConnect(Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir)) ?
+            tr("Relay connect requested") : tr("Could not remove disconnect request"));
+        Refresh();
+    });
     layout->addLayout(connection);
     auto* group = new QGroupBox(tr("Randomizer"), this);
     auto* form = new QFormLayout(group);
@@ -151,6 +164,12 @@ void CoopPanel::TestHook() {
                                  : (button->click(), message->text());
             } else if (words[0] == QStringLiteral("resync")) {
                 resync_button->click(); result = message->text();
+            } else if (words[0] == QStringLiteral("disconnect") || words[0] == QStringLiteral("connect") ||
+                       words[0] == QStringLiteral("reconnect")) {
+                Refresh();
+                auto* button = words[0] == QStringLiteral("disconnect") ? disconnect_button :
+                    words[0] == QStringLiteral("connect") ? connect_button : reconnect_button;
+                result = button->isEnabled() ? (button->click(), message->text()) : QStringLiteral("button disabled");
             } else if (words[0] == QStringLiteral("room") && words.size() == 2) {
                 if (room_window->isChecked() != (words[1] == QStringLiteral("on"))) room_window->click();
                 result = message->text() + QStringLiteral(" checked=%1").arg(room_window->isChecked());
@@ -223,17 +242,24 @@ void CoopPanel::Refresh() {
             });
         }
     }
+    const bool relay_up = status.relay_state == "connected";
     for (size_t i = 0; i < status.peers.size(); ++i) {
         const auto& peer = status.peers[i];
         const int row = static_cast<int>(i);
         peers->item(row, 0)->setText(Q(peer.name));
-        peers->item(row, 1)->setText(live ? (peer.online ? tr("Yes") : tr("No")) : tr("Unknown"));
+        // The presence book keeps peers "awaiting" across a relay gap (reconnect reconciliation), so a
+        // peer is only online here while our own relay link is connected (C17: Disconnect showed Yes).
+        const bool online = live && relay_up && peer.online;
+        peers->item(row, 1)->setText(live ? (online ? tr("Yes") : tr("No")) : tr("Unknown"));
         peers->item(row, 2)->setText(peer.has_pose ? (peer.child ? tr("child") : tr("adult")) : QStringLiteral("-"));
         peers->item(row, 3)->setText(peer.loading ? tr("Loading") : Q(peer.area));
         peers->item(row, 4)->setText(Seen(now, peer.seen_ms));
         // A stale publisher cannot confirm online peers; do not send requests based on stale rows.
-        peers->cellWidget(row, 5)->setEnabled(live && peer.online && status.teleport && !trigger.empty());
+        peers->cellWidget(row, 5)->setEnabled(online && status.teleport && !trigger.empty());
     }
+    const bool disconnected = Gui::DisconnectRequested(Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir));
+    disconnect_button->setEnabled(live && !disconnected);
+    connect_button->setEnabled(disconnected);
     reconnect_button->setEnabled(system.IsPoweredOn()); // restarting needs a running game
     const auto room_path = Gui::RoomTrigger(Env);
     const QSignalBlocker block(room_window);
@@ -247,12 +273,13 @@ void CoopPanel::Refresh() {
     const auto title = system.IsPoweredOn() ? system.GetApplicationProcessProgramID() : 0;
     if (Gui::CoopTitle(title)) {
         const auto path = Common::FS::GetEdenPath(Common::FS::EdenPath::LoadDir) / fmt::format("{:016X}", title);
-        const QDir dir(Q(Common::FS::PathToUTF8String(path)));
         const auto disabled = Settings::values.disabled_addons.find(title);
-        for (const auto& folder : dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name)) {
-            if (disabled == Settings::values.disabled_addons.end() ||
-                std::find(disabled->second.begin(), disabled->second.end(), folder.toStdString()) == disabled->second.end())
-                mods << folder;
+        try {
+            for (const auto& folder : Core::OotCoop::Ledger::EnabledModFolders(path,
+                     disabled == Settings::values.disabled_addons.end() ? std::vector<std::string>{} : disabled->second))
+                mods << Q(Common::FS::PathToUTF8String(folder.filename()));
+        } catch (const std::filesystem::filesystem_error&) {
+            mods << tr("mod folders unavailable");
         }
     }
     randomizer[3]->setText(mods.join(QLatin1Char{','}));

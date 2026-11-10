@@ -59,7 +59,11 @@ struct HashResult {
     size_t files{};
     u64 bytes{};
 };
-HashResult ModHash(const std::filesystem::path& keys, const std::filesystem::path& program_load);
+// All enabled directories are listed, including those with no hashed trees.
+std::vector<std::filesystem::path> EnabledModFolders(const std::filesystem::path& program_load,
+                                                   const std::vector<std::string>& disabled);
+HashResult ModHash(const std::filesystem::path& keys, const std::filesystem::path& program_load,
+                   const std::vector<std::string>& disabled);
 std::string Digest(std::string_view bytes);
 
 struct Page {

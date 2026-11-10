@@ -243,20 +243,30 @@ TEST_CASE("Ledger canonical mod hash matches Python synthetic fixture", "[oot_co
     Temp temp;
     temp.Put("keys.json", "{}\n");
     temp.Put("coop-ux.json", "{\"version\":1}\n");
-    temp.Put("0000000000000001/Alpha/romfs/a.bin", "abc");
+    temp.Put("0000000000000001/Alpha/RoMfS/a.bin", "abc");
+    temp.Put("0000000000000001/Alpha/romfslite/c.bin", "lite\n");
     temp.Put("0000000000000001/Beta/exefs/b.bin", "xyz\n");
     temp.Put("0000000000000001/Alpha/cheats/local.txt", "ignored");
+    temp.Put("0000000000000001/Empty/cheats/local.txt", "ignored");
     const auto title = temp.root / "0000000000000001";
-    auto hash = L::ModHash(temp.root / "keys.json", title);
+    const std::vector<std::string> disabled{"Beta"};
+    auto hash = L::ModHash(temp.root / "keys.json", title, disabled);
     CHECK(hash.files == 2);
-    CHECK(hash.bytes == 24);
-    CHECK(hash.digest == "2d664dfd842f28a77e40468dbc1b732493b854d9f52fb91945fc4f09e240867e");
-    CHECK(hash.text.starts_with("oot-coop-mod-hash 1\nkeys 3 "));
-    CHECK(hash.text.find("sidecar coop-ledger.json absent\nmod exefs/b.bin 4 ") != std::string::npos);
+    CHECK(hash.bytes == 25);
+    CHECK(hash.digest == "c8800c24610409ab0db2921a73983f00828fe9736bb78eb12a7196d5a992aceb");
+    CHECK(hash.text.starts_with("oot-coop-mod-hash 2\nkeys 3 "));
+    CHECK(hash.text.find("mod RoMfS/a.bin 3 ") != std::string::npos);
+    CHECK(hash.text.find("mod romfslite/c.bin 5 ") != std::string::npos);
+    CHECK(hash.text.find("mod exefs/") == std::string::npos);
     CHECK(hash.text.back() == '\n');
+    const auto folders = L::EnabledModFolders(title, disabled);
+    REQUIRE(folders.size() == 2);
+    CHECK(folders[0].filename() == "Alpha");
+    CHECK(folders[1].filename() == "Empty");
+    CHECK(L::ModHash(temp.root / "keys.json", title, {"beta"}).files == 3);
     fs::rename(title / "Alpha", title / "Renamed");
-    CHECK(L::ModHash(temp.root / "keys.json", title).text == hash.text);
-    CHECK_THROWS(L::ModHash(temp.root / "missing.json", title));
+    CHECK(L::ModHash(temp.root / "keys.json", title, disabled).text == hash.text);
+    CHECK_THROWS(L::ModHash(temp.root / "missing.json", title, {}));
 }
 
 TEST_CASE("Ledger catchup pages reject bad epochs revisions classes and envelopes", "[oot_coop]") {

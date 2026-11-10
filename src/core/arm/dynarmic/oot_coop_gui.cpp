@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "core/arm/dynarmic/oot_coop_gui.h"
+#include "core/arm/dynarmic/oot_coop_link.h"
 
 #include <algorithm>
 #include <array>
@@ -382,6 +383,16 @@ bool SetRoomWindow(const std::filesystem::path& path, bool shown) {
     std::error_code ec;
     std::filesystem::remove(path, ec);
     return !ec;
+}
+bool RequestDisconnect(const std::filesystem::path& eden_dir) {
+    return !eden_dir.empty() && SetRoomWindow(eden_dir / "coop-disconnect", true);
+}
+bool RequestConnect(const std::filesystem::path& eden_dir) {
+    if (eden_dir.empty()) return false;
+    return Link::DisconnectTrigger(eden_dir).TakeStale() != Link::DisconnectTrigger::Stale::Failed;
+}
+bool DisconnectRequested(const std::filesystem::path& eden_dir) {
+    return !eden_dir.empty() && Link::DisconnectTrigger(eden_dir).Present();
 }
 bool RequestResync(const std::filesystem::path& eden_dir) {
     return !eden_dir.empty() && SetRoomWindow(eden_dir / "coop-resync", true);

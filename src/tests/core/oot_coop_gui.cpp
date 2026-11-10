@@ -219,3 +219,22 @@ TEST_CASE("Co-op GUI status publication copies and advances serial", "[oot_coop]
     Gui::ClearStatus(); REQUIRE_FALSE(Gui::CurrentStatus().live);
     REQUIRE(Gui::CurrentStatus().serial > before_clear); REQUIRE(Gui::CurrentStatus().peers.empty());
 }
+
+TEST_CASE("Co-op GUI disconnect and connect use a persistent trigger", "[oot_coop]") {
+    Scratch scratch;
+    REQUIRE_FALSE(Gui::DisconnectRequested(scratch.path));
+    REQUIRE(Gui::RequestConnect(scratch.path));
+    REQUIRE(Gui::RequestDisconnect(scratch.path));
+    REQUIRE(Gui::RequestDisconnect(scratch.path));
+    REQUIRE(Gui::DisconnectRequested(scratch.path));
+    REQUIRE(Gui::RequestConnect(scratch.path));
+    REQUIRE_FALSE(Gui::DisconnectRequested(scratch.path));
+    REQUIRE(Gui::RequestConnect(scratch.path));
+    REQUIRE_FALSE(Gui::RequestConnect({}));
+    REQUIRE_FALSE(Gui::RequestDisconnect({}));
+    std::filesystem::create_directory(scratch.path / "coop-disconnect");
+    std::ofstream(scratch.path / "coop-disconnect/child") << "synthetic";
+    REQUIRE(Gui::DisconnectRequested(scratch.path));
+    REQUIRE_FALSE(Gui::RequestConnect(scratch.path));
+    REQUIRE_FALSE(Gui::RequestDisconnect(scratch.path));
+}

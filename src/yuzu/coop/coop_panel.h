@@ -34,7 +34,7 @@ private:
     QAction* action;
     QTimer* timer;
     QLabel *header, *identity, *local, *message;
-    QPushButton *resync_button{}, *copy_all_button{}, *reconnect_button{};
+    QPushButton *resync_button{}, *copy_all_button{}, *reconnect_button{}, *disconnect_button{}, *connect_button{};
     QString shots;
     int shot_count{};
     u64 shot_serial{};

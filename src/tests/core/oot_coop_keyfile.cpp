@@ -7,6 +7,7 @@
 //   EDEN_NX2_OOT_COOP_KEYS_BUILD=<40-hex main build id>
 //   tests "[.oot_coop_keyfile]"
 // The sidecars (coop-anim.json, coop-equip.json, coop-ux.json, coop-ledger.json) are read beside the key file.
+// Optional: EDEN_NX2_OOT_COOP_KEYS_DISABLED=<comma-separated exact folder names>.
 // Optional: EDEN_NX2_OOT_COOP_KEYS_LOAD=<load/<title id>> also prints the ledger mod hash of that tree.
 
 #include <cstdlib>
@@ -120,7 +121,15 @@ TEST_CASE("OoT co-op private key file loads with the strict decoders", "[.oot_co
     const auto pattern = Coop::Ledger::LoadConfig(path, ledger_why);
     WARN(fmt::format("coop-ledger.json: {}", pattern ? std::string{"save pattern loaded"} : ledger_why));
     if (const auto load = Env("EDEN_NX2_OOT_COOP_KEYS_LOAD"); !load.empty()) {
-        const auto hash = Coop::Ledger::ModHash(path, load);
+        std::vector<std::string> disabled;
+        const auto names = Env("EDEN_NX2_OOT_COOP_KEYS_DISABLED");
+        for (size_t start = 0; start < names.size();) {
+            const auto end = names.find(',', start);
+            disabled.push_back(names.substr(start, end - start));
+            if (end == std::string::npos) break;
+            start = end + 1;
+        }
+        const auto hash = Coop::Ledger::ModHash(path, load, disabled);
         WARN(fmt::format("mod hash {} ({} mod files, {} bytes)\n{}", hash.digest, hash.files, hash.bytes, hash.text));
     }
 }
