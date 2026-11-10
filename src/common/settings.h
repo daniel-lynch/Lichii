@@ -683,6 +683,20 @@ struct Values {
                                                          Specialization::Countable,
                                                          true,
                                                          true};
+    // Linux: the GPU driver's shader cache in a folder of our own (ConfigureDriverShaderCache),
+    // with its size limit in GiB. Applied at startup, before anything loads a driver.
+    Setting<bool> private_driver_shader_cache{linkage, true, "private_driver_shader_cache",
+                                              Category::RendererAdvanced, Specialization::Paired};
+    Setting<u32, true> driver_shader_cache_size{linkage,
+                                                10,
+                                                1,
+                                                1024,
+                                                "driver_shader_cache_size",
+                                                Category::RendererAdvanced,
+                                                Specialization::Countable,
+                                                true,
+                                                false,
+                                                &private_driver_shader_cache};
 
     // Precache shaders before the game starts: the compute programs in the game files and the
     // cached graphics pipelines the boot leaves for later are built on the loading screen, so the
