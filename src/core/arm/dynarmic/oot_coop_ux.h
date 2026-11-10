@@ -15,14 +15,19 @@
 // Switches (all on unless set to 0/off/false/no):
 //   EDEN_NX2_OOT_COOP_TOAST          corner toasts
 //   EDEN_NX2_OOT_COOP_TOAST_LOCAL    also toast what this player shares
+//   EDEN_NX2_OOT_COOP_TOAST_ICONS    item icons in toasts (needs the private icon pack, below)
 //   EDEN_NX2_OOT_COOP_NAMETAG        name tags
 //   EDEN_NX2_OOT_COOP_OVERLAY_SHOTS  draw the overlay into emulator screenshots too
 // Off unless set to 1: EDEN_NX2_OOT_COOP_NAMETAG_DEBUG (feet/head crosses, the projection probe).
+//
+// The optional icon pack is a private, game-derived directory (never in source):
+// EDEN_NX2_OOT_COOP_ICONS, or "coop-icons" beside the UX sidecar. See IconPack below.
 
 #include <array>
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -63,39 +68,117 @@ private:
     std::map<std::string, std::string, std::less<>> names;
 };
 
-/// "Anthony got 1x Kokiri Sword"; local: "You shared 1x Kokiri Sword". An actor the table does
-/// not name gives the explicit fallback "an item" (never a name guessed from the actor id).
+/// How a run of toast text is coloured by the presenter.
+enum class Tone : u8 { Plain, Name, Item, Muted };
+struct Run {
+    std::string text;
+    Tone tone{Tone::Plain};
+    bool operator==(const Run&) const = default;
+};
+
+/// One toast: coloured runs, an optional icon (an actor the icon pack maps, or a wallet delta)
+/// and a merge key. Toasts with the same non-empty key merge while on screen or queued: the
+/// counts add up and the presenter shows " xN" after the runs.
+struct Toast {
+    std::vector<Run> runs;
+    std::string icon;  // actor name for the icon pack; empty: none
+    s64 wallet{};      // nonzero: a rupee icon for this wallet delta
+    std::string merge; // merge key; empty: never merges
+    s64 count{1};      // shown as " xN" when > 1
+    /// The plain text (logs, tests): runs, then " xN" when count > 1.
+    [[nodiscard]] std::string Text() const;
+    bool operator==(const Toast&) const = default;
+};
+/// A plain one-run toast (presence, sync, quest, finish notices).
+[[nodiscard]] Toast PlainToast(std::string text);
+
+/// "Anthony found Kokiri Sword" (count 1) / "Anthony found Deku Nut x5"; local: "You shared
+/// Kokiri Sword". An actor the table does not name gives the explicit fallback "an item" / "N
+/// items" (never a name guessed from the actor id). Same sender + actor merge.
+[[nodiscard]] Toast ItemToast(std::string_view who, std::string_view actor, s64 count,
+                              const ItemNames& names, bool local = false);
+/// "Anthony +20 rupees" (a wallet delta; negative: "Anthony -5 rupees"), with the rupee icon.
+[[nodiscard]] Toast RupeeToast(std::string_view who, s64 delta);
+/// Plain-text forms of the above (kept for logs and older callers).
 [[nodiscard]] std::string ItemText(std::string_view who, std::string_view actor, s64 count,
                                    const ItemNames& names, bool local = false);
-/// "Anthony got 20 rupees" (a wallet delta; negative: "spent").
 [[nodiscard]] std::string RupeeText(std::string_view who, s64 delta);
 
-/// Toasts: deduplicated by id, shown in arrival order, at most MaxVisible at once, each for
-/// Duration ms from the moment it becomes visible. Clock is the caller's (ms).
+/// Toasts: deduplicated by id, merged by key, shown in arrival order, at most MaxVisible at
+/// once, each for Duration ms from the moment it becomes visible; while others wait, a toast
+/// that has been up for Hurry ms gives way. A merge into a visible toast extends it by Extend ms
+/// (never past Duration + Extend from when it appeared). Clock is the caller's (ms).
 class ToastQueue {
 public:
-    static constexpr u64 Duration = 4000;
+    static constexpr u64 Duration = 5000;
+    static constexpr u64 Hurry = 2500;
+    static constexpr u64 Extend = 2000;
     static constexpr size_t MaxVisible = 3;
     static constexpr size_t MaxQueued = 16;
     static constexpr size_t MaxIds = 4096;
 
-    /// False for a repeated id, an empty text or a full queue.
-    bool Push(std::string id, std::string text, u64 now_ms);
+    /// False for a repeated id, an empty toast or a full queue (a merge never fills the queue).
+    bool Push(std::string id, Toast toast, u64 now_ms);
+    bool Push(std::string id, std::string text, u64 now_ms) {
+        return Push(std::move(id), PlainToast(std::move(text)), now_ms);
+    }
     /// The toasts on screen now, oldest first.
-    [[nodiscard]] std::vector<std::string> Visible(u64 now_ms);
+    [[nodiscard]] std::vector<Toast> Visible(u64 now_ms);
+    /// Toasts waiting for a slot (the presenter shows "+N more").
+    [[nodiscard]] size_t Waiting() const { return waiting.size(); }
     [[nodiscard]] bool Empty() const { return shown.empty() && waiting.empty(); }
     void Clear();
 
 private:
     struct Shown {
-        std::string text;
+        Toast toast;
+        u64 since;
         u64 until;
     };
+    void Expire(u64 now_ms);
     std::deque<Shown> shown;
-    std::deque<std::string> waiting;
+    std::deque<Toast> waiting;
     std::set<std::string> ids;
     std::deque<std::string> id_order;
 };
+
+/// The private icon pack (game-derived; loaded from disk, never in source):
+///   <dir>/index.json {"format": "oot-coop-icons", "version": 1,
+///                     "sizes": [{"cell": N, "file": "<name>.rgba", "columns": C, "rows": R}, ...],
+///                     "icons": ["<icon id>", ...], "actors": {"<actor>": "<icon id>"},
+///                     "wallet": [{"min": n, "icon": "<icon id>"}, ...]}
+///   <dir>/<file>     raw RGBA8, straight alpha, (C*N) x (R*N), icon i at column i % C, row i / C.
+class IconPack {
+public:
+    struct Atlas {
+        u32 cell{}, columns{}, rows{};
+        std::vector<u8> rgba;
+    };
+    /// Strict: any malformed field rejects the pack (`why` says what). Files are read through
+    /// `read(name, limit)`, which returns nothing for a missing or larger file.
+    using Reader = std::function<std::optional<std::vector<u8>>(std::string_view name, size_t limit)>;
+    static std::shared_ptr<const IconPack> Decode(const nlohmann::json& index, const Reader& read,
+                                                  std::string* why = nullptr);
+    /// Load `dir` from disk.
+    static std::shared_ptr<const IconPack> Load(const std::string& dir, std::string* why = nullptr);
+
+    [[nodiscard]] std::optional<u32> Find(std::string_view actor) const;
+    [[nodiscard]] std::optional<u32> Wallet(s64 delta) const;
+    /// The atlas whose cell is the largest not above `pixels` (else the smallest).
+    [[nodiscard]] const Atlas* Best(u32 pixels) const;
+    /// Copy icon `index` of `atlas` into a cell x cell RGBA buffer.
+    [[nodiscard]] std::vector<u8> Icon(const Atlas& atlas, u32 index) const;
+    [[nodiscard]] size_t Size() const { return count; }
+    [[nodiscard]] size_t Actors() const { return actors.size(); }
+
+private:
+    std::vector<Atlas> atlases; // ascending cell
+    std::map<std::string, u32, std::less<>> actors;
+    std::vector<std::pair<s64, u32>> wallet; // ascending min
+    size_t count{};
+};
+/// "coop-icons" beside the UX sidecar (or EDEN_NX2_OOT_COOP_ICONS); empty when neither is set.
+[[nodiscard]] std::string IconDirectory();
 
 /// The active Main camera's read chain (static research, ghost-ux REPORT 3.3). Module offsets are
 /// relative to the main base; the rest are field offsets.
@@ -152,7 +235,7 @@ struct Point2 {
 /// Nothing when the point is behind the camera, the clip w is degenerate, anything is not finite,
 /// or it lands outside the rectangle.
 [[nodiscard]] std::optional<Point2> Project(const Camera& camera, const std::array<float, 3>& world,
-                                            bool flip_y);
+                                            bool flip_y, float* depth = nullptr);
 
 enum class CameraFail { None, Root, Registry, NoMain, Slot, Association, View, Dirty, Matrix };
 [[nodiscard]] std::string_view CameraFailName(CameraFail fail);
@@ -251,10 +334,12 @@ struct TagPeer {
 };
 
 /// An overlay item, positioned in [0, 1] of the game rectangle. `marker` is a diagnostic cross.
+/// `distance` is the view-space depth of the head point in world units (0: unknown).
 struct Tag {
     std::string text;
     Point2 at;
     bool marker{};
+    float distance{};
 };
 
 /// Tags for the peers in our scene (same banc, neither side loading), name at root + head height;
@@ -267,6 +352,7 @@ struct Config {
     ItemNames names;
     std::shared_ptr<const Room::Config> room;
     std::optional<CameraKeys> camera; // for the running build
+    std::shared_ptr<const IconPack> icons; // EDEN_NX2_OOT_COOP_TOAST_ICONS and a valid pack
 };
 /// The sidecar for `build_id` (40 hex digits). A missing file gives an empty config and `why`.
 [[nodiscard]] Config DecodeConfig(const nlohmann::json& document, std::string_view build_id,
@@ -287,7 +373,9 @@ struct Marker {
 };
 
 struct OverlayFrame {
-    std::vector<std::string> toasts;
+    std::vector<Toast> toasts;
+    size_t more{}; // toasts waiting behind the visible ones
+    std::shared_ptr<const IconPack> icons;
     std::vector<Tag> tags;
     std::shared_ptr<const Panel> panel;
     std::vector<Marker> markers;
@@ -296,6 +384,9 @@ struct OverlayFrame {
 
 /// Queue a toast (no-op when EDEN_NX2_OOT_COOP_TOAST is off). False when `id` was seen.
 bool Notify(std::string id, std::string text);
+bool Notify(std::string id, Toast toast);
+/// The icon pack the presenter draws toast icons from (Reset clears it).
+void PublishIcons(std::shared_ptr<const IconPack> icons);
 /// The name tags for this game frame; the presenter drops them after TagLifetimeMs.
 inline constexpr u64 TagLifetimeMs = 250;
 void PublishTags(std::vector<Tag> tags);
@@ -311,7 +402,10 @@ void Reset();
 /// the network thread, everything else runs on the frame thread.
 class SessionUx {
 public:
-    void Configure(std::shared_ptr<const Config> config_) { config = std::move(config_); }
+    void Configure(std::shared_ptr<const Config> config_) {
+        config = std::move(config_);
+        PublishIcons(config ? config->icons : nullptr);
+    }
     [[nodiscard]] const Config* Settings() const { return config.get(); }
     void SetName(const std::string& origin, std::string_view name);
     [[nodiscard]] std::string Name(std::string_view origin) const;
