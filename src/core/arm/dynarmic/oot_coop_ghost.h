@@ -344,6 +344,7 @@ public:
 
     bool Calling() const { return op != GhostOp::None; }
     const std::array<Slot, GhostSlots>& Slots() const { return slots; }
+    u64 SceneEpoch() const { return scene_epoch; }
     void RetireEquipment(u64 actor, bool recreate) {
         for (auto& slot : slots) {
             if (slot.actor != actor || slot.state != State::Live) continue;

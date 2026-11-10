@@ -22,6 +22,7 @@
 #include "core/arm/dynarmic/oot_coop_equip.h"
 #include "core/arm/dynarmic/oot_coop_ledger.h"
 #include "core/arm/dynarmic/oot_coop_quest.h"
+#include "core/arm/dynarmic/oot_coop_questdefer.h"
 #include "core/arm/dynarmic/oot_coop_room.h"
 #include "core/arm/dynarmic/oot_coop_teleport.h"
 #include "core/arm/dynarmic/oot_coop_sync.h"
@@ -93,6 +94,15 @@ TEST_CASE("OoT co-op private key file loads with the strict decoders", "[.oot_co
         WARN(fmt::format("quest present (enabled={}): mirror {} challenges / {} safe steps, {} commit observers, "
                          "deny.quest {}", profile->quest->enabled, profile->quest->mirror.size(), steps,
                          profile->quest->observers.size(), extras->deny_quest.size()));
+        // C17 questdefer: the optional bundle section (counts and switches only; no game values printed).
+        if (const auto& d = profile->quest->defer) {
+            size_t enabled = 0, chain = 0, bools = 0;
+            for (const auto& b : d->bosses) { enabled += b.enabled; chain += b.chain.size(); bools += b.bools.size(); }
+            WARN(fmt::format("questdefer: bosses {} (enabled {}), chain steps {}, bundle bools {}, defer_in_activity={} "
+                             "death_skips={} skip_in_place={} death_apply={} death commands {}", d->bosses.size(), enabled,
+                             chain, bools, d->defer_in_activity, d->death_skips, d->skip_in_place,
+                             d->during_gameover ? "during_gameover" : "after_respawn", d->death_commands.size()));
+        }
     } else WARN("quest absent");
     if (profile->teleport) {
         const auto& t = *profile->teleport;

@@ -253,14 +253,16 @@ void History::Step(const Sample& s, const Keys& k) {
     } else frames = std::min(frames + 1, k.settle_frames);
     previous = s;
 }
-std::string Ready(const Sample& s, const History& h, const Keys& k, bool answer) {
+std::string Ready(const Sample& s, const History& h, const Keys& k, bool answer,
+                  const std::vector<std::string>& exempt_bancs) {
     if (!k.enabled) return "disabled";
     if (s.loading) return "loading";
     if (!s.event_running || !s.block_bools_ok || !s.actor_pos || !s.resident || !s.command ||
         !Position(s.info_pos) || !std::isfinite(s.yaw) || std::abs(s.yaw) > 360 || s.banc.empty()) return "unready";
     if (*s.event_running) return "event";
     if (!*s.block_bools_ok) return "pause";
-    if (!Contains(k.allow_bancs, s.banc) || Contains(k.deny_bancs, s.banc)) return "scene";
+    if ((answer || !Contains(exempt_bancs, s.banc)) &&
+        (!Contains(k.allow_bancs, s.banc) || Contains(k.deny_bancs, s.banc))) return "scene";
     if (!Contains(answer ? k.answer_commands : k.requester_commands, *s.command)) return "state";
     if (!Within(s.info_pos, *s.actor_pos, {k.agree_epsilon, k.agree_epsilon})) return "unready";
     if (h.frames < k.settle_frames) return "airborne";
@@ -394,7 +396,7 @@ bool Controller::Frame(const Sample& s, u64 now, bool can_call, Port& port) {
         }
         if (destination.child != s.child) { refuse("age"); return false; }
         if (destination.room) { refuse("scene (rooms unsupported)"); return false; }
-        const auto why = Ready(s, history, keys, false);
+        const auto why = Ready(s, history, keys, false, exempt_bancs);
         if (!why.empty()) { refuse(why); return false; }
         if (!can_call) return false;
         if (!s.resident || !port.validate(*s.resident)) { refuse("actor changed"); return false; }
@@ -424,6 +426,7 @@ bool Controller::Frame(const Sample& s, u64 now, bool can_call, Port& port) {
                 frame - issued_frame, s.info_pos[0] - destination.pos[0], s.info_pos[1] - destination.pos[1], s.info_pos[2] - destination.pos[2], failure, Details(s)));
             if (arrived) checkpoint = Checkpoint{destination, *resident, frame, 0};
             phase = Phase::Idle; resident.reset(); history.Reset();
+            if (arrived && port.arrived) port.arrived();
         }
     }
     return false;
@@ -497,7 +500,7 @@ bool Controller::CrossFrame(const Sample& s, u64 now, bool can_call, Port& port)
     if (s.banc != scene && s.banc != destination.banc) { CrossFail(port.log, "unexpected banc"); return false; }
     if (phase == Phase::Reserve) {
         if (s.banc != scene || s.loading || s.resident != resident || !resident || !port.validate(*resident) ||
-            !Ready(s, history, keys, false).empty()) {
+            !Ready(s, history, keys, false, exempt_bancs).empty()) {
             CrossFail(port.log, "source changed during reservation"); return false;
         }
         return can_call && CrossIssue(port);
@@ -524,7 +527,7 @@ bool Controller::CrossFrame(const Sample& s, u64 now, bool can_call, Port& port)
     // plus a position that has left the source point.
     const bool moved = !Within(s.info_pos, cross_from, keys.tolerance);
     if (!switched || !loading_on || !loading_off || !reasserted || !s.resident || !moved ||
-        !Ready(s, history, keys, false).empty() || !port.validate(*s.resident)) {
+        !Ready(s, history, keys, false, exempt_bancs).empty() || !port.validate(*s.resident)) {
         arrival_frames = 0; return false;
     }
     if (new_resident && new_resident != s.resident) {
@@ -544,7 +547,9 @@ bool Controller::CrossFrame(const Sample& s, u64 now, bool can_call, Port& port)
         Within(*s.actor_pos, destination.pos, keys.tolerance)) {
         receipt("arrived (no correction)");
         checkpoint = Checkpoint{destination, *resident, frame, 0};
-        phase = Phase::Idle; resident.reset(); history.Reset(); return false;
+        phase = Phase::Idle; resident.reset(); history.Reset();
+        if (port.arrived) port.arrived();
+        return false;
     }
     if (!port.call(*resident, destination)) { CrossFail(port.log, "correction unavailable or actor changed"); return false; }
     phase = Phase::Calling; issued_frame = frame;

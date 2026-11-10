@@ -38,6 +38,7 @@ struct Rig {
     std::vector<std::string> logs;
     std::vector<Core::OotCoop::ApplyTarget> calls;
     bool valid{true}, valid_at_call{true};
+    unsigned arrivals{};
     T::Port port{
         [&](const auto& resident) { return valid && sample.resident == resident; },
         [&](const auto& resident, const auto& packet) {
@@ -45,7 +46,10 @@ struct Rig {
             calls.push_back(T::MatrixCall(0x4000, 0x5000, 0x6000, resident.actor, packet)); return true;
         }, [&](std::string_view s) { logs.emplace_back(s); }};
     u64 now{1000};
-    Rig() { for (int i = 0; i < 3; ++i) Frame(); }
+    Rig() {
+        port.arrived = [&] { ++arrivals; };
+        for (int i = 0; i < 3; ++i) Frame();
+    }
     bool Frame(bool can_call = true) { now += 16; return controller.Frame(sample, now, can_call, port); }
     void Request() { REQUIRE(controller.Trigger("peer-a", now, port.log)); controller.TakeOutput(); }
     void Receive(T::Packet p = Reply()) { controller.Receive(p, now, port.log); }
@@ -192,15 +196,15 @@ TEST_CASE("teleport calls once with the native matrix then verifies and settles"
         REQUIRE(static_cast<u32>(value >> 32) == std::bit_cast<u32>(matrix[i * 2 + 1]));
     }
     r.controller.Returned(0x1234, r.port.log);
-    r.Frame(); REQUIRE_FALSE(r.Logged("teleport arrived"));
-    r.sample.info_pos = Reply().pos; r.Frame(); REQUIRE_FALSE(r.Logged("teleport arrived"));
+    r.Frame(); REQUIRE_FALSE(r.Logged("teleport arrived")); REQUIRE(r.arrivals == 0);
+    r.sample.info_pos = Reply().pos; r.Frame(); REQUIRE_FALSE(r.Logged("teleport arrived")); REQUIRE(r.arrivals == 0);
     r.sample.actor_pos = Reply().pos; r.Frame(); REQUIRE(r.Logged("teleport arrived"));
     for (int i = 0; i < 60; ++i) r.Frame();
     REQUIRE(r.Logged("+1s stable"));
     r.sample.info_pos[1] -= 5; r.sample.actor_pos = r.sample.info_pos;
     for (int i = 0; i < 120; ++i) r.Frame();
     REQUIRE(r.Logged("+3s moved"));
-    REQUIRE(r.calls.size() == 1); REQUIRE_FALSE(r.controller.Busy());
+    REQUIRE(r.calls.size() == 1); REQUIRE_FALSE(r.controller.Busy()); REQUIRE(r.arrivals == 1);
 }
 
 TEST_CASE("teleport refuses unsafe destinations without a guest call", "[oot_coop]") {
@@ -604,16 +608,17 @@ TEST_CASE("teleport cross arrival needs a moved agreed position and consecutive 
     REQUIRE(r.calls[0].arguments[0] == r.sample.resident->actor);
     REQUIRE(r.calls[0].stores[4].second == (u64{std::bit_cast<u32>(matrix[0])} | (u64{std::bit_cast<u32>(matrix[1])} << 32)));
     r.controller.Returned(0, r.port.log); r.Agree(r.Destination().pos); r.Frame();
-    REQUIRE(r.Logged("cross arrived")); REQUIRE_FALSE(r.controller.Busy());
+    REQUIRE(r.Logged("cross arrived")); REQUIRE_FALSE(r.controller.Busy()); REQUIRE(r.arrivals == 1);
     for (int i = 0; i < 180; ++i) r.Frame();
-    REQUIRE(r.Logged("+1s stable")); REQUIRE(r.Logged("+3s stable")); REQUIRE(r.calls.size() == 1);
+    REQUIRE(r.Logged("+1s stable")); REQUIRE(r.Logged("+3s stable")); REQUIRE(r.calls.size() == 1); REQUIRE(r.arrivals == 1);
 }
 
 TEST_CASE("teleport explicit within tolerance skips correction", "[oot_coop]") {
     CrossRig r{true}; r.Reserve(); r.Live(); r.Load(); r.Agree(r.Destination().pos); r.ReadyFrames();
     REQUIRE(r.Logged("arrived (no correction)")); REQUIRE(r.calls.empty()); REQUIRE_FALSE(r.controller.Busy());
+    REQUIRE(r.arrivals == 1);
     for (int i = 0; i < 180; ++i) r.Frame();
-    REQUIRE(r.Logged("+3s stable"));
+    REQUIRE(r.Logged("+3s stable")); REQUIRE(r.arrivals == 1);
 }
 
 TEST_CASE("teleport cross fails once on timeout unexpected banc age or disconnect", "[oot_coop]") {
@@ -722,4 +727,49 @@ TEST_CASE("teleport cross resolves manager cells after context capture", "[oot_c
     r.backend.after_capture = [&] { r.m.memory.Put(0x130, 0); };
     r.Begin(); REQUIRE_FALSE(r.Frame()); REQUIRE_FALSE(r.saved); REQUIRE(r.steps.empty());
     REQUIRE_FALSE(r.controller.Busy());
+}
+
+TEST_CASE("teleport deferred region exemption is requester only and preserves hard guards", "[oot_coop]") {
+    auto k = Keys(); auto s = Sample(); T::History h;
+    const std::vector<std::string> exempt{s.banc};
+    for (int i = 0; i < 3; ++i) h.Step(s, k);
+    for (bool denied : {false, true}) {
+        if (denied) k.deny_bancs = {s.banc};
+        else k.allow_bancs.clear();
+        REQUIRE(T::Ready(s, h, k, false) == "scene");
+        REQUIRE(T::Ready(s, h, k, false, exempt).empty());
+        REQUIRE(T::Ready(s, h, k, true, exempt) == "scene");
+        REQUIRE(T::Ready(s, h, k, false, {"Other_A"}) == "scene");
+        s.loading = true;
+        REQUIRE(T::Ready(s, h, k, false, exempt) == "loading");
+        s.loading = false; s.event_running = 1;
+        REQUIRE(T::Ready(s, h, k, false, exempt) == "event");
+        s.event_running = 0; s.block_bools_ok = false;
+        REQUIRE(T::Ready(s, h, k, false, exempt) == "pause");
+        s.block_bools_ok = true; k = Keys();
+    }
+}
+
+TEST_CASE("teleport controller exempts deferred requester source but never answer or destination", "[oot_coop]") {
+    for (bool exempt : {false, true}) {
+        CrossRig r;
+        r.sample.banc = "Cave_A";
+        r.controller.SetExemptBancs(exempt ? std::vector<std::string>{"Cave_A"} : std::vector<std::string>{});
+        for (int i = 0; i < 3; ++i) r.Frame();
+        auto request = Reply(); request.request = true; r.Receive(request); r.Frame();
+        const auto output = r.controller.TakeOutput();
+        REQUIRE(output.size() == 1); REQUIRE(output[0].reason == "scene");
+        r.Begin(); r.Frame();
+        REQUIRE(r.steps.size() == (exempt ? 1 : 0));
+        REQUIRE(r.arrivals == 0);
+        if (exempt) {
+            r.Return(); r.controller.SetExemptBancs({}); r.Frame();
+            REQUIRE_FALSE(r.controller.Busy()); REQUIRE(r.steps.size() == 1);
+        }
+    }
+    CrossRig r;
+    r.controller.SetExemptBancs({"Cave_A"});
+    r.Request(); auto p = r.Destination(); p.banc = "Cave_A";
+    r.Receive(p); r.Frame();
+    REQUIRE_FALSE(r.controller.Busy()); REQUIRE(r.steps.empty()); REQUIRE(r.arrivals == 0);
 }
