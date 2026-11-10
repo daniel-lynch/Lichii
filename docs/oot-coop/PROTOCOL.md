@@ -958,3 +958,41 @@ Frame order (one guest call per frame): cross-scene teleport (exclusive while ac
 grants -> world cleanup -> quest -> pose step (room window, name tags; teleport step; ghost
 driver; equipment). Quest and teleport also refuse to call while any other call is outstanding.
 
+
+### C17 ghost colour
+
+No wire change. The optional private `offsets[<build>].colour` object selects a palette
+animation from the installed ghost mod. Its shape is shown below with placeholders;
+all native entries, layouts, animation names and palette frames come from the key file.
+
+```text
+colour: {
+  enabled: <bool>,
+  apply: {at: <module offset>, words: [<eight verification words>]},
+  animation: <1..23 printable ASCII bytes>,
+  frames: [<4..16 distinct integer palette frames, 1..255>],
+  players: {<display name, 1..32 UTF-8 bytes>: <frame 0..255>},
+  hide_armour: <bool, default true>,
+  instance: [<holder>, <model>, <getter vtable slot>, <instance>],
+  getter: {at: <module offset>, words: [<eight verification words>]},
+  bank: [<manager>, <count>, <banks>, <animation count>, <records>],
+  record_stride: <bytes>, record_name: <name-pointer offset>
+}
+```
+
+`players` and `hide_armour` are optional. The read-only pre-check uses optional
+`instance`/`getter` and `bank`/`record_stride`/`record_name` groups; the bank group
+requires the instance group. Unknown fields and malformed supplied fields reject the
+profile. Disabled objects may omit the call configuration. An absent or disabled
+object makes no calls and masks no equipment; `EDEN_NX2_OOT_COOP_COLOUR=0` forces off,
+while `=1` does not override disabled keys. Player names override slot defaults; zero
+suppresses calls and masking (it does not restore an already-applied palette).
+
+Grants, cleanup, quest and teleport retain their existing priority/exclusion. Within
+the pose lane, equipment gets first refusal on `tick % 4 == 0`, colour on
+`tick % 4 == 2`, and the ghost driver otherwise. Idle frames fall through from ghost
+to equipment to colour, skipping a lane already tried. At most one call starts per
+frame. Colour waits for a live, placed, visible actor and completed/applicable alpha
+setup; it revalidates the actor at issue and return. Adult coloured peers use the
+normal tunic equipment field when `hide_armour` is true. Palette presence and a
+returned call are separate receipts; neither alone proves the rendered result.

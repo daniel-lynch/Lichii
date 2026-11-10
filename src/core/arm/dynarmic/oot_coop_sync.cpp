@@ -22,6 +22,7 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/thread.h"
+#include "core/arm/dynarmic/oot_coop_colour.h"
 #include "core/arm/dynarmic/oot_coop_ledger.h"
 #include "core/arm/dynarmic/oot_coop_sync.h"
 #include "core/arm/dynarmic/oot_coop_teleport.h"
@@ -460,6 +461,9 @@ std::optional<OotGameDataTrace::Profile> DecodeProfile(const Json& document,
                 if (!profile.quest) return {};
                 for (const auto& observer : profile.quest->observers)
                     profile.sites.push_back({Point::StepCommit, observer.entry.offset, observer.entry.words.front()});
+            } else if (field == "colour") {
+                profile.colour = Colour::DecodeKeys(value);
+                if (!profile.colour) return {};
             } else if (field == "teleport") {
                 const auto decoded = Teleport::DecodeKeys(value);
                 if (!decoded) return std::nullopt;
@@ -1145,6 +1149,7 @@ struct Session::Impl {
     bool pose_enabled{};
     std::atomic<bool> equipment_negotiated{};
     std::unique_ptr<Equip::Controller> equipment;
+    std::unique_ptr<Colour::Controller> colour;
     PoseSender sender;
     Anim::Sender anim_sender;
     Anim::CommandWatch command_watch; // guest thread: per-frame player command transitions
@@ -1968,6 +1973,29 @@ struct Session::Impl::GhostPort {
         }
         impl.equipment->CheckContext(roots, local.banc, !local.loading && !local.banc.empty());
     }
+    std::vector<Colour::View> ColourViews(const Pose& local) {
+        std::vector<Colour::View> views;
+        if (!impl.ghost) return views;
+        const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now().time_since_epoch()).count());
+        std::scoped_lock lock{impl.mutex};
+        for (const auto& slot : impl.ghost->Slots()) {
+            const auto peer = impl.peers.find(slot.origin);
+            const auto pose = peer != impl.peers.end() ? peer->second.At(now, 0) : std::nullopt;
+            const bool visible = pose && !pose->loading && pose->banc == local.banc &&
+                pose->child == slot.child && peer->second.session == slot.session;
+            views.push_back({slot.origin, slot.banc, slot.actor, slot.record, slot.vtable,
+                slot.session, impl.ghost->SceneEpoch(), slot.generation, slot.fields, slot.child,
+                slot.state == GhostDriver<GhostPort>::State::Live, slot.placed,
+                slot.parked || !visible, slot.abandon || slot.equipment_quarantined,
+                slot.alpha_done || !impl.ghost_offsets.alpha_set || slot.fallback});
+        }
+        return views;
+    }
+    std::string ColourName(std::string_view origin) {
+        std::scoped_lock lock{impl.mutex};
+        return impl.ux.Name(origin);
+    }
     Equip::Port EquipmentPort() {
         return {
             [this](u64 a) -> std::optional<u8> {
@@ -2114,6 +2142,16 @@ Session::Session(Kernel::KernelCore& kernel, Kernel::KProcess* owner_, u64 base_
         impl->ux.Configure(Ux::LoadConfig(profile->build_id, &why));
         LOG_INFO(Core_ARM, "OoT co-op: UX {}", why);
     }
+    if (impl->pose_enabled && impl->ghost && profile->colour && profile->colour->enabled &&
+        Env("EDEN_NX2_OOT_COOP_COLOUR") != "0") {
+        impl->colour = std::make_unique<Colour::Controller>(profile->colour, impl->ghost_offsets);
+        LOG_INFO(Core_ARM, "OoT co-op: colour enabled frames={} players={} hide_armour={}",
+            nlohmann::json(profile->colour->frames).dump(), profile->colour->players.size(),
+            profile->colour->hide_armour);
+    } else {
+        LOG_INFO(Core_ARM, "OoT co-op: colour disabled (keys, pose gate or environment)");
+    }
+
     if (impl->pose_enabled && impl->ghost && profile->equip && profile->equip->enabled) {
         if (auto names = Equip::LoadNames(profile->build_id)) {
             impl->equipment = std::make_unique<Equip::Controller>(profile->equip, std::move(*names),
@@ -2486,7 +2524,8 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
         return true;
     }
     if (binding.sentinel && pc == binding.sentinel &&
-        ((impl->ghost && impl->ghost->Calling()) || (impl->equipment && impl->equipment->Calling()))) {
+        ((impl->ghost && impl->ghost->Calling()) || (impl->equipment && impl->equipment->Calling()) ||
+         (impl->colour && impl->colour->Calling()))) {
         const u64 result = jit.GetRegister(0);
         if (thread != impl->frame_thread || jit.GetSP() != impl->ghost_stack || !impl->ghost_saved ||
             !backend.Restore(*impl->ghost_saved)) {
@@ -2511,10 +2550,17 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
             for (const auto& [origin, track] : impl->peers)
                 peers.push_back({origin, track.At(now, 0), track.session});
         }
+        if (impl->colour && impl->colour->Calling()) {
+            auto colour_port = port.EquipmentPort();
+            impl->colour->Returned(colour_port, port.ColourViews(local), local.banc,
+                !local.loading && !local.banc.empty(),
+                [&](std::string_view origin) { return port.ColourName(origin); });
+            return true;
+        }
         impl->ghost->Returned(port, binding.sentinel + GhostBlock, result, log, &local, &peers);
         return true;
     }
-    if (impl->equipment && impl->equipment->Calling()) return false;
+    if ((impl->equipment && impl->equipment->Calling()) || (impl->colour && impl->colour->Calling())) return false;
     if (binding.sentinel && pc == binding.sentinel) {
         const u64 result = jit.GetRegister(0); // the call's return value, before the restore
         const auto event = runtime.Sentinel(backend, site, pc, log);
@@ -2761,7 +2807,8 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     if (teleport_exclusive) {
         FramePose(backend, memory, log, runtime.Calling() || impl->cleanup_saved.has_value());
         return runtime.Calling() || impl->cleanup_saved.has_value() || impl->teleport_saved.has_value() ||
-               (impl->ghost && impl->ghost->Calling()) || (impl->equipment && impl->equipment->Calling());
+               (impl->ghost && impl->ghost->Calling()) || (impl->equipment && impl->equipment->Calling()) ||
+               (impl->colour && impl->colour->Calling());
     }
 
     if (impl->LedgerOn()) {
@@ -3077,13 +3124,13 @@ bool Session::Hook(OotGameDataTrace::Point point, u64 pc, Dynarmic::A64::Jit& ji
     // C16 frame order (one guest call per frame, first taker wins; every later step is told the
     // slot is used): a live cross-scene teleport owns the whole frame (early return above); then
     // grants (runtime.Frame) -> FrameCleanup -> FrameQuest -> FramePose, which runs the room
-    // window / name tags (no call), the teleport step, the ghost driver, then the equipment budget
-    // (ghost first; equipment takes the ghost's idle frames and every 4th frame first).
+    // window / name tags (no call), teleport, then the ghost/equipment/colour budget
+    // (ghost first except equipment tick%4==0 and colour tick%4==2 reservations).
     const bool quest_call = FrameQuest(backend, memory, log, !runtime.Calling() && !cleaning);
     if (impl->pose_enabled) FramePose(backend, memory, log, runtime.Calling() || cleaning || quest_call);
     else impl->RoomFrame(std::nullopt, Room::NowMs());
     return runtime.Calling() || cleaning || quest_call || impl->teleport_saved.has_value() || (impl->ghost && impl->ghost->Calling()) ||
-           (impl->equipment && impl->equipment->Calling());
+           (impl->equipment && impl->equipment->Calling()) || (impl->colour && impl->colour->Calling());
 }
 
 template <typename Backend, typename Log>
@@ -3112,7 +3159,8 @@ bool Session::FrameQuest(Backend& backend, Memory::Memory& memory, Log log, bool
         return true;
     };
     available = available && !impl->cleanup_saved && !impl->ghost_saved && !impl->teleport_saved &&
-        !(impl->ghost && impl->ghost->Calling()) && !(impl->equipment && impl->equipment->Calling());
+        !(impl->ghost && impl->ghost->Calling()) && !(impl->equipment && impl->equipment->Calling()) &&
+        !(impl->colour && impl->colour->Calling());
     // The title screen runs on a bound, stable GameData manager with default data and a live
     // challenge manager (field, C16 s2: a late-join target applied there, then the save load
     // restored over it). A save is loaded once the wallet capacity Int is non-zero (the world
@@ -3141,7 +3189,7 @@ template <typename Backend, typename Log>
 bool Session::FrameCleanup(Backend& backend, Memory::Memory& memory, Log log) {
     const auto& resolver = profile->world.resolver;
     if (!resolver || impl->cleanup_saved || (impl->ghost && impl->ghost->Calling()) ||
-        (impl->equipment && impl->equipment->Calling()))
+        (impl->equipment && impl->equipment->Calling()) || (impl->colour && impl->colour->Calling()))
         return false;
     const auto line = [&](std::string text) {
         if (impl->cleanup_lines < 256) {
@@ -3307,21 +3355,18 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
             }};
         std::scoped_lock lock{impl->mutex};
         const bool can_call = !grant_calling && !impl->cleanup_saved && !impl->ghost->Calling() &&
-            (!impl->equipment || !impl->equipment->Calling()) && !impl->teleport_saved;
+            (!impl->equipment || !impl->equipment->Calling()) &&
+            (!impl->colour || !impl->colour->Calling()) && !impl->teleport_saved;
         const bool cross_active = impl->teleport->CrossActive();
         if (impl->teleport->Frame(sample, now, can_call, teleport_port) || cross_active || impl->teleport->CrossActive()) return;
     }
     // Grants keep priority: the one call slot of this frame is theirs when they used it.
     if (grant_calling) return;
     Impl::GhostPort port{backend, memory, *impl};
-    if (!impl->equipment) {
-        impl->ghost->Frame(port, impl->binding.sentinel + GhostBlock, local, peers, log, now);
-        return;
-    }
-    // One guest call per frame between them. The ghost driver (movement, animation) goes first;
-    // equipment takes the frames it leaves idle, and every fourth frame first, so neither starves.
+    // Reserve equipment tick%4==0 and colour tick%4==2; otherwise ghost gets priority.
+    // An unused reservation falls through to the other lanes in this same frame.
     const auto equipment = [&] {
-        if (impl->ghost->Calling()) return false;
+        if (!impl->equipment || impl->ghost->Calling() || (impl->colour && impl->colour->Calling())) return false;
         std::vector<Equip::Root> roots;
         for (const auto& slot : impl->ghost->Slots()) {
             if (slot.state != GhostDriver<Impl::GhostPort>::State::Live) continue;
@@ -3331,7 +3376,9 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
                 peer->pose->banc == local.banc && peer->pose->child == slot.child;
             roots.push_back({{slot.origin, slot.banc, 0, slot.actor, slot.record, 0, slot.generation,
                               static_cast<u8>(slot.child ? 0 : 1)}, eligible,
-                             peer != peers.end() && peer->pose ? peer->pose->equipment : std::nullopt});
+                             Colour::MaskEquipment(peer != peers.end() && peer->pose ? peer->pose->equipment : std::nullopt,
+                                 slot.child, impl->colour && impl->colour->On(
+                                     static_cast<size_t>(&slot - impl->ghost->Slots().data()), port.ColourName(slot.origin)))});
         }
         auto equipment_port = port.EquipmentPort();
         const bool called = impl->equipment->Frame(equipment_port, roots, local.banc,
@@ -3343,10 +3390,21 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
         }
         return called;
     };
+    const auto colour = [&] {
+        if (!impl->colour || impl->ghost->Calling() || (impl->equipment && impl->equipment->Calling())) return false;
+        auto colour_port = port.EquipmentPort();
+        return impl->colour->Frame(colour_port, port.ColourViews(local), local.banc,
+            !local.loading && !local.banc.empty(),
+            [&](std::string_view origin) { return port.ColourName(origin); }, impl->tick,
+            impl->binding.sentinel + GhostBlock);
+    };
     const bool equipment_first = impl->tick % 4 == 0;
+    const bool colour_first = impl->tick % 4 == 2;
     if (equipment_first && equipment()) return;
+    if (colour_first && colour()) return;
     if (impl->ghost->Frame(port, impl->binding.sentinel + GhostBlock, local, peers, log, now)) return;
-    if (!equipment_first) equipment();
+    if (!equipment_first && equipment()) return;
+    if (!colour_first) colour();
 }
 
 void BeginSession() {

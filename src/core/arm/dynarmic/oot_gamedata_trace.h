@@ -29,6 +29,7 @@ struct Keys;
 }
 namespace Core::OotCoop::Equip { struct Keys; }
 namespace Core::OotCoop::Teleport { struct Keys; }
+namespace Core::OotCoop::Colour { struct Keys; }
 
 namespace Kernel {
 class KProcess;
@@ -206,6 +207,7 @@ struct Profile {
     std::shared_ptr<const OotCoop::Equip::Keys> equip;
     std::shared_ptr<const OotCoop::Quest::Keys> quest;
     std::shared_ptr<const OotCoop::Teleport::Keys> teleport;
+    std::shared_ptr<const OotCoop::Colour::Keys> colour;
 
     u64 SiteOffset(Point point) const {
         for (const Site& site : sites) {
