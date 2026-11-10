@@ -242,16 +242,20 @@ void CoopPanel::Refresh() {
             });
         }
     }
+    const bool relay_up = status.relay_state == "connected";
     for (size_t i = 0; i < status.peers.size(); ++i) {
         const auto& peer = status.peers[i];
         const int row = static_cast<int>(i);
         peers->item(row, 0)->setText(Q(peer.name));
-        peers->item(row, 1)->setText(live ? (peer.online ? tr("Yes") : tr("No")) : tr("Unknown"));
+        // The presence book keeps peers "awaiting" across a relay gap (reconnect reconciliation), so a
+        // peer is only online here while our own relay link is connected (C17: Disconnect showed Yes).
+        const bool online = live && relay_up && peer.online;
+        peers->item(row, 1)->setText(live ? (online ? tr("Yes") : tr("No")) : tr("Unknown"));
         peers->item(row, 2)->setText(peer.has_pose ? (peer.child ? tr("child") : tr("adult")) : QStringLiteral("-"));
         peers->item(row, 3)->setText(peer.loading ? tr("Loading") : Q(peer.area));
         peers->item(row, 4)->setText(Seen(now, peer.seen_ms));
         // A stale publisher cannot confirm online peers; do not send requests based on stale rows.
-        peers->cellWidget(row, 5)->setEnabled(live && peer.online && status.teleport && !trigger.empty());
+        peers->cellWidget(row, 5)->setEnabled(online && status.teleport && !trigger.empty());
     }
     const bool disconnected = Gui::DisconnectRequested(Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir));
     disconnect_button->setEnabled(live && !disconnected);
