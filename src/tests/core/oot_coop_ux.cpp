@@ -179,7 +179,7 @@ TEST_CASE("OotCoopUx: toast queue dedup, order, expiry, reset", "[oot_coop]") {
     CHECK(q.Push("a/1", "one", 9000)); // a new session starts clean
     for (int i = 0; i < 40; ++i) q.Push("x/" + std::to_string(i), "t", 9000);
     CHECK(q.Visible(9000).size() == Q::MaxVisible);
-    CHECK(q.Waiting() == Q::MaxQueued - Q::MaxVisible + 1);
+    CHECK(q.Waiting() == Q::MaxQueued - Q::MaxVisible); // 16 queued, 3 moved on screen
 }
 
 TEST_CASE("OotCoopUx: toast merge", "[oot_coop]") {
