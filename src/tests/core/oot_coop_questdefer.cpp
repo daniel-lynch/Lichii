@@ -460,3 +460,39 @@ TEST_CASE("questdefer runs when the session samples only watched machines", "[oo
     REQUIRE(rig.calls.front().step == 33);
     REQUIRE(rig.Logged("watch frame="));
 }
+
+TEST_CASE("questdefer outside applies over a stale restoration NotReady pending (field C17 F-A)", "[oot_coop]") {
+    // Field C17 F-A: fresh New Game, the local quest never started (Ready), the restoration burst
+    // left pending=NotReady with no request flag; a teammate's kill arrives while outside the region.
+    const Q::Target apply{201, 33, 5, "peer-a"};
+    const Q::Manager manager{123, {}, true, false, false, false};
+    Rig r; r.records[201].pending = 11; r.observation.banc = "Outside_A";
+    REQUIRE(r.Tick()); REQUIRE(r.calls == std::vector<Q::Target>{apply});
+    REQUIRE(r.bundle_calls == std::vector<bool>{true}); REQUIRE_FALSE(r.Logged("waiting: own request pending"));
+    // The issue path's last guard admits only the authorized bundle target; the mirror path keeps the old rule.
+    REQUIRE(Q::ApplyBlock(*r.keys, manager, r.records[201], apply, &r.machine).empty());
+    REQUIRE(Q::ApplyBlock(*r.keys, manager, r.records[201], apply) == "own request pending");
+    r.Commit(); r.Tick(); REQUIRE(r.Logged("element=0 applied"));
+    REQUIRE(r.Tick()); r.Commit(); r.Tick(); REQUIRE(r.Logged("element=1 applied"));
+    REQUIRE(r.Tick()); r.bools[701] = true; r.machine.Returned(); r.Tick();
+    REQUIRE(r.Tick()); r.bools[702] = true; r.machine.Returned(); r.Tick(); r.Tick();
+    REQUIRE(r.machine.Status(201) == D::State::Done);
+    REQUIRE(r.toasts.back() == "Guardian A skipped: synced from Peer A");
+
+    // Still an own request: the request flag is set, or the pending hash is not NotReady.
+    for (int mode = 0; mode < 2; ++mode) {
+        Rig held; held.observation.banc = "Outside_A";
+        if (mode == 0) { held.records[201].pending = 11; held.records[201].flags = 4; }
+        else held.records[201].pending = 44;
+        held.Frames(5); REQUIRE(held.calls.empty()); REQUIRE(held.machine.Status(201) == D::State::Apply);
+        REQUIRE(std::count_if(held.logs.begin(), held.logs.end(), [](const auto& s) {
+            return s.find("waiting: own request pending") != std::string::npos; }) == 1);
+        REQUIRE(Q::ApplyBlock(*held.keys, manager, held.records[201], apply, &held.machine) == "own request pending");
+    }
+
+    // Inside the region the same record still defers once; a teleport arrival then applies.
+    Rig inside; inside.records[201].pending = 11;
+    inside.Frames(3); REQUIRE(inside.machine.Status(201) == D::State::Deferred); REQUIRE(inside.calls.empty());
+    REQUIRE(inside.toasts == std::vector<std::string>{"Peer A beat Guardian A. Teleport/die to skip"});
+    inside.machine.Arrival(); REQUIRE(inside.Tick()); REQUIRE(inside.calls == std::vector<Q::Target>{apply});
+}

@@ -60,7 +60,7 @@ private:
         size_t element{};
         unsigned attempts{}, primary_attempts{};
         u64 since{}, outside{};
-        bool waiting{}, returned{}, local_toast{}, deferred_toast{}, latched{}, arrival{};
+        bool waiting{}, returned{}, local_toast{}, deferred_toast{}, latched{}, arrival{}, pending_logged{};
     };
     std::shared_ptr<const Quest::Keys> keys;
     std::set<u64> denied;
