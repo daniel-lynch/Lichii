@@ -148,7 +148,7 @@ TEST_CASE("teleport readiness fails closed and settles against an anchor", "[oot
     h.Reset(); REQUIRE(T::Ready(s, h, k, false) == "airborne");
     for (int i = 0; i < 10; ++i) {
         s.info_pos[1] += 0.006f; s.actor_pos = s.info_pos; h.Step(s, k);
-        REQUIRE(T::Ready(s, h, k, false) == "airborne");
+        REQUIRE(T::Ready(s, h, k, true) == "airborne");
     }
     s = Sample(); s.command = "StandB"; h.Reset();
     for (int i = 0; i < 5; ++i) { // walking on level ground: horizontal motion keeps the settle count
@@ -176,6 +176,95 @@ TEST_CASE("teleport answers use the current frame sample and deduplicate", "[oot
     REQUIRE(output.size() == 1); REQUIRE(output[0].reason == "event");
     ++request.id; r.controller.Receive(request, r.now, r.port.log); r.now += 2001; r.Frame();
     REQUIRE(r.controller.TakeOutput()[0].reason == "unready"); REQUIRE(r.calls.empty());
+}
+
+TEST_CASE("teleport requester command contact permits slopes while answers still settle", "[oot_coop]") {
+    auto k = Keys(); k.requester_commands.push_back("StandB");
+    for (float dy : {0.0f, 0.1f, -0.1f}) {
+        CAPTURE(dy);
+        auto s = Sample(); s.command = "StandB"; T::History h;
+        for (u32 i = 1; i <= k.settle_frames + 2; ++i) {
+            s.info_pos[0] += 0.5f; s.info_pos[1] += dy; s.actor_pos = s.info_pos;
+            h.Step(s, k);
+            REQUIRE(h.ground == std::min(i, k.settle_frames));
+            REQUIRE(T::Ready(s, h, k, false) == (i < k.settle_frames ? "airborne" : ""));
+            REQUIRE(T::Ready(s, h, k, true) == (dy != 0 || i < k.settle_frames ? "airborne" : ""));
+        }
+    }
+}
+
+TEST_CASE("teleport requester contact resets on air unsafe samples and identity changes", "[oot_coop]") {
+    auto k = Keys(); k.requester_commands.push_back("StandB"); k.allow_bancs.push_back("Field_B");
+    for (int scenario = 0; scenario < 11; ++scenario) {
+        CAPTURE(scenario);
+        auto s = Sample(); T::History h;
+        for (u32 i = 0; i < k.settle_frames; ++i) h.Step(s, k);
+        REQUIRE(h.ground == k.settle_frames);
+        if (scenario == 0) { s.command = "FallA"; s.info_pos[1] -= 0.1f; s.actor_pos = s.info_pos; }
+        if (scenario == 1) s.command = "JumpA";
+        if (scenario == 2) s.loading = true;
+        if (scenario == 3) s.event_running = 123;
+        if (scenario == 4) s.block_bools_ok = false;
+        if (scenario == 5) s.actor_pos.reset();
+        if (scenario == 6) ++s.resident->generation;
+        if (scenario == 7) s.banc = "Field_B";
+        if (scenario == 8) s.child = !s.child;
+        if (scenario == 9) { k.answer_commands.push_back("AnswerOnly"); s.command = "AnswerOnly"; }
+        if (scenario == 10) (*s.actor_pos)[1] += 1;
+        h.Step(s, k);
+        const bool identity_change = scenario >= 6 && scenario <= 8;
+        REQUIRE(h.ground == (identity_change ? 1 : 0));
+        if (scenario <= 1 || scenario == 9) REQUIRE(T::Ready(s, h, k, false) == "state");
+        if (identity_change) REQUIRE(T::Ready(s, h, k, false) == "airborne");
+        s = Sample();
+        for (u32 i = 1; i <= k.settle_frames; ++i) {
+            s.command = i % 2 ? "StandA" : "StandB";
+            s.info_pos[1] += 0.1f; s.actor_pos = s.info_pos;
+            h.Step(s, k);
+            REQUIRE(h.ground == i);
+            REQUIRE(T::Ready(s, h, k, false) == (i < k.settle_frames ? "airborne" : ""));
+        }
+        h.Reset(); REQUIRE(h.ground == 0); REQUIRE(h.frames == 0); REQUIRE_FALSE(h.previous);
+    }
+}
+
+TEST_CASE("teleport walking requester on a slope issues one same scene warp", "[oot_coop]") {
+    for (float dy : {0.1f, -0.1f}) {
+        Rig r; auto k = Keys(); k.requester_commands.push_back("StandB");
+        r.controller = T::Controller{k}; r.sample.command = "StandB";
+        auto walk = [&] {
+            r.sample.info_pos[0] += 0.5f; r.sample.info_pos[1] += dy; r.sample.actor_pos = r.sample.info_pos;
+            return r.Frame();
+        };
+        for (u32 i = 0; i < k.settle_frames; ++i) walk();
+        r.Request(); r.Receive(); REQUIRE(walk()); REQUIRE(r.calls.size() == 1);
+        REQUIRE(r.Logged("teleport warp issued")); REQUIRE_FALSE(r.Logged("teleport refused"));
+        r.controller.Returned(0, r.port.log);
+        r.sample.info_pos = Reply().pos; r.sample.actor_pos = Reply().pos;
+        r.Frame(); REQUIRE_FALSE(r.controller.Busy()); REQUIRE(r.Logged("teleport arrived"));
+        REQUIRE(r.Logged("yaw=90 heading_error=135")); REQUIRE(r.calls.size() == 1);
+    }
+}
+
+TEST_CASE("teleport reserved rotation uses float radians and circular heading error", "[oot_coop]") {
+    for (float yaw : {135.0f, -90.0f, 0.0f, 180.0f, -180.0f, 360.0f}) {
+        CAPTURE(yaw);
+        const auto rotation = T::ReservedRotation(yaw);
+        const float expected = static_cast<float>(double(yaw) * 3.14159265358979323846 / 180.0);
+        REQUIRE(std::bit_cast<u32>(rotation[0]) == std::bit_cast<u32>(0.0f));
+        REQUIRE(std::bit_cast<u32>(rotation[1]) == std::bit_cast<u32>(expected));
+        REQUIRE(std::bit_cast<u32>(rotation[2]) == std::bit_cast<u32>(0.0f));
+    }
+    REQUIRE(T::HeadingError(135, 135) == 0);
+    REQUIRE(T::HeadingError(180, -180) == 0);
+    REQUIRE(T::HeadingError(179, -179) == 2);
+    REQUIRE(T::HeadingError(-90, 90) == 180);
+    REQUIRE(T::HeadingError(0, 359) == 1);
+    for (float bad : {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(),
+                      -std::numeric_limits<float>::infinity()}) {
+        REQUIRE(T::HeadingError(bad, 0) == std::numeric_limits<float>::infinity());
+        REQUIRE(T::HeadingError(0, bad) == std::numeric_limits<float>::infinity());
+    }
 }
 
 TEST_CASE("teleport calls once with the native matrix then verifies and settles", "[oot_coop]") {
@@ -212,7 +301,7 @@ TEST_CASE("teleport refuses unsafe destinations without a guest call", "[oot_coo
         if (scenario == 2) { p.ok = false; p.reason = "busy"; }
         if (scenario == 3) r.sample.event_running = 10;
         if (scenario == 4) r.sample.command = "AirA";
-        if (scenario == 5) { r.sample.info_pos[1]++; r.sample.actor_pos = r.sample.info_pos; }
+        if (scenario == 5) { r.sample.command = "AirA"; r.Frame(); r.sample.command = "StandA"; }
         if (scenario == 6) r.valid = false;
         if (scenario == 7) r.valid_at_call = false; // generation changed between check and call
         if (scenario == 8) r.sample.loading = true;
@@ -435,6 +524,7 @@ Json CrossJson(bool explicit_position = false) {
     }
     if (explicit_position) {
         c["vector3"] = {{"at", 0x200}, {"words", {5, 6, 7, 8}}}; c["reserved_position"] = 17;
+        c["reserved_rotation"] = 18;
     }
     return c;
 }
@@ -450,8 +540,9 @@ struct CrossRig : Rig {
     static constexpr u64 StackTop = 0x18000, Scratch = StackTop - 0x10000;
     std::vector<T::CrossStep> steps;
     std::vector<Core::OotCoop::ApplyTarget> cross_calls;
-    explicit CrossRig(bool explicit_position = false) {
-        const auto k = CrossKeys(explicit_position);
+    explicit CrossRig(bool explicit_position = false, bool correct_heading = false) {
+        auto k = CrossKeys(explicit_position);
+        k.cross->correct_heading = correct_heading;
         controller = T::Controller{k}; *m.keys = k;
         m.profile.manager_cell = 0x30; m.memory.Put(0x130, 0x10000);
         port.cross_call = [&](T::CrossStep step, size_t event, const T::Packet& p) {
@@ -471,7 +562,7 @@ struct CrossRig : Rig {
     }
     void Reserve(bool refuse_first = false, bool refuse_all = false) {
         Begin();
-        const unsigned count = m.keys->cross->explicit_position ? 7 : 6;
+        const unsigned count = m.keys->cross->explicit_position ? 8 : 6;
         for (unsigned i = 0; i < count; ++i) {
             REQUIRE(Frame()); REQUIRE(controller.Calling());
             if (steps.back() == T::CrossStep::Event) Return(refuse_first || refuse_all ? 0 : 3);
@@ -501,7 +592,9 @@ TEST_CASE("teleport cross keys strict mode dependent schema", "[oot_coop]") {
     REQUIRE_FALSE(T::DecodeKeys(KeyJson())->cross);
     for (bool explicit_position : {false, true}) {
         auto j = KeyJson(); j["cross"] = CrossJson(explicit_position);
+        REQUIRE(j["cross"].size() == (explicit_position ? 22 : 19));
         REQUIRE(T::DecodeKeys(j)->cross->explicit_position == explicit_position);
+        REQUIRE_FALSE(T::DecodeKeys(j)->cross->correct_heading);
         for (const auto& [field, value] : j["cross"].items()) {
             auto bad = j; bad["cross"].erase(field); CAPTURE(field); REQUIRE_FALSE(T::DecodeKeys(bad));
         }
@@ -523,6 +616,24 @@ TEST_CASE("teleport cross keys strict mode dependent schema", "[oot_coop]") {
         }
         if (!explicit_position) {
             auto bad = j; bad["cross"]["vector3"] = j["cross"]["string64"]; REQUIRE_FALSE(T::DecodeKeys(bad));
+            bad = j; bad["cross"]["reserved_rotation"] = 18; REQUIRE_FALSE(T::DecodeKeys(bad));
+            bad = j; bad["cross"]["correct_heading"] = false; REQUIRE_FALSE(T::DecodeKeys(bad));
+            bad["cross"].erase("reserved_start"); REQUIRE_FALSE(T::DecodeKeys(bad));
+        } else {
+            for (Json bad_value : {Json(0), Json(-1), Json(true), Json(1.5), Json("0x"), Json(u64{1} << 32)}) {
+                auto bad = j; bad["cross"]["reserved_rotation"] = bad_value; REQUIRE_FALSE(T::DecodeKeys(bad));
+            }
+            j["cross"]["reserved_rotation"] = "0x12";
+            REQUIRE(T::DecodeKeys(j)->cross->reserved_rotation == 18);
+            for (bool enabled : {false, true}) {
+                j["cross"]["correct_heading"] = enabled;
+                REQUIRE(j["cross"].size() == 23);
+                REQUIRE(T::DecodeKeys(j)->cross->correct_heading == enabled);
+            }
+            for (Json bad_value : {Json(0), Json(1), Json("true"), Json(nullptr), Json::array(), Json::object()}) {
+                auto bad = j; bad["cross"]["correct_heading"] = bad_value; REQUIRE_FALSE(T::DecodeKeys(bad));
+            }
+            j["cross"]["extra"] = false; REQUIRE_FALSE(T::DecodeKeys(j));
         }
     }
 }
@@ -531,7 +642,10 @@ TEST_CASE("teleport cross full reservation ABI scratch and event fallback", "[oo
     for (bool explicit_position : {false, true}) {
         CrossRig r{explicit_position}; r.Reserve(true);
         std::vector<T::CrossStep> expected{T::CrossStep::Banc, T::CrossStep::Start};
-        if (explicit_position) expected.push_back(T::CrossStep::Position);
+        if (explicit_position) {
+            expected.push_back(T::CrossStep::Position);
+            expected.push_back(T::CrossStep::Rotation);
+        }
         for (auto step : {T::CrossStep::Fade, T::CrossStep::Control, T::CrossStep::Constructor,
                           T::CrossStep::Event, T::CrossStep::Constructor, T::CrossStep::Event}) expected.push_back(step);
         REQUIRE(r.steps == expected); REQUIRE(r.Logged("event accepted"));
@@ -553,6 +667,7 @@ TEST_CASE("teleport cross full reservation ABI scratch and event fallback", "[oo
             case T::CrossStep::Banc: args = {0x10000, r.Scratch + T::BancCell, k.reserved_banc}; break;
             case T::CrossStep::Start: args = {0x10000, r.Scratch + T::StartCell, k.reserved_start}; break;
             case T::CrossStep::Position: args = {0x10000, r.Scratch + T::PositionData, k.reserved_position}; break;
+            case T::CrossStep::Rotation: args = {0x10000, r.Scratch + T::RotationData, k.reserved_rotation}; break;
             case T::CrossStep::Fade: args = {0x10000, k.fade_value, k.fade_key}; break;
             case T::CrossStep::Control: args = {0x10000, k.control_value, k.control_key}; break;
             case T::CrossStep::Constructor: args = {r.Scratch}; break;
@@ -562,13 +677,26 @@ TEST_CASE("teleport cross full reservation ABI scratch and event fallback", "[oo
             REQUIRE(call.arguments == args);
             u64 entry = k.enumeration.offset;
             if (expected[i] == T::CrossStep::Banc || expected[i] == T::CrossStep::Start) entry = k.string64.offset;
-            if (expected[i] == T::CrossStep::Position) entry = k.vector3.offset;
+            if (expected[i] == T::CrossStep::Position || expected[i] == T::CrossStep::Rotation) entry = k.vector3.offset;
             if (expected[i] == T::CrossStep::Constructor) entry = k.request_ctor.offset;
             if (expected[i] == T::CrossStep::Event) entry = k.request_event.offset;
             REQUIRE(r.backend.verified_entries[i] == entry);
         }
-        if (explicit_position) for (size_t i = 0; i < 3; ++i)
-            REQUIRE(mem.Read32(r.Scratch + T::PositionData + i * 4) == std::bit_cast<u32>(r.Destination().pos[i]));
+        if (explicit_position) {
+            for (size_t i = 0; i < 3; ++i) {
+                REQUIRE(mem.Read32(r.Scratch + T::PositionData + i * 4) == std::bit_cast<u32>(r.Destination().pos[i]));
+                REQUIRE(mem.Read32(r.Scratch + T::RotationData + i * 4) == std::bit_cast<u32>(T::ReservedRotation(r.Destination().yaw)[i]));
+            }
+            REQUIRE(r.Logged("teleport cross reserve rotation id=1 w0=0x0 name= yaw=-45 rad=-0.7853982"));
+        } else {
+            REQUIRE_FALSE(r.Logged("reserve rotation"));
+            for (auto step : {T::CrossStep::Position, T::CrossStep::Rotation}) {
+                const auto before = mem.bytes;
+                REQUIRE_FALSE(T::IssueCross(mem, r.backend, r.m.profile, 0x100, r.StackTop, 0x7000,
+                    step, 0, r.Destination(), r.saved, r.stack));
+                REQUIRE(mem.bytes == before); REQUIRE_FALSE(r.saved);
+            }
+        }
         r.Live();
         REQUIRE(r.cross_calls.back().arguments == std::array<u64, 8>{0x10000, k.control_value, k.control_key});
         for (int i = 0; i < 5; ++i) r.Frame();
@@ -594,7 +722,7 @@ TEST_CASE("teleport cross arrival needs a moved agreed position and consecutive 
     for (int i = 0; i < 10; ++i) r.Frame();
     REQUIRE(r.calls.empty());
     r.Agree();
-    for (int i = 0; i < 4; ++i) r.Frame();
+    for (int i = 0; i < 2; ++i) r.Frame();
     REQUIRE(r.calls.empty());
     r.sample.block_bools_ok = false; r.Frame(); r.sample.block_bools_ok = true;
     for (int i = 0; i < 4; ++i) r.Frame();
@@ -610,10 +738,88 @@ TEST_CASE("teleport cross arrival needs a moved agreed position and consecutive 
 }
 
 TEST_CASE("teleport explicit within tolerance skips correction", "[oot_coop]") {
-    CrossRig r{true}; r.Reserve(); r.Live(); r.Load(); r.Agree(r.Destination().pos); r.ReadyFrames();
+    CrossRig r{true}; r.Reserve(); r.Live(); r.Load(); r.Agree(r.Destination().pos);
+    r.sample.yaw = r.Destination().yaw; r.ReadyFrames();
     REQUIRE(r.Logged("arrived (no correction)")); REQUIRE(r.calls.empty()); REQUIRE_FALSE(r.controller.Busy());
     for (int i = 0; i < 180; ++i) r.Frame();
     REQUIRE(r.Logged("+3s stable"));
+}
+
+TEST_CASE("teleport explicit arrival judges the first ready heading without correction", "[oot_coop]") {
+    for (float error : {0.0f, 2.0f, 10.0f}) {
+        for (bool turn_later : {false, true}) {
+            CAPTURE(error, turn_later);
+            CrossRig r{true}; r.Reserve(); r.Live(); r.Load(); r.Agree(r.Destination().pos);
+            r.sample.yaw = r.Destination().yaw + error;
+            for (int i = 0; i < 2; ++i) r.Frame();
+            REQUIRE_FALSE(r.Logged("cross arrival resident"));
+            r.Frame(); REQUIRE(r.Logged("cross arrival resident"));
+            REQUIRE_FALSE(r.Logged("arrived (no correction)"));
+            REQUIRE(r.controller.Busy());
+            if (turn_later) r.sample.yaw = error == 0 ? 90 : r.Destination().yaw;
+            r.Frame(); r.Frame(); REQUIRE_FALSE(r.controller.Busy()); REQUIRE(r.calls.empty());
+            if (error <= 2) {
+                REQUIRE(r.Logged("arrived (no correction)")); REQUIRE_FALSE(r.Logged("reason=heading"));
+                if (error == 0 && turn_later)
+                    REQUIRE(r.Logged("arrived (no correction) yaw=-45 now=90 requested=-45 heading_error=0"));
+            } else {
+                REQUIRE(r.Logged("cross failed id=1 reason=heading yaw=-35 requested=-45 heading_error=10"));
+                REQUIRE_FALSE(r.Logged("arrived (no correction)"));
+            }
+            for (int i = 0; i < 180; ++i) r.Frame();
+            REQUIRE(r.Logged("+1s stable")); REQUIRE(r.Logged("+3s stable")); REQUIRE(r.calls.empty());
+        }
+    }
+}
+
+TEST_CASE("teleport explicit heading correction issues once and verifies heading", "[oot_coop]") {
+    for (bool heading_matches : {false, true}) {
+        CrossRig r{true, true}; r.Reserve(); r.Live(); r.Load(); r.Agree(r.Destination().pos);
+        r.sample.yaw = r.Destination().yaw + 10;
+        r.ReadyFrames(); REQUIRE(r.controller.Calling()); REQUIRE(r.calls.size() == 1);
+        REQUIRE(r.Logged("heading correction issued yaw=-35 requested=-45 heading_error=10"));
+        const auto expected = T::MatrixCall(0x4000, 0x5000, 0x6000, r.sample.resident->actor, r.Destination());
+        REQUIRE(r.calls[0].stores == expected.stores);
+        r.controller.Returned(0, r.port.log);
+        for (u32 i = 1; i < r.m.keys->verify_frames; ++i) {
+            r.Frame(); REQUIRE(r.controller.Busy()); REQUIRE_FALSE(r.Logged("cross arrived"));
+        }
+        if (heading_matches) r.sample.yaw = r.Destination().yaw;
+        r.Frame(); REQUIRE_FALSE(r.controller.Busy());
+        if (heading_matches) {
+            REQUIRE(r.Logged("cross arrived")); REQUIRE(r.Logged("yaw=-45 heading_error=0"));
+        } else {
+            REQUIRE(r.Logged("cross failed")); REQUIRE(r.Logged("reason=heading"));
+            REQUIRE(r.Logged("yaw=-35 heading_error=10")); REQUIRE_FALSE(r.Logged("cross arrived"));
+        }
+        for (int i = 0; i < 10; ++i) r.Frame();
+        REQUIRE(r.calls.size() == 1);
+    }
+}
+
+TEST_CASE("teleport explicit position correction also verifies heading with fallback off", "[oot_coop]") {
+    for (bool heading_matches : {false, true}) {
+        CrossRig r{true}; r.Reserve(); r.Live(); r.Load(); r.Agree(); r.ReadyFrames();
+        REQUIRE(r.calls.size() == 1); REQUIRE(r.Logged("cross correction issued"));
+        REQUIRE_FALSE(r.Logged("heading correction issued"));
+        r.controller.Returned(0, r.port.log); r.Agree(r.Destination().pos);
+        if (heading_matches) r.sample.yaw = r.Destination().yaw;
+        for (u32 i = 0; i < r.m.keys->verify_frames; ++i) r.Frame();
+        REQUIRE_FALSE(r.controller.Busy()); REQUIRE(r.calls.size() == 1);
+        REQUIRE(r.Logged(heading_matches ? "cross arrived" : "reason=heading"));
+    }
+}
+
+TEST_CASE("teleport explicit rotation overwrites scratch including zero every time", "[oot_coop]") {
+    CrossRig r{true}; auto p = r.Destination();
+    for (float yaw : {135.0f, 0.0f, -90.0f, 0.0f}) {
+        p.yaw = yaw;
+        REQUIRE(T::IssueCross(r.m.memory, r.backend, r.m.profile, 0x100, r.StackTop, 0x7000,
+            T::CrossStep::Rotation, 0, p, r.saved, r.stack));
+        for (size_t i = 0; i < 3; ++i)
+            REQUIRE(r.m.memory.Read32(r.Scratch + T::RotationData + i * 4) == std::bit_cast<u32>(T::ReservedRotation(yaw)[i]));
+        r.saved.reset();
+    }
 }
 
 TEST_CASE("teleport cross fails once on timeout unexpected banc age or disconnect", "[oot_coop]") {

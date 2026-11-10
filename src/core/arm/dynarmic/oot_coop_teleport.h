@@ -18,15 +18,15 @@ struct FallOrigin {
     u16 bit{}; // mask, exactly one bit
 };
 struct CrossKeys {
-    bool enabled{}, explicit_position{};
+    bool enabled{}, explicit_position{}, correct_heading{};
     OotGameDataTrace::Entry string64, enumeration, vector3, request_ctor, request_event;
     u32 request_size{}, request_name_ptr{}, request_name_cap{};
-    u32 reserved_banc{}, reserved_start{}, reserved_position{}, fade_key{}, fade_value{}, control_key{}, control_value{};
+    u32 reserved_banc{}, reserved_start{}, reserved_position{}, reserved_rotation{}, fade_key{}, fade_value{}, control_key{}, control_value{};
     std::vector<std::string> events;
     std::map<std::string, std::string, std::less<>> start_pos;
     u32 load_timeout_ms{}, arrive_frames{};
 };
-enum class CrossStep { Banc, Start, Position, Fade, Control, Constructor, Event, Reassert };
+enum class CrossStep { Banc, Start, Position, Rotation, Fade, Control, Constructor, Event, Reassert };
 struct Keys {
     bool enabled{};
     u64 actor_pos{}, event_active{};
@@ -64,12 +64,14 @@ struct Sample {
 struct History {
     std::optional<Sample> previous;
     Vec anchor{};
-    u32 frames{};
+    u32 frames{}, ground{};
     void Step(const Sample& sample, const Keys& keys);
-    void Reset() { previous.reset(); frames = 0; }
+    void Reset() { previous.reset(); frames = ground = 0; }
 };
 [[nodiscard]] std::string Ready(const Sample& sample, const History& history, const Keys& keys, bool answer);
 [[nodiscard]] bool Within(const Vec& a, const Vec& b, const std::array<float, 2>& tolerance);
+[[nodiscard]] std::array<float, 3> ReservedRotation(float yaw_degrees);
+[[nodiscard]] float HeadingError(float actual_deg, float requested_deg);
 [[nodiscard]] ApplyTarget MatrixCall(u64 entry, u64 sentinel, u64 sp, u64 actor, const Packet& packet);
 
 // Every memory read is made at the frame drain, independent of PoseSender's cached output.
@@ -133,6 +135,8 @@ bool IssueCall(Backend& backend, const OotGameDataTrace::Entry& entry, u64 stack
 inline constexpr u64 ScratchSize = 0x2000, RequestLimit = 0x1C00;
 inline constexpr u64 BancText = RequestLimit, StartText = BancText + 0x80;
 inline constexpr u64 BancCell = StartText + 0x80, StartCell = BancCell + 8, PositionData = StartCell + 8;
+inline constexpr u64 RotationData = PositionData + 16;
+static_assert(RotationData % 4 == 0 && RotationData + 12 < ScratchSize);
 template <typename Memory, typename Backend>
 bool IssueCross(Memory& memory, Backend& backend, const OotGameDataTrace::Profile& profile,
                 u64 base, u64 stack_top, u64 sentinel, CrossStep step, size_t event,
@@ -145,7 +149,7 @@ bool IssueCross(Memory& memory, Backend& backend, const OotGameDataTrace::Profil
     if (event >= k.events.size()) return false;
     const auto* entry = &k.enumeration;
     if (step == CrossStep::Banc || step == CrossStep::Start) entry = &k.string64;
-    if (step == CrossStep::Position) entry = &k.vector3;
+    if (step == CrossStep::Position || step == CrossStep::Rotation) entry = &k.vector3;
     if (step == CrossStep::Constructor) entry = &k.request_ctor;
     if (step == CrossStep::Event) entry = &k.request_event;
     return IssueCall(backend, *entry, stack_top, sentinel, saved_context, call_stack, [&](ApplyTarget& t) {
@@ -181,6 +185,13 @@ bool IssueCross(Memory& memory, Backend& backend, const OotGameDataTrace::Profil
             for (size_t i = 0; i < 3; ++i) memory.Write32(scratch + PositionData + i * 4, std::bit_cast<u32>(destination.pos[i]));
             t.arguments[1] = scratch + PositionData; t.arguments[2] = k.reserved_position;
             break;
+        case CrossStep::Rotation: {
+            if (!k.explicit_position) return false;
+            const auto rotation = ReservedRotation(destination.yaw);
+            for (size_t i = 0; i < 3; ++i) memory.Write32(scratch + RotationData + i * 4, std::bit_cast<u32>(rotation[i]));
+            t.arguments[1] = scratch + RotationData; t.arguments[2] = k.reserved_rotation;
+            break;
+        }
         case CrossStep::Fade:
             t.arguments[1] = k.fade_value; t.arguments[2] = k.fade_key;
             break;
@@ -291,6 +302,7 @@ private:
     size_t event_index{};
     u64 cross_started{};
     u32 arrival_frames{};
+    float first_ready_yaw{};
     std::optional<Player::Resident> new_resident;
     Vec cross_from{}; ///< PlayingInfo position when the cross teleport started
     Keys keys;
