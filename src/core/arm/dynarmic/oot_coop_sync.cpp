@@ -22,8 +22,10 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/thread.h"
-#include "core/arm/dynarmic/oot_coop_questdefer.h"
+#include "common/settings.h"
 #include "core/arm/dynarmic/oot_coop_colour.h"
+#include "core/arm/dynarmic/oot_coop_link.h"
+#include "core/arm/dynarmic/oot_coop_questdefer.h"
 #include "core/arm/dynarmic/oot_coop_ledger.h"
 #include "core/arm/dynarmic/oot_coop_sync.h"
 #include "core/arm/dynarmic/oot_coop_teleport.h"
@@ -768,11 +770,6 @@ std::shared_ptr<const OotGameDataTrace::Profile> LoadProfile(std::string_view bu
     return std::make_shared<const OotGameDataTrace::Profile>(std::move(*profile));
 }
 
-bool Enabled() {
-    static const bool enabled = ParseEndpoint(Env("EDEN_NX2_OOT_COOP")).has_value();
-    return enabled;
-}
-
 namespace {
 bool AnimationMatches(const Json& value, const std::string& hash) {
     return !hash.empty() && value.is_object() && value.size() == 2 && value.contains("av") &&
@@ -1001,7 +998,7 @@ struct Session::Impl {
          std::set<std::pair<Kind, u64>> keys, u64 wallet, const World::Config& world, bool quest_enabled,
          const QuestDefer::Config* bundles)
         : endpoint{std::move(endpoint_)}, hello{std::move(hello_)}, denied{std::move(denied_)},
-          local{denied}, remote{denied}, allowed_classes{std::move(allowed_)}, retry{io} {
+          local{denied}, remote{denied}, allowed_classes{std::move(allowed_)}, retry{io}, disconnect_timer{io} {
         if (!quest_enabled) allowed_classes.erase(Kind::Quest);
         if (bundles) for (const auto& boss : bundles->bosses)
             bundle_bools.insert(boss.bools.begin(), boss.bools.end());
@@ -1021,6 +1018,8 @@ struct Session::Impl {
     void Start();
     void Stop();
     void Connect();
+    bool CheckDisconnect();
+    void PollDisconnect();
     bool Receive(const Json& packet);
 
     struct CatchupEnd { u64 transaction; };
@@ -1206,7 +1205,7 @@ struct Session::Impl {
     Room::FinishWatch finish_watch;
     Room::Window room_window;
     std::atomic<bool> finished{};
-    std::atomic<int> relay_state{}; // 0 offline, 1 connected, 2 reconnecting
+    std::atomic<int> relay_state{}; // 0 offline, 1 connected, 2 reconnecting, 3 disconnected
     std::atomic<u64> relay_rtt{UINT64_MAX};
     // Room window "mod" field: the kit's mod hash when one was computed (what the two players compare), else
     // the policy id. Fixed at construction: hello.mod_hash itself is cleared by the network thread on fallback.
@@ -1225,7 +1224,7 @@ struct Session::Impl {
         Gui::Status s;
         s.live = true;
         const int state = relay_state.load();
-        s.relay_state = state == 1 ? "connected" : state == 2 ? "reconnecting" : "offline";
+        s.relay_state = state == 1 ? "connected" : state == 2 ? "reconnecting" : state == 3 ? "disconnected" : "offline";
         if (const auto rtt = relay_rtt.load(); rtt != UINT64_MAX) s.rtt_ms = rtt;
         s.room = hello.room; s.team = hello.team; s.name = hello.name; s.seed = hello.seed_hash;
         s.policy = hello.policy_id; s.mod_hash = status_mod_hash; s.teleport = teleport != nullptr;
@@ -1241,7 +1240,7 @@ struct Session::Impl {
         const auto rtt = relay_rtt.load();
         const int state = relay_state.load();
         room_window.Frame({hello.room, hello.seed_hash, mod_label,
-            state == 1 ? "connected" : state == 2 ? "reconnecting" : "offline", hello.name,
+            state == 1 ? "connected" : state == 2 ? "reconnecting" : state == 3 ? "disconnected" : "offline", hello.name,
             rtt == UINT64_MAX ? std::nullopt : std::optional{rtt}, std::move(local_pose)},
             presence, RoomConfig(), now);
     }
@@ -1277,6 +1276,9 @@ struct Session::Impl {
     }
     boost::asio::io_context io;
     boost::asio::steady_timer retry;
+    boost::asio::steady_timer disconnect_timer;
+    Link::DisconnectTrigger disconnect_trigger{Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir)};
+    bool disconnect_held{}; // io thread only
     std::shared_ptr<Connection> connection;
     std::thread thread;
 };
@@ -1310,12 +1312,12 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
             });
     }
 
-    void Fail(std::string_view why = "connection error") {
+    void Fail(std::string_view why = "connection error", bool trigger = false) {
         if (std::exchange(failed, true)) return;
         owner.ledger_capable = false;
         if (catchup_active) owner.book.Abort(transaction);
         if (!owner.stopped) Room::Dispatch(owner.presence.Lost(Room::NowMs()));
-        owner.relay_state = owner.stopped ? 0 : 2;
+        owner.relay_state = owner.stopped ? 0 : trigger ? 3 : 2;
         owner.relay_rtt = UINT64_MAX;
         size_t dropped = 0;
         {
@@ -1335,7 +1337,7 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
         boost::system::error_code ignored;
         socket.close(ignored);
         timer.cancel();
-        if (owner.stopped) return;
+        if (owner.stopped || trigger) return;
         const auto delay = owner.backoff;
         ++owner.attempts;
         if (owner.attempts <= 64 || owner.attempts % 100 == 0) {
@@ -1818,7 +1820,13 @@ struct Session::Impl::Connection : std::enable_shared_from_this<Connection> {
 };
 
 void Session::Impl::Start() {
-    Connect();
+    const auto stale = disconnect_trigger.TakeStale();
+    if (stale == Link::DisconnectTrigger::Stale::Removed)
+        LOG_INFO(Core_ARM, "OoT co-op: removed a stale coop-disconnect trigger at session start");
+    else if (stale == Link::DisconnectTrigger::Stale::Failed)
+        LOG_WARNING(Core_ARM, "OoT co-op: could not remove stale coop-disconnect trigger; holding offline");
+    // All transport and trigger work, including the first Connect, runs on the io thread.
+    boost::asio::post(io, [this] { Connect(); PollDisconnect(); });
     thread = std::thread{[this] {
         Common::SetCurrentThreadName("OotCoop");
         try {
@@ -1841,10 +1849,39 @@ void Session::Impl::Stop() {
         connection->timer.cancel();
     }
     retry.cancel();
+    disconnect_timer.cancel();
+}
+
+bool Session::Impl::CheckDisconnect() {
+    const bool present = disconnect_trigger.Present();
+    if (present && !disconnect_held) {
+        disconnect_held = true;
+        retry.cancel();
+        if (connection && !connection->failed) connection->Fail("disconnect trigger", true);
+        relay_state = 3;
+        LOG_INFO(Core_ARM, "OoT co-op: relay disconnected (trigger)");
+    } else if (!present && disconnect_held) {
+        disconnect_held = false;
+        relay_state = 2;
+        LOG_INFO(Core_ARM, "OoT co-op: relay disconnect trigger removed; reconnecting");
+        retry.expires_after(backoff);
+        retry.async_wait([this](auto error) { if (!error && !stopped) Connect(); });
+        return true; // The removal transition schedules the delay; never connect immediately.
+    }
+    return present;
+}
+
+void Session::Impl::PollDisconnect() {
+    disconnect_timer.expires_after(1s);
+    disconnect_timer.async_wait([this](auto error) {
+        if (error || stopped) return;
+        CheckDisconnect();
+        PollDisconnect();
+    });
 }
 
 void Session::Impl::Connect() {
-    if (stopped) return;
+    if (stopped || CheckDisconnect()) return;
     connection = std::make_shared<Connection>(*this);
     connection->Start();
 }
@@ -3472,6 +3509,9 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
 }
 
 void BeginSession() {
+    // This only gates first lookup. Existing JITs retain m_oot_coop and its traps even if
+    // shutdown refreshes this to false while their guest threads are still unwinding.
+    detail::enabled_gate.store(ParseEndpoint(Env("EDEN_NX2_OOT_COOP")).has_value(), std::memory_order_relaxed);
     std::shared_ptr<Session> old;
     {
         std::scoped_lock lock{sessions_mutex};
@@ -3549,8 +3589,10 @@ void RegisterMain(Kernel::KernelCore& kernel, Kernel::KProcess* owner, u64 progr
         Hello hello;
         if (Env("EDEN_NX2_OOT_COOP_MOD_HASH") != "0") {
             try {
+                const auto disabled = Settings::values.disabled_addons.find(program_id);
                 const auto hash = Ledger::ModHash(keys_path,
-                    Common::FS::GetEdenPath(Common::FS::EdenPath::LoadDir) / fmt::format("{:016X}", program_id));
+                    Common::FS::GetEdenPath(Common::FS::EdenPath::LoadDir) / fmt::format("{:016X}", program_id),
+                    disabled == Settings::values.disabled_addons.end() ? std::vector<std::string>{} : disabled->second);
                 hello.mod_hash = hash.digest;
                 LOG_INFO(Core_ARM, "OoT co-op: mod hash {} (keys + 4 sidecars + {} mod files, {:.2f} MiB)",
                          hash.digest.substr(0, 12), hash.files, static_cast<double>(hash.bytes) / (1024 * 1024));

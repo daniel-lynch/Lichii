@@ -65,6 +65,9 @@ struct FileInfo {
 std::vector<FileInfo> DescribeKit(const std::filesystem::path& keys);
 bool RequestTeleport(const std::filesystem::path& trigger, std::string_view target);
 bool SetRoomWindow(const std::filesystem::path& trigger, bool shown);
+bool RequestDisconnect(const std::filesystem::path& eden_dir);
+bool RequestConnect(const std::filesystem::path& eden_dir);
+bool DisconnectRequested(const std::filesystem::path& eden_dir);
 bool RequestResync(const std::filesystem::path& eden_dir);
 bool RoomWindowShown(const std::filesystem::path&);
 std::filesystem::path RoomTrigger(const EnvGetter&);

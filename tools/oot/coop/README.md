@@ -86,3 +86,14 @@ same room/team/policy/seed. Then append commands to `ctl/cmd.txt`; each gets one
 - `received`, `state`, `mark TEXT`, `quit`.
 
 `FakePeerTests` in `test_relay.py` covers it over real loopback TCP.
+
+## Mod hash
+
+`python3 -I tools/oot/coop/mod_hash.py --keys FILE --load DIR [--text]`
+computes the version 2 kit fingerprint. Use repeated `--disabled NAME` or
+`--config qt-config.ini` to match the selected title's disabled add-ons.
+`--program-id HEX` selects a title under a shared load root. Version 2 includes
+case-insensitive romfs/exefs/romfslite trees of enabled folders, with disk spelling
+preserved. Version 1 (`--hash-version 1`) reproduces the C16 exact-case romfs/exefs
+format and ignores exclusions/config. See [the canonical format](../../../docs/oot-coop/PROTOCOL.md#exact-mod-hash-input).
+Socket-free synthetic tests: `python3 -I -m unittest discover -s tools/oot/coop -p test_mod_hash.py`.
