@@ -274,7 +274,16 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     const u64 budget_expected = expected_memory;
     u64 max_critical = MaxCriticalMemory;
     if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
-        max_critical = (std::max)(max_critical, runtime.GetDeviceMemoryBudget() / 8 * 5);
+        const u64 budget = runtime.GetDeviceMemoryBudget();
+        max_critical = (std::max)(max_critical, budget / 8 * 5);
+        // 5/8 leaves too much unused on mid-size budgets (a 12 GB RTX 3080 Ti reports ~9 GiB):
+        // Ocarina's Kokiri pans re-decoded ASTC images at 5.8 GiB. Leaving 2.5 GiB of the budget
+        // free instead (~6.7 GiB there) cut the costly re-decodes by 93%. Not gated at 10 GiB, so
+        // the cap does not drop at that boundary (the same term #1129 uses above it). Still
+        // capped by the budget-derived critical_memory (budget minus its margins).
+        if (budget > MaxCriticalMemory + 2560_MiB) {
+            max_critical = (std::max)(max_critical, budget - 2560_MiB);
+        }
     }
     critical_memory = (std::min)(critical_memory, max_critical);
     expected_memory =
