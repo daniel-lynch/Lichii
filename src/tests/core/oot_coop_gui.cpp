@@ -177,6 +177,14 @@ TEST_CASE("Co-op GUI session kit copies sidecars and removes stale files", "[oot
     REQUIRE(Gui::WriteSessionKeys(session, keys, "{}"));
     REQUIRE(Read(session / "coop-ux.json") == "{\"changed\": true}");
     REQUIRE_FALSE(std::filesystem::exists(session / "coop-anim.json"));
+    // The icon pack directory is mirrored too (copied when present, removed when gone).
+    std::filesystem::create_directory(source / "coop-icons");
+    std::ofstream(source / "coop-icons" / "index.json") << "{}";
+    REQUIRE(Gui::WriteSessionKeys(session, keys, "{}"));
+    REQUIRE(Read(session / "coop-icons" / "index.json") == "{}");
+    std::filesystem::remove_all(source / "coop-icons");
+    REQUIRE(Gui::WriteSessionKeys(session, keys, "{}"));
+    REQUIRE_FALSE(std::filesystem::exists(session / "coop-icons"));
     REQUIRE_FALSE(Gui::WriteSessionKeys(source, keys, "must not overwrite original"));
     REQUIRE(Read(keys) == Kit);
 }
