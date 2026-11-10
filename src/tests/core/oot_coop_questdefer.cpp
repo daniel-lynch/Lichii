@@ -409,12 +409,18 @@ TEST_CASE("questdefer local completion supersedes unissued Apply intent", "[oot_
     }
 }
 
-TEST_CASE("questdefer held expired death command cannot rearm without a new death", "[oot_coop]") {
+TEST_CASE("questdefer death held on the game over menu latches and waits for a live respawn", "[oot_coop]") {
+    // Field C17 sB: Dead, then the Game Over menu waited 28 s (1703 frames > death_load_frames)
+    // before the load rose with the command still held; after the load the player stayed in the
+    // death command for 7 s while the scene restored.
     Rig r; r.Tick(); r.observation.command = "Down_A"; r.Tick();
-    r.Frames(901); r.observation.loading = true; r.Tick();
-    REQUIRE(r.machine.Status(201) == D::State::Deferred); REQUIRE(r.calls.empty());
-    r.observation.loading = false; r.observation.command = "Live_A"; r.Tick();
-    REQUIRE(r.calls.empty()); REQUIRE_FALSE(r.Logged("committed death"));
+    r.Frames(1700); REQUIRE(r.machine.Status(201) == D::State::Deferred);
+    r.observation.loading = true; r.Tick();
+    REQUIRE(r.machine.Status(201) == D::State::Latched); REQUIRE(r.Logged("committed death: latched"));
+    r.observation.loading = false; r.Frames(30);
+    REQUIRE(r.calls.empty()); REQUIRE(r.machine.Status(201) == D::State::Latched);
+    r.observation.command = "Live_A"; REQUIRE(r.Tick());
+    REQUIRE(r.Logged("respawned: live command Live_A")); REQUIRE(r.calls.size() == 1);
 }
 
 TEST_CASE("questdefer completed epoch clears consumed teleport and death permissions", "[oot_coop]") {

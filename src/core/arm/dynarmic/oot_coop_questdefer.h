@@ -69,7 +69,7 @@ private:
     Observation observation;
     std::optional<u64> death_candidate;
     std::optional<bool> previous_loading;
-    bool death_seen{};
+    bool respawn_live{}, death_committed{};
     u64 lines{}, watch_lines{};
     std::optional<u64> observed_frame;
     bool InRegion(const Boss& boss) const;

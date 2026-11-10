@@ -134,7 +134,7 @@ bool Machine::Watching() const {
 void Machine::Observe(const Observation& o, u64 frame, const Port& p) {
     const auto before = observation;
     observation = o; observed_frame = frame;
-    if (!keys->defer || !Watching()) { death_candidate.reset(); death_seen = false; previous_loading = o.loading; return; }
+    if (!keys->defer || !Watching()) { death_candidate.reset(); previous_loading = o.loading; return; }
     const auto& k = *keys->defer;
     const bool death = o.command && std::find(k.death_commands.begin(), k.death_commands.end(), *o.command) != k.death_commands.end();
     // Field diagnostics (bounded): every change of the sampled activity inputs while a bundle is watched.
@@ -148,15 +148,27 @@ void Machine::Observe(const Observation& o, u64 frame, const Port& p) {
     }
     // A rising load consumes the previous command; a freshly created player may already report a live command.
     const bool rising = o.loading == true && previous_loading == false;
+    // The candidate is refreshed while a death command is held: the Game Over menu waits for the
+    // player (field C17 sB: Dead at frame 11847, Try Again pressed 28 s later, load rose at 13550
+    // with the command still DeadRagdoll), so the window counts from the last death frame.
+    const bool latched = std::any_of(rows.begin(), rows.end(), [](const auto& e) { return e.second.state == State::Latched; });
+    if (death && o.loading == false && !death_committed) death_candidate = frame;
     if (death_candidate && frame - *death_candidate > k.death_load_frames) death_candidate.reset();
     if (rising && death_candidate) {
         Log(p, k.death_skips ? "committed death: latched" : "committed death: death_skips off");
         for (auto& [c, r] : rows) if (r.state == State::Deferred && k.death_skips) { r.latched = true; r.state = State::Latched; }
-        death_candidate.reset();
+        death_candidate.reset(); respawn_live = false; death_committed = true;
     } else if (o.command && !death && death_candidate) {
         Log(p, "revive: no respawn load"); death_candidate.reset();
-    } else if (death && !death_seen && o.loading == false) { death_candidate = frame; death_seen = true; }
-    if (o.command && !death) death_seen = false;
+    }
+    // After the respawn load the player stays in the death command for seconds while the scene
+    // restores (sB: DeadRagdoll until Fall/LandWater 7 s after the load): the latched bundle waits
+    // for the first live command after the load.
+    if (o.command && !death && o.loading == false && !respawn_live && latched) {
+        respawn_live = true;
+        Log(p, fmt::format("respawned: live command {}", *o.command));
+    }
+    if (o.command && !death && o.loading == false) death_committed = false; // alive again: a later death is new
     previous_loading = o.loading;
     for (auto& [c, r] : rows) {
         if (r.state != State::Deferred) continue;
@@ -193,7 +205,7 @@ bool Machine::Frame(Port& p, u64 frame, bool available) {
         if (r.state != State::Apply) {
             if (r.state == State::Idle) r.state = State::Pending;
             if (r.latched && !k.during_gameover &&
-                (!observation.stable || !observation.save_loaded || observation.loading != false)) {
+                (!observation.stable || !observation.save_loaded || observation.loading != false || !respawn_live)) {
                 r.state = State::Latched; continue;
             }
             if (r.arrival || r.latched || k.skip_in_place || !k.defer_in_activity ||
@@ -277,7 +289,7 @@ bool Machine::PrivateBool(u32 h) const {
 }
 void Machine::Epoch() {
     receipts.clear();
-    death_candidate.reset(); previous_loading.reset(); death_seen = false;
+    death_candidate.reset(); previous_loading.reset(); respawn_live = false; death_committed = false;
     for (auto& [c, r] : rows) {
         if (r.state == State::Failed) continue;
         const auto team = r.team;
