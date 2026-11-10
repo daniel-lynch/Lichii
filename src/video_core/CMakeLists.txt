@@ -212,6 +212,7 @@ add_library(video_core STATIC
     coop_overlay.cpp
     coop_overlay.h
     coop_overlay_font.h
+    coop_overlay_sans.h
     renderer_vulkan/vk_coop_overlay.cpp
     renderer_vulkan/vk_coop_overlay.h
     renderer_vulkan/vk_flash_detector.cpp
