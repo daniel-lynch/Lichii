@@ -40,6 +40,7 @@
 #include "common/common_types.h"
 
 namespace Core::OotCoop::Room { struct Config; }
+namespace Core::OotCoop::Checks { struct Panel; }
 
 namespace Core::OotCoop::Ux {
 
@@ -291,7 +292,10 @@ struct OverlayFrame {
     std::vector<Tag> tags;
     std::shared_ptr<const Panel> panel;
     std::vector<Marker> markers;
-    [[nodiscard]] bool Empty() const { return toasts.empty() && tags.empty() && !panel && markers.empty(); }
+    std::shared_ptr<const Checks::Panel> checks; ///< oot_coop_checks.h
+    [[nodiscard]] bool Empty() const {
+        return toasts.empty() && tags.empty() && !panel && markers.empty() && !checks;
+    }
 };
 
 /// Queue a toast (no-op when EDEN_NX2_OOT_COOP_TOAST is off). False when `id` was seen.

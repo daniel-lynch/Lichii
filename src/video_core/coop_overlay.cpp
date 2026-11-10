@@ -6,6 +6,7 @@
 #include <cmath>
 #include <string_view>
 
+#include "video_core/coop_checks_overlay.h"
 #include "video_core/coop_overlay.h"
 #include "video_core/coop_overlay_font.h"
 
@@ -157,6 +158,10 @@ std::vector<Box> Layout(const OverlayFrame& frame, Rect screen, u32 width, u32 h
     if (frame.panel) {
         thread_local PanelCache cache;
         if (const auto panel = cache.Get(*frame.panel, scale, screen, width, height)) boxes.push_back(*panel);
+    }
+    if (frame.checks) {
+        thread_local ChecksCache checks;
+        if (const auto box = checks.Get(*frame.checks, scale, screen)) place(*box);
     }
     constexpr std::array<Rgb, 4> colours{{{100, 220, 255}, {255, 190, 80}, {180, 255, 120}, {240, 130, 230}}};
     for (const auto& marker : frame.markers) {

@@ -10,6 +10,7 @@
 
 #include <fmt/format.h>
 
+#include "core/arm/dynarmic/oot_coop_checks.h"
 #include "core/arm/dynarmic/oot_coop_ux.h"
 #include "core/arm/dynarmic/oot_coop_room.h"
 
@@ -426,6 +427,7 @@ void Reset() {
     g.markers.clear();
     g.markers_ms = 0;
     g.panel.reset();
+    Checks::Reset();
 }
 
 OverlayFrame Current() {
@@ -437,6 +439,7 @@ OverlayFrame Current() {
     if (!g.tags.empty() && now - g.tags_ms <= TagLifetimeMs) frame.tags = g.tags;
     frame.panel = g.panel;
     if (!g.markers.empty() && now - g.markers_ms <= TagLifetimeMs) frame.markers = g.markers;
+    frame.checks = Checks::Current();
     return frame;
 }
 
