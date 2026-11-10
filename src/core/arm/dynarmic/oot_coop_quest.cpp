@@ -255,6 +255,12 @@ std::optional<Record> ReadRecord(const Port& p, const Keys& k, const Manager& m,
 bool Restoring(const Keys& k, const Manager& m, const Record& r) {
     return m.restoring || (r.flags & k.L("record.restoration_mask"));
 }
+bool StaleNotReady(const Keys& k, const Record& r) {
+    // Field C17 F-A: the New Game restoration burst applies a NotReady request through the pending
+    // path, then the game's automatic next-step progression moves the index on to Ready without
+    // rewriting state.pending_hash, so the record keeps pending=NotReady != current, no request flag.
+    return r.pending == k.notready_hash && r.current != k.notready_hash && !(r.flags & k.L("record.pending_mask"));
+}
 std::string_view ApplyBlock(const Keys& k, const Manager& m, const Record& r, const Target& t, const QuestDefer::Machine* defer) {
     if (!m.Ready()) return "manager not ready (uninitialized, busy or restoring)";
     if (m.gated) return "manager suppressed";
@@ -264,9 +270,11 @@ std::string_view ApplyBlock(const Keys& k, const Manager& m, const Record& r, co
     if (r.index >= t.index) return "already at or past target";
     if (r.current == k.notready_hash) return "NotReady";
     if (r.current == k.complete_hash) return "Complete";
-    if ((r.pending && r.pending != r.current) || (r.flags & k.L("record.pending_mask"))) return "own request pending";
+    const bool bundle = defer && defer->Authorizes(t);
+    if ((r.pending && r.pending != r.current && !(bundle && StaleNotReady(k, r))) ||
+        (r.flags & k.L("record.pending_mask"))) return "own request pending";
     if (r.steps[r.index].participants || r.steps[t.index].participants) return "participants";
-    if ((!defer || !defer->Authorizes(t)) &&
+    if (!bundle &&
         (r.steps[t.index].minigame || r.steps[t.index].boss || r.steps[r.index].minigame || r.steps[r.index].boss))
         return "minigame or boss step";
     return {};

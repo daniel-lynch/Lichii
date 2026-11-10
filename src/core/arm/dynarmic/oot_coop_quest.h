@@ -80,6 +80,9 @@ std::optional<Manager> ReadManager(const Port& port, const Keys& keys, u64 base,
 std::optional<Record> ReadRecord(const Port& port, const Keys& keys, const Manager& manager,
                                 u32 challenge);
 bool Restoring(const Keys& keys, const Manager& manager, const Record& record);
+/// A NotReady request left in the pending hash by save restoration and superseded by the game's
+/// automatic progression (no request flag outstanding): not an own request for a bundle apply.
+bool StaleNotReady(const Keys& keys, const Record& record);
 bool CanApply(const Keys& keys, const Manager& manager, const Record& record, const Target& target);
 /// Why a target may not be issued now (empty: it may). Diagnostics for the bounded quest log.
 std::string_view ApplyBlock(const Keys& keys, const Manager& manager, const Record& record, const Target& target, const QuestDefer::Machine* defer = nullptr);

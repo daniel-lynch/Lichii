@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <charconv>
 #include <fmt/format.h>
+#include <utility>
 
 namespace Core::OotCoop::QuestDefer {
 namespace {
@@ -224,8 +225,13 @@ bool Machine::Frame(Port& p, u64 frame, bool available) {
         if (r.element == 0 && !r.waiting && InRegion(b) && !r.arrival && !r.latched &&
             k.defer_in_activity && !k.skip_in_place) { r.state = State::Deferred; r.outside = 0; continue; }
         if (!available || !observation.stable || !observation.save_loaded || observation.loading != false || observation.event != false) continue;
-        if ((local->pending && local->pending != local->current) ||
-            (local->flags & keys->L("record.pending_mask"))) continue;
+        if ((local->pending && local->pending != local->current && !Quest::StaleNotReady(*keys, *local)) ||
+            (local->flags & keys->L("record.pending_mask"))) {
+            if (!std::exchange(r.pending_logged, true))
+                Log(p, fmt::format("challenge={:08x} waiting: own request pending (pending={:08x} current={:08x} flags={:04x})",
+                                   c, local->pending, local->current, local->flags));
+            continue;
+        }
         const size_t steps = 1 + b.chain.size();
         const size_t total = steps + b.bools.size();
         if (r.element == total) {
