@@ -271,7 +271,10 @@ std::string_view ApplyBlock(const Keys& k, const Manager& m, const Record& r, co
     if (r.current == k.notready_hash) return "NotReady";
     if (r.current == k.complete_hash) return "Complete";
     const bool bundle = defer && defer->Authorizes(t);
-    if ((r.pending && r.pending != r.current && !(bundle && StaleNotReady(k, r))) ||
+    // Field C17.2 F-A: on a vanilla New Game a bundle's chain step meets the same stale restoration pending.
+    // It is exempt from that pending only; the boss/minigame lift stays primary-only.
+    const bool chain = !bundle && defer && defer->AuthorizesChain(t);
+    if ((r.pending && r.pending != r.current && !((bundle || chain) && StaleNotReady(k, r))) ||
         (r.flags & k.L("record.pending_mask"))) return "own request pending";
     if (r.steps[r.index].participants || r.steps[t.index].participants) return "participants";
     if (!bundle &&
@@ -506,14 +509,18 @@ bool Controller::Frame(Port& p, u64 frame, u64 bind_epoch, bool stable, bool neg
             if (!r || !last || !last->Same(*m) || !last->Ready() || Restoring(*keys, *last, *r)) return {};
             return r;
         };
-        bundles->step = [&](const Target& t, bool boss) {
+        bundles->step = [&](const Target& t, bool) -> std::string {
+            // ApplyBlock decides primary vs chain from the machine (Authorizes / AuthorizesChain).
             const auto m = ReadManager(p, *keys, base);
-            if (!m || !m->Same(*checked)) return false;
+            if (!m || !m->Same(*checked)) return "manager changed or unreadable";
             const auto r = ReadRecord(p, *keys, *m, t.challenge);
             const auto last = ReadManager(p, *keys, base);
-            if (!r || !last || !last->Same(*m) || !p.ready() ||
-                !ApplyBlock(*keys, *last, *r, t, boss ? defer.get() : nullptr).empty()) return false;
-            return p.call(keys->setter, {m->pointer, t.challenge, t.step, keys->arguments[0], keys->arguments[1], 0, 0, 0});
+            if (!r || !last || !last->Same(*m)) return "record unreadable or manager moved";
+            if (!p.ready()) return "applier not ready";
+            if (const auto why = ApplyBlock(*keys, *last, *r, t, defer.get()); !why.empty()) return std::string{why};
+            if (!p.call(keys->setter, {m->pointer, t.challenge, t.step, keys->arguments[0], keys->arguments[1], 0, 0, 0}))
+                return "setter call refused";
+            return {};
         };
         if (defer->Frame(*bundles, tick, negotiated && available && !flight && p.ready())) return true;
     }
