@@ -209,6 +209,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_fence_manager.cpp
     renderer_vulkan/vk_fence_manager.h
     renderer_vulkan/vk_frame_dump.cpp
+    coop_checks_overlay.cpp
+    coop_checks_overlay.h
     coop_overlay.cpp
     coop_overlay.h
     coop_overlay_font.h
