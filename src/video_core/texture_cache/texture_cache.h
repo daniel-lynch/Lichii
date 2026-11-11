@@ -266,7 +266,7 @@ void TextureCache<P>::RunGarbageCollector() {
 }
 
 template <class P>
-void TextureCache<P>::ApplyThresholdOverrides(bool log) {
+bool TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // Past what a frame needs, more device memory only keeps the textures of earlier scenes
     // (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
     // MaxCriticalMemory on rather than near the card's budget. Larger cards get 5/8 of the
@@ -305,10 +305,18 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
         }
     }
     expected_memory = (std::min)(expected_memory, critical_memory);
+    // Compare what is applied (after the caps) with the last line: the budget re-read moves the
+    // uncapped figures by a few MiB all the time, and comparing those against the capped ones
+    // logged this line every re-read (~2 a second).
+    const auto moved = [](u64 a, u64 b) { return (a > b ? a - b : b - a) >= 256_MiB; };
+    log = log || !logged_thresholds || moved(expected_memory, logged_thresholds->first) ||
+          moved(critical_memory, logged_thresholds->second);
     if (log) {
+        logged_thresholds.emplace(expected_memory, critical_memory);
         LOG_INFO(HW_GPU, "Texture cache thresholds: expected {} MiB, critical {} MiB, minimum {} MiB",
                  expected_memory >> 20, critical_memory >> 20, minimum_memory >> 20);
     }
+    return log;
 }
 
 template <class P>
@@ -365,7 +373,6 @@ void TextureCache<P>::TickFrame() {
             if (native_thresholds_applied && budget_check_frames++ % 30 == 0) {
                 const u64 budget = runtime.GetDeviceMemoryBudget();
                 if (budget > 2_GiB) {
-                    const u64 old_critical = critical_memory;
                     const u64 margin = (std::min)(budget / 8, 1_GiB);
                     if constexpr (requires { runtime.GetDeviceMemorySlack(); }) {
                         // The usage counted here leaves out the unused part of the allocator's
@@ -382,14 +389,9 @@ void TextureCache<P>::TickFrame() {
                     critical_memory =
                         budget - (std::min)(margin + pressure_margin + slack_margin, budget / 2);
                     expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
-                    // Log the first values and real changes (the budget moves by a few MiB all
-                    // the time).
-                    const u64 change = critical_memory > old_critical
-                                           ? critical_memory - old_critical
-                                           : old_critical - critical_memory;
-                    const bool log = budget_check_frames == 1 || change >= 256_MiB;
-                    ApplyThresholdOverrides(log);
-                    if (log) {
+                    // Log the first values and real changes of the applied thresholds (the
+                    // budget moves by a few MiB all the time).
+                    if (ApplyThresholdOverrides(budget_check_frames == 1)) {
                         LOG_INFO(HW_GPU,
                                  "Memory margins: base {} MiB, out of memory {} MiB, block slack {} MiB",
                                  margin >> 20, pressure_margin >> 20, slack_margin >> 20);
