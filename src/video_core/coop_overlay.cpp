@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <optional>
 #include <string_view>
 
 #include <fmt/format.h>
@@ -485,9 +486,39 @@ std::vector<Box> Layout(const OverlayFrame& frame, Rect screen, u32 width, u32 h
         thread_local PanelCache cache;
         if (const auto panel = cache.Get(*frame.panel, scale, screen, width, height)) boxes.push_back(*panel);
     }
+    // The right column: the checks panel (when shown) at the edge, the toast column beside it.
+    std::optional<Rect> checks_rect;
     if (frame.checks) {
         thread_local ChecksCache checks;
-        if (const auto box = checks.Get(*frame.checks, scale, screen)) place(*box);
+        if (const auto box = checks.Get(*frame.checks, scale, screen)) {
+            checks_rect = Rect{box->x, box->y, box->x + static_cast<s32>(box->width),
+                               box->y + static_cast<s32>(box->height)};
+            place(*box);
+        }
+    }
+    const s32 gap = static_cast<s32>(8 * scale);
+    auto toasts = PlaceToasts(screen, scale);
+    if (checks_rect) {
+        // Beside the panel, not over it (both start near a quarter down); at 720p with the dense panel
+        // the text limit also shrinks so the column keeps to the left half of what is left.
+        toasts.right = std::min(toasts.right, checks_rect->left - gap);
+        const s32 room = std::max<s32>(0, toasts.right - screen.left) / 2;
+        toasts.max_text = std::min<u32>(toasts.max_text, std::max<u32>(160 * scale, static_cast<u32>(room)));
+    }
+    std::vector<Box> column;
+    s32 y = toasts.top;
+    for (const auto& toast : frame.toasts) {
+        auto box = ToastBox(toast, frame.icons.get(), scale, toasts.max_text);
+        box.x = toasts.right - static_cast<s32>(box.width);
+        box.y = y;
+        y += static_cast<s32>(box.height) + gap;
+        column.push_back(std::move(box));
+    }
+    if (frame.more && !frame.toasts.empty()) {
+        auto box = MoreBox(frame.more, scale);
+        box.x = toasts.right - static_cast<s32>(box.width);
+        box.y = y;
+        column.push_back(std::move(box));
     }
     constexpr std::array<Rgb, 4> colours{{{100, 220, 255}, {255, 190, 80}, {180, 255, 120}, {240, 130, 230}}};
     for (const auto& marker : frame.markers) {
@@ -520,22 +551,7 @@ std::vector<Box> Layout(const OverlayFrame& frame, Rect screen, u32 width, u32 h
         box.y = py - static_cast<s32>(box.height) - static_cast<s32>(2 * scale);
         place(std::move(box));
     }
-    const auto toasts = PlaceToasts(screen, scale);
-    const s32 gap = static_cast<s32>(8 * scale);
-    s32 y = toasts.top;
-    for (const auto& toast : frame.toasts) {
-        auto box = ToastBox(toast, frame.icons.get(), scale, toasts.max_text);
-        box.x = toasts.right - static_cast<s32>(box.width);
-        box.y = y;
-        y += static_cast<s32>(box.height) + gap;
-        place(std::move(box));
-    }
-    if (frame.more && !frame.toasts.empty()) {
-        auto box = MoreBox(frame.more, scale);
-        box.x = toasts.right - static_cast<s32>(box.width);
-        box.y = y;
-        place(std::move(box));
-    }
+    for (auto& box : column) place(std::move(box));
     return boxes;
 }
 

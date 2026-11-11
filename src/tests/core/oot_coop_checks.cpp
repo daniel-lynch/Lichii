@@ -276,6 +276,25 @@ TEST_CASE("OotCoopChecks: raster box and layout", "[oot_coop]") {
     CHECK(boxes[0].width == box->width);
     // Offscreen rectangle: clipped away by Layout.
     CHECK(Overlay::Layout(frame, {0, 0, 1920, 1080}, 100, 100).empty());
+
+    // Toasts start a quarter down at the right edge too: with the panel shown they sit beside it.
+    frame.toasts = {Ux::PlainToast("Anthony found a rather long item name here"), Ux::PlainToast("second")};
+    frame.more = 2;
+    const auto with = Overlay::Layout(frame, screen, 1920, 1080);
+    REQUIRE(with.size() == 4); // panel, two toasts, "+2 more"
+    for (size_t i = 1; i < with.size(); ++i) {
+        CHECK(with[i].x + static_cast<s32>(with[i].width) == box->x - 8);
+        CHECK(with[i].x >= 0);
+    }
+    // 720p, dense-width panel: the column still fits left of it.
+    Checks::Panel wide{{{std::string(52, 'w'), Style::Title}}, true, 9};
+    frame.checks = std::make_shared<const Checks::Panel>(wide);
+    const auto small = Overlay::Layout(frame, {0, 0, 1280, 720}, 1280, 720);
+    REQUIRE(small.size() == 4);
+    for (size_t i = 1; i < small.size(); ++i) {
+        CHECK(small[i].x + static_cast<s32>(small[i].width) == small[0].x - 8);
+        CHECK(small[i].x >= 0);
+    }
 }
 
 TEST_CASE("OotCoopChecks: trigger path", "[oot_coop]") {
