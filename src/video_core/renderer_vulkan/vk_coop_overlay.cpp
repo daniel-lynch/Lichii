@@ -117,12 +117,18 @@ void CoopOverlay::Draw(VkImage image, VkFormat format, u32 width, u32 height,
             slot->panel_cache_id = box.cache_id;
             slot->panel_format = format;
         }
-        copies.push_back({.bufferOffset = offset,
-                          .bufferRowLength = 0,
-                          .bufferImageHeight = 0,
-                          .imageSubresource = Layers,
-                          .imageOffset = {box.x, box.y, 0},
-                          .imageExtent = {box.width, box.height, 1}});
+        // A shaped box (pill, caret) copies only its covered runs: the copy cannot blend, so
+        // pixels outside the shape must not be written at all.
+        for (const auto& run : VideoCore::CoopOverlay::Runs(box)) {
+            copies.push_back({.bufferOffset = offset + (VkDeviceSize{static_cast<u32>(run.top)} * box.width +
+                                                        static_cast<u32>(run.left)) * 4,
+                              .bufferRowLength = box.width,
+                              .bufferImageHeight = 0,
+                              .imageSubresource = Layers,
+                              .imageOffset = {box.x + run.left, box.y + run.top, 0},
+                              .imageExtent = {static_cast<u32>(run.right - run.left),
+                                              static_cast<u32>(run.bottom - run.top), 1}});
+        }
         offset = (offset + bytes + 15) & ~VkDeviceSize{15};
     }
     if (copies.empty()) return;

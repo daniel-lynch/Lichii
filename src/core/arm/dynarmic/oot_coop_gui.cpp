@@ -22,6 +22,7 @@ namespace {
 using Json = nlohmann::ordered_json;
 constexpr std::array Tokens{"bool", "bit", "rupee", "item", "pose", "dungeon", "quest"};
 constexpr std::array Sidecars{"coop-ux.json", "coop-anim.json", "coop-equip.json", "coop-ledger.json"};
+constexpr const char* IconPackDir = "coop-icons";
 constexpr std::string_view Prefix = "EDEN_NX2_OOT_COOP";
 std::mutex status_mutex;
 Status status;
@@ -321,6 +322,17 @@ bool WriteSessionKeys(const std::filesystem::path& session, const std::filesyste
         if (exists) std::filesystem::copy_file(source, dest, std::filesystem::copy_options::overwrite_existing, ec);
         else std::filesystem::remove(dest, ec);
         if (ec) return false;
+    }
+    // The optional toast icon pack (a directory; not part of the mod hash) follows the sidecars.
+    {
+        const auto source = source_dir / IconPackDir, dest = session / IconPackDir;
+        std::filesystem::remove_all(dest, ec);
+        if (ec) return false;
+        if (std::filesystem::is_directory(source, ec)) {
+            std::filesystem::copy(source, dest, std::filesystem::copy_options::recursive, ec);
+            if (ec) return false;
+        }
+        ec.clear();
     }
     const auto dest = session / original.filename();
     auto temp = dest;

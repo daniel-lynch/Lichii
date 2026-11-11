@@ -2,20 +2,35 @@
 
 Host-side only: nothing here writes guest memory or calls guest code.
 
-- **Corner toast.** A receiver replay that returned successfully (item give with w0=1, wallet delta)
-  queues "Anthony got 1x Kokiri Sword" / "Anthony got 20 rupees". A forwarded local give queues
-  "You shared 1x ...". One toast per grant id (origin/seq), at most three on screen, 4 s each, upper
-  right of the game rectangle; cleared when the session resets. Item names come from the private
-  sidecar; an actor the table does not name shows "an item".
+- **Toasts.** A receiver replay that returned successfully (item give with w0=1, wallet delta)
+  queues "Anthony found Kokiri Sword" / "Anthony +20 rupees"; a forwarded local give queues
+  "You shared Kokiri Sword". One toast per grant id (origin/seq). The same sender's same item
+  merges while on screen or queued ("Anthony found Deku Nut x3"; a merge extends a visible toast
+  by 2 s, never past 7 s from when it appeared). At most three on screen, 5 s each; while more
+  wait, each gives way after 2.5 s and a "+N more" pill shows the backlog (16 queued at most).
+  Cleared when the session resets. Item names come from the private sidecar; an actor the table
+  does not name shows "an item" and no icon.
+- **Toast look.** Opaque rounded pills, right-aligned 2.5 % in from the right edge of the game
+  rectangle and starting a quarter of the way down (below the game's own item HUD in the upper
+  right, clear of the hearts and the room panel on the left). Proportional bold type (Noto Sans
+  Bold, OFL, 22 px at 1080p; doubled at 4K); the sender in light blue, the item in gold, the rest
+  light grey. Text wider than 30 % of the rectangle wraps to two lines, then ends in "...". With
+  the private icon pack, the item's icon (40 px at 1080p) sits in a disc at the pill's left end;
+  wallet deltas show the rupee icon for the amount.
 - **Name tag.** At the frame drain the active Main camera (view 3x4, projection 4x4) is read, pure
   reads, every pointer checked; a frame whose CPU projection is dirty keeps the previous tags. Each peer
   in our settled scene is projected at its ghost root plus a head height; the name is drawn above that
   point with depth off (visible through walls), hidden behind the camera or off screen, dropped when
   the peer leaves the scene or either side loads. Tags expire 250 ms after the last frame drain.
-- **Drawing.** `src/video_core/coop_overlay.*` rasterises opaque text boxes (embedded Noto Sans Mono
-  bitmap); `renderer_vulkan/vk_coop_overlay.*` copies them into the composited present frame after
-  composition (and after frame generation consumed it) and before flush/present. Emulator screenshots
-  blend the same boxes in (`EDEN_NX2_OOT_COOP_OVERLAY_SHOTS`).
+  The tag is an opaque pill with a light-blue dot and the name, and a caret pointing at the head.
+  From 15 world units away it switches to the compact style: one size smaller (16 px), dimmer,
+  with the distance ("Anthony  24m").
+- **Drawing.** `src/video_core/coop_overlay.*` rasterises the boxes (embedded Noto Sans Bold and
+  Noto Sans Mono bitmaps; `tools/oot/coop/overlay_font.py` regenerates `coop_overlay_sans.h`);
+  `renderer_vulkan/vk_coop_overlay.*` copies them into the composited present frame after
+  composition (and after frame generation consumed it) and before flush/present. The copy cannot
+  blend, so a shaped box (pill, caret) is copied as its covered runs only (`Runs()`); corners are
+  not anti-aliased. Emulator screenshots blend the same boxes in (`EDEN_NX2_OOT_COOP_OVERLAY_SHOTS`).
 - **Names on the wire.** Peer names come from the relay's `client_state.state.name`; our own
   `client_state` now carries `name`, so the relay's cache keeps it for late joiners.
 
@@ -25,6 +40,8 @@ Host-side only: nothing here writes guest memory or calls guest code.
 |---|---|---|
 | `EDEN_NX2_OOT_COOP_TOAST` | on | corner toasts |
 | `EDEN_NX2_OOT_COOP_TOAST_LOCAL` | on | toasts for what this player shares |
+| `EDEN_NX2_OOT_COOP_TOAST_ICONS` | on | item icons in toasts (off by itself when the icon pack is missing or invalid) |
+| `EDEN_NX2_OOT_COOP_ICONS` | `coop-icons` beside the UX sidecar | the icon pack directory |
 | `EDEN_NX2_OOT_COOP_NAMETAG` | on | name tags (needs camera keys for the build) |
 | `EDEN_NX2_OOT_COOP_NAMETAG_DEBUG` | off | crosses at the ghost root and the head point, camera matrices logged |
 | `EDEN_NX2_OOT_COOP_OVERLAY_SHOTS` | on | overlay in emulator screenshots |
@@ -37,6 +54,26 @@ Host-side only: nothing here writes guest memory or calls guest code.
  "builds": {"<main build id>": {"camera": {"registry_cell": "0x...", "...": "...",
                                             "head_child": 1.5, "head_adult": 1.5, "flip_y": false}}}}
 ```
+
+## Icon pack (private, game-derived; never in source)
+
+A directory `coop-icons/` beside the UX sidecar (or `EDEN_NX2_OOT_COOP_ICONS`), built by each
+player from their own game with the private kit's tool. The emulator only reads it:
+
+```json
+{"format": "oot-coop-icons", "version": 1,
+ "sizes": [{"cell": 40, "file": "atlas-40.rgba", "columns": 16, "rows": 9}, {"cell": 80, "...": "..."}],
+ "icons": ["<icon id>", "..."],
+ "actors": {"<actor name>": "<icon id>"},
+ "wallet": [{"min": 1, "icon": "<icon id>"}, "..."]}
+```
+
+Each atlas is raw RGBA8 (straight alpha), `columns*cell` x `rows*cell`, icon *i* at column
+`i % columns`, row `i / columns`. The presenter uses the largest cell not above 40 px x the overlay
+scale (box-filtered or repeated to fit). Decoding is strict (format/version, safe file names, exact
+file sizes, at most 32 MiB per atlas, every mapped icon listed); any error logs why and turns
+icons off, toasts still work. The pack is not part of the mod hash: it changes only what this
+player sees. Properties → Co-op session copies mirror the directory with the sidecars.
 
 Every camera field in `CameraKeys` (`src/core/arm/dynarmic/oot_coop_ux.h`) is required; an unknown
 field rejects the camera object (toasts still work). The sidecar is separate from the co-op profile
