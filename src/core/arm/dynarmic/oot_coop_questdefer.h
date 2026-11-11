@@ -30,7 +30,9 @@ struct Observation {
 };
 struct Port {
     std::function<std::optional<Quest::Record>(u32)> read;
-    std::function<bool(const Quest::Target&, bool)> step;
+    // Issues the setter for a step element; returns empty when the call was issued, otherwise why
+    // not (the guard's reason, or the applier state), which the failed receipt prints.
+    std::function<std::string(const Quest::Target&, bool)> step;
     std::function<std::optional<bool>(u32)> read_bool;
     std::function<bool(u32)> grant_bool;
     std::function<void(std::string_view)> log, toast;
@@ -49,6 +51,7 @@ public:
     bool Watching() const;
     bool Calling() const;
     bool Authorizes(const Quest::Target& target) const;
+    bool AuthorizesChain(const Quest::Target& target) const;
     bool Echo(const Quest::Record& record) const;
     bool PrivateBool(u32 hash) const;
     std::vector<std::string> ExemptBancs() const;
@@ -57,6 +60,7 @@ private:
     struct Row {
         State state{State::Idle};
         std::optional<Quest::Target> team, receipt;
+        std::string blocked;
         size_t element{};
         unsigned attempts{}, primary_attempts{};
         u64 since{}, outside{};
