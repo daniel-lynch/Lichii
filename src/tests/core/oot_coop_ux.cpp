@@ -612,6 +612,33 @@ TEST_CASE("OotCoopUx: name tags shrink and show distance when far", "[oot_coop]"
     CHECK(big[0].height == 2 * near_box[0].height);
 }
 
+TEST_CASE("OotCoopUx: a name tag under the toast column moves to its left", "[oot_coop]") {
+    namespace Overlay = VideoCore::CoopOverlay;
+    const Overlay::Rect screen{0, 0, 1920, 1080};
+    const auto place = Overlay::PlaceToasts(screen, 1);
+    Ux::OverlayFrame frame;
+    frame.toasts = {Ux::PlainToast("Anthony found Kokiri Sword")};
+    // The head upper right, at the height of the first toast.
+    frame.tags = {{"Anthony", {0.875f, 0.296875f}, false, 3.0f}};
+    auto boxes = Overlay::Layout(frame, screen, 1920, 1080);
+    REQUIRE(boxes.size() == 2); // tag, toast
+    const auto& toast = boxes[1];
+    CHECK(toast.x + static_cast<s32>(toast.width) == place.right);
+    CHECK(boxes[0].x + static_cast<s32>(boxes[0].width) == toast.x - 8);
+    CHECK(boxes[0].y + static_cast<s32>(boxes[0].height) == 320 - 2); // height unchanged
+    // No toast: the tag stays centred over the head.
+    frame.toasts.clear();
+    boxes = Overlay::Layout(frame, screen, 1920, 1080);
+    REQUIRE(boxes.size() == 1);
+    CHECK(boxes[0].x + static_cast<s32>(boxes[0].width / 2) == 1680);
+    // Below the column: not moved.
+    frame.toasts = {Ux::PlainToast("Anthony found Kokiri Sword")};
+    frame.tags = {{"Anthony", {0.875f, 0.6f}, false, 3.0f}};
+    boxes = Overlay::Layout(frame, screen, 1920, 1080);
+    REQUIRE(boxes.size() == 2);
+    CHECK(boxes[0].x + static_cast<s32>(boxes[0].width / 2) == 1680);
+}
+
 TEST_CASE("OotCoopUx: session frame publishes tags from the camera", "[oot_coop]") {
     Ux::Reset();
     const std::string build = "0123456789ABCDEF0123456789ABCDEF01234567";

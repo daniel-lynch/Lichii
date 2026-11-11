@@ -373,6 +373,13 @@ Box TagBox(const Core::OotCoop::Ux::Tag& tag, u32 s) {
     }
     return box;
 }
+/// A name tag that overlaps `column` moves left until its right edge is `gap` clear of it (same height).
+void NudgeLeftOf(Box& box, const std::optional<Rect>& column, s32 gap) {
+    if (!column) return;
+    const s32 right = box.x + static_cast<s32>(box.width), bottom = box.y + static_cast<s32>(box.height);
+    if (right <= column->left || box.x >= column->right || bottom <= column->top || box.y >= column->bottom) return;
+    box.x = column->left - gap - static_cast<s32>(box.width);
+}
 } // namespace
 
 std::vector<Rect> Runs(const Box& box) {
@@ -520,6 +527,13 @@ std::vector<Box> Layout(const OverlayFrame& frame, Rect screen, u32 width, u32 h
         box.y = y;
         column.push_back(std::move(box));
     }
+    std::optional<Rect> toast_rect;
+    for (const auto& box : column) {
+        const Rect r{box.x, box.y, box.x + static_cast<s32>(box.width), box.y + static_cast<s32>(box.height)};
+        toast_rect = toast_rect ? Rect{std::min(toast_rect->left, r.left), std::min(toast_rect->top, r.top),
+                                       std::max(toast_rect->right, r.right), std::max(toast_rect->bottom, r.bottom)}
+                                : r;
+    }
     constexpr std::array<Rgb, 4> colours{{{100, 220, 255}, {255, 190, 80}, {180, 255, 120}, {240, 130, 230}}};
     for (const auto& marker : frame.markers) {
         if (!std::isfinite(marker.at.x) || !std::isfinite(marker.at.y) ||
@@ -536,7 +550,8 @@ std::vector<Box> Layout(const OverlayFrame& frame, Rect screen, u32 width, u32 h
         square.y = screen.top + static_cast<s32>(marker.at.y * sh) - static_cast<s32>(side / 2);
         place(std::move(square));
     }
-    // Name tags before toasts, so a toast covers a tag.
+    // Name tags before toasts; a tag that lands under the right column (toasts, checks panel) moves
+    // to its left, same height, so the column never hides the peer's name.
     for (const auto& tag : frame.tags) {
         const s32 px = screen.left + static_cast<s32>(tag.at.x * static_cast<float>(sw));
         const s32 py = screen.top + static_cast<s32>(tag.at.y * static_cast<float>(sh));
@@ -549,6 +564,9 @@ std::vector<Box> Layout(const OverlayFrame& frame, Rect screen, u32 width, u32 h
         auto box = TagBox(tag, scale);
         box.x = px - static_cast<s32>(box.width / 2);
         box.y = py - static_cast<s32>(box.height) - static_cast<s32>(2 * scale);
+        NudgeLeftOf(box, toast_rect, gap);
+        NudgeLeftOf(box, checks_rect, gap);
+        NudgeLeftOf(box, toast_rect, gap); // moved left of the panel, it can land under a wider toast
         place(std::move(box));
     }
     for (auto& box : column) place(std::move(box));

@@ -286,6 +286,16 @@ TEST_CASE("OotCoopChecks: raster box and layout", "[oot_coop]") {
         CHECK(with[i].x + static_cast<s32>(with[i].width) == box->x - 8);
         CHECK(with[i].x >= 0);
     }
+    // A tag under the panel (no toast over it) moves left of the panel and of the toasts beside it.
+    frame.toasts = {Ux::PlainToast("short")};
+    frame.more = 0;
+    frame.tags = {{"Anthony", {0.96875f, 0.3125f}, false, 3.0f}};
+    const auto tagged = Overlay::Layout(frame, screen, 1920, 1080);
+    REQUIRE(tagged.size() == 3); // panel, tag, toast
+    CHECK(tagged[1].x + static_cast<s32>(tagged[1].width) <= box->x - 8);
+    frame.tags.clear();
+    frame.toasts = {Ux::PlainToast("Anthony found a rather long item name here"), Ux::PlainToast("second")};
+    frame.more = 2;
     // 720p, dense-width panel: the column still fits left of it.
     Checks::Panel wide{{{std::string(52, 'w'), Style::Title}}, true, 9};
     frame.checks = std::make_shared<const Checks::Panel>(wide);
