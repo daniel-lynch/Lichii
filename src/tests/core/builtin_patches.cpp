@@ -546,3 +546,48 @@ TEST_CASE("PatchNSO reports which built-in patches applied", "[patch_manager]") 
         REQUIRE_FALSE(has(applied, FpsUnlock));
     }
 }
+
+TEST_CASE("Built-in Texture Pool x2 doubles the allocator's initial pool size",
+          "[patch_manager]") {
+    constexpr std::string_view TexturePool = "Texture Pool x2 (built-in)";
+    constexpr size_t CallOffset = sizeof(Loader::NSOHeader) + 0xC2A36C;
+    constexpr size_t RoutineOffset = sizeof(Loader::NSOHeader) + 0x3C462C0;
+    constexpr u32 StpInstruction = 0xA90127E8;
+    constexpr u32 CallInstruction = 0x94C06FD5;
+    PatchManagerTestContext context;
+    const auto manager = context.Manager();
+    auto nso = MakeDynamicMain();
+    std::memcpy(nso.data() + CallOffset, &StpInstruction, sizeof(StpInstruction));
+
+    auto patched = manager.PatchNSO(nso, "main");
+    REQUIRE(WordAt(patched, CallOffset) == CallInstruction);
+    REQUIRE(Common::HexToString(std::span{patched}.subspan(RoutineOffset, 12)) ==
+            "08F97FD3E82701A9C0035FD6");
+    REQUIRE(WordAt(patched, RoutineOffset + 12) == 0);
+
+    // Listed in Add-Ons, on by default (Lichii: checked here too).
+    const auto patches = manager.GetPatches();
+    const auto listed = std::ranges::find(patches, TexturePool, &FileSys::Patch::name);
+    REQUIRE(listed != patches.end());
+    REQUIRE(listed->enabled);
+    REQUIRE(listed->type == FileSys::PatchType::Mod);
+    REQUIRE(std::ranges::count(patches, TexturePool, &FileSys::Patch::name) == 1);
+
+    // Gated on Ocarina's build id (Lichii): another build of main is left alone.
+    auto other_build = nso;
+    other_build[offsetof(Loader::NSOHeader, build_id)] ^= 1;
+    const auto unpatched = manager.PatchNSO(other_build, "main");
+    REQUIRE(WordAt(unpatched, CallOffset) == StpInstruction);
+    REQUIRE(WordAt(unpatched, RoutineOffset) == 0);
+
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{TexturePool}};
+    patched = manager.PatchNSO(nso, "main");
+    REQUIRE(WordAt(patched, CallOffset) == StpInstruction);
+    REQUIRE(WordAt(patched, RoutineOffset) == 0);
+
+    Settings::values.disabled_addons.erase(OcarinaTitleId);
+    std::memcpy(nso.data() + CallOffset, &NopInstruction, sizeof(NopInstruction));
+    patched = manager.PatchNSO(nso, "main");
+    REQUIRE(WordAt(patched, CallOffset) == NopInstruction);
+    REQUIRE(WordAt(patched, RoutineOffset) == 0);
+}
