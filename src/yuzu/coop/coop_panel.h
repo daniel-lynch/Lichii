@@ -39,6 +39,7 @@ private:
     int shot_count{};
     u64 shot_serial{};
     QCheckBox* room_window;
+    QCheckBox* checks_window;
     QTableWidget* peers;
     std::vector<std::string> peer_ids;
     std::array<QLabel*, 4> randomizer;

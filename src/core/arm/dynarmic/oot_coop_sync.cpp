@@ -23,6 +23,7 @@
 #include "common/logging.h"
 #include "common/thread.h"
 #include "common/settings.h"
+#include "core/arm/dynarmic/oot_coop_checks.h"
 #include "core/arm/dynarmic/oot_coop_colour.h"
 #include "core/arm/dynarmic/oot_coop_link.h"
 #include "core/arm/dynarmic/oot_coop_questdefer.h"
@@ -1204,6 +1205,7 @@ struct Session::Impl {
     Room::PresenceBook presence;
     Room::FinishWatch finish_watch;
     Room::Window room_window;
+    Checks::Window checks_window; // frame thread only
     std::atomic<bool> finished{};
     std::atomic<int> relay_state{}; // 0 offline, 1 connected, 2 reconnecting, 3 disconnected
     std::atomic<u64> relay_rtt{UINT64_MAX};
@@ -3427,6 +3429,13 @@ void Session::FramePose(Backend& backend, Memory::Memory& memory, Log log, bool 
         }
         impl->RoomFrame(Room::RoomPeer{{}, impl->hello.name, local.banc, true, true,
                                       local.child, local.loading, now}, now);
+        // Checks overlay: pure flag reads through the frame poll's reader, only while it is shown.
+        impl->checks_window.Frame([&](const Checks::Flag& flag) {
+            Change probe;
+            probe.kind = flag.kind == Checks::FlagKind::Bit ? Kind::Bit : Kind::Bool;
+            probe.key = flag.key;
+            return backend.ReadFlag(probe);
+        }, local.banc, local.loading, now);
         std::vector<Ux::Marker> markers;
         if (const auto& keys = impl->RoomConfig().minimap; keys && !local.loading) {
             if (const auto map = Room::ReadMinimap(memory, base, *keys)) {

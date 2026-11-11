@@ -22,6 +22,7 @@
 #include <fmt/format.h>
 #include "common/fs/path_util.h"
 #include "common/settings.h"
+#include "core/arm/dynarmic/oot_coop_checks.h"
 #include "core/arm/dynarmic/oot_coop_gui.h"
 #include "core/arm/dynarmic/oot_coop_ledger.h"
 #include "core/core.h"
@@ -66,6 +67,9 @@ CoopPanel::CoopPanel(Core::System& system_, QWidget* parent)
     buttons->addWidget(resync);
     room_window = new QCheckBox(tr("Show room window"), this);
     buttons->addWidget(room_window);
+    checks_window = new QCheckBox(tr("Show checks overlay"), this);
+    checks_window->setToolTip(tr("Randomizer checks of the current area (needs coop-checks.json beside the key file)"));
+    buttons->addWidget(checks_window);
     layout->addLayout(buttons);
     message = label();
     connect(resync, &QPushButton::clicked, this, [this] {
@@ -75,6 +79,11 @@ CoopPanel::CoopPanel(Core::System& system_, QWidget* parent)
     connect(room_window, &QCheckBox::clicked, this, [this](bool shown) {
         message->setText(Gui::SetRoomWindow(Gui::RoomTrigger(Env), shown) ?
             tr("Room window preference saved") : tr("Could not update room window trigger"));
+        Refresh();
+    });
+    connect(checks_window, &QCheckBox::clicked, this, [this](bool shown) {
+        message->setText(Gui::SetRoomWindow(Core::OotCoop::Checks::TriggerPath(Env), shown) ?
+            tr("Checks overlay preference saved") : tr("Could not update checks overlay trigger"));
         Refresh();
     });
     auto* connection = new QHBoxLayout;
@@ -173,6 +182,9 @@ void CoopPanel::TestHook() {
             } else if (words[0] == QStringLiteral("room") && words.size() == 2) {
                 if (room_window->isChecked() != (words[1] == QStringLiteral("on"))) room_window->click();
                 result = message->text() + QStringLiteral(" checked=%1").arg(room_window->isChecked());
+            } else if (words[0] == QStringLiteral("checks") && words.size() == 2) {
+                if (checks_window->isChecked() != (words[1] == QStringLiteral("on"))) checks_window->click();
+                result = message->text() + QStringLiteral(" checked=%1").arg(checks_window->isChecked());
             } else if (words[0] == QStringLiteral("copyall")) {
                 copy_all_button->click();
                 result = QStringLiteral("clipboard: ") + QGuiApplication::clipboard()->text();
@@ -265,6 +277,10 @@ void CoopPanel::Refresh() {
     const QSignalBlocker block(room_window);
     room_window->setEnabled(!room_path.empty());
     room_window->setChecked(Gui::RoomWindowShown(room_path));
+    const std::filesystem::path checks_path{Core::OotCoop::Checks::TriggerPath(Env)};
+    const QSignalBlocker block_checks(checks_window);
+    checks_window->setEnabled(!checks_path.empty());
+    checks_window->setChecked(Gui::RoomWindowShown(checks_path));
     auto seed = Env("EDEN_NX2_OOT_COOP_SEED");
     randomizer[0]->setText(seed.empty() || seed == "0" ? tr("0 (vanilla)") : Q(seed));
     randomizer[1]->setText(live && !status.mod_hash.empty() ? Q(status.mod_hash) : tr("not reported by this build"));

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -9,7 +10,9 @@
 #include <mutex>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
+#include "core/arm/dynarmic/oot_coop_checks.h"
 #include "core/arm/dynarmic/oot_coop_ux.h"
 #include "core/arm/dynarmic/oot_coop_room.h"
 
@@ -74,6 +77,7 @@ std::string Printable(std::string_view text, size_t limit) {
 struct Global {
     std::mutex mutex;
     ToastQueue toasts;
+    std::shared_ptr<const IconPack> icons;
     std::vector<Tag> tags;
     u64 tags_ms{}, markers_ms{}, panel_generation{};
     std::vector<Marker> markers;
@@ -121,44 +125,105 @@ std::optional<std::string> ItemNames::Find(std::string_view actor) const {
     return it == names.end() ? std::nullopt : std::optional<std::string>{it->second};
 }
 
-std::string ItemText(std::string_view who, std::string_view actor, s64 count,
-                     const ItemNames& names, bool local) {
+std::string Toast::Text() const {
+    std::string out;
+    for (const auto& run : runs) out += run.text;
+    if (count > 1) out += fmt::format(" x{}", count);
+    return out;
+}
+
+Toast PlainToast(std::string text) {
+    Toast toast;
+    if (!text.empty()) toast.runs.push_back({std::move(text), Tone::Plain});
+    return toast;
+}
+
+Toast ItemToast(std::string_view who, std::string_view actor, s64 count, const ItemNames& names,
+                bool local) {
     const auto name = names.Find(actor);
     const s64 n = std::clamp<s64>(count, 1, 999);
-    const std::string subject = local ? std::string{"You shared"} : CleanName(who) + " got";
-    if (!name) return n == 1 ? subject + " an item" : fmt::format("{} {} items", subject, n);
-    return fmt::format("{} {}x {}", subject, n, *name);
+    Toast toast;
+    const std::string sender = local ? std::string{"You"} : CleanName(who);
+    toast.runs.push_back({sender, Tone::Name});
+    toast.runs.push_back({local ? " shared " : " found ", Tone::Plain});
+    if (name) {
+        toast.runs.push_back({*name, Tone::Item});
+        toast.count = n;
+        toast.icon = std::string{actor};
+        toast.merge = fmt::format("{}/{}", local ? std::string{"local"} : sender, actor);
+    } else {
+        toast.runs.push_back({n == 1 ? std::string{"an item"} : fmt::format("{} items", n), Tone::Item});
+    }
+    return toast;
+}
+
+Toast RupeeToast(std::string_view who, s64 delta) {
+    const s64 n = delta < 0 ? -delta : delta;
+    Toast toast;
+    toast.runs.push_back({CleanName(who), Tone::Name});
+    toast.runs.push_back({fmt::format(" {}{} rupee{}", delta < 0 ? '-' : '+', n, n == 1 ? "" : "s"),
+                          Tone::Item});
+    toast.wallet = delta;
+    return toast;
+}
+
+std::string ItemText(std::string_view who, std::string_view actor, s64 count,
+                     const ItemNames& names, bool local) {
+    return ItemToast(who, actor, count, names, local).Text();
 }
 
 std::string RupeeText(std::string_view who, s64 delta) {
-    const s64 n = delta < 0 ? -delta : delta;
-    return fmt::format("{} {} {} rupee{}", CleanName(who), delta < 0 ? "spent" : "got", n,
-                       n == 1 ? "" : "s");
+    return RupeeToast(who, delta).Text();
 }
 
-bool ToastQueue::Push(std::string id, std::string text, u64 now_ms) {
-    (void)now_ms;
-    if (text.empty() || ids.contains(id)) return false;
-    if (waiting.size() >= MaxQueued) return false;
-    ids.insert(id);
-    id_order.push_back(std::move(id));
-    while (id_order.size() > MaxIds) {
-        ids.erase(id_order.front());
-        id_order.pop_front();
+bool ToastQueue::Push(std::string id, Toast toast, u64 now_ms) {
+    if (toast.runs.empty() || ids.contains(id)) return false;
+    const auto remember = [&] {
+        ids.insert(id);
+        id_order.push_back(std::move(id));
+        while (id_order.size() > MaxIds) {
+            ids.erase(id_order.front());
+            id_order.pop_front();
+        }
+    };
+    if (!toast.merge.empty()) {
+        Expire(now_ms);
+        for (auto& s : shown) {
+            if (s.toast.merge != toast.merge) continue;
+            s.toast.count = std::min<s64>(s.toast.count + toast.count, 999);
+            s.until = std::min(std::max(s.until, now_ms + Extend), s.since + Duration + Extend);
+            remember();
+            return true;
+        }
+        for (auto& w : waiting) {
+            if (w.merge != toast.merge) continue;
+            w.count = std::min<s64>(w.count + toast.count, 999);
+            remember();
+            return true;
+        }
     }
-    waiting.push_back(std::move(text));
+    if (waiting.size() >= MaxQueued) return false;
+    remember();
+    waiting.push_back(std::move(toast));
     return true;
 }
 
-std::vector<std::string> ToastQueue::Visible(u64 now_ms) {
-    std::erase_if(shown, [now_ms](const Shown& s) { return s.until <= now_ms; });
+void ToastQueue::Expire(u64 now_ms) {
+    const bool backlog = !waiting.empty();
+    std::erase_if(shown, [&](const Shown& s) {
+        return s.until <= now_ms || (backlog && now_ms >= s.since + Hurry);
+    });
+}
+
+std::vector<Toast> ToastQueue::Visible(u64 now_ms) {
+    Expire(now_ms);
     while (shown.size() < MaxVisible && !waiting.empty()) {
-        shown.push_back({std::move(waiting.front()), now_ms + Duration});
+        shown.push_back({std::move(waiting.front()), now_ms, now_ms + Duration});
         waiting.pop_front();
     }
-    std::vector<std::string> out;
+    std::vector<Toast> out;
     out.reserve(shown.size());
-    for (const auto& s : shown) out.push_back(s.text);
+    for (const auto& s : shown) out.push_back(s.toast);
     return out;
 }
 
@@ -167,6 +232,167 @@ void ToastQueue::Clear() {
     waiting.clear();
     ids.clear();
     id_order.clear();
+}
+
+std::shared_ptr<const IconPack> IconPack::Decode(const Json& index, const Reader& read, std::string* why) {
+    const auto fail = [&](std::string text) -> std::shared_ptr<const IconPack> {
+        if (why) *why = std::move(text);
+        return nullptr;
+    };
+    constexpr size_t MaxIcons = 4096, MaxAtlasBytes = size_t{32} << 20;
+    try {
+        if (!index.is_object() || index.value("format", std::string{}) != "oot-coop-icons" ||
+            !index.contains("version") || !index.at("version").is_number_integer() ||
+            index.at("version").get<s64>() != 1)
+            return fail("not an oot-coop-icons v1 index");
+        const auto& icons = index.at("icons");
+        if (!icons.is_array() || icons.empty() || icons.size() > MaxIcons) return fail("bad icons list");
+        std::map<std::string, u32, std::less<>> ids;
+        for (const auto& icon : icons) {
+            if (!icon.is_string() || !ActorName(icon.get<std::string>())) return fail("bad icon id");
+            if (!ids.emplace(icon.get<std::string>(), static_cast<u32>(ids.size())).second)
+                return fail("duplicate icon id");
+        }
+        auto pack = std::make_shared<IconPack>();
+        pack->count = ids.size();
+        const auto& sizes = index.at("sizes");
+        if (!sizes.is_array() || sizes.empty() || sizes.size() > 8) return fail("bad sizes list");
+        for (const auto& size : sizes) {
+            if (!size.is_object()) return fail("bad size entry");
+            const auto cell = Number(size.at("cell"), 256), columns = Number(size.at("columns"), 256),
+                       rows = Number(size.at("rows"), 256);
+            const auto file = size.at("file");
+            if (!cell || *cell < 8 || !columns || !*columns || !rows || !*rows || !file.is_string())
+                return fail("bad size fields");
+            const auto name = file.get<std::string>();
+            if (name.empty() || name.size() > 64 || name.front() == '.' ||
+                !std::all_of(name.begin(), name.end(), [](char c) {
+                    return std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.';
+                }))
+                return fail("bad atlas file name");
+            if (*columns * *rows < pack->count) return fail("atlas smaller than the icon list");
+            const size_t bytes = size_t{*cell} * *columns * *cell * *rows * 4;
+            if (bytes > MaxAtlasBytes) return fail("atlas too large");
+            auto data = read(name, bytes);
+            if (!data || data->size() != bytes) return fail(fmt::format("atlas {} missing or wrong size", name));
+            pack->atlases.push_back({static_cast<u32>(*cell), static_cast<u32>(*columns),
+                                     static_cast<u32>(*rows), std::move(*data)});
+        }
+        std::sort(pack->atlases.begin(), pack->atlases.end(),
+                  [](const Atlas& a, const Atlas& b) { return a.cell < b.cell; });
+        for (size_t i = 1; i < pack->atlases.size(); ++i)
+            if (pack->atlases[i].cell == pack->atlases[i - 1].cell) return fail("duplicate cell size");
+        const auto& actors = index.at("actors");
+        if (!actors.is_object() || actors.size() > 8192) return fail("bad actors map");
+        for (const auto& [actor, icon] : actors.items()) {
+            if (!ActorName(actor) || !icon.is_string()) return fail("bad actor entry");
+            const auto it = ids.find(icon.get<std::string>());
+            if (it == ids.end()) return fail(fmt::format("actor {} names an unknown icon", actor));
+            pack->actors.emplace(actor, it->second);
+        }
+        if (index.contains("wallet")) {
+            const auto& wallet = index.at("wallet");
+            if (!wallet.is_array() || wallet.size() > 16) return fail("bad wallet list");
+            for (const auto& entry : wallet) {
+                if (!entry.is_object() || !entry.contains("min") || !entry.contains("icon"))
+                    return fail("bad wallet entry");
+                const auto min = Number(entry.at("min"), 1000000);
+                const auto it = entry.at("icon").is_string() ? ids.find(entry.at("icon").get<std::string>())
+                                                             : ids.end();
+                if (!min || !*min || it == ids.end()) return fail("bad wallet entry");
+                pack->wallet.emplace_back(static_cast<s64>(*min), it->second);
+            }
+            std::sort(pack->wallet.begin(), pack->wallet.end());
+        }
+        if (why) *why = fmt::format("{} icons, {} actors, cells {}", pack->count, pack->actors.size(),
+                                    fmt::join([&] {
+                                        std::vector<u32> cells;
+                                        for (const auto& a : pack->atlases) cells.push_back(a.cell);
+                                        return cells;
+                                    }(), "/"));
+        return pack;
+    } catch (const Json::exception& e) {
+        return fail(fmt::format("index: {}", e.what()));
+    }
+}
+
+std::shared_ptr<const IconPack> IconPack::Load(const std::string& dir, std::string* why) {
+    const std::filesystem::path root{dir};
+    const auto slurp = [](const std::filesystem::path& path, size_t limit) -> std::optional<std::vector<u8>> {
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(path, ec);
+        if (ec || size > limit) return std::nullopt;
+        std::ifstream in{path, std::ios::binary};
+        if (!in) return std::nullopt;
+        std::vector<u8> bytes(static_cast<size_t>(size));
+        in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!in) return std::nullopt;
+        return bytes;
+    };
+    const auto text = slurp(root / "index.json", size_t{1} << 20);
+    if (!text) {
+        if (why) *why = fmt::format("no icon pack at {}", dir);
+        return nullptr;
+    }
+    const auto index = Json::parse(text->begin(), text->end(), nullptr, false);
+    if (index.is_discarded()) {
+        if (why) *why = fmt::format("icon pack {}: index.json is not JSON", dir);
+        return nullptr;
+    }
+    std::string note;
+    auto pack = Decode(index, [&](std::string_view name, size_t limit) {
+        return slurp(root / std::string{name}, limit);
+    }, &note);
+    if (why) *why = fmt::format("icon pack {}: {}", dir, note);
+    return pack;
+}
+
+std::optional<u32> IconPack::Find(std::string_view actor) const {
+    const auto it = actors.find(actor);
+    return it == actors.end() ? std::nullopt : std::optional<u32>{it->second};
+}
+
+std::optional<u32> IconPack::Wallet(s64 delta) const {
+    const s64 n = delta < 0 ? -delta : delta;
+    std::optional<u32> out;
+    for (const auto& [min, icon] : wallet)
+        if (n >= min) out = icon;
+    return out;
+}
+
+const IconPack::Atlas* IconPack::Best(u32 pixels) const {
+    if (atlases.empty()) return nullptr;
+    const Atlas* best = &atlases.front();
+    for (const auto& atlas : atlases)
+        if (atlas.cell <= pixels) best = &atlas;
+    return best;
+}
+
+std::vector<u8> IconPack::Icon(const Atlas& atlas, u32 index) const {
+    std::vector<u8> out(size_t{atlas.cell} * atlas.cell * 4);
+    if (index >= count || index >= atlas.columns * atlas.rows) return out;
+    const size_t stride = size_t{atlas.columns} * atlas.cell * 4;
+    const size_t x0 = size_t{index % atlas.columns} * atlas.cell * 4;
+    const size_t y0 = size_t{index / atlas.columns} * atlas.cell;
+    for (u32 y = 0; y < atlas.cell; ++y)
+        std::copy_n(atlas.rgba.begin() + static_cast<std::ptrdiff_t>((y0 + y) * stride + x0),
+                    size_t{atlas.cell} * 4, out.begin() + static_cast<std::ptrdiff_t>(size_t{y} * atlas.cell * 4));
+    return out;
+}
+
+namespace {
+std::filesystem::path UxSidecarPath() {
+    if (const char* ux = std::getenv("EDEN_NX2_OOT_COOP_UX"); ux && *ux) return ux;
+    if (const char* keys = std::getenv("EDEN_NX2_OOT_COOP_KEYS"); keys && *keys)
+        return std::filesystem::path{keys}.parent_path() / "coop-ux.json";
+    return {};
+}
+} // namespace
+
+std::string IconDirectory() {
+    if (const char* icons = std::getenv("EDEN_NX2_OOT_COOP_ICONS"); icons && *icons) return icons;
+    const auto ux = UxSidecarPath();
+    return ux.empty() ? std::string{} : (ux.parent_path() / "coop-icons").string();
 }
 
 std::optional<CameraKeys> DecodeCamera(const Json& value) {
@@ -242,7 +468,8 @@ std::optional<CameraKeys> DecodeCamera(const Json& value) {
     return k.Valid() ? std::optional<CameraKeys>{k} : std::nullopt;
 }
 
-std::optional<Point2> Project(const Camera& camera, const std::array<float, 3>& world, bool flip_y) {
+std::optional<Point2> Project(const Camera& camera, const std::array<float, 3>& world, bool flip_y,
+                              float* depth) {
     const auto& m = camera.view;
     const float q[4]{world[0], world[1], world[2], 1.0f};
     float v[4]{0, 0, 0, 1.0f};
@@ -263,6 +490,7 @@ std::optional<Point2> Project(const Camera& camera, const std::array<float, 3>& 
     if (!std::isfinite(nx) || !std::isfinite(ny) || nx < -1.0f || nx > 1.0f || ny < -1.0f || ny > 1.0f)
         return std::nullopt;
     Point2 out{(nx + 1.0f) * 0.5f, flip_y ? (ny + 1.0f) * 0.5f : (1.0f - ny) * 0.5f};
+    if (depth) *depth = -v[2];
     return out;
 }
 
@@ -293,7 +521,9 @@ std::vector<Tag> BuildTags(const Camera& camera, const CameraKeys& keys, std::st
             if (const auto root = Project(camera, peer.pos, keys.flip_y)) out.push_back({"", *root, true});
             if (const auto top = Project(camera, head, keys.flip_y)) out.push_back({"", *top, true});
         }
-        if (const auto at = Project(camera, head, keys.flip_y)) out.push_back({CleanName(peer.name), *at, false});
+        float depth{};
+        if (const auto at = Project(camera, head, keys.flip_y, &depth))
+            out.push_back({CleanName(peer.name), *at, false, depth});
     }
     return out;
 }
@@ -328,33 +558,51 @@ Config DecodeConfig(const Json& document, std::string_view build_id, std::string
     return config;
 }
 
-std::shared_ptr<const Config> LoadConfig(std::string_view build_id, std::string* why) {
-    std::filesystem::path path;
-    if (const char* ux = std::getenv("EDEN_NX2_OOT_COOP_UX"); ux && *ux) {
-        path = ux;
-    } else if (const char* keys = std::getenv("EDEN_NX2_OOT_COOP_KEYS"); keys && *keys) {
-        path = std::filesystem::path{keys}.parent_path() / "coop-ux.json";
+namespace {
+std::shared_ptr<const IconPack> LoadIcons(std::string& note) {
+    if (!Switch("TOAST_ICONS")) {
+        note = "toast icons off (EDEN_NX2_OOT_COOP_TOAST_ICONS=0)";
+        return nullptr;
     }
+    const auto dir = IconDirectory();
+    if (dir.empty()) {
+        note = "toast icons off (no icon pack path)";
+        return nullptr;
+    }
+    auto pack = IconPack::Load(dir, &note);
+    if (!pack) note = "toast icons off: " + note;
+    return pack;
+}
+} // namespace
+
+std::shared_ptr<const Config> LoadConfig(std::string_view build_id, std::string* why) {
+    std::string icons_note;
+    auto icons = LoadIcons(icons_note);
+    const auto with_icons = [&](Config config) {
+        config.icons = icons;
+        return std::make_shared<const Config>(std::move(config));
+    };
+    const std::filesystem::path path = UxSidecarPath();
     if (path.empty()) {
-        if (why) *why = "no sidecar path (EDEN_NX2_OOT_COOP_UX and EDEN_NX2_OOT_COOP_KEYS unset)";
-        return std::make_shared<const Config>();
+        if (why) *why = "no sidecar path (EDEN_NX2_OOT_COOP_UX and EDEN_NX2_OOT_COOP_KEYS unset); " + icons_note;
+        return with_icons({});
     }
     std::ifstream in{path};
     if (!in) {
-        if (why) *why = fmt::format("no sidecar at {}", path.string());
-        return std::make_shared<const Config>();
+        if (why) *why = fmt::format("no sidecar at {}; {}", path.string(), icons_note);
+        return with_icons({});
     }
     std::string text;
     char c;
     while (in.get(c) && text.size() <= (4U << 20)) text.push_back(c);
     const auto document = Json::parse(text, nullptr, false);
     if (document.is_discarded()) {
-        if (why) *why = fmt::format("sidecar {} is not JSON", path.string());
-        return std::make_shared<const Config>();
+        if (why) *why = fmt::format("sidecar {} is not JSON; {}", path.string(), icons_note);
+        return with_icons({});
     }
     std::string note;
-    auto config = std::make_shared<const Config>(DecodeConfig(document, build_id, &note));
-    if (why) *why = fmt::format("sidecar {}: {}", path.string(), note);
+    auto config = with_icons(DecodeConfig(document, build_id, &note));
+    if (why) *why = fmt::format("sidecar {}: {}; {}", path.string(), note, icons_note);
     return config;
 }
 
@@ -373,26 +621,36 @@ std::string SessionUx::Name(std::string_view origin) const {
 void SessionUx::ItemReceived(std::string_view origin, u64 seq, std::string_view actor, s64 count) {
     static const ItemNames empty;
     Notify(fmt::format("{}/{}", origin, seq),
-           ItemText(Name(origin), actor, count, config ? config->names : empty));
+           ItemToast(Name(origin), actor, count, config ? config->names : empty));
 }
 
 void SessionUx::RupeeReceived(std::string_view origin, u64 seq, s64 delta) {
-    Notify(fmt::format("{}/{}", origin, seq), RupeeText(Name(origin), delta));
+    Notify(fmt::format("{}/{}", origin, seq), RupeeToast(Name(origin), delta));
 }
 
 void SessionUx::ItemShared(std::string_view actor, s64 count) {
     static const bool enabled = Switch("TOAST_LOCAL");
     static const ItemNames empty;
     if (!enabled) return;
-    Notify(fmt::format("local/{}", ++shared), ItemText({}, actor, count, config ? config->names : empty, true));
+    Notify(fmt::format("local/{}", ++shared), ItemToast({}, actor, count, config ? config->names : empty, true));
 }
 
 bool Notify(std::string id, std::string text) {
+    return Notify(std::move(id), PlainToast(std::move(text)));
+}
+
+bool Notify(std::string id, Toast toast) {
     static const bool enabled = Switch("TOAST");
     if (!enabled) return false;
     auto& g = State();
     std::scoped_lock lock{g.mutex};
-    return g.toasts.Push(std::move(id), std::move(text), NowMs());
+    return g.toasts.Push(std::move(id), std::move(toast), NowMs());
+}
+
+void PublishIcons(std::shared_ptr<const IconPack> icons) {
+    auto& g = State();
+    std::scoped_lock lock{g.mutex};
+    g.icons = std::move(icons);
 }
 
 void PublishTags(std::vector<Tag> tags) {
@@ -421,11 +679,13 @@ void Reset() {
     auto& g = State();
     std::scoped_lock lock{g.mutex};
     g.toasts.Clear();
+    g.icons.reset();
     g.tags.clear();
     g.tags_ms = 0;
     g.markers.clear();
     g.markers_ms = 0;
     g.panel.reset();
+    Checks::Reset();
 }
 
 OverlayFrame Current() {
@@ -433,10 +693,15 @@ OverlayFrame Current() {
     const u64 now = NowMs();
     std::scoped_lock lock{g.mutex};
     OverlayFrame frame;
-    if (!g.toasts.Empty()) frame.toasts = g.toasts.Visible(now);
+    if (!g.toasts.Empty()) {
+        frame.toasts = g.toasts.Visible(now);
+        frame.more = g.toasts.Waiting();
+        if (!frame.toasts.empty()) frame.icons = g.icons;
+    }
     if (!g.tags.empty() && now - g.tags_ms <= TagLifetimeMs) frame.tags = g.tags;
     frame.panel = g.panel;
     if (!g.markers.empty() && now - g.markers_ms <= TagLifetimeMs) frame.markers = g.markers;
+    frame.checks = Checks::Current();
     return frame;
 }
 
