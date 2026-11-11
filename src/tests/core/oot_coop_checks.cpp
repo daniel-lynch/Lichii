@@ -207,9 +207,52 @@ TEST_CASE("OotCoopChecks: spoiler text and row budget", "[oot_coop]") {
     rows = m.Rows("Beta", false, {false, true, false, false});
     CHECK(rows[1].text == "[ ] Cave chest - Very Long Item Name"); // cut to the narrow width
     rows = m.Rows("Beta", false, {true, true, false, true}); // dense: 52 wide, 22 rows
-    CHECK(rows.size() == 16);
+    REQUIRE(rows.size() == 20); // Beta's title + 15, then the other area: its row + 3 open checks
     CHECK(rows[1].text == "[ ] Cave chest - Very Long Item Name Here");
+    CHECK(rows[16].text == "Alpha Woods  0/3");
+    CHECK(rows[16].style == Style::Title);
+    CHECK(rows[17].text == "[ ] Adult chest");
     for (const auto& r : rows) CHECK(r.text.size() <= 52);
+}
+
+TEST_CASE("OotCoopChecks: dense view pins the current area on top", "[oot_coop]") {
+    auto d = Document();
+    for (int i = 0; i < 30; ++i)
+        d["checks"].push_back(Check(fmt::format("g:{:02}", i), fmt::format("Gamma chest {:02}", i), {"Gamma"},
+                                    {{"bool", fmt::format("0x{:x}", 0x200 + i)}}));
+    for (auto& c : d["checks"])
+        if (c["id"].get<std::string>().starts_with("g:")) c["area"] = ""; // no area name: the banc's
+    auto s = Checks::Decode(d);
+    REQUIRE(s);
+    Checks::Model m{*s};
+    m.Set(5, true); // Cave chest done: Beta has nothing open
+    const Checks::Options dense{false, false, false, true};
+    // Conservative (default): the current area only.
+    auto rows = m.Rows("Alpha_Child", false, {});
+    CHECK(Texts(rows) == std::vector<std::string>{"Alpha Woods  0/2  total 1/34", "[ ] Chest one", "[ ] Chest two",
+                                                  "[?] Npc gift"});
+    // Dense: the same area first, then other areas' open checks; the other age's banc (same area
+    // name) and areas with nothing open are left out; cut to 22 rows with a note.
+    rows = m.Rows("Alpha_Child", false, dense);
+    REQUIRE(rows.size() == 23);
+    CHECK(rows[0].text == "Alpha Woods  0/2  total 1/34");
+    CHECK(rows[1].text == "[ ] Chest one");
+    CHECK(rows[3].text == "[?] Npc gift");
+    CHECK(rows[4].text == "Gamma  0/30");
+    CHECK(rows[4].style == Style::Title);
+    CHECK(rows[5].text == "[ ] Gamma chest 00");
+    CHECK(rows.back().style == Style::Note);
+    CHECK(rows.back().text == "  +13 more in other areas"); // 30 open, 17 shown
+    for (const auto& r : rows) CHECK(r.text.find("Cave") == std::string::npos);
+    // Moving: the new area takes the top.
+    rows = m.Rows("Gamma", false, dense);
+    CHECK(rows[0].text == "Gamma  0/30  total 1/34");
+    CHECK(rows.back().text == "  +9 more");
+    // An area with no checks still lists the others below its note.
+    rows = m.Rows("Delta", false, dense);
+    CHECK(rows[1].text == "No checks in this area");
+    CHECK(rows[2].text == "Alpha Woods  1/4");
+    CHECK(rows[3].text == "[ ] Adult chest");
 }
 
 TEST_CASE("OotCoopChecks: narrow spoiler rows are cut to width", "[oot_coop]") {

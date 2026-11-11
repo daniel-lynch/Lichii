@@ -15,7 +15,8 @@
 // Shown while the trigger file exists (EDEN_NX2_OOT_COOP_CHECKS_TRIGGER, default "coop-checks.show"
 // beside the keys; EDEN_NX2_OOT_COOP_CHECKS_WINDOW=on|off forces it). The trigger's text holds
 // options, any of: "all" (also list checked), "spoiler" (item names), "vanilla" (unshuffled checks
-// too), "dense" (more and wider rows, implies all). An empty trigger shows the default list.
+// too), "dense" (more and wider rows, implies all; the other areas' open checks follow the current
+// area's). An empty trigger shows the default (conservative) list: the current area only.
 
 #include <functional>
 #include <map>
@@ -106,9 +107,14 @@ public:
     [[nodiscard]] std::string AreaName(std::string_view banc) const;
     /// The panel: a title row with counts, then this banc's checks (open, untracked, then done
     /// when listed), cut to the row budget with a "+N more" note. Empty banc: the title only.
+    /// Dense: the current area stays on top; the rows left in the budget list the other areas'
+    /// open checks below it, by area name, each under an area row with its counts.
     [[nodiscard]] std::vector<Row> Rows(std::string_view banc, bool loading, const Options& options) const;
 
 private:
+    void Elsewhere(std::vector<Row>& out, std::string_view banc, std::string_view here, size_t room,
+                   const Options& options) const;
+
     Sidecar sidecar;
     std::vector<bool> done;
 };

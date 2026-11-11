@@ -257,6 +257,7 @@ std::vector<Row> Model::Rows(std::string_view banc, bool loading, const Options&
     for (auto* group : {&open, &untracked, &closed}) std::sort(group->begin(), group->end(), by_name);
     if (open.empty() && untracked.empty() && closed.empty()) {
         out.push_back({"No checks in this area", Style::Note});
+        if (o.dense) Elsewhere(out, banc, area, budget - 1, o);
         return out;
     }
     std::vector<std::pair<size_t, Style>> listed;
@@ -284,7 +285,52 @@ std::vector<Row> Model::Rows(std::string_view banc, bool loading, const Options&
     if (shown < listed.size()) out.push_back({fmt::format("  +{} more", listed.size() - shown), Style::Note});
     else if (!list_done && open.empty() && untracked.empty())
         out.push_back({fmt::format("All {} done here", closed.size()), Style::Note});
+    else if (o.dense) Elsewhere(out, banc, area, budget - shown, o);
     return out;
+}
+
+void Model::Elsewhere(std::vector<Row>& out, std::string_view banc, std::string_view here, size_t room,
+                      const Options& o) const {
+    // Open checks of the other areas, by area name, each under an area row with its counts. The
+    // current area stays on top; an area that shares its name (the other age's banc) is left out.
+    std::map<std::string, std::vector<size_t>, std::less<>> areas;
+    std::map<std::string, Counts, std::less<>> counts;
+    for (size_t i = 0; i < sidecar.checks.size(); ++i) {
+        const auto& check = sidecar.checks[i];
+        if ((!o.vanilla && !check.shuffled) || check.In(banc) || !check.Tracked()) continue;
+        std::string name = check.area.empty() ? Ascii(check.bancs.empty() ? std::string{} : check.bancs[0], NameLimit)
+                                              : check.area;
+        if (name.empty() || name == here) continue;
+        auto& c = counts[name];
+        ++c.tracked;
+        c.done += done[i];
+        if (!done[i]) areas[name].push_back(i);
+    }
+    std::vector<Row> rows;
+    size_t total = 0;
+    for (auto& [name, list] : areas) {
+        std::sort(list.begin(), list.end(), [&](size_t a, size_t b) {
+            return std::tie(sidecar.checks[a].name, sidecar.checks[a].id) <
+                   std::tie(sidecar.checks[b].name, sidecar.checks[b].id);
+        });
+        const auto& c = counts[name];
+        const auto suffix = fmt::format("  {}/{}", c.done, c.tracked);
+        const size_t width = DenseWidth > suffix.size() + 4 ? DenseWidth - suffix.size() : 4;
+        rows.push_back({Ascii(name, width) + suffix, Style::Title});
+        for (const auto i : list) rows.push_back({Ascii("[ ] " + sidecar.checks[i].name, DenseWidth), Style::Open});
+        total += list.size();
+    }
+    if (rows.empty() || room < 2) return;
+    if (rows.size() <= room) {
+        out.insert(out.end(), rows.begin(), rows.end());
+        return;
+    }
+    size_t take = room - 1; // the last row says how many are left
+    if (rows[take - 1].style == Style::Title) --take;  // never end on an area row
+    size_t listed = 0;
+    for (size_t n = 0; n < take; ++n) listed += rows[n].style == Style::Open;
+    out.insert(out.end(), rows.begin(), rows.begin() + static_cast<std::ptrdiff_t>(take));
+    out.push_back({fmt::format("  +{} more in other areas", total - listed), Style::Note});
 }
 
 void Publish(std::vector<Row> rows, bool dense) {
