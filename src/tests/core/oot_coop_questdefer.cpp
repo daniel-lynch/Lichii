@@ -60,15 +60,21 @@ struct Rig {
     D::Observation observation{std::string{"Arena_A"}, std::string{"Live_A"}, false, false, false, true, true};
     D::Port port;
     u64 frame{};
-    bool step_ok{true}, bool_ok{true};
+    bool step_ok{true}, bool_ok{true}, guard{};
     explicit Rig(Json j = BundleDocument(), std::set<u64> denied = {})
         : keys{Keys(std::move(j))}, machine{keys, std::move(denied)} {
         port.read = [&](u32 c) -> std::optional<Q::Record> {
             const auto it = records.find(c); return it == records.end() ? std::nullopt : std::optional{it->second};
         };
-        port.step = [&](const Q::Target& t, bool bundle) {
-            if (!step_ok) return false;
-            calls.push_back(t); bundle_calls.push_back(bundle); return true;
+        port.step = [&](const Q::Target& t, bool bundle) -> std::string {
+            if (!step_ok) return "rig refused";
+            if (guard) {
+                // The live port's last guard: ApplyBlock with the machine, as Controller's bundle step does.
+                const Q::Manager manager{123, {}, true, false, false, false};
+                if (const auto why = Q::ApplyBlock(*keys, manager, records.at(t.challenge), t, &machine); !why.empty())
+                    return std::string{why};
+            }
+            calls.push_back(t); bundle_calls.push_back(bundle); return {};
         };
         port.read_bool = [&](u32 h) -> std::optional<bool> {
             const auto it = bools.find(h); return it == bools.end() ? std::nullopt : std::optional{it->second};
@@ -495,4 +501,52 @@ TEST_CASE("questdefer outside applies over a stale restoration NotReady pending 
     inside.Frames(3); REQUIRE(inside.machine.Status(201) == D::State::Deferred); REQUIRE(inside.calls.empty());
     REQUIRE(inside.toasts == std::vector<std::string>{"Peer A beat Guardian A. Teleport/die to skip"});
     inside.machine.Arrival(); REQUIRE(inside.Tick()); REQUIRE(inside.calls == std::vector<Q::Target>{apply});
+}
+
+TEST_CASE("questdefer chain step applies over a stale restoration NotReady pending (field C17.2 F-A)", "[oot_coop]") {
+    // Field C17.2 F-A (vanilla New Game): the chain record (Goto_HyruleCastle) sits at Ready with the
+    // restoration's pending=NotReady and no request flag, like the primary record did in C17 F-A.
+    const Q::Manager manager{123, {}, true, false, false, false};
+    const Q::Target chain{202, 44, 2, "peer-a"};
+    Rig r; r.guard = true; r.observation.banc = "Outside_A";
+    r.records[201].pending = 11; r.records[202].pending = 11;
+    REQUIRE(r.Tick()); r.Commit(); r.Tick(); REQUIRE(r.Logged("element=0 applied"));
+    // Before the call: exact chain target authorized; other steps, the mirror path and the primary rule unchanged.
+    REQUIRE(r.machine.AuthorizesChain(chain));
+    REQUIRE_FALSE(r.machine.AuthorizesChain({202, 55, 3, "peer-a"}));
+    REQUIRE_FALSE(r.machine.Authorizes(chain));
+    REQUIRE(Q::ApplyBlock(*r.keys, manager, r.records[202], chain, &r.machine).empty());
+    REQUIRE(Q::ApplyBlock(*r.keys, manager, r.records[202], chain) == "own request pending");
+    REQUIRE(Q::ApplyBlock(*r.keys, manager, r.records[202], {202, 55, 3, "peer-a"}, &r.machine) == "own request pending");
+    // The boss/minigame lift stays primary-only.
+    {
+        auto boss = r.records[202]; boss.steps[2].boss = true;
+        REQUIRE(Q::ApplyBlock(*r.keys, manager, boss, chain, &r.machine) == "minigame or boss step");
+    }
+    REQUIRE(r.Tick()); REQUIRE(r.calls.back() == chain); REQUIRE_FALSE(r.bundle_calls.back());
+    REQUIRE_FALSE(r.machine.AuthorizesChain(chain)); // in flight
+    r.Commit(); r.Tick(); REQUIRE(r.Logged("element=1 applied chain=000000ca/0000002c"));
+    REQUIRE_FALSE(r.Logged("element=1 failed("));
+    REQUIRE(r.Tick()); r.bools[701] = true; r.machine.Returned(); r.Tick();
+    REQUIRE(r.Tick()); r.bools[702] = true; r.machine.Returned(); r.Tick(); r.Tick();
+    REQUIRE(r.machine.Status(201) == D::State::Done);
+    REQUIRE(r.toasts.back() == "Guardian A skipped: synced from Peer A");
+    REQUIRE_FALSE(r.machine.AuthorizesChain(chain)); // done: no authorization left
+}
+
+TEST_CASE("questdefer chain step with a real own request still fails after the timeout and names the guard", "[oot_coop]") {
+    for (int mode = 0; mode < 2; ++mode) {
+        CAPTURE(mode);
+        Rig r; r.guard = true; r.observation.banc = "Outside_A";
+        if (mode == 0) { r.records[202].pending = 11; r.records[202].flags = 4; } // request flag set
+        else r.records[202].pending = 55;                                         // a non-NotReady pending
+        REQUIRE(r.Tick()); r.Commit(); r.Tick(); REQUIRE(r.Logged("element=0 applied"));
+        r.Frames(3); REQUIRE(r.calls.size() == 1);
+        REQUIRE(r.Logged("element=1 failed(guard or setter unavailable: own request pending) chain=000000ca/0000002c"));
+        REQUIRE(r.Tick()); REQUIRE(r.grants == std::vector<u32>{701});
+        r.bools[701] = true; r.machine.Returned(); r.Tick();
+        REQUIRE(r.Tick()); r.bools[702] = true; r.machine.Returned(); r.Tick(); r.Tick();
+        REQUIRE(r.machine.Status(201) == D::State::Done);
+        REQUIRE(r.records[202].index == 1); // never written
+    }
 }

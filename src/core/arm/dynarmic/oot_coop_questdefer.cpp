@@ -247,7 +247,7 @@ bool Machine::Frame(Port& p, u64 frame, bool available) {
         if (is_step) { record = p.read(pair.first); if (record) index = record->Index(pair.second); }
         else flag = p.read_bool(b.bools[r.element - steps]);
         const bool reached = is_step ? record && index && record->index >= *index : flag == true;
-        auto advance = [&] { ++r.element; r.attempts = 0; r.waiting = r.returned = false; r.since = frame; };
+        auto advance = [&] { ++r.element; r.attempts = 0; r.waiting = r.returned = false; r.since = frame; r.blocked.clear(); };
         if (reached && (!r.waiting || r.returned)) {
             Receipt(p, b, r, r.waiting ? "applied" : "already");
             if (r.element == 0) r.primary_attempts = 0;
@@ -270,9 +270,15 @@ bool Machine::Frame(Port& p, u64 frame, bool available) {
         if (r.element == 0 && r.primary_attempts >= 3) {
             Receipt(p, b, r, "failed(session attempts exhausted)"); r.state = State::Failed; continue;
         }
-        const bool issued = is_step ? p.step(t, r.element == 0) : flag.has_value() && p.grant_bool(b.bools[r.element - steps]);
+        bool issued{};
+        if (is_step) { r.blocked = p.step(t, r.element == 0); issued = r.blocked.empty(); }
+        else issued = flag.has_value() && p.grant_bool(b.bools[r.element - steps]);
         if (issued) { if (is_step) receipts[t.challenge] = t; if (r.element == 0) ++r.primary_attempts; r.receipt = is_step ? std::optional{t} : std::nullopt; r.waiting = true; r.returned = false; ++r.attempts; r.since = frame; return true; }
-        if (frame - r.since >= keys->apply_timeout && r.element != 0) { Receipt(p, b, r, "failed(guard or setter unavailable)"); advance(); }
+        if (frame - r.since >= keys->apply_timeout && r.element != 0) {
+            Receipt(p, b, r, r.blocked.empty() ? std::string{"failed(guard or setter unavailable)"} :
+                                                 fmt::format("failed(guard or setter unavailable: {})", r.blocked));
+            advance();
+        }
     }
     return false;
 }
@@ -283,6 +289,17 @@ bool Machine::Authorizes(const Quest::Target& t) const {
     const auto* b = keys->defer ? keys->defer->Find(t.challenge) : nullptr;
     return b && it != rows.end() && it->second.state == State::Apply && t.step == b->apply &&
         (!InRegion(*b) || it->second.arrival || it->second.latched || keys->defer->skip_in_place || !keys->defer->defer_in_activity);
+}
+bool Machine::AuthorizesChain(const Quest::Target& t) const {
+    // Field C17.2 F-A: a chain step of a bundle being applied (row in Apply at that element, call not in
+    // flight). Only this exact chain target; it lifts the stale restoration pending, never the boss guard.
+    if (!keys->defer) return false;
+    for (const auto& [c, r] : rows) {
+        const auto* b = keys->defer->Find(c);
+        if (!b || r.state != State::Apply || r.waiting || r.element == 0 || r.element > b->chain.size()) continue;
+        if (b->chain[r.element - 1] == std::pair{t.challenge, t.step}) return true;
+    }
+    return false;
 }
 bool Machine::Echo(const Quest::Record& r) const {
     const auto it = receipts.find(r.challenge);
