@@ -121,6 +121,7 @@ void BufferCache<P>::TickFrame() {
     UpdateExactPreflush();
     // Pages the core could not arm may be cached by now.
     unarmed_read_trap_ranges.Clear();
+    VideoCommon::g_hot_page_epoch.fetch_add(1, std::memory_order_relaxed);
     // Homebrew console apps don't create or bind any channels, so this will be nullptr.
     if (!channel_state) {
         return;
