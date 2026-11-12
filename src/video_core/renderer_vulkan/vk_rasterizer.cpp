@@ -2554,8 +2554,12 @@ bool RasterizerVulkan::HoldsQueries(DAddr addr, u64 size) {
 }
 
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
+    // Guest cores ask this on reads of cached pages, and the back holds both caches' locks through
+    // each draw. Pages no image was ever registered on, and Switch 2 pages the GPU never wrote,
+    // get the clean area the caches would return without a look under their locks (after
+    // Stephen Jayakar's EDEN_NX2_READ_FASTPATH, eb3553bcb8).
     std::optional<VideoCore::RasterizerDownloadArea> texture_area;
-    {
+    if (texture_cache.page_filter.Any(addr, size)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_area = texture_cache.GetFlushArea(addr, size);
     }
@@ -2567,12 +2571,17 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
         buffer_cache.ForgetReadTraps(texture_area->start_address,
                                      texture_area->end_address - texture_area->start_address);
     }
-    if (buffer_cache.FlushesOnCpuRead()) {
-        // The core skips the flush of later reads inside the returned area, so the buffer cache
-        // answers for all of it (marks the read's GPU-written pages Preflushable, ends the traps
-        // of the rest), and the area is preemptive only if both caches say so.
-        const DAddr start = texture_area ? texture_area->start_address : addr;
-        const DAddr end = texture_area ? texture_area->end_address : addr + size;
+    // The core skips the flush of later reads inside the returned area, so the buffer cache
+    // answers for all of it (marks the read's GPU-written pages Preflushable, ends the traps of
+    // the rest), and the area is preemptive only if both caches say so.
+    const DAddr start = texture_area ? texture_area->start_address : addr;
+    const DAddr end = texture_area ? texture_area->end_address : addr + size;
+    // #1479: Switch 2 pages the GPU never wrote hold no buffer cache read traps (the mark comes
+    // before QueueFenceDownload arms them), so the whole area skips the lock. Lichii: the check
+    // covers [start, end), which our buffer cache answers for, not only the read.
+    if (buffer_cache.FlushesOnCpuRead() &&
+        (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+         Tegra::Nx2MayBeGpuWritten(start, end - start))) {
         std::scoped_lock lock{buffer_cache.mutex};
         auto area = buffer_cache.GetFlushArea(addr, size, start, end);
         if (area && texture_area) {
