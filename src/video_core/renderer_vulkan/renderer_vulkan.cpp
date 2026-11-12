@@ -24,6 +24,7 @@
 #include "video_core/coop_overlay.h"
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/present.h"
 #include "video_core/render_trace.h"
 #include "video_core/renderer_vulkan/present/util.h"
@@ -233,10 +234,16 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         return;
     }
 
+    if (VideoCommon::StutterTrace::Enabled()) {
+        VideoCommon::StutterTrace::OnPresent();
+    }
     RenderScreenshot(framebuffers);
     const auto acquiring = trace ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
-    Frame* frame = present_manager.GetRenderFrame();
+    Frame* frame = [this] {
+        const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::Present};
+        return present_manager.GetRenderFrame();
+    }();
     const auto acquired = trace ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
 
@@ -285,7 +292,10 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
 
     const auto presenting = trace ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
-    present_manager.Present(frame);
+    {
+        const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::Present};
+        present_manager.Present(frame);
+    }
     VideoCommon::PipelineDiagnostics::AdvancePresentCount();
     const auto presented = trace ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};

@@ -73,7 +73,7 @@ TEST_CASE("Recorded producer validates every record on resume without changing s
     ComputeEnvironment broken(true);
     for (auto* env : {&good, &good, &broken}) {
         const std::array<const VideoCommon::GenericEnvironment*, 1> envs{env};
-        VideoCommon::SerializePipeline(key, envs, source, VideoCommon::VulkanPipelineCacheVersion);
+        VideoCommon::SerializePipeline(key, envs, source, VideoCommon::VulkanPipelineCacheVersion, 0);
     }
     const auto original = ReadAll(source);
     Shader::Profile profile{};
@@ -143,7 +143,7 @@ TEST_CASE("Recorded task and mesh entries use the pipeline slots and replay mesh
     key.unique_hashes[1] = 0x123;
     key.unique_hashes[2] = 0x456;
     const std::array<const VideoCommon::GenericEnvironment*, 2> envs{&task, &mesh};
-    VideoCommon::SerializePipeline(key, envs, source, VideoCommon::VulkanPipelineCacheVersion);
+    VideoCommon::SerializePipeline(key, envs, source, VideoCommon::VulkanPipelineCacheVersion, 0);
     Shader::Profile profile{};
     profile.supported_spirv = 0x00010500;
     const auto config = TC::MakeConfigDigest(profile, {}, 0);
@@ -229,12 +229,13 @@ TEST_CASE("Offline producer validates explicit private inputs without a window",
 
 namespace {
 std::vector<VideoCommon::FileEnvironment> ReadGraphicsRecord(const std::filesystem::path& path) {
-    std::ifstream file(path, std::ios::binary);
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    const auto end = file.tellg();
     file.seekg(12);
     u32 count{};
     file.read(reinterpret_cast<char*>(&count), sizeof(count));
     std::vector<VideoCommon::FileEnvironment> envs(count);
-    for (auto& env : envs) env.Deserialize(file);
+    for (auto& env : envs) env.Deserialize(file, end);
     return envs;
 }
 }
@@ -254,7 +255,7 @@ TEST_CASE("Exact recorded recipes close runtime variant misses and validate afte
     key.state.y_negate.Assign(1);
     key.state.point_size = std::bit_cast<u32>(1.0f);
     const std::array<const VideoCommon::GenericEnvironment*, 2> envs{&vertex, &fragment};
-    VideoCommon::SerializePipeline(key, envs, source, VideoCommon::VulkanPipelineCacheVersion);
+    VideoCommon::SerializePipeline(key, envs, source, VideoCommon::VulkanPipelineCacheVersion, 0);
     const auto original = ReadAll(source);
     Shader::Profile profile{};
     profile.supported_spirv = 0x00010500;
@@ -358,7 +359,7 @@ TEST_CASE("Exact synthesis retains different texture answers under the same stag
     key.unique_hashes[5] = 0x456;
     for (auto* fragment : {&first, &second}) {
         const std::array<const VideoCommon::GenericEnvironment*, 2> envs{&vertex, fragment};
-        VideoCommon::SerializePipeline(key, envs, source, VideoCommon::VulkanPipelineCacheVersion);
+        VideoCommon::SerializePipeline(key, envs, source, VideoCommon::VulkanPipelineCacheVersion, 0);
     }
     Shader::Profile profile{};
     profile.supported_spirv = 0x00010500;
@@ -392,7 +393,7 @@ TEST_CASE("Exact validation reports modules rejected by the persisted product re
     key.unique_hashes[1] = 0x123;
     // A zero point size can be emitted but is rejected by the stored recipe reader.
     const std::array<const VideoCommon::GenericEnvironment*, 1> envs{&vertex};
-    VideoCommon::SerializePipeline(key, envs, source, VideoCommon::VulkanPipelineCacheVersion);
+    VideoCommon::SerializePipeline(key, envs, source, VideoCommon::VulkanPipelineCacheVersion, 0);
     Shader::Profile profile{};
     profile.supported_spirv = 0x00010500;
     const auto config = TC::MakeConfigDigest(profile, {}, 0);
@@ -422,7 +423,7 @@ TEST_CASE("Exact synthesis does not count pipelines the runtime never looks up a
     key.unique_hashes[0] = 0x111;
     key.unique_hashes[1] = 0x123;
     const std::array<const VideoCommon::GenericEnvironment*, 2> envs{&vertex_a, &vertex_b};
-    VideoCommon::SerializePipeline(key, envs, source, VideoCommon::VulkanPipelineCacheVersion);
+    VideoCommon::SerializePipeline(key, envs, source, VideoCommon::VulkanPipelineCacheVersion, 0);
     Shader::Profile profile{};
     profile.supported_spirv = 0x00010500;
     const auto config = TC::MakeConfigDigest(profile, {}, 0);

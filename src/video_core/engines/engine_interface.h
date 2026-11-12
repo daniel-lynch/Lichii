@@ -44,18 +44,13 @@ public:
     }
 
     std::bitset<(std::numeric_limits<u16>::max)()> execution_mask{};
-    /// Methods that can write memory in command order (uploads, reports, copies, dispatches):
-    /// the split's front waits for the last one sent before its macros read memory. Draws and
-    /// clears are left out: their writes are visible only after a host-level wait.
-    std::bitset<(std::numeric_limits<u16>::max)()> memory_write_mask =
-        std::bitset<(std::numeric_limits<u16>::max)()>{}.set();
     /// A Maxwell3D whose CallMethod takes its fast path (Nx2Perf): GpuSplit's back calls it
     /// without the virtual call.
     bool fast_maxwell3d{};
     std::vector<std::pair<u32, u32>> method_sink{};
     GPUVAddr current_dma_segment;
     bool current_dirty{};
-    /// EDEN_NX2_FAST_DRAW: the engine reports its own changes (Maxwell3D); a method of any other
+    /// Fast draw (nx2_fast_draw.h): the engine reports its own changes (Maxwell3D); a method of any other
     /// engine ends draw reuse.
     bool reports_fast_draw_breaks{};
 protected:

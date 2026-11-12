@@ -271,6 +271,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
     }
     // When finishing, we need to wait for the submission to have executed on the device.
+    const VideoCommon::StutterTrace::SiteScope site{VideoCommon::StutterTrace::Site::SchedulerFinish};
     const u64 presubmit_tick = CurrentTick();
     const bool profile = VideoCommon::Nx2Profile::Enabled();
     const u64 start = profile ? VideoCommon::Nx2Profile::Now() : 0;
@@ -458,7 +459,14 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     const VkRenderPass renderpass = framebuffer->RenderPass();
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
-    if (renderpass == state.renderpass && framebuffer_handle == state.framebuffer &&
+    // A draw continues the active pass whenever the same framebuffer and area are bound. The
+    // render-pass *variant* (a deferred clear's loadOp=CLEAR form) is only meaningful at begin -
+    // loadOps are applied once, and the base/variant passes are render-pass-compatible (only
+    // loadOp/storeOp differ). Comparing the exact handle here made every draw after a deferred
+    // clear restart the pass and re-LOAD what was just CLEARed (~118 MB of attachment traffic per
+    // world-target turn). The framebuffer handle already fixes the attachment structure and key,
+    // so it is the correct identity to compare.
+    if (state.renderpass && framebuffer_handle == state.framebuffer &&
         render_area.width == state.render_area.width &&
         render_area.height == state.render_area.height) {
         return;
@@ -527,6 +535,8 @@ bool Scheduler::UpdateDescriptorBufferChunk(u32 descriptor_chunk) {
 void Scheduler::WorkerThread(std::stop_token stop_token) {
     Common::SetCurrentThreadName("VulkanWorker");
     const Common::DkbCpuTrace::Registration trace_thread{Common::DkbCpuTrace::Role::VulkanWorker};
+    const VideoCommon::StutterTrace::ThreadScope stutter_thread{
+        VideoCommon::StutterTrace::Thread::Worker};
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
 
@@ -548,10 +558,13 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             std::unique_lock lk{queue_mutex};
 
             // Wait for work.
-            event_cv.wait(lk, stop_token, [&] {
-                worker_waiting = !TryPopQueue(work);
-                return !worker_waiting;
-            });
+            {
+                const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::WorkerIdle};
+                event_cv.wait(lk, stop_token, [&] {
+                    worker_waiting = !TryPopQueue(work);
+                    return !worker_waiting;
+                });
+            }
             worker_waiting = false;
 
             // If we've been asked to stop, we're done.
@@ -586,6 +599,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // Recycle the chunk back to the reserve.
             chunk_reserve.emplace_back(std::move(work));
         }
+        VideoCommon::Nx2Profile::Report("Vulkan worker");
     }
 }
 

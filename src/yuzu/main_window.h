@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <QElapsedTimer>
 #include <QMainWindow>
+#include <QPointer>
 #include <QMessageBox>
 #include <QFutureWatcher>
 #include <QPushButton>
@@ -58,6 +59,8 @@ class MultiplayerState;
 class QPushButton;
 class QProgressDialog;
 class NupProgressDialog;
+class ShaderWarmDialog;
+class NxTools;
 class QSlider;
 class QHBoxLayout;
 class WaitTreeWidget;
@@ -363,6 +366,9 @@ private slots:
     void OnGameListDumpRomFS(u64 program_id, const std::string& game_path, DumpRomFSTarget target);
     void OnGameListVerifyIntegrity(const std::string& game_path);
     void OnGameListConvertToNup(const std::string& game_path);
+    void OnGameListPrepareShaderWarm(u64 program_id, const std::string& game_path);
+    void OnGameListDeleteShaderWarm(u64 program_id);
+    void PrepareShaderPrecache(u64 title_id, const std::filesystem::path& game_path);
     void OnGameListExtractNup(const std::string& game_path);
     void OnGameListEditNupMetadata(const std::string& game_path);
     void OnGameListCopyTID(u64 program_id);
@@ -452,6 +458,7 @@ private slots:
 #endif
 
 private:
+    void OnGameListNxTool(const std::string& game_path, void (NxTools::*tool)(const std::string&));
     void RemovePlayTimeData(u64 program_id);
     bool SelectRomFSDumpTarget(const FileSys::ContentProvider&, u64 program_id,
                                u64* selected_title_id, u8* selected_content_record_type);
@@ -603,6 +610,8 @@ private:
     QFutureWatcher<FileSys::Nup::PackResult> nup_watcher;
     std::shared_ptr<std::atomic_bool> nup_cancel;
     bool nup_running{};
+    QPointer<ShaderWarmDialog> shader_warm_dialog;
+    NxTools* nx_tools = nullptr;
     std::string nup_source_path;
 
     // Last game booted, used for multi-process apps

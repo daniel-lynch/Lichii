@@ -166,7 +166,7 @@ bool RunTest(const Device& device) {
         .stage{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .pNext = nullptr,
-            .flags = 0,
+            .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT,
             .stage = VK_SHADER_STAGE_COMPUTE_BIT,
             .module = *module,
             .pName = "main",

@@ -98,6 +98,8 @@ add_library(core STATIC
     file_sys/content_archive.h
     file_sys/control_metadata.cpp
     file_sys/control_metadata.h
+    file_sys/decrypted_nca.cpp
+    file_sys/decrypted_nca.h
     file_sys/errors.h
     file_sys/fs_directory.h
     file_sys/fs_file.h
@@ -691,6 +693,8 @@ add_library(core STATIC
     hle/service/filesystem/fsp/fs_i_save_data_info_reader.h
     hle/service/filesystem/fsp/fs_i_storage.cpp
     hle/service/filesystem/fsp/fs_i_storage.h
+    hle/service/filesystem/fsp/fs_read_trace.cpp
+    hle/service/filesystem/fsp/fs_read_trace.h
     hle/service/filesystem/fsp/fsp_ldr.cpp
     hle/service/filesystem/fsp/fsp_ldr.h
     hle/service/filesystem/fsp/fsp_pr.cpp
@@ -874,6 +878,8 @@ add_library(core STATIC
     hle/service/ns/ns.h
     hle/service/ns/ns_results.h
     hle/service/ns/ns_types.h
+    hle/service/ns/font_merge.cpp
+    hle/service/ns/font_merge.h
     hle/service/ns/platform_service_manager.cpp
     hle/service/ns/platform_service_manager.h
     hle/service/ns/query_service.cpp
@@ -1090,6 +1096,7 @@ add_library(core STATIC
     hle/service/nx2_stub_interface.h
     hle/service/nx2_gsv.h
     hle/service/nx2_gsv_server.h
+    hle/service/nx2_movie_clock.h
     hle/service/nx2_video_input_queue.h
     hle/service/nx2_image_layout.h
     hle/service/nx2_oot_time.h
@@ -1213,6 +1220,8 @@ add_library(core STATIC
     loader/nsp.h
     loader/nup.cpp
     loader/nup.h
+    loader/nx.cpp
+    loader/nx.h
     loader/xci.cpp
     loader/xci.h
     memory.cpp
@@ -1288,7 +1297,7 @@ target_link_libraries(core PRIVATE
     RenderDoc::API
     ZLIB::ZLIB)
 
-target_link_libraries(core PUBLIC httplib::httplib zstd::zstd)
+target_link_libraries(core PUBLIC httplib::httplib zstd::zstd nxformat_reader)
 
 if (ENABLE_WEB_SERVICE)
     target_compile_definitions(core PUBLIC ENABLE_WEB_SERVICE)

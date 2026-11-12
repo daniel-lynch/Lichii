@@ -2083,7 +2083,8 @@ u32 FileVersion(const std::filesystem::path& path) {
 // without frag_color_components. Built from the format-11 file by splicing each record's Info
 // bytes, independently of the reader's own conversion.
 std::vector<u8> ToPre353File(const std::vector<u8>& file, std::span<const Shader::Info> infos,
-                             u32 version = 10) {
+                             u32 version = 10,
+                             InfoLayout layout = InfoLayout::NoFragColorComponents) {
     constexpr size_t Header = 8 + 4 + 16;
     REQUIRE(file.size() >= Header);
     std::vector<u8> out(file.begin(), file.begin() + Header);
@@ -2100,7 +2101,7 @@ std::vector<u8> ToPre353File(const std::vector<u8>& file, std::span<const Shader
             for (const auto& info : infos) {
                 std::vector<u8> current, legacy;
                 WriteInfo(current, info);
-                WriteInfo(legacy, info, InfoLayout::NoFragColorComponents);
+                WriteInfo(legacy, info, layout);
                 const auto it = std::ranges::search(record, current).begin();
                 if (it == record.end()) continue;
                 const auto at = it - record.begin();
@@ -2157,7 +2158,7 @@ struct FormatFixture {
 };
 } // Anonymous namespace
 
-TEST_CASE("Translation cache writes format 12 and round-trips frag_color_components",
+TEST_CASE("Translation cache writes format 13 and round-trips frag_color_components",
           "[video_core][translation_cache]") {
     const auto directory = TempPath("lichii_translation_format12_test");
     std::filesystem::remove_all(directory);
@@ -2165,7 +2166,7 @@ TEST_CASE("Translation cache writes format 12 and round-trips frag_color_compone
     const auto path = directory / "vulkan_translations.1111111111111111.fork-v53.bin";
     FormatFixture fixture;
     fixture.Write(path);
-    REQUIRE(FileVersion(path) == 12);
+    REQUIRE(FileVersion(path) == 13);
     {
         Store store;
         store.Open(path, fixture.config);
@@ -2179,7 +2180,7 @@ TEST_CASE("Translation cache writes format 12 and round-trips frag_color_compone
         REQUIRE(found->info.frag_color_components[2] == 0x7);
         REQUIRE(InfoEqual(found->info, fixture.variant.info));
     }
-    REQUIRE(FileVersion(path) == 12);
+    REQUIRE(FileVersion(path) == 13);
     const auto catalog = Store::ReadRecipeCatalog(path, {1, 2});
     REQUIRE(catalog.scanned_records == 2);
     REQUIRE(catalog.eligible_records == 1);
@@ -2201,7 +2202,8 @@ TEST_CASE("Translation cache reads version-10 files written before frag_color_co
         info.frag_color_components[0] = 0x1;
         info.frag_color_components[2] = 0x7;
         std::vector<u8> current, legacy;
-        WriteInfo(current, info);
+        // Formats 11-12 (and 10 since #353): 89 fields, before uses_cooperative_matrix.
+        WriteInfo(current, info, InfoLayout::NoCooperativeMatrix);
         WriteInfo(legacy, info, InfoLayout::NoFragColorComponents);
         REQUIRE(current.size() == legacy.size() + 8);
         const auto at = static_cast<size_t>(
@@ -2233,8 +2235,8 @@ TEST_CASE("Translation cache reads version-10 files written before frag_color_co
     const auto current_bytes = ReadFileBytes(current_path);
     const std::array infos{fixture.meta.info, fixture.variant.info};
     const auto legacy_bytes = ToPre353File(current_bytes, infos);
-    // One Info in the entry, one in the variant.
-    REQUIRE(legacy_bytes.size() == current_bytes.size() - 16);
+    // One Info in the entry, one in the variant: 8 component bytes + the cooperative-matrix bool.
+    REQUIRE(legacy_bytes.size() == current_bytes.size() - 18);
     // A recipe source of another translator tag, as the producer imports it.
     const auto other_tag = directory / "vulkan_translations.84d3ee17e49f2a55.fork-v53.bin";
     WriteFileBytes(other_tag, legacy_bytes);
@@ -2266,7 +2268,7 @@ TEST_CASE("Translation cache reads version-10 files written before frag_color_co
         REQUIRE(recipes[static_cast<size_t>(Shader::Stage::Fragment)].bindings.texture == 5);
         REQUIRE(ReadFileBytes(other_tag) == legacy_bytes);
     }
-    SECTION("a live cache of the same configuration loads and is upgraded to format 12") {
+    SECTION("a live cache of the same configuration loads and is upgraded to format 13") {
         std::filesystem::remove(current_path);
         const auto live = directory / "vulkan_translations.2222222222222222.fork-v53.bin";
         WriteFileBytes(live, legacy_bytes);
@@ -2292,7 +2294,7 @@ TEST_CASE("Translation cache reads version-10 files written before frag_color_co
                                         recipe.bindings);
             REQUIRE(store.InsertVariant(*entry, second_key, fixture.variant, &recipe));
         }
-        REQUIRE(FileVersion(live) == 12);
+        REQUIRE(FileVersion(live) == 13);
         {
             Store store;
             store.Open(live, fixture.config);
@@ -2312,9 +2314,8 @@ TEST_CASE("Translation cache reads version-10 files written before frag_color_co
     }
     SECTION("a version-10 file written since #353 keeps its components") {
         const auto since = directory / "vulkan_translations.fc5d3b7d1d0996fe.fork-v53.bin";
-        auto bytes = current_bytes;
-        const u32 ten = 10;
-        std::memcpy(bytes.data() + 8, &ten, sizeof(ten));
+        const auto bytes = ToPre353File(current_bytes, infos, 10, InfoLayout::NoCooperativeMatrix);
+        REQUIRE(bytes.size() == current_bytes.size() - 2);
         WriteFileBytes(since, bytes);
         const auto catalog = Store::ReadRecipeCatalog(since, {1, 2});
         REQUIRE(catalog.admitted_records == 1);
@@ -2328,15 +2329,29 @@ TEST_CASE("Translation cache reads version-10 files written before frag_color_co
             REQUIRE(found);
             REQUIRE(InfoEqual(found->info, fixture.variant.info));
         }
-        // Only the version changes: the layout already is the current one.
-        REQUIRE(FileVersion(since) == 12);
+        // Upgraded to format 13: each Info gains uses_cooperative_matrix (false).
+        REQUIRE(FileVersion(since) == 13);
         REQUIRE(ReadFileBytes(since) == current_bytes);
+    }
+    SECTION("a format-12 recipe source (89-field Info) is imported and read") {
+        const auto twelve = directory / "vulkan_translations.95dda7e1fb237028.fork-v54.bin";
+        const auto bytes = ToPre353File(current_bytes, infos, 12, InfoLayout::NoCooperativeMatrix);
+        WriteFileBytes(twelve, bytes);
+        REQUIRE(FileVersion(twelve) == 12);
+        const auto catalog = Store::ReadRecipeCatalog(twelve, {1, 2});
+        REQUIRE(catalog.scanned_records == 2);
+        REQUIRE(catalog.admitted_records == 1);
+        REQUIRE(catalog.invalid_recipes == 0);
+        REQUIRE(catalog.exact.at(fixture.stage_key).front().recipe.bindings.texture == 5);
+        const auto recipes = Store::ReadRecipes(twelve, fixture.config);
+        REQUIRE(recipes[static_cast<size_t>(Shader::Stage::Fragment)].bindings.texture == 5);
+        REQUIRE(ReadFileBytes(twelve) == bytes);
     }
     SECTION("another configuration still starts over") {
         Store store;
         store.Open(other_tag, Digest{0x353, 0x89});
         REQUIRE_FALSE(store.FindEntry(fixture.stage_key, fixture.env));
-        REQUIRE(FileVersion(other_tag) == 12);
+        REQUIRE(FileVersion(other_tag) == 13);
     }
     std::filesystem::remove_all(directory);
 }

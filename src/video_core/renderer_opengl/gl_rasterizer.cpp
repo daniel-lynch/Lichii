@@ -524,6 +524,14 @@ VideoCore::RasterizerDownloadArea RasterizerOpenGL::GetFlushArea(DAddr addr, u64
         std::scoped_lock lock{texture_cache.mutex};
         texture_area = texture_cache.GetFlushArea(addr, size);
     }
+    if (texture_area) {
+        // The core disarmed the read's pages before asking, and skips later reads in this area,
+        // even through another device alias of those pages. The buffer cache arms only pages it
+        // doesn't count as armed (#264), so it must forget the whole area.
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.ForgetReadTraps(texture_area->start_address,
+                                     texture_area->end_address - texture_area->start_address);
+    }
     if (buffer_cache.FlushesOnCpuRead()) {
         // As in RasterizerVulkan::GetFlushArea: the buffer cache answers for the whole area.
         const DAddr start = texture_area ? texture_area->start_address : addr;
@@ -532,6 +540,8 @@ VideoCore::RasterizerDownloadArea RasterizerOpenGL::GetFlushArea(DAddr addr, u64
         auto area = buffer_cache.GetFlushArea(addr, size, start, end);
         if (area && texture_area) {
             area->preemtive &= texture_area->preemtive;
+            // Images to flush: not only a wait for downloads in flight.
+            area->in_flight &= texture_area->preemtive;
         }
         if (area) {
             return *area;

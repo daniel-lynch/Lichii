@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <cstring>
 #include <memory>
+#include <span>
 #include <variant>
 #include <vector>
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -105,6 +107,12 @@ public:
         *(payload_cursor++) = texel_buffer;
     }
 
+    /// Entries an earlier draw added (delta draws).
+    void AddEntries(std::span<const DescriptorUpdateEntry> entries) {
+        std::memcpy(payload_cursor, entries.data(), entries.size_bytes());
+        payload_cursor += entries.size();
+    }
+
     void AddTexelBuffer(VkBufferView texel_buffer, VkDeviceAddress base_address,
                         VkDeviceSize offset, VkDeviceSize size, VkFormat format) {
         if (!use_descriptor_buffer) {
@@ -120,7 +128,8 @@ public:
 
 private:
     const Device& device;
-    const size_t frame_payload_size;
+    size_t frame_payload_size;
+    const size_t maximum_frame_payload_size;
     const bool supports_descriptor_buffer;
     bool use_descriptor_buffer{false};
     size_t frame_index{0};
@@ -128,6 +137,8 @@ private:
     DescriptorUpdateEntry* payload_start = nullptr;
     const DescriptorUpdateEntry* upload_start = nullptr;
     std::unique_ptr<DescriptorUpdateEntry[]> payload;
+    bool growth_disabled{};
+    bool fallback_reported{};
 };
 
 // TODO: should these be separate classes instead?

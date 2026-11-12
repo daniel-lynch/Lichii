@@ -25,6 +25,9 @@
 #include "common/common_types.h"
 #include "core/core.h"
 #include "core/file_sys/nup_writer.h"
+#ifdef LICHII_NX_TOOLS
+#include "yuzu/nx_tools.h"
+#endif
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/registered_cache.h"
 #include "qt_common/config/uisettings.h"
@@ -38,6 +41,7 @@
 #include "yuzu/game/game_tree.h"
 #include "yuzu/game/search_field.h"
 #include "yuzu/main_window.h"
+#include "yuzu/shader_warm_dialog.h"
 #include "yuzu/util/controller_navigation.h"
 
 GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvider* provider_,
@@ -102,6 +106,10 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
 
 void GameList::SetNupConversionRunning(bool running) {
     nup_conversion_running = running;
+}
+
+void GameList::SetNxToolRunning(bool running) {
+    nx_tool_running = running;
 }
 
 GameList::~GameList() {
@@ -484,6 +492,13 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     precompile_shader_cache->setToolTip(
         tr("Boots the game, builds every pipeline in its disk cache, saves the Vulkan pipeline "
            "cache and stops before the game runs."));
+    const bool has_shader_warm = ShaderWarmFilesExist(program_id);
+    QAction* prepare_shaders = context_menu.addAction(
+        has_shader_warm ? tr("Rebuild Shader Precache") : tr("Build Shader Precache"));
+    QAction* delete_shader_warm = nullptr;
+    if (has_shader_warm) {
+        delete_shader_warm = context_menu.addAction(tr("Delete Shader Precache"));
+    }
     QAction* ryujinx = context_menu.addAction(tr("Link to Ryujinx"));
     context_menu.addSeparator();
     QMenu* remove_menu = context_menu.addMenu(tr("Remove"));
@@ -517,6 +532,24 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
         convert_nup = context_menu.addAction(tr("Convert to NUP..."));
         convert_nup->setEnabled(!nup_conversion_running);
     }
+    QAction* convert_nx = nullptr;
+    QAction* add_to_nx = nullptr;
+    QAction* remove_from_nx = nullptr;
+    QAction* edit_nx_metadata = nullptr;
+#ifdef LICHII_NX_TOOLS
+    if (NxTools::CanConvert(path)) {
+        convert_nx = context_menu.addAction(tr("Convert to NX..."));
+        convert_nx->setEnabled(!nx_tool_running);
+    }
+    if (NxTools::IsNxArchive(path)) {
+        QMenu* nx_menu = context_menu.addMenu(tr("Manage NX Archive"));
+        add_to_nx = nx_menu->addAction(tr("Add Update or DLC..."));
+        remove_from_nx = nx_menu->addAction(tr("Remove Update or DLC..."));
+        nx_menu->addSeparator();
+        edit_nx_metadata = nx_menu->addAction(tr("Edit Title and Icon..."));
+        nx_menu->setEnabled(!nx_tool_running);
+    }
+#endif
 #if !defined(__APPLE__)
     QMenu* shortcut_menu = context_menu.addMenu(tr("Create Shortcut"));
     QAction* create_desktop_shortcut = shortcut_menu->addAction(tr("Add to Desktop"));
@@ -543,6 +576,7 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     open_mod_location->setVisible(program_id != 0);
     open_transferable_shader_cache->setVisible(program_id != 0);
     precompile_shader_cache->setVisible(program_id != 0);
+    prepare_shaders->setVisible(program_id != 0);
     remove_update->setVisible(program_id != 0);
     remove_dlc->setVisible(program_id != 0);
     remove_gl_shader_cache->setVisible(program_id != 0);
@@ -567,6 +601,12 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     connect(precompile_shader_cache, &QAction::triggered, this, [this, path]() {
         emit PrecompileShaderCacheRequested(QString::fromStdString(path));
     });
+    connect(prepare_shaders, &QAction::triggered, this,
+            [this, program_id, path]() { emit PrepareShaderWarmRequested(program_id, path); });
+    if (delete_shader_warm) {
+        connect(delete_shader_warm, &QAction::triggered, this,
+                [this, program_id]() { emit DeleteShaderWarmRequested(program_id); });
+    }
     connect(remove_all_content, &QAction::triggered, this, [this, program_id]() {
         emit RemoveInstalledEntryRequested(program_id, QtCommon::Game::InstalledEntryType::Game);
     });
@@ -614,6 +654,18 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     if (convert_nup) {
         connect(convert_nup, &QAction::triggered, this,
                 [this, path]() { emit ConvertToNupRequested(path); });
+    }
+    if (convert_nx) {
+        connect(convert_nx, &QAction::triggered, this,
+                [this, path]() { emit ConvertToNxRequested(path); });
+    }
+    if (add_to_nx) {
+        connect(add_to_nx, &QAction::triggered, this,
+                [this, path]() { emit AddToNxRequested(path); });
+        connect(remove_from_nx, &QAction::triggered, this,
+                [this, path]() { emit RemoveFromNxRequested(path); });
+        connect(edit_nx_metadata, &QAction::triggered, this,
+                [this, path]() { emit EditNxMetadataRequested(path); });
     }
     if (extract_nup) {
         connect(extract_nup, &QAction::triggered, this,

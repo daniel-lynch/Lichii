@@ -36,17 +36,10 @@ IAudioRenderer::IAudioRenderer(Core::System& system_, std::shared_ptr<Manager> m
         {11, nullptr, "ExecuteAudioRendererRendering"}, //3.0.0+
         {12, D<&IAudioRenderer::SetVoiceDropParameter>, "SetVoiceDropParameter"}, //15.0.0+
         {13, D<&IAudioRenderer::GetVoiceDropParameter>, "GetVoiceDropParameter"}, //15.0.0+
+        {14, D<&IAudioRenderer::SetAsyncMemoryPoolControlEnabled>, "SetAsyncMemoryPoolControlEnabled"}, //23.0.0+
     };
     // clang-format on
     RegisterHandlers(functions);
-
-    if (AudioCore::Nx2AudioOptions::AsyncMemoryPoolControlEnabled()) {
-        static const FunctionInfo async_functions[] = {
-            {14, D<&IAudioRenderer::SetAsyncMemoryPoolControlEnabled>,
-             "SetAsyncMemoryPoolControlEnabled"},
-        };
-        RegisterHandlers(async_functions);
-    }
 
     process_handle->Open(system_.Kernel());
     impl->Initialize(params, transfer_memory, transfer_memory_size, process_handle,
@@ -136,15 +129,14 @@ Result IAudioRenderer::GetRenderingTimeLimit(Out<u32> out_rendering_time_limit) 
     R_SUCCEED();
 }
 
-Result IAudioRenderer::SetVoiceDropParameter(f32 voice_drop_parameter) {
-    LOG_DEBUG(Service_Audio, "called");
-    impl->GetSystem().SetVoiceDropParameter(voice_drop_parameter);
+Result IAudioRenderer::SetAsyncMemoryPoolControlEnabled(bool enabled) {
+    LOG_INFO(Service_Audio, "SetAsyncMemoryPoolControlEnabled enabled={}", enabled);
     R_SUCCEED();
 }
 
-Result IAudioRenderer::SetAsyncMemoryPoolControlEnabled(bool enabled) {
-    // Pool attach/detach completes synchronously in RequestUpdate; no pending work to enable.
-    LOG_INFO(Service_Audio, "SetAsyncMemoryPoolControlEnabled enabled={} (synchronous pools)", enabled);
+Result IAudioRenderer::SetVoiceDropParameter(f32 voice_drop_parameter) {
+    LOG_DEBUG(Service_Audio, "called");
+    impl->GetSystem().SetVoiceDropParameter(voice_drop_parameter);
     R_SUCCEED();
 }
 

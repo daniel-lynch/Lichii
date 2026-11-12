@@ -34,6 +34,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
 #include "common/settings.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/util.h"
@@ -181,6 +182,7 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                 // Native programs are lowered while the environment is built (once: the
                 // ShaderInfo keeps the result for the pipeline's environments).
                 RethrowIfRejected(*cpu_shader_addr);
+                const Nx2Profile::Scope profile_scope{Nx2Profile::Zone::ShaderCapture};
                 GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address};
                 shader_info = MakeShaderInfo(env, *cpu_shader_addr);
                 if (native) {
@@ -380,6 +382,7 @@ const ShaderInfo* ShaderCache::ComputeShader() {
     } else {
         try {
             RethrowIfRejected(*cpu_shader_addr);
+            const Nx2Profile::Scope profile_scope{Nx2Profile::Zone::ShaderCapture};
             ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
             shader = MakeShaderInfo(env, *cpu_shader_addr);
         } catch (const Shader::Ampere::TrapGuardError&) {
@@ -396,6 +399,10 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         DlssContract::IsFastFusionCandidate(program_id,
                                             shader->lowered_native->native_program_key)) {
         kepler_compute->TraceDlssContract(shader->lowered_native->native_program_key);
+    }
+    if (kepler_compute->IsNativeMode() && shader->lowered_native &&
+        kepler_compute->BypassOotNetwork(program_id, shader->lowered_native->native_program_key)) {
+        throw FireEmblemUpscale::DispatchReplaced{};
     }
     if (kepler_compute->IsNativeMode() && shader->lowered_native &&
         kepler_compute->ProcessGameDlss(program_id, shader->lowered_native->native_program_key)) {
@@ -424,6 +431,7 @@ void ShaderCache::RememberRejection(VAddr addr) {
         return;
     }
     rejected_native.emplace(addr, std::current_exception());
+    page_filter.Mark(addr, 1); // InnerInvalidation reaches InvalidatePagesInRegion for it
     rejected_lowest.store((std::min)(rejected_lowest.load(std::memory_order_relaxed), addr),
                           std::memory_order_relaxed);
     rejected_highest.store((std::max)(rejected_highest.load(std::memory_order_relaxed), addr),
@@ -469,6 +477,7 @@ void ShaderCache::Register(std::unique_ptr<ShaderInfo> data, VAddr addr, size_t 
 
     const VAddr addr_end = addr + size;
     Entry* const entry = NewEntry(addr, addr_end, data.get());
+    page_filter.Mark(addr, size);
 
     const u64 page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
     for (u64 page = addr >> YUZU_PAGEBITS; page < page_end; ++page) {

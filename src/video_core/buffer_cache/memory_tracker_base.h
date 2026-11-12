@@ -143,16 +143,18 @@ public:
         cached_pages.clear();
     }
 
-    /// EDEN_NX2_BUFFER_SKIP: remembers a range ForEachUploadRange just went through. It stays
-    /// synchronized (an upload would find nothing) until a CPU write may reach it.
+    /// A range an upload scan just cleared (BufferCache::SynchronizeGeometryBuffer). Only a CPU
+    /// mark or a cached-write flush sets CPU or Untracked bits again, so until one reaches its
+    /// pages another scan would find and change nothing.
     void WatchSynchronized(u32 slot, VAddr cpu_addr, u64 size) noexcept {
         synchronized_ranges[slot] = {Common::AlignDown(cpu_addr, BYTES_PER_PAGE),
                                      Common::AlignUp(cpu_addr + size, BYTES_PER_PAGE)};
-        synchronized_mask |= 1U << slot;
+        synchronized_mask |= u64{1} << slot;
     }
 
+    /// The slot's binding changed (BufferCache::UpdateVertexBufferSlot).
     void ForgetSynchronized(u32 slot) noexcept {
-        synchronized_mask &= ~(1U << slot);
+        synchronized_mask &= ~(u64{1} << slot);
     }
 
     [[nodiscard]] bool IsSynchronized(u32 slot) const noexcept {
@@ -224,11 +226,11 @@ private:
     void ForgetSynchronized(VAddr cpu_addr, u64 size) noexcept {
         const VAddr write_begin = Common::AlignDown(cpu_addr, BYTES_PER_PAGE);
         const VAddr write_end = Common::AlignUp(cpu_addr + size, BYTES_PER_PAGE);
-        for (u32 mask = synchronized_mask; mask != 0; mask &= mask - 1) {
+        for (u64 mask = synchronized_mask; mask != 0; mask &= mask - 1) {
             const u32 slot = static_cast<u32>(std::countr_zero(mask));
             const auto [begin, end] = synchronized_ranges[slot];
             if (write_begin < end && begin < write_end) {
-                synchronized_mask &= ~(1U << slot);
+                synchronized_mask &= ~(u64{1} << slot);
             }
         }
     }
@@ -331,8 +333,8 @@ private:
     std::deque<std::array<Manager, MANAGER_POOL_SIZE>> manager_pool;
     std::deque<Manager*> free_managers;
     ::Common::unordered_set<u32> cached_pages;
-    std::array<std::pair<VAddr, VAddr>, 32> synchronized_ranges{};
-    u32 synchronized_mask{};
+    std::array<std::pair<VAddr, VAddr>, 64> synchronized_ranges{};
+    u64 synchronized_mask{};
     DeviceTracker* device_tracker = nullptr;
 };
 

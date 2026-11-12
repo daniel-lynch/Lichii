@@ -18,10 +18,8 @@ TEST_CASE("Buffer cache holds every shader storage binding", "[video_core][stora
     STATIC_REQUIRE(sizeof(decltype(Channel::enabled_compute_storage_buffers)) * 8 >= Shader::Info::MAX_SSBOS);
     STATIC_REQUIRE(sizeof(decltype(Channel::written_compute_storage_buffers)) * 8 >= Shader::Info::MAX_SSBOS);
     STATIC_REQUIRE(sizeof(decltype(Channel::native_compute_storage_buffers)) * 8 >= Shader::Info::MAX_SSBOS);
-    STATIC_REQUIRE(sizeof(decltype(Channel::bounded_compute_storage_buffers)) * 8 >= Shader::Info::MAX_SSBOS);
     STATIC_REQUIRE(sizeof(typename decltype(Channel::enabled_storage_buffers)::value_type) * 8 >= Shader::Info::MAX_SSBOS);
     STATIC_REQUIRE(sizeof(typename decltype(Channel::written_storage_buffers)::value_type) * 8 >= Shader::Info::MAX_SSBOS);
-
 
     ComputeBindings compute{};
     GraphicsBindings graphics{};

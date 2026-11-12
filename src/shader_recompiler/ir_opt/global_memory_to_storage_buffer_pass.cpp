@@ -1974,13 +1974,15 @@ private:
         if (!low || low->base != 1 || guard_failed) {
             return std::nullopt;
         }
-        const s64 end{low->c + addr->imm_offset + StoreSize(inst.GetOpcode())};
-        if (end > s64{0xffffffff}) {
+        // Below zero, invocation 0's offset wraps modulo 2^32 (see IdBound).
+        const s64 start{low->c + addr->imm_offset};
+        const s64 end{start + StoreSize(inst.GetOpcode())};
+        if (start < 0 || end > s64{0xffffffff}) {
             return std::nullopt;
         }
         StorageWriteExtent result{
             .bounded = true,
-            .const_end = static_cast<u32>((std::max)(end, s64{0})),
+            .const_end = static_cast<u32>(end),
         };
         for (size_t i = 0; i < 3; ++i) {
             if (low->coef[i] >= COEF_LIMIT || low->coef[i + 3] >= COEF_LIMIT) {
@@ -2522,6 +2524,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         std::swap(info, with_tables);
         collect();
         if (table_accounting && info.set.size() > max_ssbos) {
+            // Never more storage buffers than a stage binds: without the table entries, then.
             info = std::move(with_tables);
         }
     }
@@ -2529,6 +2532,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         throw std::bad_alloc{};
     }
     if (StorageBuffers64() && info.set.size() > max_ssbos) {
+        // Binding only some of them would drop the accesses through the others.
         throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
                                       info.set.size(), max_ssbos);
     }
@@ -2708,7 +2712,7 @@ size_t StorageBufferLimit(const HostTranslateInfo& host_info) {
     }
     size_t limit{Info::MAX_SSBOS};
     for (const u32 device_limit : {host_info.max_per_stage_descriptor_storage_buffers,
-                                  host_info.max_descriptor_set_storage_buffers}) {
+                                   host_info.max_descriptor_set_storage_buffers}) {
         if (device_limit != 0) {
             limit = (std::min)(limit, size_t{device_limit});
         }

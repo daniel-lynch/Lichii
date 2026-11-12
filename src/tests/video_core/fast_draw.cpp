@@ -76,11 +76,17 @@ private:
 
 struct FastDrawFixture {
     FastDrawFixture() : memory{system, device_memory, 32, 1ULL << 31}, maxwell3d{memory} {
-        FastDraw::g_enabled = true;
+        SetSwitch(true);
+        FastDraw::g_delta = {};
         maxwell3d.BindRasterizer(&rasterizer);
     }
     ~FastDrawFixture() {
-        FastDraw::g_enabled = previous;
+        FastDraw::SetEnabledForTest(previous);
+        FastDraw::g_delta = {};
+    }
+
+    static void SetSwitch(bool on) {
+        FastDraw::SetEnabledForTest(on);
     }
 
     u32 Reg(u32 method) const {
@@ -105,7 +111,7 @@ struct FastDrawFixture {
         return draws[draws.size() - 1] == draws[draws.size() - 2];
     }
 
-    const bool previous = FastDraw::g_enabled;
+    const bool previous = FastDraw::Enabled();
     ScopedSystemTestContext context;
     Core::System system;
     Core::DeviceMemory physical;
@@ -149,8 +155,6 @@ TEST_CASE("Fast draw breaks reuse on anything that changes what a draw binds", "
         f.Write(ViewportScaleX,
                 f.Reg(ViewportScaleX) + 1);
     }));
-    CHECK(breaks([&] { f.Write(MAXWELL3D_REG_INDEX(const_buffer.buffer), 0x12345678); }));
-    CHECK(breaks([&] { f.Write(MAXWELL3D_REG_INDEX(bind_groups[0].raw_config), 0x11); }));
     CHECK(breaks([&] { f.Write(MAXWELL3D_REG_INDEX(clear_surface), 0x3c); }));
     CHECK(breaks([&] { f.Write(MAXWELL3D_REG_INDEX(tiled_cache_barrier), 0); }));
     CHECK(breaks([&] { FastDraw::Break(FastDraw::Reason::Fence); }));
@@ -158,7 +162,7 @@ TEST_CASE("Fast draw breaks reuse on anything that changes what a draw binds", "
 
 TEST_CASE("Fast draw serial never moves while disabled", "[fast_draw]") {
     FastDrawFixture f;
-    FastDraw::g_enabled = false;
+    FastDrawFixture::SetSwitch(false);
     f.DrawArrays(0, 3);
     f.Write(MAXWELL3D_REG_INDEX(blend.enable[0]), f.Reg(MAXWELL3D_REG_INDEX(blend.enable[0])) ^ 1);
     f.Write(MAXWELL3D_REG_INDEX(const_buffer.buffer), 1);
@@ -169,28 +173,17 @@ TEST_CASE("Fast draw serial never moves while disabled", "[fast_draw]") {
 namespace {
 
 struct DeltaFixture : FastDrawFixture {
-    DeltaFixture() {
-        FastDraw::g_delta_enabled = true;
-        FastDraw::g_delta = {};
-    }
-    ~DeltaFixture() {
-        FastDraw::g_delta_enabled = previous_delta;
-        FastDraw::g_delta = {};
-    }
-
     void SetConstantBuffer(GPUVAddr address, u32 size, u32 offset) {
         Write(MAXWELL3D_REG_INDEX(const_buffer.size), size);
         Write(MAXWELL3D_REG_INDEX(const_buffer.address_high), static_cast<u32>(address >> 32));
         Write(MAXWELL3D_REG_INDEX(const_buffer.address_low), static_cast<u32>(address));
         Write(MAXWELL3D_REG_INDEX(const_buffer.offset), offset);
     }
-
-    const bool previous_delta = FastDraw::g_delta_enabled;
 };
 
 } // namespace
 
-TEST_CASE("Fast draw delta mode records index buffer, bind and constant data changes",
+TEST_CASE("Fast draw records bind and constant data changes, keeps index buffer changes light",
           "[fast_draw]") {
     DeltaFixture f;
     f.DrawArrays(0, 3);
@@ -199,7 +192,9 @@ TEST_CASE("Fast draw delta mode records index buffer, bind and constant data cha
 
     f.Write(MAXWELL3D_REG_INDEX(index_buffer.start_addr_low),
             f.Reg(MAXWELL3D_REG_INDEX(index_buffer.start_addr_low)) + 0x100);
-    CHECK(FastDraw::g_delta.index_buffer);
+    f.Write(MAXWELL3D_REG_INDEX(index_buffer.format), f.Reg(MAXWELL3D_REG_INDEX(index_buffer.format)) ^ 1);
+    CHECK(FastDraw::Serial() == serial);
+    CHECK(FastDraw::g_delta.Empty());
 
     f.SetConstantBuffer(0x10000, 0x100, 0);
     f.Write(MAXWELL3D_REG_INDEX(bind_groups[4].raw_config), 0x31); // slot 3, valid
@@ -221,7 +216,7 @@ TEST_CASE("Fast draw delta mode records index buffer, bind and constant data cha
     CHECK_FALSE(FastDraw::g_delta.Empty());
 }
 
-TEST_CASE("Fast draw delta mode still breaks on state, texture headers and overflow",
+TEST_CASE("Fast draw breaks on state, texture headers and delta overflow",
           "[fast_draw]") {
     DeltaFixture f;
     f.Write(MAXWELL3D_REG_INDEX(tex_header.address_high), 0);
@@ -259,17 +254,84 @@ TEST_CASE("Fast draw delta mode still breaks on state, texture headers and overf
     }));
 }
 
-TEST_CASE("Fast draw mode 1 breaks on what delta mode records", "[fast_draw]") {
-    FastDrawFixture f;
-    REQUIRE_FALSE(FastDraw::g_delta_enabled);
-    f.DrawArrays(0, 3);
-    f.Write(MAXWELL3D_REG_INDEX(index_buffer.start_addr_low),
-            f.Reg(MAXWELL3D_REG_INDEX(index_buffer.start_addr_low)) + 0x100);
-    f.DrawArrays(0, 3);
-    CHECK_FALSE(f.Reusable());
+TEST_CASE("Fast draw breaks on texture header data written through another mapping",
+          "[fast_draw]") {
+    DeltaFixture f;
+    f.memory.BindRasterizer(&f.rasterizer);
+    constexpr GPUVAddr headers = 0x40000;
+    constexpr GPUVAddr alias = 0x90000;
+    f.memory.Map(headers, 0x100000, 0x1000, Tegra::PTEKind::PITCH, false);
+    f.memory.Map(alias, 0x100000, 0x1000, Tegra::PTEKind::PITCH, false);
+    f.Write(MAXWELL3D_REG_INDEX(tex_header.address_high), 0);
+    f.Write(MAXWELL3D_REG_INDEX(tex_header.address_low), static_cast<u32>(headers));
+    f.Write(MAXWELL3D_REG_INDEX(tex_header.limit), 7);
+    const auto breaks = [&](u32 offset) {
+        FastDraw::g_delta = {};
+        const u64 serial = FastDraw::Serial();
+        f.SetConstantBuffer(alias, 0x1000, offset);
+        f.Write(MAXWELL3D_REG_INDEX(const_buffer.buffer), 1);
+        return FastDraw::Serial() != serial;
+    };
+    CHECK(breaks(0xe0));        // the last texture header
+    CHECK_FALSE(breaks(0x100)); // just past the headers
+}
+
+TEST_CASE("Fast draw finds texture handle data written through another mapping",
+          "[fast_draw]") {
+    DeltaFixture f;
+    f.memory.BindRasterizer(&f.rasterizer);
+    constexpr GPUVAddr handles = 0x100000; // a buffer of texture handles, 0x100 bytes
+    constexpr GPUVAddr alias = 0x300000;   // its device memory, mapped again
+    constexpr GPUVAddr other = 0x500000;   // other device memory
+    constexpr GPUVAddr unmapped = 0x700000;
+    constexpr auto Kind = Tegra::PTEKind::PITCH;
+    f.memory.Map(handles, 0x200000, 0x1000, Kind, false);
+    f.memory.Map(alias, 0x200000, 0x1000, Kind, false);
+    f.memory.Map(other, 0x400000, 0x1000, Kind, false);
+    FastDraw::DeviceSpans spans;
+    const auto reaches = [&](GPUVAddr handle_buffer, GPUVAddr buffer, u32 offset,
+                             std::vector<u32> words) {
+        FastDraw::g_delta = {};
+        f.SetConstantBuffer(buffer, 0x2000, offset);
+        f.maxwell3d.CallMultiMethod(f.system, MAXWELL3D_REG_INDEX(const_buffer.buffer),
+                                    words.data(), static_cast<u32>(words.size()),
+                                    static_cast<u32>(words.size()));
+        spans.Update(f.memory, handle_buffer, 0x100);
+        return FastDraw::g_delta.Reaches(handle_buffer, 0x100, spans);
+    };
+    CHECK(reaches(handles, handles, 0x10, {1}));
+    CHECK(reaches(handles, alias, 0x10, {1})); // missed when compared by GPU address only
+    CHECK(reaches(handles, alias, 0xfc, {1, 2}));
+    CHECK_FALSE(reaches(handles, alias, 0x100, {1})); // just past the handles
+    CHECK_FALSE(reaches(handles, other, 0x10, {1}));
+    // Nothing mapped there: compared by GPU address, as before.
+    CHECK(reaches(unmapped, unmapped, 0x10, {1}));
+    CHECK_FALSE(reaches(unmapped, other, 0x10, {1}));
+
+    // A write across two pages that map device memory apart lands on both.
+    f.memory.Map(alias, 0x201000, 0x1000, Kind, false);
+    f.memory.Map(alias + 0x1000, 0x200000, 0x1000, Kind, false);
+    CHECK(reaches(handles, alias, 0xffc, {1, 2}));
+    CHECK(FastDraw::g_delta.num_device_writes == 2);
+    CHECK_FALSE(reaches(handles, alias, 0xff8, {1, 2}));
+
+    // Mapping changes translate the handle buffer again.
+    CHECK_FALSE(reaches(handles, other, 0x10, {1}));
+    f.memory.Map(handles, 0x400000, 0x1000, Kind, false);
+    CHECK(reaches(handles, other, 0x10, {1}));
+    CHECK_FALSE(reaches(handles, alias + 0x1000, 0x10, {1}));
+}
+
+TEST_CASE("Fast draw records and breaks nothing while switched off", "[fast_draw]") {
+    DeltaFixture f;
+    FastDrawFixture::SetSwitch(false);
+    const u64 serial = FastDraw::Serial();
+    f.Write(MAXWELL3D_REG_INDEX(blend.enable[0]), f.Reg(MAXWELL3D_REG_INDEX(blend.enable[0])) ^ 1);
+    f.SetConstantBuffer(0x10000, 0x100, 0);
     f.Write(MAXWELL3D_REG_INDEX(bind_groups[0].raw_config), 0x11);
-    f.DrawArrays(0, 3);
-    CHECK_FALSE(f.Reusable());
+    f.Write(MAXWELL3D_REG_INDEX(const_buffer.buffer), 1);
+    FastDraw::Break(FastDraw::Reason::Fence);
+    CHECK(FastDraw::Serial() == serial);
     CHECK(FastDraw::g_delta.Empty());
 }
 
@@ -284,7 +346,7 @@ TEST_CASE("Fast draw keeps base vertex and instance as draw parameters", "[fast_
     CHECK(f.Reusable());
 }
 
-TEST_CASE("Fast draw delta mode records vertex stream addresses and sizes", "[fast_draw]") {
+TEST_CASE("Fast draw keeps vertex stream addresses and sizes light", "[fast_draw]") {
     DeltaFixture f;
     const auto stream = [](u32 index, u32 word) {
         return static_cast<u32>(MAXWELL3D_REG_INDEX(vertex_streams) + index * 4 + word);
@@ -293,7 +355,7 @@ TEST_CASE("Fast draw delta mode records vertex stream addresses and sizes", "[fa
         FastDraw::g_delta = {};
         const u64 serial = FastDraw::Serial();
         f.Write(method, f.Reg(method) + 0x40);
-        return FastDraw::Serial() == serial && FastDraw::g_delta.vertex_buffers;
+        return FastDraw::Serial() == serial;
     };
     CHECK(light(stream(0, 1)));
     CHECK(light(stream(3, 2)));

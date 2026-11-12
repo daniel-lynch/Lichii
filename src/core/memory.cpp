@@ -976,6 +976,9 @@ struct Memory::Impl {
                 Tegra::Nx2NoteCollectedWrite(address, size);
             }
             gpu_dirty_managers[core].Collect(address, size);
+            // A download writing to guest memory here may have looked at the collected writes
+            // before this one: its bytes would land over the ones stored after this returns.
+            VideoCore::DownloadLanding::Await(address, size);
         });
     }
 

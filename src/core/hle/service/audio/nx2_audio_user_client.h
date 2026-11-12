@@ -4,6 +4,7 @@
 #pragma once
 
 #include "audio_core/nx2_audio_options.h"
+#include "core/core.h"
 #include "core/hle/service/audio/audio_in_manager.h"
 #include "core/hle/service/audio/audio_out_manager.h"
 #include "core/hle/service/audio/audio_renderer_manager.h"

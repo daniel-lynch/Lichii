@@ -243,8 +243,10 @@ struct Variant {
 /// layout: upstream #353 added frag_color_components without a format bump, so files written
 /// before that merge lack it.
 enum class InfoLayout : u8 {
-    Current,               ///< All fields (format 11, and format 10 written since #353).
+    Current,               ///< All fields (format 13: 90 fields).
     NoFragColorComponents, ///< Format 10 written before #353: 88 fields.
+    NoCooperativeMatrix,   ///< Formats 11-12, and format 10 written since #353: 89 fields
+                           ///< (before uses_cooperative_matrix, upstream #582).
 };
 
 /// frag_color_components for an info read without it: no components for a render target the

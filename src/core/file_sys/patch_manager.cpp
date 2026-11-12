@@ -64,6 +64,8 @@ struct BuiltinPatch {
     size_t state_size = 0;
     /// Skipped when the named built-in patch applied earlier in BUILTIN_PATCHES (Lichii).
     std::string_view yields_to{};
+    // Another built-in this one contains; it is skipped once this one is applied.
+    std::string_view replaces{};
 };
 
 constexpr std::array<u8, 4> MAX_RESOLUTION_ORIGINAL{0xE8, 0x41, 0x00, 0x36};
@@ -95,19 +97,35 @@ constexpr std::array REAL_TIME_RECORDS{
 
 constexpr std::array<u8, 4> DYNAMIC_FPS_ORIGINAL{0x28, 0x18, 0x20, 0x1E};
 constexpr std::array<u8, 4> DYNAMIC_FPS_CALL{0x4F, 0x7D, 0xD5, 0x94};
+// Dark's routine up to the step computation; the two built-ins differ only in the tail.
+#define DYNAMIC_FPS_ROUTINE_HEAD                                                                      0x28, 0x18, 0x20, 0x1E, 0xCA, 0x92, 0x00, 0xB0, 0x4A, 0x01, 0x38, 0x91, 0x2B, 0xE0, 0x3B,             0xD5, 0x4C, 0x01, 0x40, 0xF9, 0x4B, 0x01, 0x00, 0xF9, 0xCC, 0x02, 0x00, 0xB4, 0x6B, 0x01,         0x0C, 0xCB, 0x0D, 0xE0, 0x3B, 0xD5, 0x4E, 0x01, 0x80, 0xD2, 0xAE, 0x09, 0xCE, 0x9A, 0x7F,         0x01, 0x0E, 0xEB, 0xCB, 0x81, 0x8B, 0x9A, 0x4C, 0x05, 0x40, 0xF9, 0x4C, 0x00, 0x00, 0xB5,         0xEC, 0x03, 0x0B, 0xAA, 0x6E, 0x01, 0x0C, 0xCB, 0x8C, 0x0D, 0x8E, 0x8B, 0x4C, 0x05, 0x00,         0xF9, 0x82, 0x01, 0x23, 0x9E, 0xA3, 0x01, 0x23, 0x9E, 0x42, 0x18, 0x23, 0x1E, 0x42, 0x08
+// The original routine caps the measured delta at CNTFRQ / 20 (50 ms); the head uses /10
+// (100 ms) so Ocarina keeps real speed down to 10 fps.
 constexpr std::array<u8, 120> DYNAMIC_FPS_ROUTINE{
-    0x28, 0x18, 0x20, 0x1E, 0xCA, 0x92, 0x00, 0xB0, 0x4A, 0x01, 0x38, 0x91, 0x2B, 0xE0, 0x3B,
-    0xD5, 0x4C, 0x01, 0x40, 0xF9, 0x4B, 0x01, 0x00, 0xF9, 0xCC, 0x02, 0x00, 0xB4, 0x6B, 0x01,
-    0x0C, 0xCB, 0x0D, 0xE0, 0x3B, 0xD5, 0x8E, 0x02, 0x80, 0xD2, 0xAE, 0x09, 0xCE, 0x9A, 0x7F,
-    0x01, 0x0E, 0xEB, 0xCB, 0x81, 0x8B, 0x9A, 0x4C, 0x05, 0x40, 0xF9, 0x4C, 0x00, 0x00, 0xB5,
-    0xEC, 0x03, 0x0B, 0xAA, 0x6E, 0x01, 0x0C, 0xCB, 0x8C, 0x0D, 0x8E, 0x8B, 0x4C, 0x05, 0x00,
-    0xF9, 0x82, 0x01, 0x23, 0x9E, 0xA3, 0x01, 0x23, 0x9E, 0x42, 0x18, 0x23, 0x1E, 0x42, 0x08,
+    DYNAMIC_FPS_ROUTINE_HEAD,
+    // Dark's tail: the smoothed step if it is above original * 1.03, else the original step.
     0x21, 0x1E, 0xC3, 0x00, 0x00, 0x1C, 0x03, 0x09, 0x23, 0x1E, 0x40, 0x20, 0x23, 0x1E, 0x4D,
     0x00, 0x00, 0x54, 0x48, 0x40, 0x20, 0x1E, 0xC0, 0x03, 0x5F, 0xD6, 0x0A, 0xD7, 0x83, 0x3F,
 };
+constexpr std::array<u8, 128> FPS_UNLOCK_ROUTINE{
+    DYNAMIC_FPS_ROUTINE_HEAD,
+    // Unlock tail: the smoothed real-time step in 1/60-s units is clamped into [0.02, 6.0] and
+    // always returned, so logic follows real time above 60 fps too (0.5 units/frame at 120 fps)
+    // and down to 10 fps (6.0 matches the 100 ms delta cap). At 60 fps it equals Dark's tail.
+    // 0x5C: ldr s3, +0x78 (0.02f) ; fmaxnm s2, s2, s3 ; 0x64: ldr s3, +0x7c (6.0f) ;
+    // fminnm s2, s2, s3 ; fmov s8, s2 ; ret ; nop ; 0.02f ; 6.0f
+    0x21, 0x1E, 0xE3, 0x00, 0x00, 0x1C, 0x42, 0x68, 0x23, 0x1E, 0xC3, 0x00, 0x00, 0x1C, 0x42,
+    0x78, 0x23, 0x1E, 0x48, 0x40, 0x20, 0x1E, 0xC0, 0x03, 0x5F, 0xD6, 0x1F, 0x20, 0x03, 0xD5,
+    0x0A, 0xD7, 0xA3, 0x3C, 0x00, 0x00, 0xC0, 0x40,
+};
+#undef DYNAMIC_FPS_ROUTINE_HEAD
 constexpr std::array DYNAMIC_FPS_RECORDS{
     BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
     BuiltinPatchRecord{0x3C46200, DYNAMIC_FPS_ROUTINE, {}, true},
+};
+constexpr std::array FPS_UNLOCK_RECORDS{
+    BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
+    BuiltinPatchRecord{0x3C46200, FPS_UNLOCK_ROUTINE, {}, true},
 };
 
 constexpr std::array BUILTIN_PATCHES{
@@ -129,9 +147,25 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = REAL_TIME_RECORDS,
     },
-    // Lichii: Dark's routine hooks the same fdiv as the real-time patch above, so stacking them
-    // would correct the frame step twice. It yields to the exact measured delta and applies only
-    // when "Real-time speed (built-in)" is off in Add-Ons (docs/nx2/ocarina-dynamic-fps.md).
+    // Lichii: Dark's routine and upstream's FPS Unlock (below) hook the same fdiv as the
+    // real-time patch above, so stacking them would correct the frame step twice. Both yield to
+    // the exact measured delta and apply only when "Real-time speed (built-in)" is off in Add-Ons
+    // (docs/nx2/ocarina-dynamic-fps.md); then FPS Unlock applies and replaces Dark's routine.
+    // Dark's routine with a tail that also lowers the step above 60 fps, so the game keeps real
+    // speed at any frame rate limit (Settings frame_rate_limit).
+    BuiltinPatch{
+        .name = "FPS Unlock (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = FPS_UNLOCK_RECORDS,
+        .state_offset = 0x4E9FE00,
+        .state_size = 16,
+        // Lichii: the same fdiv as the real-time patch above; it yields to the exact measured
+        // delta, and with it Dark's routine (which it replaces) stays off too.
+        .yields_to = Service::Nx2OotTime::RealTimePatchName,
+        .replaces = "Dynamic FPS by Dark (built-in)",
+    },
     BuiltinPatch{
         .name = "Dynamic FPS by Dark (built-in)",
         .title_id = 0x0400486024DEC000,
@@ -431,7 +465,10 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
     const auto load_dir = GetModificationLoadRoot();
     const auto sdmc_load_dir = GetModificationLoadRoot(true);
 
-    std::vector<VirtualDir> patch_dirs = {sdmc_load_dir};
+    std::vector<VirtualDir> patch_dirs;
+    if (sdmc_load_dir != nullptr) {
+        patch_dirs.push_back(sdmc_load_dir);
+    }
     if (load_dir != nullptr) {
         const auto load_patch_dirs = load_dir->GetSubdirectories();
         patch_dirs.insert(patch_dirs.end(), load_patch_dirs.begin(), load_patch_dirs.end());
@@ -565,12 +602,18 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
 
     const auto disabled = GetDisabledAddons();
     std::vector<std::string_view> applied_builtins;
+    std::vector<std::string_view> replaced;
     for (const auto& patch : BUILTIN_PATCHES) {
         if (patch.title_id != title_id || patch.module != name) {
             continue;
         }
         if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
+            continue;
+        }
+        if (std::find(replaced.cbegin(), replaced.cend(), patch.name) != replaced.cend()) {
+            LOG_INFO(Loader, "    - Skipping \"{}\": included in an applied built-in patch",
+                     patch.name);
             continue;
         }
         if (patch.build_id != build_id) {
@@ -663,6 +706,9 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         LOG_INFO(Loader, "    - Applying built-in patch \"{}\" ({} records) to {}", patch.name,
                  patch.records.size(), name);
         applied_builtins.push_back(patch.name);
+        if (!patch.replaces.empty()) {
+            replaced.push_back(patch.replaces);
+        }
     }
 
     if (out.size() < sizeof(Loader::NSOHeader)) {
@@ -757,8 +803,8 @@ bool PatchManager::CollectLayeredFSDirs(ContentRecordType type, std::vector<Virt
     if (load_dir != nullptr) {
         patch_dirs = load_dir->GetSubdirectories();
     }
-    if (sdmc_load_dir != nullptr &&
-        std::find(disabled.cbegin(), disabled.cend(), "SDMC") == disabled.cend()) {
+    if (std::find(disabled.cbegin(), disabled.cend(), "SDMC") == disabled.cend() &&
+        sdmc_load_dir != nullptr) {
         patch_dirs.push_back(sdmc_load_dir);
     }
     std::sort(patch_dirs.begin(), patch_dirs.end(),
@@ -1280,11 +1326,22 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
         if (patch.title_id != title_id) {
             continue;
         }
-        const auto patch_disabled =
-            std::find(disabled.begin(), disabled.end(), patch.name) != disabled.end();
-        out.push_back({.enabled = !patch_disabled,
+        const auto is_disabled = [&](std::string_view name) {
+            return std::find(disabled.begin(), disabled.end(), name) != disabled.end();
+        };
+        // Name an enabled built-in that contains this one, so unchecking only this one is not
+        // mistaken for turning the change off. Whether it applies is only known in PatchNSO (a
+        // user mod can make it skip), hence "when it applies".
+        const auto replacing = std::ranges::find_if(BUILTIN_PATCHES, [&](const BuiltinPatch& other) {
+            return other.title_id == title_id && other.replaces == patch.name &&
+                   !is_disabled(other.name);
+        });
+        out.push_back({.enabled = !is_disabled(patch.name),
                        .name = std::string{patch.name},
-                       .version = "IPS",
+                       .version = replacing != BUILTIN_PATCHES.end()
+                                      ? fmt::format("IPS, replaced by {} when it applies",
+                                                    replacing->name)
+                                      : std::string{"IPS"},
                        .type = PatchType::Mod,
                        .program_id = title_id,
                        .title_id = title_id,

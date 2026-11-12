@@ -120,7 +120,14 @@ inline void MemoryManager::SetBigPageContinuous(size_t big_page_index, bool valu
         (~(1ULL << sub_index) & continuous_mask) | (value ? 1ULL << sub_index : 0);
 }
 
+/// Maps, reserves, or frees small pages in [gpu_addr, +size). A range that does not lie
+/// entirely in the address space is left unchanged.
 GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, MemoryManager::EntryType entry_type) {
+    if (size != 0 && (!IsWithinGPUAddressRange(gpu_addr) || size > address_space_size - gpu_addr)) {
+        LOG_ERROR(HW_GPU, "GPU mapping {:#x}+{:#x} is outside the {:#x}-byte address space",
+                  gpu_addr, size, address_space_size);
+        return gpu_addr;
+    }
     [[maybe_unused]] u64 remaining_size{size};
     if (entry_type == EntryType::Mapped) {
         page_table.ReserveRange(gpu_addr, size);
@@ -165,7 +172,14 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
     return gpu_addr;
 }
 
+/// Maps, reserves, or frees big pages in [gpu_addr, +size). A range that does not lie
+/// entirely in the address space is left unchanged.
 GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, MemoryManager::EntryType entry_type) {
+    if (size != 0 && (!IsWithinGPUAddressRange(gpu_addr) || size > address_space_size - gpu_addr)) {
+        LOG_ERROR(HW_GPU, "GPU mapping {:#x}+{:#x} is outside the {:#x}-byte address space",
+                  gpu_addr, size, address_space_size);
+        return gpu_addr;
+    }
     [[maybe_unused]] u64 remaining_size{size};
     GPUVAddr modified_start{};
     u64 modified_size{};
@@ -316,6 +330,18 @@ T MemoryManager::Read(GPUVAddr addr) const {
 
 template <typename T>
 void MemoryManager::Write(GPUVAddr addr, T data) {
+    // A download for a guest read not yet in guest memory would land over this write later.
+    if (VideoCore::g_read_downloads.load(std::memory_order_relaxed) != 0) {
+        if (const auto address = GpuToCpuAddress(addr);
+            address && rasterizer != nullptr &&
+            VideoCore::ReadDownloadsMayCover(*address, sizeof(T))) {
+            if (VideoCore::ReadCheckWrites::Enabled()) {
+                VideoCore::ReadCheckWrites::Note(*address, sizeof(T),
+                                                 "MemoryManager::Write (a semaphore or report)");
+            }
+            rasterizer->FinishRead(*address, sizeof(T));
+        }
+    }
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
         // NOTE: Avoid adding any extra logic to this fast-path block
         std::memcpy(page_pointer, &data, sizeof(T));
@@ -516,8 +542,24 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
     auto just_advance = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
+    // A download for a guest read not yet in guest memory would land over this write later.
+    const auto finish_reads = [this, unsafe](DAddr dev_addr, std::size_t amount) {
+        if (VideoCore::g_read_downloads.load(std::memory_order_relaxed) != 0) {
+            if (rasterizer != nullptr && VideoCore::ReadDownloadsMayCover(dev_addr, amount)) {
+                if (VideoCore::ReadCheckWrites::Enabled()) {
+                    VideoCore::ReadCheckWrites::Note(
+                        dev_addr, amount,
+                        unsafe ? "MemoryManager::WriteBlockUnsafe/Cached (inline-to-memory or "
+                                 "constant buffer data)"
+                               : "MemoryManager::WriteBlock");
+                }
+                rasterizer->FinishRead(dev_addr, amount);
+            }
+        }
+    };
     auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
         const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
+        finish_reads(dev_addr_base, copy_amount);
         if (!unsafe) {
             rasterizer->PrepareRegionWrite(dev_addr_base, copy_amount, which);
         }
@@ -532,6 +574,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
     };
     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
         const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
+        finish_reads(dev_addr_base, copy_amount);
         if (!unsafe) {
             rasterizer->PrepareRegionWrite(dev_addr_base, copy_amount, which);
         }
@@ -948,6 +991,16 @@ MemoryManager::GetSubmappedRange(GPUVAddr gpu_addr, std::size_t size) const {
     return result;
 }
 
+boost::container::small_vector<std::pair<DAddr, std::size_t>, 32>
+MemoryManager::GetSubmappedDeviceRange(GPUVAddr gpu_addr, std::size_t size) const {
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> result{};
+    if (IsWithinGPUAddressRange(gpu_addr)) {
+        GetSubmappedRangeImpl<false>(
+            gpu_addr, (std::min<u64>)(size, address_space_size - gpu_addr), result);
+    }
+    return result;
+}
+
 template <bool is_gpu_address>
 void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, boost::container::small_vector<std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>& result)
     const {
@@ -1018,7 +1071,6 @@ void MemoryManager::FlushCaching() {
     if (accumulator.InvalidateAll([this](GPUVAddr addr, size_t size) {
         GetSubmappedRangeImpl<false>(addr, size, page_stash2);
     })) {
-        VideoCommon::Nx2FastDraw::NoteInvalidation();
         rasterizer->InnerInvalidation(page_stash2);
         page_stash2.clear();
     }

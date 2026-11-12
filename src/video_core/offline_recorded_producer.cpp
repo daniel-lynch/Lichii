@@ -281,7 +281,7 @@ RecordedOutcome ProduceRecorded(const std::filesystem::path& source,
                     file.read(reinterpret_cast<char*>(&count), sizeof(count));
                     if (count == 0 || count > 6) throw std::runtime_error("invalid_environment_count");
                     std::vector<FileEnvironment> envs(count);
-                    for (auto& env : envs) env.Deserialize(file);
+                    for (auto& env : envs) env.Deserialize(file, end);
                     std::array<u64, 6> hashes{};
                     u64 pipeline{};
                     Vulkan::GraphicsPipelineCacheKey graphics_key{};

@@ -57,13 +57,18 @@ namespace {
 //     are still read; their Info layout is recognised from their records (DetectInfoLayout).
 // 12: The configuration covers storage-buffer capacity/accounting and grass A/B translation
 //     policy, including the device's per-stage storage-buffer limit.
-constexpr u32 FormatVersion = 12;
+// 13: upstream nx2 111d0c6ef5 merge (C17.5): Info::uses_cooperative_matrix (#582), Profile
+//     max_compute_shared_memory_size + support_cooperative_hmma_16x16x16 (#582/#583), RuntimeInfo
+//     noperspective outputs/inputs (#820) and mesh emulation (#569) in the variant digest. Older
+//     files keep being read (recipe sources for the producer): their Info lacks
+//     uses_cooperative_matrix (InfoLayout::NoCooperativeMatrix, read as false).
+constexpr u32 FormatVersion = 13;
 // The oldest version still read. Its records keep their meaning; only the Info layout differs.
 constexpr u32 OldestReadableVersion = 10;
 // The version folded into the configuration digest: the last version that changed what records
 // mean. A layout-only bump keeps it, so a version-10 file of the same translator and
 // configuration still matches (and is upgraded to the current layout when opened for writing).
-constexpr u32 DigestFormatVersion = 12;
+constexpr u32 DigestFormatVersion = 13;
 constexpr std::array<char, 8> FileMagic{'L', 'X', 'T', 'R', 'A', 'N', 'S', 'C'};
 constexpr u32 RecordMagic = 0x52435453; // "STCR"
 constexpr u8 RecordEntry = 0;
@@ -129,7 +134,8 @@ consteval size_t CountFields() {
     POD(uses_atomic_f16x2_max) POD(uses_atomic_f32x2_add) POD(uses_atomic_f32x2_min)              \
     POD(uses_atomic_f32x2_max) POD(uses_atomic_s32_min) POD(uses_atomic_s32_max)                   \
     POD(uses_int64_bit_atomics) POD(uses_global_memory) POD(requires_coherent_global_memory)      \
-    POD(requires_coherent_image_memory) POD(native_global_bounds) POD(native_global_stats)        \
+    POD(requires_coherent_image_memory) POD(uses_cooperative_matrix) POD(native_global_bounds)    \
+    POD(native_global_stats)                                                                       \
     VEC(native_indirect_slots) POD(uses_atomic_image_u32)                                          \
     POD(uses_shadow_lod) POD(uses_rescaling_uniform) POD(uses_cbuf_indirect)                       \
     POD(uses_render_area) POD(used_constant_buffer_types) POD(used_storage_buffer_types)          \
@@ -139,7 +145,7 @@ consteval size_t CountFields() {
     VEC(storage_buffers_descriptors) VEC(texture_buffer_descriptors)                               \
     VEC(image_buffer_descriptors) VEC(texture_descriptors) VECVEC(handle_programs)                 \
     VEC(image_descriptors)
-constexpr size_t InfoFields = 89;
+constexpr size_t InfoFields = 90;
 
 #define TRANSLATION_CACHE_PROFILE_FIELDS(X) \
     X(supported_spirv) X(unified_descriptor_binding) X(support_descriptor_aliasing) \
@@ -175,11 +181,11 @@ constexpr size_t InfoFields = 89;
     X(has_broken_spirv_subgroup_mask_vector_extract_dynamic) \
     X(has_broken_spirv_subgroup_shuffle) X(has_broken_spirv_fragment_shuffle) X(max_subgroup_size) X(gl_max_compute_smem_size) \
     X(has_broken_robust) X(min_ssbo_alignment) X(max_user_clip_distances) \
-    X(support_cooperative_hmma)
-constexpr size_t ProfileFields = 77;
+    X(support_cooperative_hmma) X(support_cooperative_hmma_16x16x16) X(max_compute_shared_memory_size)
+constexpr size_t ProfileFields = 79;
 
 constexpr size_t HostFields = 23;
-constexpr size_t RuntimeInfoFields = 19;
+constexpr size_t RuntimeInfoFields = 27;
 constexpr size_t ProgramFields = 13;
 constexpr size_t BindingsFields = 7;
 
@@ -345,7 +351,15 @@ private:
 
 // Whether a layout serializes a field of TRANSLATION_CACHE_INFO_FIELDS.
 constexpr bool InfoLayoutHas(InfoLayout layout, std::string_view field) {
-    return layout == InfoLayout::Current || field != "frag_color_components";
+    switch (layout) {
+    case InfoLayout::Current:
+        return true;
+    case InfoLayout::NoCooperativeMatrix:
+        return field != "uses_cooperative_matrix";
+    case InfoLayout::NoFragColorComponents:
+        return field != "frag_color_components" && field != "uses_cooperative_matrix";
+    }
+    return true;
 }
 
 bool SkipInfo(FramedReader& reader, InfoLayout layout, Shader::Info* catalog_info = nullptr) {
@@ -1300,6 +1314,8 @@ Digest DigestRuntimeInfo(const Shader::RuntimeInfo& info) {
     hasher.Add(info.generic_input_types);
     hasher.Add(info.previous_stage_stores.mask);
     hasher.Add(info.per_primitive_generics.to_ullong());
+    hasher.Add(info.noperspective_outputs.to_ullong());
+    hasher.Add(info.scaled_noperspective_inputs);
     hasher.Add(static_cast<u64>(info.previous_stage_legacy_stores_mapping.size()));
     for (const auto& [from, to] : info.previous_stage_legacy_stores_mapping) {
         hasher.Add(from);
@@ -1325,6 +1341,12 @@ Digest DigestRuntimeInfo(const Shader::RuntimeInfo& info) {
     }
     hasher.Add(info.color_output_types);
     hasher.Add(info.dual_source_blend);
+    hasher.Add(info.mesh_as_compute);
+    hasher.Add(info.mesh_output_binding);
+    hasher.Add(info.mesh_task_payload_binding);
+    hasher.Add(info.mesh_task_offsets_binding);
+    hasher.Add(info.mesh_task_args_binding);
+    hasher.Add(info.mesh_task_payload_stride);
     return hasher.Finish();
 }
 
@@ -1722,19 +1744,27 @@ InfoLayout DetectInfoLayout(std::ifstream& in, u64 size) {
         offset += 8 + u64{length};
         if (data[0] != RecordEntry && data[0] != RecordVariant) continue;
         ++examined;
-        const bool current = FindInfoSpan(data, InfoLayout::Current).has_value();
+        const bool current = FindInfoSpan(data, InfoLayout::NoCooperativeMatrix).has_value();
         const bool legacy = FindInfoSpan(data, InfoLayout::NoFragColorComponents).has_value();
         if (current != legacy) ++votes[current ? 0 : 1];
         if (votes[0] + votes[1] >= 8) break;
     }
     in.clear();
     // Without a decisive record the layout does not matter; 88 fields is what 10 first meant.
-    return votes[0] > votes[1] ? InfoLayout::Current : InfoLayout::NoFragColorComponents;
+    return votes[0] > votes[1] ? InfoLayout::NoCooperativeMatrix
+                               : InfoLayout::NoFragColorComponents;
 }
 
 std::string_view InfoLayoutName(InfoLayout layout) {
-    return layout == InfoLayout::Current ? "89-field (with frag_color_components)"
-                                         : "88-field (before frag_color_components)";
+    switch (layout) {
+    case InfoLayout::Current:
+        return "90-field (with uses_cooperative_matrix)";
+    case InfoLayout::NoCooperativeMatrix:
+        return "89-field (with frag_color_components, before uses_cooperative_matrix)";
+    case InfoLayout::NoFragColorComponents:
+        break;
+    }
+    return "88-field (before frag_color_components)";
 }
 
 // Rewrites a version-10 file as version 11 so records appended in the current layout follow
@@ -2018,7 +2048,7 @@ bool Store::LoadFile(const std::filesystem::path& path, const Digest& config, bo
     }
     info_layout = InfoLayout::Current;
     if (version < FormatVersion) {
-        info_layout = DetectInfoLayout(in, size);
+        info_layout = version == 10 ? DetectInfoLayout(in, size) : InfoLayout::NoCooperativeMatrix;
         LOG_INFO(Render_Vulkan, "Translation cache: {} is format {} with the {} info layout",
                  Common::FS::PathToUTF8String(path.filename()), version,
                  InfoLayoutName(info_layout));
