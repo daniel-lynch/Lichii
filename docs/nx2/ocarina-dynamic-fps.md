@@ -174,6 +174,29 @@ slots of `{u64 counter address, f32 remainder, pad}` at `+0x10`. The range
 and the sound gate (state through `+0xA8`, caves `0x3C46280` and `0x3C46800`), so the
 three patches share the timer state without overlapping.
 
+## FPS Unlock ground velocity
+
+The character controller compares a frame-rate value with `100.0` in three places; above it
+(`b.gt` at `0x13A070`, `0x13D710` and `0x389AC2C`) it scales its ground's velocity by `0.1`
+(`0x3E40FB4`). Over 100 fps a moving platform then slides away under the player.
+`FPS Unlock (built-in)` replaces the three branches with `nop`. `Dynamic FPS by Dark (built-in)`
+never exceeds 60 fps and leaves them alone. Measured on the Deku Tree B1 raft: the applied
+velocity was 0.100 of the ground's at steps below 0.6 and 1.000 at steps of 0.627 and above.
+
+## FPS Unlock turn speed
+
+The turn action at `0x261E8E0` (`ExecuteASApproachStickX`; Gohma steers with it while walking)
+keeps a turn speed per 60 Hz frame at `+0x24`. It ends by clamping that speed to the change it
+applied this frame times the frame step (`fmul` at `0x261EB18` and `0x261EB1C`). The change already
+carries the step, so below a step of 1 the speed decays by step² every frame. At 150 fps Gohma then
+steered at 0.045 rad/s instead of about 1 rad/s and walked into the wall of her room.
+
+`FPS Unlock (built-in)` branches at `0x261EB18` to 40 bytes at `0x3C46A40`, in guarded zero-filled
+executable padding. Below a step of 1 the bounds become ±(applied change / step), which keeps the
+speed; at 1 and above the routine runs the game's two instructions. The hook record checks both
+replaced instructions, so a user mod at either one skips the patch. Measured live at step 0.65 with
+the fix: 0.94 rad/s median while she walks on the ceiling, matching 0.75 to 1.1 rad/s at 60 fps.
+
 ## Tests
 
 The `[patch_manager]` tests call production `PatchManager::PatchNSO` with

@@ -76,6 +76,13 @@ constexpr std::string_view SoundFeed = "001140BD10102E1E0068301EC0035FD6";
 constexpr u32 DynamicCallInstruction = 0x94D57D4F;
 constexpr u32 DynamicOriginalInstruction = 0x1E201828;
 constexpr u32 RealTimeHookInstruction = 0x14D57D48;
+constexpr size_t TurnSpeedHookOffset = sizeof(Loader::NSOHeader) + 0x261EB18;
+constexpr u32 TurnSpeedOriginalInstruction = 0x1E210801;
+constexpr u32 TurnSpeedHookInstruction = 0x14589FCA;
+// The second instruction the routine replaces; the hook guards it and leaves it in place.
+constexpr u32 TurnSpeedSecondInstruction = 0x1E280800;
+constexpr size_t TurnSpeedRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46A40;
+constexpr size_t TurnSpeedRoutineSize = 40;
 
 constexpr size_t StepRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46900;
 constexpr size_t StepStateSize = 0x1C0;
@@ -333,6 +340,13 @@ TEST_CASE("Built-in Max Resolution patch is listed and loaded for Ocarina's main
 
 namespace {
 
+// The three "frame rate over 100" branches FPS Unlock removes, with their original words.
+constexpr std::array<std::pair<size_t, u32>, 3> GroundVelocityBranches{{
+    {sizeof(Loader::NSOHeader) + 0x13A070, 0x5400196C},
+    {sizeof(Loader::NSOHeader) + 0x13D710, 0x54001E2C},
+    {sizeof(Loader::NSOHeader) + 0x389AC2C, 0x540017CC},
+}};
+
 std::vector<u8> MakeDynamicMain() {
     auto nso = MakeMain(OcarinaBuildId, TbzInstruction);
     nso.resize(DynamicStateOffset + StepStateSize);
@@ -365,6 +379,11 @@ std::vector<u8> MakeDynamicMain() {
         0x3F, 0x05, 0x00, 0x71, 0x29, 0xC5, 0x9F, 0x1A,
     };
     std::copy(hitstop_original.begin(), hitstop_original.end(), nso.begin() + HitstopHookOffset);
+    for (const auto& [offset, original] : GroundVelocityBranches) {
+        std::memcpy(nso.data() + offset, &original, sizeof(original));
+    }
+    std::memcpy(nso.data() + TurnSpeedHookOffset, &TurnSpeedOriginalInstruction, sizeof(u32));
+    std::memcpy(nso.data() + TurnSpeedHookOffset + 4, &TurnSpeedSecondInstruction, sizeof(u32));
     return nso;
 }
 
@@ -440,6 +459,12 @@ TEST_CASE("Built-in FPS Unlock and Dynamic FPS yield to the real-time patch, the
     REQUIRE(routine(patched, UnlockRoutineSize) ==
             std::string{RoutineHead} + "E300001C4268231EC300001C4278231E4840201EC0035FD6"
                                        "1F2003D50AD7A33C0000C040");
+    REQUIRE(WordAt(patched, TurnSpeedHookOffset) == TurnSpeedHookInstruction);
+    REQUIRE(WordAt(patched, TurnSpeedHookOffset + 4) == TurnSpeedSecondInstruction);
+    REQUIRE(Common::HexToString(
+                std::span{patched}.subspan(TurnSpeedRoutineOffset, TurnSpeedRoutineSize)) ==
+            "01102E1E0021211E8A0000540018281E0140211E3360A717E10F40BD0108211E0008281E"
+            "2F60A717");
     REQUIRE(WordAt(patched) == BranchInstruction);
     REQUIRE(water_patched(patched));
     REQUIRE(sound_gate_patched(patched));
@@ -465,6 +490,9 @@ TEST_CASE("Built-in FPS Unlock and Dynamic FPS yield to the real-time patch, the
     REQUIRE(water_patched(patched));
     // Dark's step stays at or above 1.0, so the sound manager keeps running every frame.
     REQUIRE(sound_gate_untouched(patched));
+    // The turn speed fix belongs to FPS Unlock only.
+    REQUIRE(WordAt(patched, TurnSpeedHookOffset) == TurnSpeedOriginalInstruction);
+    REQUIRE(WordAt(patched, TurnSpeedRoutineOffset) == 0);
 
     // All three unchecked: hook and code cave stay untouched.
     Settings::values.disabled_addons[OcarinaTitleId] = {
@@ -655,6 +683,37 @@ TEST_CASE("Built-in FPS Unlock defers transactionally to mods in step records", 
     REQUIRE(context.Manager().PatchNSO(nso, "main") == expected);
 }
 
+TEST_CASE("Built-in FPS Unlock removes the ground velocity branches", "[patch_manager]") {
+    PatchManagerTestContext context;
+    const auto manager = context.Manager();
+    auto nso = MakeDynamicMain();
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{RealTime}};
+    auto patched = manager.PatchNSO(nso, "main");
+    for (const auto& [offset, original] : GroundVelocityBranches) {
+        REQUIRE(WordAt(patched, offset) == NopInstruction);
+    }
+
+    // Dynamic FPS never exceeds 60 fps and keeps the game's branches.
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{RealTime}, std::string{FpsUnlock}};
+    patched = manager.PatchNSO(nso, "main");
+    REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicCallInstruction);
+    for (const auto& [offset, original] : GroundVelocityBranches) {
+        REQUIRE(WordAt(patched, offset) == original);
+    }
+
+    // Another branch at one of the sites skips all of FPS Unlock.
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{RealTime}, std::string{DynamicFps}};
+    for (const auto& [changed, word] : GroundVelocityBranches) {
+        auto other = nso;
+        other[changed] ^= 1;
+        patched = manager.PatchNSO(other, "main");
+        REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicOriginalInstruction);
+        for (const auto& [offset, original] : GroundVelocityBranches) {
+            REQUIRE(WordAt(patched, offset) == WordAt(other, offset));
+        }
+    }
+}
+
 TEST_CASE("Built-in Dynamic FPS rejects mismatched or truncated modules transactionally",
           "[patch_manager]") {
     PatchManagerTestContext context;
@@ -812,6 +871,45 @@ TEST_CASE("PatchNSO reports which built-in patches applied", "[patch_manager]") 
         REQUIRE_FALSE(has(applied, DynamicFps));
         REQUIRE_FALSE(has(applied, FpsUnlock));
     }
+}
+
+TEST_CASE("Built-in FPS Unlock validates the turn speed records before writing", "[patch_manager]") {
+    PatchManagerTestContext context;
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution},
+                                                        std::string{DynamicFps},
+                                                        std::string{RealTime}};
+    auto nso = MakeDynamicMain();
+    SECTION("Wrong turn speed original") {
+        nso[TurnSpeedHookOffset] ^= 1;
+    }
+    SECTION("Wrong second turn speed instruction") {
+        nso[TurnSpeedHookOffset + 4] ^= 1;
+    }
+    SECTION("Nonzero turn speed cave") {
+        nso[TurnSpeedRoutineOffset + TurnSpeedRoutineSize - 1] = 1;
+    }
+    REQUIRE(context.Manager().PatchNSO(nso, "main") == nso);
+}
+
+TEST_CASE("Built-in FPS Unlock leaves all records alone when a user mod changes the turn speed fix",
+          "[patch_manager]") {
+    size_t offset = TurnSpeedHookOffset;
+    SECTION("User turn speed hook takes precedence") {}
+    SECTION("User second turn speed instruction takes precedence") {
+        offset = TurnSpeedHookOffset + 4;
+    }
+    SECTION("User turn speed routine takes precedence") {
+        offset = TurnSpeedRoutineOffset;
+    }
+    constexpr u32 mod_word = 0x11223344;
+    PatchManagerTestContext context{mod_word, offset};
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution},
+                                                        std::string{DynamicFps},
+                                                        std::string{RealTime}};
+    const auto nso = MakeDynamicMain();
+    auto expected = nso;
+    std::memcpy(expected.data() + offset, &mod_word, sizeof(mod_word));
+    REQUIRE(context.Manager().PatchNSO(nso, "main") == expected);
 }
 
 TEST_CASE("Built-in Texture Pool x2 doubles the allocator's initial pool size",

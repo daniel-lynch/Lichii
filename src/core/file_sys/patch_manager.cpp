@@ -276,6 +276,35 @@ constexpr std::array<u8, 60> STEP_AMBIENT_ROUTINE{
     0xB8, 0xE3, 0x23, 0x17,
 };
 
+// The character controller takes a tenth of its ground's velocity once the frame rate is over
+// 100 (b.gt after fcmp with 100.0, in three places), so a moving platform leaves the player behind.
+constexpr std::array<u8, 4> GROUND_VELOCITY_ORIGINAL_A{
+    0x6C, 0x19, 0x00, 0x54,
+};
+constexpr std::array<u8, 4> GROUND_VELOCITY_ORIGINAL_B{
+    0x2C, 0x1E, 0x00, 0x54,
+};
+constexpr std::array<u8, 4> GROUND_VELOCITY_ORIGINAL_C{
+    0xCC, 0x17, 0x00, 0x54,
+};
+constexpr std::array<u8, 4> GROUND_VELOCITY_NOP{
+    0x1F, 0x20, 0x03, 0xD5,
+};
+// A turn action (main+0x261E8E0, ExecuteASApproachStickX; Gohma steers with it) ends by clamping
+// its turn speed, kept per 60 Hz frame, to the change it applied times the frame step. The change
+// already carries the step, so below a step of 1 the speed decays by step^2 every frame. The routine
+// divides by the step there instead and runs the game's two instructions at a step of 1 and above.
+// The routine replaces both fmul (0x261EB18 and 0x261EB1C) and returns to 0x261EB20, so the hook
+// guards both; the second instruction stays in place, unreached.
+constexpr std::array<u8, 8> TURN_SPEED_ORIGINAL{0x01, 0x08, 0x21, 0x1E, 0x00, 0x08, 0x28, 0x1E};
+constexpr std::array<u8, 8> TURN_SPEED_HOOK{0xCA, 0x9F, 0x58, 0x14, 0x00, 0x08, 0x28, 0x1E};
+// fmov s1, #1.0 ; fcmp s8, s1 ; b.ge +0x10 ; fdiv s0, s0, s8 ; fneg s1, s0 ; b 0x261EB20 ;
+// ldr s1, [sp, #0xc] ; fmul s1, s0, s1 ; fmul s0, s0, s8 ; b 0x261EB20
+constexpr std::array<u8, 40> TURN_SPEED_ROUTINE{
+    0x01, 0x10, 0x2E, 0x1E, 0x00, 0x21, 0x21, 0x1E, 0x8A, 0x00, 0x00, 0x54, 0x00, 0x18,
+    0x28, 0x1E, 0x01, 0x40, 0x21, 0x1E, 0x33, 0x60, 0xA7, 0x17, 0xE1, 0x0F, 0x40, 0xBD,
+    0x01, 0x08, 0x21, 0x1E, 0x00, 0x08, 0x28, 0x1E, 0x2F, 0x60, 0xA7, 0x17,
+};
 constexpr std::array FPS_UNLOCK_RECORDS{
     BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
     BuiltinPatchRecord{0x3C46200, FPS_UNLOCK_ROUTINE, {}, true},
@@ -295,6 +324,11 @@ constexpr std::array FPS_UNLOCK_RECORDS{
     BuiltinPatchRecord{0x53F914, STEP_AMBIENT_HOOK, STEP_AMBIENT_ORIGINAL},
     BuiltinPatchRecord{0x3C46A00, STEP_AMBIENT_ROUTINE, {}, true},
     BuiltinPatchRecord{0x3C46980, STEP_SHARED_ROUTINE, {}, true},
+    BuiltinPatchRecord{0x13A070, GROUND_VELOCITY_NOP, GROUND_VELOCITY_ORIGINAL_A},
+    BuiltinPatchRecord{0x13D710, GROUND_VELOCITY_NOP, GROUND_VELOCITY_ORIGINAL_B},
+    BuiltinPatchRecord{0x389AC2C, GROUND_VELOCITY_NOP, GROUND_VELOCITY_ORIGINAL_C},
+    BuiltinPatchRecord{0x261EB18, TURN_SPEED_HOOK, TURN_SPEED_ORIGINAL},
+    BuiltinPatchRecord{0x3C46A40, TURN_SPEED_ROUTINE, {}, true},
 };
 
 constexpr std::array BUILTIN_PATCHES{
