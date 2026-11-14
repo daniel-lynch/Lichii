@@ -88,6 +88,14 @@ constexpr u32 MovieFramesOriginalInstruction = 0x11000508; // add w8, w8, #1
 constexpr u32 MovieFramesHookInstruction = 0x1403A8AA;     // b main+0x3C46A70
 constexpr size_t MovieFramesRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46A70;
 constexpr size_t MovieFramesRoutineSize = 56;
+constexpr u32 ScarecrowCutOriginalInstruction = 0x1E390008; // fcvtzu w8, s0
+constexpr size_t ScarecrowRecordHookOffset = sizeof(Loader::NSOHeader) + 0x3296B08;
+constexpr u32 ScarecrowRecordHookInstruction = 0x1426BFEA; // b main+0x3C46AB0
+constexpr size_t ScarecrowRecordRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46AB0;
+constexpr size_t ScarecrowLastHookOffset = sizeof(Loader::NSOHeader) + 0x32926C8;
+constexpr u32 ScarecrowLastHookInstruction = 0x1426D104; // b main+0x3C46AD8
+constexpr size_t ScarecrowLastRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46AD8;
+constexpr size_t ScarecrowRoutineSize = 40;
 
 constexpr size_t StepRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46900;
 constexpr size_t StepStateSize = 0x1C0;
@@ -390,6 +398,10 @@ std::vector<u8> MakeDynamicMain() {
     std::memcpy(nso.data() + TurnSpeedHookOffset, &TurnSpeedOriginalInstruction, sizeof(u32));
     std::memcpy(nso.data() + TurnSpeedHookOffset + 4, &TurnSpeedSecondInstruction, sizeof(u32));
     std::memcpy(nso.data() + MovieFramesHookOffset, &MovieFramesOriginalInstruction, sizeof(u32));
+    std::memcpy(nso.data() + ScarecrowRecordHookOffset, &ScarecrowCutOriginalInstruction,
+                sizeof(u32));
+    std::memcpy(nso.data() + ScarecrowLastHookOffset, &ScarecrowCutOriginalInstruction,
+                sizeof(u32));
     return nso;
 }
 
@@ -476,6 +488,16 @@ TEST_CASE("Built-in FPS Unlock and Dynamic FPS yield to the real-time patch, the
                 std::span{patched}.subspan(MovieFramesRoutineOffset, MovieFramesRoutineSize)) ==
             "ED3BBDA9EF4301A9FE1300F98DE20B91CE810090CE4944F9CE0140F9C01140BDBCFFFF97"
             "08010D0BFE1340F9EF4341A9ED3BC3A84A57FC17");
+    REQUIRE(WordAt(patched, ScarecrowRecordHookOffset) == ScarecrowRecordHookInstruction);
+    REQUIRE(Common::HexToString(std::span{patched}.subspan(ScarecrowRecordRoutineOffset,
+                                                           ScarecrowRoutineSize)) ==
+            "ED3BBDA9EF4301A9FE1300F9ED0309AAB0FFFF97E8030D2AFE1340F9EF4341A9ED3BC3A8"
+            "0E40D917");
+    REQUIRE(WordAt(patched, ScarecrowLastHookOffset) == ScarecrowLastHookInstruction);
+    REQUIRE(Common::HexToString(
+                std::span{patched}.subspan(ScarecrowLastRoutineOffset, ScarecrowRoutineSize)) ==
+            "ED3BBDA9EF4301A9FE1300F98DF21791A6FFFF97E8030D2AFE1340F9EF4341A9ED3BC3A8"
+            "F42ED917");
     REQUIRE(WordAt(patched) == BranchInstruction);
     REQUIRE(water_patched(patched));
     REQUIRE(sound_gate_patched(patched));
@@ -507,6 +529,11 @@ TEST_CASE("Built-in FPS Unlock and Dynamic FPS yield to the real-time patch, the
     // So does the movie frame count, since its helper is FPS Unlock's.
     REQUIRE(WordAt(patched, MovieFramesHookOffset) == MovieFramesOriginalInstruction);
     REQUIRE(WordAt(patched, MovieFramesRoutineOffset) == 0);
+    // So do the Scarecrow's Song recording counters, since their helper is FPS Unlock's.
+    REQUIRE(WordAt(patched, ScarecrowRecordHookOffset) == ScarecrowCutOriginalInstruction);
+    REQUIRE(WordAt(patched, ScarecrowRecordRoutineOffset) == 0);
+    REQUIRE(WordAt(patched, ScarecrowLastHookOffset) == ScarecrowCutOriginalInstruction);
+    REQUIRE(WordAt(patched, ScarecrowLastRoutineOffset) == 0);
 
     // All three unchecked: hook and code cave stay untouched.
     Settings::values.disabled_addons[OcarinaTitleId] = {
@@ -949,6 +976,53 @@ TEST_CASE("Built-in FPS Unlock leaves all records alone when a user mod changes 
     SECTION("User movie frame count hook takes precedence") {}
     SECTION("User movie frame count routine takes precedence") {
         offset = MovieFramesRoutineOffset;
+    }
+    constexpr u32 mod_word = 0x11223344;
+    PatchManagerTestContext context{mod_word, offset};
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution},
+                                                        std::string{DynamicFps},
+                                                        std::string{RealTime}};
+    const auto nso = MakeDynamicMain();
+    auto expected = nso;
+    std::memcpy(expected.data() + offset, &mod_word, sizeof(mod_word));
+    REQUIRE(context.Manager().PatchNSO(nso, "main") == expected);
+}
+
+TEST_CASE("Built-in FPS Unlock validates the Scarecrow's Song records before writing",
+          "[patch_manager]") {
+    PatchManagerTestContext context;
+    Settings::values.disabled_addons[OcarinaTitleId] = {std::string{MaxResolution},
+                                                        std::string{DynamicFps},
+                                                        std::string{RealTime}};
+    auto nso = MakeDynamicMain();
+    SECTION("Wrong recording original") {
+        nso[ScarecrowRecordHookOffset] ^= 1;
+    }
+    SECTION("Wrong last note original") {
+        nso[ScarecrowLastHookOffset] ^= 1;
+    }
+    SECTION("Nonzero recording cave") {
+        nso[ScarecrowRecordRoutineOffset + ScarecrowRoutineSize - 1] = 1;
+    }
+    SECTION("Nonzero last note cave") {
+        nso[ScarecrowLastRoutineOffset + ScarecrowRoutineSize - 1] = 1;
+    }
+    REQUIRE(context.Manager().PatchNSO(nso, "main") == nso);
+}
+
+TEST_CASE("Built-in FPS Unlock leaves all records alone when a user mod changes the Scarecrow's "
+          "Song fix",
+          "[patch_manager]") {
+    size_t offset = ScarecrowRecordHookOffset;
+    SECTION("User recording hook takes precedence") {}
+    SECTION("User last note hook takes precedence") {
+        offset = ScarecrowLastHookOffset;
+    }
+    SECTION("User recording routine takes precedence") {
+        offset = ScarecrowRecordRoutineOffset;
+    }
+    SECTION("User last note routine takes precedence") {
+        offset = ScarecrowLastRoutineOffset;
     }
     constexpr u32 mod_word = 0x11223344;
     PatchManagerTestContext context{mod_word, offset};
