@@ -24,6 +24,7 @@ add_executable(tests
     video_core/semaphore_waiters.cpp
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
+    core/nx2_thread_stats.cpp
     core/nx2_debug_server.cpp
     core/exec_coverage.cpp
     core/nx2_oot_time.cpp

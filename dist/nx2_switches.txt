@@ -153,3 +153,7 @@ EDEN_NX2_FENCE_BATCH=1
 # waits per second" line (busy, idle, idle hook submits, present and GPU waits). Unlike
 # EDEN_NX2_GPU_PROFILE it times only the waits and keeps the fast 3D method path on.
 #EDEN_NX2_GPU_WAITS=1
+# Guest CPU threads: every 10 s, per frame, the guest threads with the most time on a core (JIT,
+# outside it, ready, and waits by kind; the presenting thread is marked) and per core its busy
+# and idle ms/s, JIT time, exits and hints. Off: one bool check per JIT run and thread switch.
+#EDEN_NX2_GUEST_THREAD_STATS=1

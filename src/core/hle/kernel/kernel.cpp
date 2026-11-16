@@ -44,6 +44,7 @@
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_worker_task_manager.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/hle/kernel/physical_core.h"
 #include "core/hle/result.h"
 #include "core/hle/service/server_manager.h"
@@ -871,6 +872,7 @@ void KernelCore::SetMulticore(bool is_multicore) {
 }
 
 void KernelCore::Initialize() {
+    Nx2ThreadStats::ReadSwitch();
     slab_heap_container = std::make_unique<SlabHeapContainer>();
     impl->Initialize(*this);
 }
