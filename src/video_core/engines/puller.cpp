@@ -375,6 +375,10 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // counting those made the count odd ("suspended") at random, so submit-time snapshots were
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
+        // A resumed acquire is met: the CPU may have rewritten what the next draws read before it
+        // released. The suspension's fences (a deferred call) bump this already; said here so it
+        // doesn't rest on that.
+        VideoCommon::Nx2FastDraw::NoteSync();
         pending_acquire.reset();
         dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
         Nx2SemaphoreWaiters::Get().Remove(this);

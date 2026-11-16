@@ -1321,7 +1321,10 @@ void Maxwell3D::NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end) {
     const u64 tic_size = FastDrawHeadersSize(regs);
     const GPUVAddr tsc = regs.tex_sampler.Address();
     const u64 tsc_size = FastDrawSamplersSize(regs);
+    // A break here notes neither range, and with skip_cpu_inner_invalidation the buffer cache never
+    // hears of the write either: the next draw keeps no uniforms.
     if ((begin < tic + tic_size && tic < end) || (begin < tsc + tsc_size && tsc < end)) {
+        FastDraw::g_delta.no_uniform_keeps = true;
         FastDraw::Break(FastDraw::Reason::TextureHeaders);
         return;
     }
@@ -1336,6 +1339,7 @@ void Maxwell3D::NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end) {
             const DAddr device_end = *device + (page_end - page);
             if (fast_draw_header_spans.Intersects(*device, device_end) ||
                 fast_draw_sampler_spans.Intersects(*device, device_end)) {
+                FastDraw::g_delta.no_uniform_keeps = true;
                 FastDraw::Break(FastDraw::Reason::TextureHeaders);
                 return;
             }
