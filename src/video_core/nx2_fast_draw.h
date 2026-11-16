@@ -142,6 +142,37 @@ inline void Break(Reason reason, u32 method = 0) {
     }
 }
 
+/// EDEN_NX2_BACK_PLAIN_BREAKS=1 (off by default): the split's back ends draw reuse for other
+/// engines' methods and deferred calls (GpuSplit::Execute, about a thousand a frame) with plain
+/// stores instead of two locked adds, each a full barrier on x86.
+inline const bool g_back_plain_breaks = [] {
+    const char* const value = std::getenv("EDEN_NX2_BACK_PLAIN_BREAKS");
+    return value != nullptr && value[0] == '1';
+}();
+
+/// Break for the split's back thread only. The back is the one thread that records both serials
+/// (a draw's Serial, a uniform keep's SyncSerial) and compares them, and other threads only add to
+/// them. So a load and a store here may drop another thread's concurrent add, but never bring
+/// either serial back to a value the back recorded: every recorded value was the serial's value
+/// then, others' adds only raise it, and this stores one past what it loaded. After any break
+/// from any thread the serial differs from every value recorded before it, which is all a break
+/// promises.
+inline void BreakOnBack(Reason reason, u32 method = 0) {
+    if (!g_back_plain_breaks) {
+        Break(reason, method);
+        return;
+    }
+    if (reason != Reason::Register && reason != Reason::Method && reason != Reason::ConstantData &&
+        reason != Reason::TextureHeaders && reason != Reason::Invalidation) {
+        g_sync_serial.store(g_sync_serial.load(std::memory_order_relaxed) + 1,
+                            std::memory_order_release);
+    }
+    if (Enabled()) {
+        g_serial.store(g_serial.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
+    }
+}
+
 /// Unsplit counterparts of commands whose split entries already end draw reuse.
 inline void BreakUnsplit(Reason reason) {
     Break(reason);
