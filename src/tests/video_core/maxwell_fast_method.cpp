@@ -905,21 +905,16 @@ TEST_CASE("Split tells equal and mask acquires which queued work can still write
     REQUIRE(queued.has_value());
     CHECK(queued->position == released);
     CHECK(split.HasQueuedWritesAt(f.memory, word, 4));
-    CHECK_FALSE(split.HasWritesAtAfter(f.memory, word, 4, queued->position));
-    // Work that writes only what it notes, noted elsewhere, comes after it: still the last.
+    // Work that writes only what it notes (elsewhere), then work that may write anywhere.
     split.Defer([] {}, 0, Writes::Noted);
-    CHECK_FALSE(split.HasWritesAtAfter(f.memory, word, 4, queued->position));
-    // Work that may write anywhere comes after it.
     split.Defer([] {});
-    CHECK(split.HasWritesAtAfter(f.memory, word, 4, queued->position));
     // Once the back ran the release, it is no longer queued; what came after it still is.
     Access::SetBack(split, true, true, released);
     CHECK_FALSE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
     CHECK(split.HasQueuedWritesAt(f.memory, word, 4));
-    // Once it ran everything, nothing queued can write the word; what was sent stays sent.
+    // Once it ran everything, nothing queued can write the word.
     Access::SetBack(split, true, true, Access::End(split));
     CHECK_FALSE(split.HasQueuedWritesAt(f.memory, word, 4));
-    CHECK(split.HasWritesAtAfter(f.memory, word, 4, released));
 }
 
 TEST_CASE("Split publishes to a back that waits for work after a few words",

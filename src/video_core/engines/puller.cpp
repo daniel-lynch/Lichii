@@ -130,10 +130,7 @@ AcquireCheck CheckEqualMaskWithoutDrain(DmaPusher& dma_pusher, const Puller::Pen
     auto& stats = VideoCommon::g_acquire_stats;
     std::optional<VideoCommon::QueuedWordRelease> queued;
     if (const auto write = split.QueuedSemaphoreWriteAt(device)) {
-        queued = VideoCommon::QueuedWordRelease{
-            write->payload, write->known,
-            split.HasWritesAtAfter(dma_pusher.memory_manager, acquire.address, sizeof(u32),
-                                   write->position)};
+        queued = VideoCommon::QueuedWordRelease{write->payload, write->known};
     }
     // Before the word is read: a write the back runs in between is then either still seen as
     // queued here, or it ran and the read sees what it wrote (it stores `consumed` after).
@@ -153,9 +150,6 @@ AcquireCheck CheckEqualMaskWithoutDrain(DmaPusher& dma_pusher, const Puller::Pen
     case VideoCommon::EqualMaskStep::Met:
         VideoCommon::Count(stats.eqmask_met);
         return AcquireCheck::Met;
-    case VideoCommon::EqualMaskStep::MetByQueued:
-        VideoCommon::Count(stats.eqmask_by_queued);
-        return AcquireCheck::MetByQueued;
     case VideoCommon::EqualMaskStep::NotMet:
         return AcquireCheck::NotMet;
     case VideoCommon::EqualMaskStep::WaitForWrites:
@@ -166,10 +160,11 @@ AcquireCheck CheckEqualMaskWithoutDrain(DmaPusher& dma_pusher, const Puller::Pen
     }
     // Everything queued that can write the word ran: memory decides (WaitForWrites waits for the
     // last entry that may write anywhere, so for every release still queued too), as a drained
-    // read would. Like that read, it can't see a write that lands later, once the host GPU passed
+    // read would. eqmask_by_queued: the wait was for a queued release that meets the acquire. Like that read, it can't see a write that lands later, once the host GPU passed
     // a fence (fence-flagged releases, counter reports): the back ran it, memory doesn't hold it
     // yet. No idle hook: such a write latches the waiter when it lands.
     VideoCommon::Count(stats.eqmask_waits);
+    VideoCommon::Count(stats.eqmask_by_queued, queued ? 1 : 0);
     split.WaitForWrites(dma_pusher.memory_manager, acquire.address, sizeof(u32),
                         VideoCommon::DrainSite::AcquireWrites);
     // The work waited for may have been the first to make the page GPU-written (see above).

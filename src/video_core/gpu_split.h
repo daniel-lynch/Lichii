@@ -90,7 +90,7 @@ struct AcquireStats {
     std::atomic<u64> late{};       ///< VERIFY: a poll kept waiting, yet a drain meets it
     // EDEN_NX2_ACQUIRE_NODRAIN: equal and mask acquires and polls decided without a drain.
     std::atomic<u64> eqmask_met{};       ///< Met by the word in memory
-    std::atomic<u64> eqmask_by_queued{}; ///< Met by a queued release to the word
+    std::atomic<u64> eqmask_by_queued{}; ///< Of eqmask_waits: for a queued release that meets it
     std::atomic<u64> eqmask_waits{};     ///< Waited for the queued writes to the word first
     std::atomic<u64> eqmask_not_met{};   ///< Not met: polled again later
     std::atomic<u64> eqmask_mismatches{}; ///< VERIFY: of mismatches, equal or mask acquires
@@ -445,11 +445,6 @@ public:
     /// Whether an entry WaitForWrites would wait for is still queued.
     [[nodiscard]] bool HasQueuedWritesAt(const Tegra::MemoryManager& memory, GPUVAddr address,
                                          u64 size) const;
-    /// Whether an entry WaitForWrites would wait for was sent after `position` (queued or not).
-    [[nodiscard]] bool HasWritesAtAfter(const Tegra::MemoryManager& memory, GPUVAddr address,
-                                        u64 size, u64 position) const {
-        return WritesTarget(memory, address, size) > position;
-    }
 
 private:
     friend struct GpuSplitTestAccess;

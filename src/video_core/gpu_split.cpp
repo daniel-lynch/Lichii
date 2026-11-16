@@ -797,10 +797,10 @@ void GpuSplit::ReportAcquire() {
     const u64 eqmask_not_met = take(stats.eqmask_not_met);
     if (g_acquire_nodrain) {
         LOG_INFO(HW_GPU,
-                 "Equal and mask acquires without a drain in 10 s: {} met by the word, {} by a "
-                 "queued release, {} not met (polled again), {} waited for the word's queued "
-                 "writes first",
-                 eqmask_met, eqmask_by_queued, eqmask_not_met, eqmask_waits);
+                 "Equal and mask acquires without a drain in 10 s: {} met by the word, {} not "
+                 "met (polled again), {} waited for the word's queued writes first ({} for a "
+                 "queued release that meets it)",
+                 eqmask_met, eqmask_not_met, eqmask_waits, eqmask_by_queued);
     }
     const u64 mismatches = take(stats.mismatches);
     const u64 unlanded = take(stats.unlanded);

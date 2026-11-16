@@ -37,23 +37,20 @@ TEST_CASE("Equal and mask acquires pass on memory only when nothing queued can w
 TEST_CASE("Equal and mask acquires follow the last release queued to the word",
           "[video_core][nx2_acquire]") {
     using Q = QueuedWordRelease;
-    // It meets the acquire and nothing sent after it can write the word: the word will hold it.
-    CHECK(DecideEqualMask(Equal(7), std::optional<Q>{Q{7, true, false}}, 3, true) ==
-          EqualMaskStep::MetByQueued);
-    CHECK(DecideEqualMask(Mask(0x10), std::optional<Q>{Q{0x30, true, false}}, 0, true) ==
-          EqualMaskStep::MetByQueued);
-    // Work sent after it may write the word again.
-    CHECK(DecideEqualMask(Equal(7), std::optional<Q>{Q{7, true, true}}, 3, true) ==
+    // It meets the acquire: wait for it to run (and land) instead of passing on its word.
+    CHECK(DecideEqualMask(Equal(7), std::optional<Q>{Q{7, true}}, 3, true) ==
+          EqualMaskStep::WaitForWrites);
+    CHECK(DecideEqualMask(Mask(0x10), std::optional<Q>{Q{0x30, true}}, 0, true) ==
           EqualMaskStep::WaitForWrites);
     // It will overwrite a word that meets the acquire now with one that doesn't.
-    CHECK(DecideEqualMask(Equal(7), std::optional<Q>{Q{8, true, false}}, 7, false) ==
+    CHECK(DecideEqualMask(Equal(7), std::optional<Q>{Q{8, true}}, 7, false) ==
           EqualMaskStep::NotMet);
-    CHECK(DecideEqualMask(Mask(0x1), std::optional<Q>{Q{0x2, true, true}}, 0x1, true) ==
+    CHECK(DecideEqualMask(Mask(0x1), std::optional<Q>{Q{0x2, true}}, 0x1, true) ==
           EqualMaskStep::NotMet);
     // A reduction or a counter report: the front can't tell what it writes.
-    CHECK(DecideEqualMask(Equal(7), std::optional<Q>{Q{7, false, false}}, 7, false) ==
+    CHECK(DecideEqualMask(Equal(7), std::optional<Q>{Q{7, false}}, 7, false) ==
           EqualMaskStep::Drain);
-    CHECK(DecideEqualMask(Mask(0x1), std::optional<Q>{Q{0, false, true}}, 0, true) ==
+    CHECK(DecideEqualMask(Mask(0x1), std::optional<Q>{Q{0, false}}, 0, true) ==
           EqualMaskStep::Drain);
 }
 
