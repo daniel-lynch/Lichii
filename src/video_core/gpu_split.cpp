@@ -28,6 +28,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_acquire_decision.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 
@@ -125,6 +126,12 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     check_owner = std::getenv("EDEN_NX2_SPLIT_CHECK") != nullptr;
     const char* const verify = std::getenv("EDEN_NX2_ACQUIRE_VERIFY");
     g_acquire_verify = verify != nullptr && verify[0] == '1';
+    const char* const nodrain = std::getenv("EDEN_NX2_ACQUIRE_NODRAIN");
+    g_acquire_nodrain = nodrain != nullptr && nodrain[0] == '1';
+    if (g_acquire_nodrain) {
+        LOG_INFO(HW_GPU, "GPU thread split: equal and mask semaphore acquires are decided without "
+                         "a drain (EDEN_NX2_ACQUIRE_NODRAIN=1)");
+    }
     g_acquire_counting = g_acquire_verify || Nx2Profile::Enabled();
     ring = std::make_unique<u64[]>(RingWords);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
@@ -365,7 +372,7 @@ std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
         it->second.position <= consumed.load(std::memory_order_acquire)) {
         return std::nullopt;
     }
-    return QueuedSemaphoreWrite{it->second.payload, it->second.known};
+    return QueuedSemaphoreWrite{it->second.payload, it->second.known, it->second.position};
 }
 
 namespace {
@@ -425,9 +432,15 @@ u64 GpuSplit::DeviceWritesTarget(DAddr address, u64 size) const {
     return target;
 }
 
-bool GpuSplit::WaitForWrites(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) {
-    return WaitFor(std::min(WritesTarget(memory, address, size), write_position),
-                   DrainSite::MacroDmaWrites);
+bool GpuSplit::WaitForWrites(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
+                             DrainSite site) {
+    return WaitFor(std::min(WritesTarget(memory, address, size), write_position), site);
+}
+
+bool GpuSplit::HasQueuedWritesAt(const Tegra::MemoryManager& memory, GPUVAddr address,
+                                 u64 size) const {
+    return std::min(WritesTarget(memory, address, size), write_position) >
+           consumed.load(std::memory_order_acquire);
 }
 
 bool GpuSplit::WaitForSyncedWriters() {
@@ -778,6 +791,17 @@ void GpuSplit::ReportAcquire() {
              "either: {} found while polling, {} found late in the OS wait",
              front_polls, front_sleeps, front_woken, front_stored, front_found_polling,
              front_found_late);
+    const u64 eqmask_met = take(stats.eqmask_met);
+    const u64 eqmask_by_queued = take(stats.eqmask_by_queued);
+    const u64 eqmask_waits = take(stats.eqmask_waits);
+    const u64 eqmask_not_met = take(stats.eqmask_not_met);
+    if (g_acquire_nodrain) {
+        LOG_INFO(HW_GPU,
+                 "Equal and mask acquires without a drain in 10 s: {} met by the word, {} by a "
+                 "queued release, {} not met (polled again), {} waited for the word's queued "
+                 "writes first",
+                 eqmask_met, eqmask_by_queued, eqmask_not_met, eqmask_waits);
+    }
     const u64 mismatches = take(stats.mismatches);
     const u64 unlanded = take(stats.unlanded);
     const u64 late = take(stats.late);

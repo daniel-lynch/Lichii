@@ -26,6 +26,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_acquire_decision.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -113,14 +114,71 @@ enum class AcquireCheck {
     Drain,       ///< Drain the split and read the word as before
 };
 
+// The word as ReadSemaphoreWord sees it, without the flush: for words not on GPU-written pages.
+u32 ReadSemaphoreWordUnflushed(DmaPusher& dma_pusher, GPUVAddr address, DAddr device) {
+    const u32 guest = dma_pusher.memory_manager.Read<u32>(address);
+    return Nx2MirrorShadow::Get().Read(device, guest).value_or(guest);
+}
+
+// EDEN_NX2_ACQUIRE_NODRAIN=1: an equal or mask acquire, past the checks greater-or-equal ones
+// take (VideoCommon::DecideEqualMask).
+AcquireCheck CheckEqualMaskWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
+                                        DAddr device) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    auto& stats = VideoCommon::g_acquire_stats;
+    std::optional<VideoCommon::QueuedWordRelease> queued;
+    if (const auto write = split.QueuedSemaphoreWriteAt(device)) {
+        queued = VideoCommon::QueuedWordRelease{
+            write->payload, write->known,
+            split.HasWritesAtAfter(dma_pusher.memory_manager, acquire.address, sizeof(u32),
+                                   write->position)};
+    }
+    // Before the word is read: a write the back runs in between is then either still seen as
+    // queued here, or it ran and the read sees what it wrote (it stores `consumed` after).
+    const bool writes_queued =
+        split.HasQueuedWritesAt(dma_pusher.memory_manager, acquire.address, sizeof(u32));
+    const u32 word = ReadSemaphoreWordUnflushed(dma_pusher, acquire.address, device);
+    const auto matches = [&acquire](u32 value) { return acquire.Matches(value); };
+    switch (VideoCommon::DecideEqualMask(matches, queued, word, writes_queued)) {
+    case VideoCommon::EqualMaskStep::Met:
+        VideoCommon::Count(stats.eqmask_met);
+        return AcquireCheck::Met;
+    case VideoCommon::EqualMaskStep::MetByQueued:
+        VideoCommon::Count(stats.eqmask_by_queued);
+        return AcquireCheck::MetByQueued;
+    case VideoCommon::EqualMaskStep::NotMet:
+        VideoCommon::Count(stats.eqmask_not_met);
+        return AcquireCheck::NotMet;
+    case VideoCommon::EqualMaskStep::WaitForWrites:
+        break;
+    case VideoCommon::EqualMaskStep::Drain:
+        VideoCommon::Count(stats.drain_queued);
+        return AcquireCheck::Drain;
+    }
+    // Everything queued that can write the word ran: memory decides (WaitForWrites waits for the
+    // last entry that may write anywhere, so for every release still queued too). No idle hook:
+    // a release that lands once the host GPU passed a fence latches the waiter when it does.
+    VideoCommon::Count(stats.eqmask_waits);
+    split.WaitForWrites(dma_pusher.memory_manager, acquire.address, sizeof(u32),
+                        VideoCommon::DrainSite::AcquireWrites);
+    if (acquire.Matches(ReadSemaphoreWordUnflushed(dma_pusher, acquire.address, device))) {
+        VideoCommon::Count(stats.eqmask_met);
+        return AcquireCheck::Met;
+    }
+    VideoCommon::Count(stats.eqmask_not_met);
+    return AcquireCheck::NotMet;
+}
+
 // Checks a greater-or-equal acquire without draining the split. The words Switch 2 syncs on only
 // advance (NVN2 even releases QMD completions as maxima, KeplerCompute::ProcessNativeMethod), so
 // a value that meets one now still does once the back ran the queued work. Only the last release
 // the front sent to the word decides instead, when the back may not have run it yet.
+// Equal and mask acquires drain, unless EDEN_NX2_ACQUIRE_NODRAIN=1 (CheckEqualMaskWithoutDrain).
 AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
     auto& split = VideoCommon::GpuSplit::Get();
     auto& stats = VideoCommon::g_acquire_stats;
-    if (!acquire.WaitsToReach()) {
+    const bool reach = acquire.WaitsToReach();
+    if (!reach && !VideoCommon::g_acquire_nodrain) {
         VideoCommon::Count(stats.drain_operation);
         return AcquireCheck::Drain;
     }
@@ -133,6 +191,9 @@ AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcqui
     if (!device || Nx2MayBeGpuWritten(*device, sizeof(u32))) {
         VideoCommon::Count(stats.drain_word);
         return AcquireCheck::Drain;
+    }
+    if (!reach) {
+        return CheckEqualMaskWithoutDrain(dma_pusher, acquire, *device);
     }
     if (const auto queued = split.QueuedSemaphoreWriteAt(*device)) {
         if (queued->known && acquire.Matches(queued->payload)) {
@@ -173,9 +234,10 @@ void VerifyWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
     VideoCommon::Count(stats.mismatches);
     if (static std::atomic<u32> logged{}; logged.fetch_add(1) < 16) {
         LOG_WARNING(HW_GPU,
-                    "Acquire verify: channel {} passed semaphore {:#x} (>= {:#x}) without a "
+                    "Acquire verify: channel {} passed semaphore {:#x} (op {}, {:#x}) without a "
                     "drain, the word is {:#x} after it",
-                    dma_pusher.channel_state.bind_id, acquire.address, acquire.value, word);
+                    dma_pusher.channel_state.bind_id, acquire.address, acquire.operation,
+                    acquire.value, word);
     }
 }
 

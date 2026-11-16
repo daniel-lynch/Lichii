@@ -884,6 +884,44 @@ TEST_CASE("Split remembers the semaphore writes its back has not run yet",
     REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
 }
 
+TEST_CASE("Split tells equal and mask acquires which queued work can still write their word",
+          "[video_core][gpu_split_dependencies][nx2_acquire]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using Writes = VideoCommon::GpuSplit::Writes;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    Access::SetBack(split, true, true, 0);
+    // An unmapped word: only entries that may write anywhere can write it.
+    constexpr GPUVAddr word = 0x300000;
+    split.Defer([] {}, 0, Writes::Noted);
+    CHECK_FALSE(split.HasQueuedWritesAt(f.memory, word, 4));
+    // A release (the puller sends it as an entry that may write anywhere, then notes it).
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x1000, 5, true);
+    const u64 released = Access::End(split);
+    auto queued = split.QueuedSemaphoreWriteAt(0x1000);
+    REQUIRE(queued.has_value());
+    CHECK(queued->position == released);
+    CHECK(split.HasQueuedWritesAt(f.memory, word, 4));
+    CHECK_FALSE(split.HasWritesAtAfter(f.memory, word, 4, queued->position));
+    // Work that writes only what it notes, noted elsewhere, comes after it: still the last.
+    split.Defer([] {}, 0, Writes::Noted);
+    CHECK_FALSE(split.HasWritesAtAfter(f.memory, word, 4, queued->position));
+    // Work that may write anywhere comes after it.
+    split.Defer([] {});
+    CHECK(split.HasWritesAtAfter(f.memory, word, 4, queued->position));
+    // Once the back ran the release, it is no longer queued; what came after it still is.
+    Access::SetBack(split, true, true, released);
+    CHECK_FALSE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
+    CHECK(split.HasQueuedWritesAt(f.memory, word, 4));
+    // Once it ran everything, nothing queued can write the word; what was sent stays sent.
+    Access::SetBack(split, true, true, Access::End(split));
+    CHECK_FALSE(split.HasQueuedWritesAt(f.memory, word, 4));
+    CHECK(split.HasWritesAtAfter(f.memory, word, 4, released));
+}
+
 TEST_CASE("Split publishes to a back that waits for work after a few words",
           "[video_core][gpu_split_dependencies]") {
     using Access = VideoCommon::GpuSplitTestAccess;

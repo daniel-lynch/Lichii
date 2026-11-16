@@ -55,6 +55,7 @@ enum class DrainSite : u32 {
     SafeReadFlush,  ///< EDEN_NX2_SPLIT_SAFE_READS: a CPU-side read flushes back-owned caches
     BackRegister,   ///< A register a macro the back ran may have written (Maxwell3D)
     BackCode,       ///< The macro code changes under the macros the back has yet to run
+    AcquireWrites,  ///< An equal or mask acquire: the queued work that can write its word
     Count,
 };
 
@@ -87,6 +88,11 @@ struct AcquireStats {
     std::atomic<u64> mismatches{}; ///< VERIFY: passed, yet the word after a drain doesn't meet it
     std::atomic<u64> unlanded{};   ///< VERIFY: met by a queued release not in memory after a drain
     std::atomic<u64> late{};       ///< VERIFY: a poll kept waiting, yet a drain meets it
+    // EDEN_NX2_ACQUIRE_NODRAIN: equal and mask acquires and polls decided without a drain.
+    std::atomic<u64> eqmask_met{};       ///< Met by the word in memory
+    std::atomic<u64> eqmask_by_queued{}; ///< Met by a queued release to the word
+    std::atomic<u64> eqmask_waits{};     ///< Waited for the queued writes to the word first
+    std::atomic<u64> eqmask_not_met{};   ///< Not met: polled again later
 };
 inline AcquireStats g_acquire_stats;
 /// Whether g_acquire_stats counts (EDEN_NX2_GPU_PROFILE or EDEN_NX2_ACQUIRE_VERIFY), as of the
@@ -106,6 +112,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "list writers",    "list sync",     "list flush", "macro dma read",  "macro dma writes",
     "macro dma flush", "gp sync fence", "map",        "front start",     "front verify",
     "ring full",       "macro dma check", "safe read flush", "back register", "back code",
+    "acquire writes",
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -409,6 +416,7 @@ public:
     struct QueuedSemaphoreWrite {
         u32 payload;
         bool known;
+        u64 position; ///< write_position once it was sent
     };
     /// The last write sent to the semaphore word at `device_address`, if the back may not have run
     /// it yet.
@@ -429,7 +437,16 @@ public:
     /// [address, address + size) of `memory`, not the others. Returns whether one was queued.
     /// Writes are placed by the device memory the GPU addresses map to when noted and read: GPU
     /// maps drain the split first (GPU::MapInOrder), the unmaps it is sent count as anywhere.
-    bool WaitForWrites(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size);
+    bool WaitForWrites(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
+                       DrainSite site = DrainSite::MacroDmaWrites);
+    /// Whether an entry WaitForWrites would wait for is still queued.
+    [[nodiscard]] bool HasQueuedWritesAt(const Tegra::MemoryManager& memory, GPUVAddr address,
+                                         u64 size) const;
+    /// Whether an entry WaitForWrites would wait for was sent after `position` (queued or not).
+    [[nodiscard]] bool HasWritesAtAfter(const Tegra::MemoryManager& memory, GPUVAddr address,
+                                        u64 size, u64 position) const {
+        return WritesTarget(memory, address, size) > position;
+    }
 
 private:
     friend struct GpuSplitTestAccess;
