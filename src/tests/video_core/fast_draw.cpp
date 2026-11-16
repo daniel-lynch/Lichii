@@ -383,6 +383,27 @@ TEST_CASE("Fast draw keeps base vertex and instance as draw parameters", "[fast_
     CHECK(f.Reusable());
 }
 
+TEST_CASE("Fast draw keeps reuse across vertex_id_base, counter resets and render enable",
+          "[fast_draw]") {
+    FastDrawFixture f;
+    f.DrawArrays(0, 3);
+    f.Write(MAXWELL3D_REG_INDEX(vertex_id_base), f.Reg(MAXWELL3D_REG_INDEX(vertex_id_base)) + 9);
+    f.Write(MAXWELL3D_REG_INDEX(clear_report_value),
+            f.Reg(MAXWELL3D_REG_INDEX(clear_report_value)) ^ 1);
+    f.Write(MAXWELL3D_REG_INDEX(render_enable.address_high),
+            f.Reg(MAXWELL3D_REG_INDEX(render_enable.address_high)) + 1);
+    f.Write(MAXWELL3D_REG_INDEX(render_enable.address_low),
+            f.Reg(MAXWELL3D_REG_INDEX(render_enable.address_low)) + 0x10);
+    f.Write(MAXWELL3D_REG_INDEX(render_enable.mode), 1); // True
+    f.DrawArrays(3, 3);
+    CHECK(f.Reusable());
+    // A state register next to them still ends reuse.
+    constexpr u32 blend = MAXWELL3D_REG_INDEX(blend.enable[0]);
+    f.Write(blend, f.Reg(blend) ^ 1);
+    f.DrawArrays(6, 3);
+    CHECK_FALSE(f.Reusable());
+}
+
 TEST_CASE("Fast draw keeps vertex stream addresses and sizes light", "[fast_draw]") {
     DeltaFixture f;
     const auto stream = [](u32 index, u32 word) {
