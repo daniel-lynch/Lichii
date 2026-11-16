@@ -93,6 +93,9 @@ struct AcquireStats {
     std::atomic<u64> eqmask_by_queued{}; ///< Met by a queued release to the word
     std::atomic<u64> eqmask_waits{};     ///< Waited for the queued writes to the word first
     std::atomic<u64> eqmask_not_met{};   ///< Not met: polled again later
+    std::atomic<u64> eqmask_mismatches{}; ///< VERIFY: of mismatches, equal or mask acquires
+    std::atomic<u64> eqmask_unlanded{};   ///< ...of unlanded
+    std::atomic<u64> eqmask_late{};       ///< ...of late
 };
 inline AcquireStats g_acquire_stats;
 /// Whether g_acquire_stats counts (EDEN_NX2_GPU_PROFILE or EDEN_NX2_ACQUIRE_VERIFY), as of the

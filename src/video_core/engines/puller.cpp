@@ -232,21 +232,26 @@ void VerifyWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
     DrainBack();
     const u32 word = ReadSemaphoreWord(dma_pusher, acquire.address);
     auto& stats = VideoCommon::g_acquire_stats;
+    // Of each count, how many were equal or mask acquires (EDEN_NX2_ACQUIRE_NODRAIN).
+    const bool equal_mask = !acquire.WaitsToReach();
     if (acquire.Matches(word)) {
         if (decided == AcquireCheck::NotMet) {
             VideoCommon::Count(stats.late);
+            VideoCommon::Count(stats.eqmask_late, equal_mask ? 1 : 0);
         }
         return;
     }
     if (decided == AcquireCheck::MetByQueued) {
         // A fence-flagged release writes memory once the host GPU passed it.
         VideoCommon::Count(stats.unlanded);
+        VideoCommon::Count(stats.eqmask_unlanded, equal_mask ? 1 : 0);
         return;
     }
     if (decided != AcquireCheck::Met) {
         return;
     }
     VideoCommon::Count(stats.mismatches);
+    VideoCommon::Count(stats.eqmask_mismatches, equal_mask ? 1 : 0);
     if (static std::atomic<u32> logged{}; logged.fetch_add(1) < 16) {
         LOG_WARNING(HW_GPU,
                     "Acquire verify: channel {} passed semaphore {:#x} (op {}, {:#x}) without a "

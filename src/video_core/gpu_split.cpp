@@ -805,12 +805,21 @@ void GpuSplit::ReportAcquire() {
     const u64 mismatches = take(stats.mismatches);
     const u64 unlanded = take(stats.unlanded);
     const u64 late = take(stats.late);
+    const u64 eqmask_mismatches = take(stats.eqmask_mismatches);
+    const u64 eqmask_unlanded = take(stats.eqmask_unlanded);
+    const u64 eqmask_late = take(stats.eqmask_late);
     if (mismatches != 0 || unlanded != 0 || late != 0) {
         LOG_WARNING(HW_GPU,
                     "Acquire verify: {} passed but not met after a drain, {} met by a "
                     "queued release not in memory after it, {} polls waited though a drain meets "
                     "them, in 10 s",
                     mismatches, unlanded, late);
+        if (g_acquire_nodrain) {
+            LOG_WARNING(HW_GPU,
+                        "Acquire verify, equal and mask acquires of those: {} passed but not met, "
+                        "{} met by a queued release not in memory, {} polls waited though met",
+                        eqmask_mismatches, eqmask_unlanded, eqmask_late);
+        }
     }
 }
 
