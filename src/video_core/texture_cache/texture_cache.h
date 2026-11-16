@@ -619,7 +619,9 @@ void TextureCache<P>::TickFrame() {
         // most that many frames past their age before they go.
         static const u64 idle_skip = [] {
             const char* value = std::getenv("EDEN_NX2_TC_GC_IDLE_SKIP");
-            const u64 skip = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+            // At most 600 frames, so a stray value (a negative one wraps) can't stop collection.
+            const u64 skip =
+                value != nullptr ? (std::min)(std::strtoull(value, nullptr, 10), 600ULL) : 0ULL;
             if (skip > 1) {
                 LOG_INFO(HW_GPU, "Texture cache: a collector pass that frees nothing below the "
                                  "expected threshold skips the next {} frames "
@@ -647,6 +649,10 @@ void TextureCache<P>::TickFrame() {
                                  ? idle_skip - 1
                                  : 0;
         }
+    } else {
+        // Under the minimum no pass runs: a count left from before must not skip the first one
+        // when usage climbs back.
+        gc_idle_frames = 0;
     }
     if (out_of_memory) {
         // Textures left out for lack of memory are made again on their next read, once a frame
