@@ -115,9 +115,11 @@ enum class AcquireCheck {
 };
 
 // The word as ReadSemaphoreWord sees it, without the flush: for words not on GPU-written pages.
+// Peek, not Read: the back may be releasing into the word meanwhile, and Read forgets a mirrored
+// value the guest word no longer holds before a combined release could combine with it.
 u32 ReadSemaphoreWordUnflushed(DmaPusher& dma_pusher, GPUVAddr address, DAddr device) {
     const u32 guest = dma_pusher.memory_manager.Read<u32>(address);
-    return Nx2MirrorShadow::Get().Read(device, guest).value_or(guest);
+    return Nx2MirrorShadow::Get().Peek(device, guest).value_or(guest);
 }
 
 // EDEN_NX2_ACQUIRE_NODRAIN=1: an equal or mask acquire, past the checks greater-or-equal ones
@@ -137,6 +139,14 @@ AcquireCheck CheckEqualMaskWithoutDrain(DmaPusher& dma_pusher, const Puller::Pen
     // queued here, or it ran and the read sees what it wrote (it stores `consumed` after).
     const bool writes_queued =
         split.HasQueuedWritesAt(dma_pusher.memory_manager, acquire.address, sizeof(u32));
+    // Work the back ran since the caller looked may have made the word's page GPU-written (the
+    // back marks it as it runs the work, before it stores `consumed`): memory may then be older
+    // than the buffer cache, which only a drained read flushes. Greater-or-equal acquires only
+    // see such a word as not met yet; an equal or mask one could pass on the old value.
+    if (Nx2MayBeGpuWritten(device, sizeof(u32))) {
+        VideoCommon::Count(stats.drain_word);
+        return AcquireCheck::Drain;
+    }
     const u32 word = ReadSemaphoreWordUnflushed(dma_pusher, acquire.address, device);
     const auto matches = [&acquire](u32 value) { return acquire.Matches(value); };
     switch (VideoCommon::DecideEqualMask(matches, queued, word, writes_queued)) {
@@ -147,7 +157,6 @@ AcquireCheck CheckEqualMaskWithoutDrain(DmaPusher& dma_pusher, const Puller::Pen
         VideoCommon::Count(stats.eqmask_by_queued);
         return AcquireCheck::MetByQueued;
     case VideoCommon::EqualMaskStep::NotMet:
-        VideoCommon::Count(stats.eqmask_not_met);
         return AcquireCheck::NotMet;
     case VideoCommon::EqualMaskStep::WaitForWrites:
         break;
@@ -156,16 +165,22 @@ AcquireCheck CheckEqualMaskWithoutDrain(DmaPusher& dma_pusher, const Puller::Pen
         return AcquireCheck::Drain;
     }
     // Everything queued that can write the word ran: memory decides (WaitForWrites waits for the
-    // last entry that may write anywhere, so for every release still queued too). No idle hook:
-    // a release that lands once the host GPU passed a fence latches the waiter when it does.
+    // last entry that may write anywhere, so for every release still queued too), as a drained
+    // read would. Like that read, it can't see a write that lands later, once the host GPU passed
+    // a fence (fence-flagged releases, counter reports): the back ran it, memory doesn't hold it
+    // yet. No idle hook: such a write latches the waiter when it lands.
     VideoCommon::Count(stats.eqmask_waits);
     split.WaitForWrites(dma_pusher.memory_manager, acquire.address, sizeof(u32),
                         VideoCommon::DrainSite::AcquireWrites);
+    // The work waited for may have been the first to make the page GPU-written (see above).
+    if (Nx2MayBeGpuWritten(device, sizeof(u32))) {
+        VideoCommon::Count(stats.drain_word);
+        return AcquireCheck::Drain;
+    }
     if (acquire.Matches(ReadSemaphoreWordUnflushed(dma_pusher, acquire.address, device))) {
         VideoCommon::Count(stats.eqmask_met);
         return AcquireCheck::Met;
     }
-    VideoCommon::Count(stats.eqmask_not_met);
     return AcquireCheck::NotMet;
 }
 
@@ -276,6 +291,10 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         VerifyWithoutDrain(dma_pusher, *pending_acquire, check);
         return true;
     case AcquireCheck::NotMet: {
+        if (!pending_acquire->WaitsToReach()) {
+            // Only polls: an initial acquire that isn't met drains below anyway.
+            VideoCommon::Count(stats.eqmask_not_met);
+        }
         // A release the back ran latches the waiter. Otherwise poll again later, without waiting
         // for the back: until it runs one, nothing sent to the word meets it. Work only a drain
         // finishes (the back's idle hook submits what the host GPU writes) still lands: a waiting

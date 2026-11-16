@@ -406,6 +406,21 @@ public:
         return it->second.value;
     }
 
+    /// As Read, without forgetting a mirrored value whose guest word changed: for a reader on
+    /// another thread than the one releasing into the word (the split's front while its back runs).
+    /// A combined release still finds it then (NoteCombinedRelease).
+    std::optional<u32> Peek(u64 device_address, u32 guest) const {
+        if (!has_words.load(std::memory_order_acquire)) {
+            return std::nullopt;
+        }
+        std::scoped_lock lock{mutex};
+        const auto it = words.find(device_address & ~u64{3});
+        if (it == words.end() || it->second.guest != guest) {
+            return std::nullopt;
+        }
+        return it->second.value;
+    }
+
     void Clear() {
         std::scoped_lock lock{mutex};
         direct_words.clear();

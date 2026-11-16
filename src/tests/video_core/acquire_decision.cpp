@@ -5,6 +5,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "video_core/nx2.h"
 #include "video_core/nx2_acquire_decision.h"
 
 using VideoCommon::DecideEqualMask;
@@ -54,4 +55,17 @@ TEST_CASE("Equal and mask acquires follow the last release queued to the word",
           EqualMaskStep::Drain);
     CHECK(DecideEqualMask(Mask(0x1), std::optional<Q>{Q{0, false, true}}, 0, true) ==
           EqualMaskStep::Drain);
+}
+
+TEST_CASE("Peeking at a mirrored semaphore word keeps it for a combined release",
+          "[video_core][nx2_acquire]") {
+    Tegra::Nx2MirrorShadow shadow;
+    shadow.Set(0x1000, 7, 3);
+    CHECK(shadow.Peek(0x1000, 3) == std::optional<u32>{7});
+    // The guest word changed (a combined release on the back is writing it): Peek sees no
+    // mirrored value but leaves it, Read forgets it.
+    CHECK_FALSE(shadow.Peek(0x1000, 4).has_value());
+    CHECK(shadow.Read(0x1000, 3) == std::optional<u32>{7});
+    CHECK_FALSE(shadow.Read(0x1000, 4).has_value());
+    CHECK_FALSE(shadow.Read(0x1000, 3).has_value());
 }
