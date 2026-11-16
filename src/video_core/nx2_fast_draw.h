@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -48,7 +49,6 @@ enum class Reason : u8 {
     IndirectReset,
     Frame,
     TextureHeaders,
-    DeltaOverflow,
     Map,
     Count,
 };
@@ -57,7 +57,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Reason::Count)> rea
     "register",      "method",    "constant buffer data", "inline data",
     "other engine",  "deferred call", "tick work",        "invalidation",
     "fence release", "indirect reset", "frame",           "texture header data",
-    "delta overflow", "memory map",
+    "memory map",
 };
 
 inline std::atomic<bool> g_enabled{true};
@@ -133,8 +133,7 @@ inline void Break(Reason reason, u32 method = 0) {
     // 3D methods that let the CPU synchronise (reports, syncpoints) note it where they reach the
     // rasterizer. Invalidations end image and shader lifetimes, not guest memory writes.
     if (reason != Reason::Register && reason != Reason::Method && reason != Reason::ConstantData &&
-        reason != Reason::TextureHeaders && reason != Reason::DeltaOverflow &&
-        reason != Reason::Invalidation) {
+        reason != Reason::TextureHeaders && reason != Reason::Invalidation) {
         NoteSync();
     }
     if (Enabled()) {
@@ -185,8 +184,9 @@ struct Delta {
     std::array<DAddr, MaxWrites> device_begin{};
     std::array<DAddr, MaxWrites> device_end{};
     u32 num_device_writes{};
-    /// A write didn't fit: the lists miss some (uniform keeps then keep nothing).
-    bool overflow{};
+    /// Set when the ranges were widened (AppendRange): the draw keeps no uniforms, as when such
+    /// writes ended draw reuse.
+    bool no_uniform_keeps{};
 
     [[nodiscard]] bool Empty() const {
         return num_writes == 0 && (binds[0] | binds[1] | binds[2] | binds[3] | binds[4]) == 0;
@@ -211,20 +211,40 @@ struct Delta {
 
 inline Delta g_delta;
 
-/// Appends [begin, end) to a delta's range list, or extends its last range when that ends at
-/// begin. False when the list is full.
+/// Adds [begin, end) to a delta's range list: extends a range it touches or overlaps, else
+/// appends it. A full list widens the range that grows least instead (true then), which only
+/// makes Reaches more conservative.
 inline bool AppendRange(std::array<u64, Delta::MaxWrites>& begins,
                         std::array<u64, Delta::MaxWrites>& ends, u32& count, u64 begin, u64 end) {
     if (count != 0 && ends[count - 1] == begin) {
         ends[count - 1] = end;
-        return true;
-    }
-    if (count == Delta::MaxWrites) {
         return false;
     }
-    begins[count] = begin;
-    ends[count] = end;
-    ++count;
+    for (u32 i = 0; i < count; ++i) {
+        if (begin <= ends[i] && begins[i] <= end) {
+            begins[i] = (std::min)(begins[i], begin);
+            ends[i] = (std::max)(ends[i], end);
+            return false;
+        }
+    }
+    if (count < Delta::MaxWrites) {
+        begins[count] = begin;
+        ends[count] = end;
+        ++count;
+        return false;
+    }
+    u32 best = 0;
+    u64 best_growth = ~u64{0};
+    for (u32 i = 0; i < count; ++i) {
+        const u64 growth = ((std::max)(ends[i], end) - (std::min)(begins[i], begin)) -
+                           (ends[i] - begins[i]);
+        if (growth < best_growth) {
+            best = i;
+            best_growth = growth;
+        }
+    }
+    begins[best] = (std::min)(begins[best], begin);
+    ends[best] = (std::max)(ends[best], end);
     return true;
 }
 
@@ -236,25 +256,19 @@ inline void NoteBind(size_t stage, u32 slot) {
 
 /// Inline constant buffer data written to GPU addresses [begin, end).
 inline void NoteConstantData(GPUVAddr begin, GPUVAddr end) {
-    if (!Enabled()) {
-        return;
-    }
-    Delta& delta = g_delta;
-    if (!AppendRange(delta.write_begin, delta.write_end, delta.num_writes, begin, end)) {
-        delta.overflow = true;
-        Break(Reason::DeltaOverflow);
+    if (Enabled()) {
+        Delta& delta = g_delta;
+        delta.no_uniform_keeps |=
+            AppendRange(delta.write_begin, delta.write_end, delta.num_writes, begin, end);
     }
 }
 
 /// The device addresses [begin, end) that inline constant buffer data landed on.
 inline void NoteDeviceData(DAddr begin, DAddr end) {
-    if (!Enabled()) {
-        return;
-    }
-    Delta& delta = g_delta;
-    if (!AppendRange(delta.device_begin, delta.device_end, delta.num_device_writes, begin, end)) {
-        delta.overflow = true;
-        Break(Reason::DeltaOverflow);
+    if (Enabled()) {
+        Delta& delta = g_delta;
+        delta.no_uniform_keeps |= AppendRange(delta.device_begin, delta.device_end,
+                                              delta.num_device_writes, begin, end);
     }
 }
 

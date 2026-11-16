@@ -218,8 +218,7 @@ TEST_CASE("Fast draw records bind and constant data changes, keeps index buffer 
     CHECK_FALSE(FastDraw::g_delta.Empty());
 }
 
-TEST_CASE("Fast draw breaks on state, texture headers and delta overflow",
-          "[fast_draw]") {
+TEST_CASE("Fast draw breaks on state and texture headers", "[fast_draw]") {
     DeltaFixture f;
     f.Write(MAXWELL3D_REG_INDEX(tex_header.address_high), 0);
     f.Write(MAXWELL3D_REG_INDEX(tex_header.address_low), 0x40000);
@@ -247,13 +246,25 @@ TEST_CASE("Fast draw breaks on state, texture headers and delta overflow",
         f.SetConstantBuffer(0x40000, 0x1000, 0x100); // just past the headers
         f.Write(MAXWELL3D_REG_INDEX(const_buffer.buffer), 1);
     }));
-    CHECK(breaks([&] {
+    // More separate writes than the delta holds widen its ranges instead of ending draw reuse.
+    CHECK_FALSE(breaks([&] {
         f.SetConstantBuffer(0x60000, 0x1000, 0);
         for (u32 i = 0; i <= FastDraw::Delta::MaxWrites; ++i) {
             f.Write(MAXWELL3D_REG_INDEX(const_buffer.offset), i * 0x20);
             f.Write(MAXWELL3D_REG_INDEX(const_buffer.buffer), i);
         }
     }));
+    const auto& delta = FastDraw::g_delta;
+    REQUIRE(delta.num_writes == FastDraw::Delta::MaxWrites);
+    CHECK(delta.no_uniform_keeps);
+    for (u32 i = 0; i <= FastDraw::Delta::MaxWrites; ++i) {
+        const GPUVAddr address = 0x60000 + i * 0x20;
+        bool covered = false;
+        for (u32 write = 0; write < delta.num_writes; ++write) {
+            covered |= delta.write_begin[write] <= address && address + 4 <= delta.write_end[write];
+        }
+        CHECK(covered);
+    }
 }
 
 TEST_CASE("Fast draw breaks on texture header data written through another mapping",

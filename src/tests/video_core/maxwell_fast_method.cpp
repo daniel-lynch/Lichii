@@ -1840,8 +1840,8 @@ TEST_CASE("Split front sends state writes to the back as register blocks that ma
         auto& split = splits[i];
         auto& engine = *engines[i];
         // Lichii: our inline constant data notes (NoteConstantData) collect into the global
-        // g_delta, which no draw clears on this null back, and overflow it (a DeltaOverflow break).
-        // Both runs start from the same delta, or the second one overflows at another write.
+        // g_delta, which no draw clears on this null back, and fill it. Both runs start from the
+        // same delta, so they see the same notes.
         VideoCommon::Nx2FastDraw::g_delta = {};
         const u64 serial = VideoCommon::Nx2FastDraw::Serial();
         for (const Step& step : steps) {
