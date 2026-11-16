@@ -288,6 +288,22 @@ add_subdirectory(input_common)
 add_subdirectory(frontend_common)
 add_subdirectory(shader_recompiler)
 
+# Frame pointers for stack-walking profilers (perf record --call-graph fp), on these targets
+# alone and PRIVATE, so nothing propagates to the targets that link them. Never through
+# CMAKE_CXX_FLAGS or anything on shader_recompiler: CMakeModules/TranslatorIdentity.cmake hashes
+# both into the translator tag, which keys the translation cache on disk.
+if (LICHII_PERF_FRAME_POINTERS)
+    if (MSVC)
+        message(WARNING "LICHII_PERF_FRAME_POINTERS: not supported with MSVC, ignored")
+    else()
+        foreach (target common core video_core)
+            target_compile_options(${target} PRIVATE
+                -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer)
+        endforeach()
+        message(STATUS "LICHII_PERF_FRAME_POINTERS: frame pointers in common, core and video_core")
+    endif()
+endif()
+
 if (YUZU_TESTS)
     add_subdirectory(tests)
 endif()

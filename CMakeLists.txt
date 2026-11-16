@@ -83,6 +83,8 @@ cmake_dependent_option(YUZU_USE_BUNDLED_QT "Download bundled Qt binaries" "${MSV
 
 option(ENABLE_DEBUG_TOOLS "Enable debugging tools (maxwell disassembler, SPIRV translator, etc)" OFF)
 option(ENABLE_WERROR "Enable -Werror diagnostics" ON)
+# Frame pointers for perf/sampling profilers in common, core and video_core only (see src/CMakeLists.txt).
+option(LICHII_PERF_FRAME_POINTERS "Keep frame pointers in common, core and video_core for profilers" OFF)
 
 option(LICHII_FUZZERS "Build libFuzzer harnesses for the game-file parsers (clang only; instruments everything with ASan and UBSan)" OFF)
 if (LICHII_FUZZERS)
