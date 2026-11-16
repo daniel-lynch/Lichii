@@ -15,6 +15,7 @@ add_executable(tests
     video_core/spirv_inline_control.cpp
     video_core/flicker_meter.cpp
     video_core/nx2_stutter_trace.cpp
+    video_core/nx2_gpu_waits.cpp
     video_core/host_mip_limits.cpp
     video_core/gpu_timestamp.cpp
     video_core/parallel_record.cpp

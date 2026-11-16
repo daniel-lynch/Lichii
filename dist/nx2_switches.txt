@@ -146,3 +146,10 @@ EDEN_NX2_FENCE_BATCH=1
 # one flipped away from its default gets no offline-product hits. The rest leave it. Preserve a clean
 # copy of the field tester's pipeline-key cache and restore it before EACH comparison: rebuilds
 # append pointer classifications to that cache, and later runs would otherwise inherit them.
+
+# --- Performance diagnostics (log only) ---
+# Cheap GPU wait accounting (<1% fps): every 10 s one "GPU waits per second" line (the GPU thread's
+# work and its waits for the back, releases and the guest, with drains by site) and one "GPU back
+# waits per second" line (busy, idle, idle hook submits, present and GPU waits). Unlike
+# EDEN_NX2_GPU_PROFILE it times only the waits and keeps the fast 3D method path on.
+#EDEN_NX2_GPU_WAITS=1

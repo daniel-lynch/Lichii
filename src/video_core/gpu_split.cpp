@@ -202,7 +202,7 @@ void GpuSplit::WaitForSpace(size_t words) {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
-    const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
+    const u64 start = Nx2Profile::CountsDrains() ? Nx2Profile::Ticks() : 0;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (write_position + words - consumed_cache <= RingWords) {
@@ -237,7 +237,7 @@ void GpuSplit::Drain(DrainSite site) {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
-    const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
+    const u64 start = Nx2Profile::CountsDrains() ? Nx2Profile::Ticks() : 0;
     // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
     // from its idle hook afterwards, and the caller may use the scheduler once this returns.
     bool hook_asked = false;
@@ -455,7 +455,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
-    const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
+    const u64 start = Nx2Profile::CountsDrains() ? Nx2Profile::Ticks() : 0;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
@@ -656,7 +656,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
 #endif
     u64 read_position = 0;
     while (!stop_token.stop_requested()) {
-        Nx2Profile::Report("GPU back thread", true);
+        Nx2Profile::Report("GPU back thread", true, Nx2Profile::WaitsLine::Back);
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
@@ -684,6 +684,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // too, so the deferred submit can't overlap whatever the front does next.
                 if (!back_quiet.load(std::memory_order_relaxed)) {
                     if (idle_hook != nullptr) {
+                        // Timed apart from the split wait around it: the submit is work.
+                        Nx2Profile::Scope hook_scope{Nx2Profile::Zone::IdleHook};
                         idle_hook(idle_argument);
                     }
                     back_quiet.store(true, std::memory_order_release);
@@ -717,6 +719,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {
                 hook_requested.store(false, std::memory_order_seq_cst);
+                Nx2Profile::Scope hook_scope{Nx2Profile::Zone::IdleHook};
                 idle_hook(idle_argument);
             }
             // Hand ring space back now and then while working through a long batch, and at once

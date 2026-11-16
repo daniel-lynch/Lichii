@@ -89,7 +89,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         namespace Profile = VideoCommon::Nx2Profile;
         auto& split = VideoCommon::GpuSplit::Get();
         while (!stop_token.stop_requested()) {
-            Profile::Report();
+            Profile::Report("GPU thread", false, Profile::WaitsLine::Front);
             split.MaybeStart(system);
             if (VideoCommon::g_acquire_counting) {
                 split.ReportAcquire();
