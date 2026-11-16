@@ -183,6 +183,12 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 astc_alpha_images{};
     Common::ScratchBuffer<u8> astc_scan_buffer;
     u64 images_deleted{};
+    /// EDEN_NX2_TC_GC_IDLE_SKIP: passes left to skip after a normal-mode pass that freed nothing.
+    u64 gc_idle_frames{};
+    /// EDEN_NX2_TC_LOG: collector passes run and skipped, and their time (last 600 frames).
+    u64 gc_passes{};
+    u64 gc_skipped_passes{};
+    u64 gc_pass_ns{};
     /// Why the next DeleteImage happens, for EDEN_NX2_TC_TRACE: the collector (and its mode),
     /// an unmap or a join. Read and reset by DeleteImage.
     const char* trace_delete_reason = "other";

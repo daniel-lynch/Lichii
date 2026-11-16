@@ -569,6 +569,13 @@ void TextureCache<P>::TickFrame() {
                  images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
                  gc_download_deletes,
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
+        LOG_INFO(HW_GPU,
+                 "Texture cache last 600 frames: collector ran {} passes in {:.3f} ms ({:.1f} us "
+                 "per pass), skipped {}",
+                 gc_passes, static_cast<double>(gc_pass_ns) / 1e6,
+                 gc_passes != 0 ? static_cast<double>(gc_pass_ns) / 1e3 / static_cast<double>(gc_passes) : 0.0,
+                 gc_skipped_passes);
+        gc_passes = gc_skipped_passes = gc_pass_ns = 0;
         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
         LOG_INFO(HW_GPU,
@@ -604,7 +611,42 @@ void TextureCache<P>::TickFrame() {
         seen_failed_images = failed;
     }
     if (out_of_memory || total_used_memory > minimum_memory) {
-        RunGarbageCollector(out_of_memory);
+        // EDEN_NX2_TC_GC_IDLE_SKIP=<frames> (off by default): below the expected threshold a pass
+        // that freed nothing is usually followed by more of the same (Ocarina's Market: the
+        // oldest images are all costly or GPU-written, so each pass gathers, sorts and skips
+        // them every frame). Run the next one only after that many frames, or at once when
+        // memory reaches the expected threshold or an image did not fit. Images then wait at
+        // most that many frames past their age before they go.
+        static const u64 idle_skip = [] {
+            const char* value = std::getenv("EDEN_NX2_TC_GC_IDLE_SKIP");
+            const u64 skip = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+            if (skip > 1) {
+                LOG_INFO(HW_GPU, "Texture cache: a collector pass that frees nothing below the "
+                                 "expected threshold skips the next {} frames "
+                                 "(EDEN_NX2_TC_GC_IDLE_SKIP)", skip - 1);
+            }
+            return skip;
+        }();
+        if (idle_skip > 1 && gc_idle_frames != 0 && !out_of_memory &&
+            total_used_memory < expected_memory) {
+            --gc_idle_frames;
+            ++gc_skipped_passes;
+        } else {
+            const u64 deleted_before = images_deleted;
+            const auto pass_start = log_tc ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+            RunGarbageCollector(out_of_memory);
+            if (log_tc) {
+                ++gc_passes;
+                gc_pass_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now() - pass_start)
+                                                   .count());
+            }
+            gc_idle_frames = idle_skip > 1 && !out_of_memory && images_deleted == deleted_before &&
+                                     total_used_memory < expected_memory
+                                 ? idle_skip - 1
+                                 : 0;
+        }
     }
     if (out_of_memory) {
         // Textures left out for lack of memory are made again on their next read, once a frame
