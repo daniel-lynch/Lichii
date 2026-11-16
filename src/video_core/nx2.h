@@ -69,61 +69,70 @@ inline const std::pair<u64, u64> g_nx2_deferred_pool = [] {
     }
     return std::pair<u64, u64>{begin, last};
 }();
+/// One counter per cache line. The guest CPU threads (collected writes), the split's back (staging
+/// requests, uploads) and the fence thread (downloads) each count into their own counters; packed
+/// together, every relaxed add pulled a line another core had just written (C17.11: the two adds in
+/// StagingBufferPool::Request were 2% of the back's perf samples in Ocarina's Market, and the
+/// harness runs with EDEN_NX2_DEFERRED_WRITE_LOG=1 for its per-frame line).
+struct alignas(64) Nx2Counter : std::atomic<u64> {
+    constexpr Nx2Counter() noexcept : std::atomic<u64>{0} {}
+};
+static_assert(sizeof(Nx2Counter) == 64 && alignof(Nx2Counter) == 64);
 struct Nx2DeferredWriteCounters {
-    std::atomic<u64> collected_writes{0};
-    std::atomic<u64> collected_bytes{0};
-    std::atomic<u64> pool_writes{0};
-    std::atomic<u64> pool_bytes{0};
-    std::atomic<u64> applied_calls{0};
-    std::atomic<u64> applied_ranges{0};
-    std::atomic<u64> applied_bytes{0};
-    std::atomic<u64> applied_pool_bytes{0};
+    Nx2Counter collected_writes;
+    Nx2Counter collected_bytes;
+    Nx2Counter pool_writes;
+    Nx2Counter pool_bytes;
+    Nx2Counter applied_calls;
+    Nx2Counter applied_ranges;
+    Nx2Counter applied_bytes;
+    Nx2Counter applied_pool_bytes;
     // GPU -> guest buffer-cache downloads: [0] at a fence (async), [1] synchronous (a CPU read,
     // a CPU write over GPU bytes, a DMA/flush request), which stall on the host GPU.
-    std::array<std::atomic<u64>, 2> download_ranges{};
-    std::array<std::atomic<u64>, 2> download_bytes{};
-    std::array<std::atomic<u64>, 2> download_pool_bytes{};
-    std::atomic<u64> sync_download_calls{0};
+    std::array<Nx2Counter, 2> download_ranges{};
+    std::array<Nx2Counter, 2> download_bytes{};
+    std::array<Nx2Counter, 2> download_pool_bytes{};
+    Nx2Counter sync_download_calls;
     // StagingBufferPool::Request, every buffer- and texture-cache staging allocation:
     // [0] Upload (host -> GPU), [1] Download (GPU -> host), [2] DeviceLocal (GPU-side scratch).
-    std::array<std::atomic<u64>, 3> staging_requests{};
-    std::array<std::atomic<u64>, 3> staging_bytes{};
+    std::array<Nx2Counter, 3> staging_requests{};
+    std::array<Nx2Counter, 3> staging_bytes{};
     // Buffer-cache uploads of CPU-modified pages (SynchronizeBuffer), and the part done while
     // binding native compute storage buffers.
-    std::atomic<u64> buffer_upload_bytes{0};
-    std::atomic<u64> native_storage_upload_bytes{0};
+    Nx2Counter buffer_upload_bytes;
+    Nx2Counter native_storage_upload_bytes;
     // Native (Switch 2) compute dispatches, their storage bindings, the bytes those bindings
     // cover and the bytes marked GPU-written for them (after EDEN_NX2_COMPUTE_WRITE_MARK).
-    std::atomic<u64> native_dispatches{0};
-    std::atomic<u64> native_storage_bindings{0};
-    std::atomic<u64> native_storage_bytes{0};
-    std::atomic<u64> native_marked_bytes{0};
+    Nx2Counter native_dispatches;
+    Nx2Counter native_storage_bindings;
+    Nx2Counter native_storage_bytes;
+    Nx2Counter native_marked_bytes;
     // Read-only bindings for pointers native programs load from records: bound, left out by the
     // binding cap, records read back from the host copy because GPU work wrote them, and the
     // waits for the GPU those read backs took. Compute dispatches, then task and mesh stages of
     // draws. Cache hits: GPU-written records reused from an earlier read back (no wait).
-    std::atomic<u64> native_indirect_bound{0};
-    std::atomic<u64> native_indirect_dropped{0};
-    std::atomic<u64> native_indirect_host_reads{0};
-    std::atomic<u64> native_indirect_waits{0};
-    std::atomic<u64> native_indirect_gfx_bound{0};
-    std::atomic<u64> native_indirect_gfx_dropped{0};
-    std::atomic<u64> native_indirect_gfx_host_reads{0};
-    std::atomic<u64> native_indirect_gfx_waits{0};
-    std::atomic<u64> native_indirect_gfx_draws{0};
-    std::atomic<u64> native_indirect_cache_hits{0};
+    Nx2Counter native_indirect_bound;
+    Nx2Counter native_indirect_dropped;
+    Nx2Counter native_indirect_host_reads;
+    Nx2Counter native_indirect_waits;
+    Nx2Counter native_indirect_gfx_bound;
+    Nx2Counter native_indirect_gfx_dropped;
+    Nx2Counter native_indirect_gfx_host_reads;
+    Nx2Counter native_indirect_gfx_waits;
+    Nx2Counter native_indirect_gfx_draws;
+    Nx2Counter native_indirect_cache_hits;
     // Written native bindings whose mark the shader's store extent bounded this dispatch, and the
     // ones that kept the mode's full mark (unknown extent, Full, or the 64 KiB cap).
-    std::atomic<u64> native_bounded_bindings{0};
-    std::atomic<u64> native_unbounded_bindings{0};
+    Nx2Counter native_bounded_bindings;
+    Nx2Counter native_unbounded_bindings;
     // Fence downloads as copied by the GPU into host staging (CommitAsyncFlushesHigh), before
     // PopAsyncBuffers drops what later GPU or CPU writes superseded; and the pool's share.
-    std::atomic<u64> fence_copies{0};
-    std::atomic<u64> fence_copy_bytes{0};
-    std::atomic<u64> fence_copy_pool_bytes{0};
+    Nx2Counter fence_copies;
+    Nx2Counter fence_copy_bytes;
+    Nx2Counter fence_copy_pool_bytes;
     // DownloadBufferMemory's mapped branch: the CPU reads host-visible device-local memory
     // (ReBAR) directly, over PCIe.
-    std::atomic<u64> mapped_read_bytes{0};
+    Nx2Counter mapped_read_bytes;
 };
 inline Nx2DeferredWriteCounters g_nx2_deferred_writes{};
 
