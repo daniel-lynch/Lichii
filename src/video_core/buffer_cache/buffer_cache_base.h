@@ -663,6 +663,10 @@ private:
 
     void UpdateVertexBuffer(u32 index);
 
+    /// EDEN_NX2_PERF_VERIFY: logs a resolve memo hit that resolving again does not give.
+    void CheckResolveMemo(const char* kind, u32 index, const Binding& kept,
+                          const Binding& resolved);
+
     void UpdateDrawIndirect();
 
     void UpdateUniformBuffers(size_t stage);
@@ -865,17 +869,7 @@ private:
     u64 vertex_buffers_serial = 0;
     std::array<Binding, 32> v_buffer{};
 
-    /// EDEN_NX2_BUFFER_SKIP: the inputs and result of each vertex stream's last lookup.
-    struct VertexLookup {
-        GPUVAddr begin{};
-        GPUVAddr end{};
-        const void* owner{};
-        u64 map_serial{};
-        u64 deletions{};
-        Binding binding{};
-        bool valid{};
-    };
-    std::array<VertexLookup, NUM_VERTEX_BUFFERS> vertex_lookups{};
+    /// EDEN_NX2_BUFFER_SKIP: vertex stream resolves and how many the resolve memo answered.
     struct SkipStats {
         u64 window_start{};
         u64 lookups{};
@@ -892,6 +886,18 @@ private:
     std::array<GeometrySync, NUM_VERTEX_BUFFERS + 1> geometry_syncs{};
     /// Counts DeleteBuffer calls: a buffer id older than this count may have been freed or reused.
     u64 buffer_deletions = 0;
+    /// A vertex stream's or the index buffer's last resolution, made in the address space `owner`
+    /// names (its GetID() + 1; 0 never matches) under its MapSerial and buffer_deletions.
+    struct ResolveMemo {
+        size_t owner{};
+        u64 map_serial{};
+        u64 deletions{};
+        GPUVAddr begin{};
+        GPUVAddr end{}; ///< Vertex streams only
+        Binding binding{};
+    };
+    std::array<ResolveMemo, NUM_VERTEX_BUFFERS> vertex_memos{};
+    ResolveMemo index_memo{};
     struct GeometryStats {
         u64 syncs{};
         u64 syncs_skipped{};

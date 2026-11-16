@@ -379,6 +379,27 @@ struct BufferCacheTestAccess {
     static const auto& ReadChecks(Cache& cache) {
         return cache.read_check;
     }
+    template <class C>
+    static void UseChannel(C& cache, BufferCacheChannelInfo& channel) {
+        cache.channel_state = &channel;
+        cache.maxwell3d = &channel.maxwell3d;
+        cache.gpu_memory = &channel.gpu_memory;
+    }
+    static void Delete(Cache& cache, BufferId id) {
+        cache.DeleteBuffer(id);
+    }
+    static Binding ResolveVertex(Cache& cache, BufferCacheChannelInfo& channel, u32 index) {
+        UseChannel(cache, channel);
+        channel.maxwell3d.dirty.flags[Dirty::VertexBuffer0 + index] = true;
+        cache.UpdateVertexBuffer(index);
+        return channel.vertex_buffers[index];
+    }
+    static Binding ResolveIndex(Cache& cache, BufferCacheChannelInfo& channel) {
+        UseChannel(cache, channel);
+        channel.maxwell3d.dirty.flags[Dirty::IndexBuffer] = true;
+        cache.UpdateIndexBuffer();
+        return channel.index_buffer;
+    }
 };
 
 } // namespace VideoCommon
@@ -655,6 +676,64 @@ TEST_CASE("Storage binding cache does not reuse a destroyed address space", "[bu
     REQUIRE(f.memory->MapSerial() == serial);
     REQUIRE(f.memory->GetID() != owner);
     REQUIRE(f.Bind(true).device_addr == 0x30000);
+}
+
+TEST_CASE("Vertex and index resolve memos end at map changes and buffer deletions",
+          "[buffer_ports]") {
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    auto& regs = channel.maxwell3d.regs;
+    auto& stream = regs.vertex_streams[0];
+    stream.enable.Assign(1);
+    stream.address_high = 0;
+    stream.address_low = 0x100800;
+    regs.vertex_stream_limits[0].address_high = 0;
+    regs.vertex_stream_limits[0].address_low = 0x100fff;
+    auto& index = channel.maxwell3d.draw_manager.draw_state.index_buffer;
+    index.start_addr_low = 0x100400;
+    index.limit_addr_low = 0x100fff;
+    index.format = Tegra::Engines::Maxwell3D::Regs::IndexFormat::UnsignedShort;
+    index.count = 0x100;
+    const auto resolve = [&] { return Access::ResolveVertex(*f.cache, channel, 0); };
+
+    const auto first = Access::Add(*f.cache, 0x10000, 0x10000);
+    for (bool verify : {false, true, false}) {
+        VideoCommon::Nx2Perf::g_verify = verify;
+        const auto binding = resolve();
+        REQUIRE(binding.device_addr == 0x10800);
+        REQUIRE(binding.size == 0x800);
+        REQUIRE(binding.buffer_id == first);
+    }
+    VideoCommon::Nx2Perf::g_verify = VideoCommon::Nx2Perf::VerifySwitchSet();
+    REQUIRE(Access::ResolveIndex(*f.cache, channel).size == 0x200);
+    index.count = 0x80;
+    auto index_binding = Access::ResolveIndex(*f.cache, channel);
+    REQUIRE(index_binding.device_addr == 0x10400);
+    REQUIRE(index_binding.size == 0x100);
+    REQUIRE(index_binding.buffer_id == first);
+
+    stream.enable.Assign(0);
+    REQUIRE(resolve().buffer_id == VideoCommon::NULL_BINDING.buffer_id);
+    REQUIRE(resolve().size == 0);
+    stream.enable.Assign(1);
+
+    Access::Delete(*f.cache, first);
+    const auto filler = Access::Add(*f.cache, 0x30000, 0x1000);
+    const auto second = Access::Add(*f.cache, 0x10000, 0x10000);
+    REQUIRE(filler != second);
+    REQUIRE(resolve().buffer_id == second);
+    REQUIRE(Access::ResolveIndex(*f.cache, channel).buffer_id == second);
+
+    f.memory->Map(0x100000, 0x20000, 0x10000, Tegra::PTEKind::PITCH, true);
+    const auto remapped = resolve();
+    REQUIRE(remapped.device_addr == 0x20800);
+    REQUIRE(remapped.buffer_id != second);
+    index_binding = Access::ResolveIndex(*f.cache, channel);
+    REQUIRE(index_binding.device_addr == 0x20400);
+    REQUIRE(index_binding.buffer_id == remapped.buffer_id);
 }
 
 TEST_CASE("Batch downloads clamp buffers, deduplicate pages and finish before publication",
