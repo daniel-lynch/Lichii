@@ -57,7 +57,14 @@ inline std::atomic<u32> g_hot_page_epoch{0};
 /// (tests may flip it before building trackers).
 inline bool g_hot_pages = [] {
     const char* const value = std::getenv("EDEN_NX2_HOT_PAGES");
-    return value != nullptr && value[0] == '1';
+    return value != nullptr && (value[0] == '1' || value[0] == '2');
+}();
+/// EDEN_NX2_HOT_PAGES=2: hot pages are also uploaded again after every guest sync point
+/// (Nx2FastDraw::SyncSerial), not only once a present (=1, upstream's rule). Narrower stale window,
+/// many more uploads: C17.13's first screen of it lost 36% of Market's fps to them.
+inline bool g_hot_pages_sync = [] {
+    const char* const value = std::getenv("EDEN_NX2_HOT_PAGES");
+    return value != nullptr && value[0] == '2';
 }();
 
 /// EDEN_NX2_HOT_PAGES_VERIFY=1 (with EDEN_NX2_HOT_PAGES=1): hashes each hot page's guest bytes at
@@ -68,6 +75,8 @@ inline bool g_hot_pages_verify = [] {
     return value != nullptr && value[0] == '1';
 }();
 struct HotVerifyStats {
+    std::atomic<u64> hot_page_uploads{}; ///< hot pages uploaded (any hot mode)
+    std::atomic<u64> hot_page_skips{};   ///< hot pages an upload skipped as uploaded already
     std::atomic<u64> uploads{};  ///< hot pages hashed at an upload
     std::atomic<u64> checked{};  ///< skipped uploads checked
     std::atomic<u64> stale{};    ///< of them, guest bytes changed since the upload
@@ -178,12 +187,13 @@ struct WordManager {
 
     /// Forgets which pages are hot every 128 frames, so a page that stopped being rewritten gets
     /// tracked again at its next upload.
-    /// Hot pages are uploaded again (HotClean dropped) after every point where the guest may have
-    /// written memory nobody watches: Nx2FastDraw::SyncSerial (each submitted list, fences,
-    /// semaphores, syncpoints, reports), as uniform keeps do, and at least once a frame.
+    /// Hot pages are uploaded again (HotClean dropped) once a frame, and with EDEN_NX2_HOT_PAGES=2
+    /// after every point where the guest may have written memory nobody watches:
+    /// Nx2FastDraw::SyncSerial (each submitted list, fences, semaphores, syncpoints, reports), as
+    /// uniform keeps do.
     void RefreshHotEpoch() noexcept {
         const u32 frame = g_hot_page_epoch.load(std::memory_order_relaxed);
-        const u64 sync = Nx2FastDraw::SyncSerial();
+        const u64 sync = g_hot_pages_sync ? Nx2FastDraw::SyncSerial() : hot_sync;
         if (frame != hot_frame || sync != hot_sync) {
             hot_frame = frame;
             hot_sync = sync;
@@ -323,8 +333,18 @@ struct WordManager {
                 // Hot pages stay modified and untracked: their next use uploads them again,
                 // with no write protection to set and no write fault to take.
                 const u64 hot = hot_pages ? hot_words[index] & mask : 0;
-                if (hot_pages && g_hot_pages_verify) [[unlikely]] {
-                    VerifyHot(index, hot & word, hot_clean);
+                if (hot_pages) {
+                    if (const u64 uploading = hot & word; uploading != 0) {
+                        g_hot_verify_stats.hot_page_uploads.fetch_add(std::popcount(uploading),
+                                                                       std::memory_order_relaxed);
+                    }
+                    if (hot_clean != 0) {
+                        g_hot_verify_stats.hot_page_skips.fetch_add(std::popcount(hot_clean),
+                                                                    std::memory_order_relaxed);
+                    }
+                    if (g_hot_pages_verify) [[unlikely]] {
+                        VerifyHot(index, hot & word, hot_clean);
+                    }
                 }
                 hot_clean_words[index] |= hot & word;
                 const u64 clear_mask = mask & ~hot;

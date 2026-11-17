@@ -126,18 +126,20 @@ void BufferCache<P>::TickFrame() {
         // A hot page uploaded this frame is due again (HotClean resets): drop the geometry scans'
         // "nothing to upload" until a scan this frame finds it so again.
         memory_tracker.ForgetAllSynchronized();
-        if (VideoCommon::g_hot_pages_verify) [[unlikely]] {
-            static u32 frames{};
-            if (++frames % 600 == 0) {
-                auto& stats = VideoCommon::g_hot_verify_stats;
-                LOG_INFO(HW_GPU,
-                         "Hot pages verify: {} hot uploads hashed, {} skipped uploads checked, {} "
-                         "stale (guest bytes changed since the upload), last stale page {:#x}",
-                         stats.uploads.load(std::memory_order_relaxed),
-                         stats.checked.load(std::memory_order_relaxed),
-                         stats.stale.load(std::memory_order_relaxed),
-                         stats.last_stale.load(std::memory_order_relaxed));
-            }
+        static u32 frames{};
+        if (++frames % 600 == 0) {
+            auto& stats = VideoCommon::g_hot_verify_stats;
+            LOG_INFO(HW_GPU,
+                     "Hot pages (mode {}): {} hot page uploads, {} skips as uploaded already, in {} "
+                     "frames; verify: {} hashed, {} checked, {} stale (guest bytes changed since the "
+                     "upload), last stale page {:#x}",
+                     VideoCommon::g_hot_pages_sync ? 2 : 1,
+                     stats.hot_page_uploads.load(std::memory_order_relaxed),
+                     stats.hot_page_skips.load(std::memory_order_relaxed), frames,
+                     stats.uploads.load(std::memory_order_relaxed),
+                     stats.checked.load(std::memory_order_relaxed),
+                     stats.stale.load(std::memory_order_relaxed),
+                     stats.last_stale.load(std::memory_order_relaxed));
         }
     }
     // Homebrew console apps don't create or bind any channels, so this will be nullptr.

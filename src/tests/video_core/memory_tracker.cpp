@@ -844,12 +844,15 @@ namespace {
 /// EDEN_NX2_HOT_PAGES on for one test, at a frame count that does not cross a 128-frame reset.
 struct HotPagesOn {
     bool saved = VideoCommon::g_hot_pages;
-    HotPagesOn() {
+    bool saved_sync = VideoCommon::g_hot_pages_sync;
+    explicit HotPagesOn(bool sync = false) {
         VideoCommon::g_hot_pages = true;
+        VideoCommon::g_hot_pages_sync = sync;
         VideoCommon::g_hot_page_epoch.store(1024 + 1, std::memory_order_relaxed);
     }
     ~HotPagesOn() {
         VideoCommon::g_hot_pages = saved;
+        VideoCommon::g_hot_pages_sync = saved_sync;
     }
 };
 int Uploads(MemoryTracker& tracker, DAddr addr, u64 size) {
@@ -939,8 +942,21 @@ TEST_CASE("MemoryTracker: ForgetAllSynchronized drops every watched range", "[vi
     REQUIRE_FALSE(memory_track->IsSynchronized(5));
 }
 
-TEST_CASE("MemoryTracker: hot pages are uploaded again after every guest sync point", "[video_core]") {
-    const HotPagesOn hot;
+TEST_CASE("MemoryTracker: hot pages mode 2 uploads again after every guest sync point; mode 1 does not",
+          "[video_core]") {
+    {
+        const HotPagesOn hot;
+        RasterizerInterface rasterizer;
+        std::optional<MemoryTracker> memory_track(rasterizer);
+        REQUIRE(Uploads(*memory_track, c, WORD) == 1);
+        for (int flip = 0; flip < 2; ++flip) {
+            memory_track->MarkRegionAsCpuModified(c + PAGE, PAGE);
+            REQUIRE(Uploads(*memory_track, c, WORD) == 1);
+        }
+        VideoCommon::Nx2FastDraw::NoteSync();
+        REQUIRE(Uploads(*memory_track, c, WORD) == 0); // once a present only
+    }
+    const HotPagesOn hot{true};
     RasterizerInterface rasterizer;
     std::optional<MemoryTracker> memory_track(rasterizer);
     REQUIRE(Uploads(*memory_track, c, WORD) == 1);
