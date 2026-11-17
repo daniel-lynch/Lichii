@@ -171,6 +171,13 @@ public:
         synchronized_mask &= ~(u64{1} << slot);
     }
 
+    /// Every slot. With EDEN_NX2_HOT_PAGES a guest write to a hot page marks nothing, so a scan
+    /// that found nothing this frame says nothing about the next one: BufferCache::TickFrame
+    /// forgets the watched ranges once a frame.
+    void ForgetAllSynchronized() noexcept {
+        synchronized_mask = 0;
+    }
+
     [[nodiscard]] bool IsSynchronized(u32 slot) const noexcept {
         return ((synchronized_mask >> slot) & 1) != 0;
     }

@@ -122,6 +122,11 @@ void BufferCache<P>::TickFrame() {
     // Pages the core could not arm may be cached by now.
     unarmed_read_trap_ranges.Clear();
     VideoCommon::g_hot_page_epoch.fetch_add(1, std::memory_order_relaxed);
+    if (VideoCommon::g_hot_pages) {
+        // A hot page uploaded this frame is due again (HotClean resets): drop the geometry scans'
+        // "nothing to upload" until a scan this frame finds it so again.
+        memory_tracker.ForgetAllSynchronized();
+    }
     // Homebrew console apps don't create or bind any channels, so this will be nullptr.
     if (!channel_state) {
         return;

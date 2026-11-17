@@ -839,3 +839,102 @@ TEST_CASE("DeviceMemoryManager: UpdatePagesCachedBatch basic") {
     manager.UpdatePagesCachedBatch(ranges, 1);
     SUCCEED("UpdatePagesCachedBatch executed without error");
 }
+
+namespace {
+/// EDEN_NX2_HOT_PAGES on for one test, at a frame count that does not cross a 128-frame reset.
+struct HotPagesOn {
+    bool saved = VideoCommon::g_hot_pages;
+    HotPagesOn() {
+        VideoCommon::g_hot_pages = true;
+        VideoCommon::g_hot_page_epoch.store(1024 + 1, std::memory_order_relaxed);
+    }
+    ~HotPagesOn() {
+        VideoCommon::g_hot_pages = saved;
+    }
+};
+int Uploads(MemoryTracker& tracker, DAddr addr, u64 size) {
+    int uploads = 0;
+    tracker.ForEachUploadRange(addr, size, [&](u64, u64) { ++uploads; });
+    return uploads;
+}
+} // Anonymous namespace
+
+TEST_CASE("MemoryTracker: hot pages are off by default and change nothing", "[video_core]") {
+    REQUIRE_FALSE(VideoCommon::g_hot_pages); // EDEN_NX2_HOT_PAGES unset in the test environment
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    REQUIRE(Uploads(*memory_track, c, WORD) == 1);
+    for (int flip = 0; flip < 4; ++flip) {
+        memory_track->MarkRegionAsCpuModified(c + PAGE, PAGE);
+        REQUIRE(rasterizer.Count(c + PAGE) == 0);
+        REQUIRE(Uploads(*memory_track, c, WORD) == 1);
+        REQUIRE(rasterizer.Count(c + PAGE) == 1); // write-protected again after every upload
+        REQUIRE(Uploads(*memory_track, c, WORD) == 0);
+    }
+}
+
+TEST_CASE("MemoryTracker: a page the CPU rewrites twice turns hot", "[video_core]") {
+    const HotPagesOn hot;
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    REQUIRE(Uploads(*memory_track, c, WORD) == 1);
+    REQUIRE(rasterizer.Count() == WORD / PAGE);
+
+    // First rewrite: tracked again after its upload.
+    memory_track->MarkRegionAsCpuModified(c + PAGE, PAGE);
+    REQUIRE(Uploads(*memory_track, c, WORD) == 1);
+    REQUIRE(rasterizer.Count(c + PAGE) == 1);
+    // Second: hot. Uploaded, but left unprotected and modified.
+    memory_track->MarkRegionAsCpuModified(c + PAGE, PAGE);
+    const size_t calls = rasterizer.UpdateCallsList().size();
+    REQUIRE(Uploads(*memory_track, c, WORD) == 1);
+    REQUIRE(rasterizer.Count(c + PAGE) == 0);
+    REQUIRE(rasterizer.UpdateCallsList().size() == calls); // no protection call
+    REQUIRE(memory_track->IsRegionCpuModified(c + PAGE, PAGE));
+    // At most once a frame.
+    REQUIRE(Uploads(*memory_track, c, WORD) == 0);
+    VideoCommon::g_hot_page_epoch.fetch_add(1, std::memory_order_relaxed);
+    REQUIRE(Uploads(*memory_track, c, WORD) == 1);
+    REQUIRE(Uploads(*memory_track, c, WORD) == 0);
+    REQUIRE(rasterizer.UpdateCallsList().size() == calls);
+    // A mark in the frame (a GPU engine write, a bank re-upload) wants it uploaded again.
+    memory_track->MarkRegionAsWrittenTracked(c + PAGE, PAGE);
+    REQUIRE(Uploads(*memory_track, c, WORD) == 1);
+    memory_track->MarkRegionAsCpuModified(c + PAGE, PAGE);
+    REQUIRE(Uploads(*memory_track, c, WORD) == 1);
+    // Neighbours stay tracked.
+    REQUIRE(rasterizer.Count(c) == 1);
+    REQUIRE(rasterizer.Count(c + PAGE * 2) == 1);
+}
+
+TEST_CASE("MemoryTracker: GPU-written pages never turn hot; hot state resets every 128 frames",
+          "[video_core]") {
+    const HotPagesOn hot;
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    REQUIRE(Uploads(*memory_track, c, WORD) == 1);
+    memory_track->MarkRegionAsGpuModified(c + PAGE * 3, PAGE);
+    for (int flip = 0; flip < 3; ++flip) {
+        memory_track->MarkRegionAsCpuModified(c + PAGE * 3, PAGE);
+        memory_track->MarkRegionAsCpuModified(c + PAGE * 5, PAGE);
+        REQUIRE(Uploads(*memory_track, c, WORD) >= 1);
+        REQUIRE(rasterizer.Count(c + PAGE * 3) == 1);
+    }
+    REQUIRE(rasterizer.Count(c + PAGE * 5) == 0); // hot
+    VideoCommon::g_hot_page_epoch.fetch_add(128, std::memory_order_relaxed);
+    REQUIRE(Uploads(*memory_track, c, WORD) == 1);
+    REQUIRE(rasterizer.Count(c + PAGE * 5) == 1); // forgotten: tracked again at its upload
+}
+
+TEST_CASE("MemoryTracker: ForgetAllSynchronized drops every watched range", "[video_core]") {
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    memory_track->ForEachUploadRange(c, PAGE * 4, [](u64, u64) {});
+    memory_track->WatchSynchronized(1, c, PAGE * 4);
+    memory_track->WatchSynchronized(5, c, PAGE * 2);
+    REQUIRE(memory_track->IsSynchronized(1));
+    REQUIRE(memory_track->IsSynchronized(5));
+    memory_track->ForgetAllSynchronized();
+    REQUIRE_FALSE(memory_track->IsSynchronized(1));
+    REQUIRE_FALSE(memory_track->IsSynchronized(5));
+}

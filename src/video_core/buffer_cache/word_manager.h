@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <limits>
 #include <span>
 #include <utility>
@@ -43,6 +44,18 @@ enum class Type {
 
 /// Frames since start, moved by BufferCache::TickFrame. Hot page state is dropped every 128.
 inline std::atomic<u32> g_hot_page_epoch{0};
+
+/// EDEN_NX2_HOT_PAGES=1: pages the CPU rewrites again and again stay modified and unprotected
+/// (the Hot, Flip, NoHot and HotClean words below) instead of being write-protected after every
+/// upload and unprotected again by the guest's next write: in OoT that ping-pong is ~13.6k
+/// mprotect calls a second on the GPU back thread (1.8 ms a frame) and ~8k on the guest cores,
+/// each a TLB shootdown (C17.13). A hot page is uploaded at most once a frame, so a guest write to
+/// it after its upload in a frame reaches the GPU the next frame. Default off; set once at start
+/// (tests may flip it before building trackers).
+inline bool g_hot_pages = [] {
+    const char* const value = std::getenv("EDEN_NX2_HOT_PAGES");
+    return value != nullptr && value[0] == '1';
+}();
 
 template <class DeviceTracker, size_t stack_words, size_t size_bytes>
 struct WordManager {
@@ -162,7 +175,10 @@ struct WordManager {
     /// @param dirty_addr    Base address to mark or unmark as modified
     /// @param size          Size in bytes to mark or unmark as modified
     void ChangeRegionState(Type type, bool enable, u64 dirty_addr, u64 size) noexcept {
-        RefreshHotEpoch();
+        const bool hot_pages = g_hot_pages;
+        if (hot_pages) {
+            RefreshHotEpoch();
+        }
         std::span<u64> hot_words = Span(Type::Hot);
         std::span<u64> flip_words = Span(Type::Flip);
         std::span<u64> no_hot_words = Span(Type::NoHot);
@@ -172,7 +188,7 @@ struct WordManager {
         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
         CollectedRanges ranges;
         IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
-            if (enable) {
+            if (hot_pages && enable) {
                 if (type == Type::CPU) {
                     // Whoever marks a hot page modified (a write made by the GPU in the middle of
                     // the frame, a bank re-upload) wants it uploaded again, whatever was sent.
@@ -225,7 +241,7 @@ struct WordManager {
     template <typename Func>
     void ForEachModifiedRange(Type type, bool clear, VAddr query_cpu_range, s64 size, Func&& func) {
         //static_assert(type != Type::Untracked);
-        const bool hot_pages = clear && type == Type::CPU;
+        const bool hot_pages = g_hot_pages && clear && type == Type::CPU;
         if (hot_pages) {
             RefreshHotEpoch();
         }
