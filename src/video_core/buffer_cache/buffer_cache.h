@@ -3439,7 +3439,7 @@ void BufferCache<P>::UpdateIndexBuffer() {
     ResolveMemo& memo = index_memo;
     const size_t owner = gpu_memory->GetID() + 1;
     const u64 serial = gpu_memory->MapSerial();
-    const bool hit = memo.owner == owner && memo.map_serial == serial &&
+    const bool hit = ResolveMemoEnabled() && memo.owner == owner && memo.map_serial == serial &&
                      memo.deletions == buffer_deletions && memo.begin == gpu_addr_begin &&
                      size <= memo.binding.size && !Settings::IsGPUFenceBehaviorAccurate();
     const Binding kept{
@@ -3506,7 +3506,7 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
     ResolveMemo& memo = vertex_memos[index];
     const size_t owner = gpu_memory->GetID() + 1;
     const u64 serial = gpu_memory->MapSerial();
-    const bool hit = memo.owner == owner && memo.map_serial == serial &&
+    const bool hit = ResolveMemoEnabled() && memo.owner == owner && memo.map_serial == serial &&
                      memo.deletions == buffer_deletions && memo.begin == gpu_addr_begin &&
                      memo.end == gpu_addr_end && !Settings::IsGPUFenceBehaviorAccurate();
     if (Nx2FastDraw::g_buffer_skip) [[unlikely]] {
@@ -4209,12 +4209,22 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
     const DAddr device_addr_end = device_addr_begin + size;
     const u64 page_begin = device_addr_begin / CACHING_PAGESIZE;
     const u64 page_end = Common::DivCeil(device_addr_end, CACHING_PAGESIZE);
+    bool replaced = false;
     for (u64 page = page_begin; page != page_end; ++page) {
         if constexpr (insert) {
+            // ResolveOverlaps joins nothing for a range that starts in the first 64 KiB, so a new
+            // buffer can be registered over pages another live buffer holds. FindBuffer answers
+            // differently for those pages from now on: count it as a deletion, which ends the
+            // resolve memos and every other binding kept under buffer_deletions.
+            const BufferId previous = page_table[page];
+            replaced |= previous && previous != buffer_id;
             page_table[page] = buffer_id;
         } else {
             page_table[page] = BufferId{};
         }
+    }
+    if (replaced) {
+        ++buffer_deletions;
     }
 }
 

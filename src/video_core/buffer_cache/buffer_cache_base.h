@@ -898,6 +898,14 @@ private:
     };
     std::array<ResolveMemo, NUM_VERTEX_BUFFERS> vertex_memos{};
     ResolveMemo index_memo{};
+    /// EDEN_NX2_RESOLVE_MEMO=0 turns the resolve memos off (every resolve is a full one).
+    [[nodiscard]] static bool ResolveMemoEnabled() noexcept {
+        static const bool enabled = [] {
+            const char* const value = std::getenv("EDEN_NX2_RESOLVE_MEMO");
+            return !(value != nullptr && value[0] == '0');
+        }();
+        return enabled;
+    }
     struct GeometryStats {
         u64 syncs{};
         u64 syncs_skipped{};

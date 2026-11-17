@@ -223,9 +223,13 @@ void CheckOneCopyDirectBinds() {
 
 TEST_CASE("Uniform stream reuse: one-copy direct binds never reuse by stale slot bytes",
           "[video_core]") {
-    const bool saved = VideoCommon::g_uniform_one_copy;
+    struct Restore {
+        bool saved = VideoCommon::g_uniform_one_copy;
+        ~Restore() {
+            VideoCommon::g_uniform_one_copy = saved;
+        }
+    } restore;
     VideoCommon::g_uniform_one_copy = true;
     CheckOneCopyDirectBinds<Memory>();
     CheckOneCopyDirectBinds<SpanMemory>();
-    VideoCommon::g_uniform_one_copy = saved;
 }

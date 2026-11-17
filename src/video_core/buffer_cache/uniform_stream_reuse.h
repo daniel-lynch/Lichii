@@ -122,7 +122,8 @@ template <class Runtime, class DeviceMemory>
     slot.device_addr = device_addr;
     if (slot.direct != 0) {
         // A slot whose bytes change every bind: read straight into its bytes, no compare (from
-        // skolvolt 9267908a3d). The bytes stay the last bind's, for keeps and their verify.
+        // skolvolt 9267908a3d). The bytes stay the last bind's, for keeps and their verify,
+        // except with EDEN_NX2_UBO_ONECOPY, which leaves them stale (keep verify turns it off).
         --slot.direct;
         slot.size = size;
         if (g_uniform_one_copy) {
