@@ -40,6 +40,17 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
     return enabled;
 }
 
+/// EDEN_NX2_UBO_ONECOPY=1: a slot in its direct binds (bytes that change every bind) copies guest
+/// memory straight into the stream allocation, instead of into the slot's bytes and from there
+/// into the stream. The slot's bytes are then stale and the next compare misses once. Off with
+/// EDEN_NX2_UBO_KEEP_VERIFY=1, whose check reads the slot's bytes. Default off.
+[[nodiscard]] inline bool UniformOneCopySwitchSet() noexcept {
+    const char* const value = std::getenv("EDEN_NX2_UBO_ONECOPY");
+    const char* const verify = std::getenv("EDEN_NX2_UBO_KEEP_VERIFY");
+    return value != nullptr && value[0] == '1' && !(verify != nullptr && verify[0] == '1');
+}
+inline bool g_uniform_one_copy = UniformOneCopySwitchSet();
+
 template <class Ref>
 class UniformStreamReuse {
 public:
@@ -58,6 +69,7 @@ public:
         u32 size{};        // 0: nothing streamed yet
         u16 misses{};      ///< Binds in a row whose bytes differed from the slot's last
         u16 direct{};      ///< Binds left that copy without comparing
+        bool stale{};      ///< EDEN_NX2_UBO_ONECOPY: `bytes` are not what the last bind copied
         std::array<u8, MaxBytes> bytes{};
     };
 
@@ -68,6 +80,7 @@ public:
                 slot.tick = 0;
                 slot.misses = 0;
                 slot.direct = 0;
+                slot.stale = false;
             }
         }
     }
@@ -111,8 +124,26 @@ template <class Runtime, class DeviceMemory>
         // A slot whose bytes change every bind: read straight into its bytes, no compare (from
         // skolvolt 9267908a3d). The bytes stay the last bind's, for keeps and their verify.
         --slot.direct;
-        device_memory.ReadBlockUnsafe(device_addr, slot.bytes.data(), size);
         slot.size = size;
+        if (g_uniform_one_copy) {
+            // One copy, guest memory to the stream; the compare after the direct binds misses.
+            slot.stale = true;
+            const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+            const u8* guest = nullptr;
+            if constexpr (requires { device_memory.GetSpan(device_addr, size); }) {
+                guest = device_memory.GetSpan(device_addr, size);
+            }
+            if (guest != nullptr) {
+                std::memcpy(span.data(), guest, size);
+            } else {
+                device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+            }
+            slot.ref = runtime.LastStreamUniformRef();
+            slot.tick = runtime.CurrentTick();
+            return true;
+        }
+        slot.stale = false;
+        device_memory.ReadBlockUnsafe(device_addr, slot.bytes.data(), size);
         const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
         std::memcpy(span.data(), slot.bytes.data(), size);
         slot.ref = runtime.LastStreamUniformRef();
@@ -128,7 +159,8 @@ template <class Runtime, class DeviceMemory>
     if constexpr (requires { device_memory.GetSpan(device_addr, size); }) {
         const u8* const guest = device_memory.GetSpan(device_addr, size);
         if (guest != nullptr) {
-            const bool same = slot.size == size && std::memcmp(slot.bytes.data(), guest, size) == 0;
+            const bool same = !slot.stale && slot.size == size &&
+                              std::memcmp(slot.bytes.data(), guest, size) == 0;
             if (same) {
                 slot.misses = 0;
                 if (slot.tick == runtime.CurrentTick()) {
@@ -138,6 +170,7 @@ template <class Runtime, class DeviceMemory>
             } else {
                 std::memcpy(slot.bytes.data(), guest, size);
                 slot.size = size;
+                slot.stale = false;
                 if (++slot.misses >= Reuse::MissStreak) {
                     slot.misses = 0;
                     slot.direct = Reuse::DirectBinds;
@@ -153,8 +186,8 @@ template <class Runtime, class DeviceMemory>
     u8* const scratch = reuse.scratch.data();
     device_memory.ReadBlockUnsafe(device_addr, scratch, size);
 
-    const bool same_bytes =
-        slot.size == size && std::memcmp(slot.bytes.data(), scratch, size) == 0;
+    const bool same_bytes = !slot.stale && slot.size == size &&
+                            std::memcmp(slot.bytes.data(), scratch, size) == 0;
     if (same_bytes && slot.tick == runtime.CurrentTick()) {
         slot.misses = 0;
         runtime.RebindStreamUniform(slot.ref, size);
@@ -169,6 +202,7 @@ template <class Runtime, class DeviceMemory>
         slot.misses = 0;
     } else {
         slot.size = size;
+        slot.stale = false;
         std::memcpy(slot.bytes.data(), scratch, size);
         if (++slot.misses >= Reuse::MissStreak) {
             slot.misses = 0;

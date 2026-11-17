@@ -172,3 +172,60 @@ TEST_CASE("Uniform stream reuse: a slot whose bytes change every bind skips the 
     bind();
     Check(runtime.allocations.size() == before + 1, "a streak survived a reused bind");
 }
+
+namespace {
+/// Guest memory whose pages are one host run, as DeviceMemoryManager::GetSpan finds them.
+struct SpanMemory : Memory {
+    const u8* GetSpan(u64 address, u64 size) {
+        Check(address + size <= bytes.size(), "span outside guest memory");
+        return bytes.data() + address;
+    }
+};
+
+template <class M>
+void CheckOneCopyDirectBinds() {
+    using VideoCommon::BindSmallUniformReusing;
+    using Reuse = VideoCommon::UniformStreamReuse<Runtime::StreamUniformRef>;
+    M memory;
+    Runtime runtime;
+    VideoCommon::ResetUniformStreamReuse<Runtime>();
+    constexpr u64 address = 128;
+    constexpr u32 size = 256;
+    const auto bind = [&] {
+        Check(BindSmallUniformReusing(runtime, memory, 2, 3, 3, address, size),
+              "valid small uniform rejected");
+        CheckBound(runtime, memory, address, size);
+    };
+    for (u32 i = 0; i < Reuse::MissStreak; ++i) {
+        memory.bytes[address] = static_cast<u8>(i + 1);
+        bind();
+    }
+    // The slot's bytes are the last compared bind's; the direct binds copy past them.
+    const u8 compared = memory.bytes[address];
+    for (u32 i = 0; i < Reuse::DirectBinds; ++i) {
+        memory.bytes[address] = static_cast<u8>(0x80 + i);
+        bind();
+    }
+    Check(runtime.allocations.size() == Reuse::MissStreak + Reuse::DirectBinds,
+          "a direct bind was reused");
+    // Guest memory holds the slot's stale bytes again, but the last allocation holds the last
+    // direct bind's: this bind copies.
+    memory.bytes[address] = compared;
+    bind();
+    Check(runtime.allocations.size() == Reuse::MissStreak + Reuse::DirectBinds + 1,
+          "stale slot bytes reused an allocation");
+    // From there the compare reuses unchanged bytes again.
+    bind();
+    Check(runtime.allocations.size() == Reuse::MissStreak + Reuse::DirectBinds + 1,
+          "unchanged bytes after the one-copy binds were copied again");
+}
+} // namespace
+
+TEST_CASE("Uniform stream reuse: one-copy direct binds never reuse by stale slot bytes",
+          "[video_core]") {
+    const bool saved = VideoCommon::g_uniform_one_copy;
+    VideoCommon::g_uniform_one_copy = true;
+    CheckOneCopyDirectBinds<Memory>();
+    CheckOneCopyDirectBinds<SpanMemory>();
+    VideoCommon::g_uniform_one_copy = saved;
+}
