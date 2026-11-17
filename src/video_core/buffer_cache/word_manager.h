@@ -19,6 +19,7 @@
 #include "common/common_funcs.h"
 #include "common/common_types.h"
 #include "common/div_ceil.h"
+#include "video_core/nx2_fast_draw.h"
 #include "common/logging.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2_perf.h"
@@ -155,10 +156,15 @@ struct WordManager {
 
     /// Forgets which pages are hot every 128 frames, so a page that stopped being rewritten gets
     /// tracked again at its next upload.
+    /// Hot pages are uploaded again (HotClean dropped) after every point where the guest may have
+    /// written memory nobody watches: Nx2FastDraw::SyncSerial (each submitted list, fences,
+    /// semaphores, syncpoints, reports), as uniform keeps do, and at least once a frame.
     void RefreshHotEpoch() noexcept {
         const u32 frame = g_hot_page_epoch.load(std::memory_order_relaxed);
-        if (frame != hot_frame) {
+        const u64 sync = Nx2FastDraw::SyncSerial();
+        if (frame != hot_frame || sync != hot_sync) {
             hot_frame = frame;
+            hot_sync = sync;
             std::fill_n(heap.data() + size_t(Type::HotClean) * num_words, num_words, u64{0});
         }
         const u32 now = frame >> 7;
@@ -186,7 +192,9 @@ struct WordManager {
         std::span<u64> state_words = Span(type);
         [[maybe_unused]] std::span<u64> untracked_words = Span(Type::Untracked);
         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
+        std::span<u64> cpu_words = Span(Type::CPU);
         CollectedRanges ranges;
+        CollectedRanges retrack;
         IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
             if (hot_pages && enable) {
                 if (type == Type::CPU) {
@@ -201,8 +209,24 @@ struct WordManager {
                         flip_words[index] |= flipped;
                     }
                 } else if (type == Type::GPU) {
+                    // A hot page stays CPU-modified and untracked after its upload, and GPU
+                    // queries mask untracked pages out: one the GPU now writes would hide the
+                    // write from downloads. A hot page uploaded since the last sync is what the
+                    // old tracker had after the bind's upload (CPU clear, tracked): put it back
+                    // there, with its protection. (C17.13 review finding 1.)
+                    const u64 synced = hot_words[index] & hot_clean_words[index] &
+                                       untracked_words[index] & mask;
+                    if (synced != 0) {
+                        CollectChangedRanges(true, index, untracked_words[index], synced, retrack);
+                        untracked_words[index] &= ~synced;
+                        cpu_words[index] &= ~synced;
+                        cached_words[index] &= ~synced;
+                        NoteCleanWord(index);
+                    }
                     no_hot_words[index] |= mask;
                     hot_words[index] &= ~mask;
+                    hot_clean_words[index] &= ~mask;
+                } else if (type == Type::CachedCPU) {
                     hot_clean_words[index] &= ~mask;
                 }
             }
@@ -228,6 +252,9 @@ struct WordManager {
         });
         if (!ranges.empty()) {
             ApplyCollectedRanges(ranges, (!enable) ? 1 : -1);
+        }
+        if (!retrack.empty()) {
+            ApplyCollectedRanges(retrack, 1);
         }
     }
 
@@ -488,6 +515,7 @@ struct WordManager {
     VAddr cpu_addr = 0;
     u32 hot_epoch = 0;
     u32 hot_frame = 0;
+    u64 hot_sync = 0;
 };
 
 } // namespace VideoCommon

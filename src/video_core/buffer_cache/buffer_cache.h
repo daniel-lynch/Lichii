@@ -4351,7 +4351,15 @@ void BufferCache<P>::SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAd
         }
         return;
     }
-    SynchronizeBuffer(buffer, device_addr, size);
+    const bool nothing_uploaded = SynchronizeBuffer(buffer, device_addr, size);
+    if constexpr (requires { runtime.IsVertexRepacked(u32{}); }) {
+        // A guest write to a hot page notifies nothing, so MarkVertexBuffersStale never runs for
+        // it: re-run the repack of a repacked stream whose upload found new bytes (C17.13 review).
+        if (VideoCommon::g_hot_pages && !nothing_uploaded && slot < NUM_VERTEX_BUFFERS &&
+            runtime.IsVertexRepacked(slot)) {
+            maxwell3d->dirty.flags[Dirty::VertexBuffer0 + slot] = true;
+        }
+    }
     sync = GeometrySync{
         .buffer_id = buffer_id,
         .device_addr = device_addr,

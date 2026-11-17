@@ -938,3 +938,44 @@ TEST_CASE("MemoryTracker: ForgetAllSynchronized drops every watched range", "[vi
     REQUIRE_FALSE(memory_track->IsSynchronized(1));
     REQUIRE_FALSE(memory_track->IsSynchronized(5));
 }
+
+TEST_CASE("MemoryTracker: hot pages are uploaded again after every guest sync point", "[video_core]") {
+    const HotPagesOn hot;
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    REQUIRE(Uploads(*memory_track, c, WORD) == 1);
+    for (int flip = 0; flip < 2; ++flip) {
+        memory_track->MarkRegionAsCpuModified(c + PAGE, PAGE);
+        REQUIRE(Uploads(*memory_track, c, WORD) == 1);
+    }
+    REQUIRE(rasterizer.Count(c + PAGE) == 0); // hot
+    REQUIRE(Uploads(*memory_track, c, WORD) == 0);
+    VideoCommon::Nx2FastDraw::NoteSync(); // a submitted list, a fence, a report...
+    REQUIRE(Uploads(*memory_track, c, WORD) == 1);
+    REQUIRE(Uploads(*memory_track, c, WORD) == 0);
+}
+
+TEST_CASE("MemoryTracker: a hot page the GPU writes is tracked and GPU-modified again", "[video_core]") {
+    const HotPagesOn hot;
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    REQUIRE(Uploads(*memory_track, c, WORD) == 1);
+    for (int flip = 0; flip < 2; ++flip) {
+        memory_track->MarkRegionAsCpuModified(c + PAGE, PAGE);
+        REQUIRE(Uploads(*memory_track, c, WORD) == 1);
+    }
+    REQUIRE(rasterizer.Count(c + PAGE) == 0); // hot, uploaded since the last sync
+    memory_track->MarkRegionAsGpuModified(c + PAGE, PAGE);
+    REQUIRE(rasterizer.Count(c + PAGE) == 1);
+    REQUIRE(memory_track->IsRegionGpuModified(c + PAGE, PAGE));
+    REQUIRE_FALSE(memory_track->IsRegionCpuModified(c + PAGE, PAGE));
+    int downloads = 0;
+    memory_track->ForEachDownloadRange(c, WORD, false, [&](u64, u64) { ++downloads; });
+    REQUIRE(downloads == 1);
+    // Never hot again: CPU rewrites are tracked again after each upload.
+    for (int flip = 0; flip < 3; ++flip) {
+        memory_track->MarkRegionAsCpuModified(c + PAGE, PAGE);
+        Uploads(*memory_track, c, WORD);
+        REQUIRE(rasterizer.Count(c + PAGE) == 1);
+    }
+}
