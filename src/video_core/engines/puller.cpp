@@ -202,10 +202,10 @@ InflightStats& GetInflightStats() {
 
 // Whether the word's last async report landed (or there is none in flight).
 bool InflightLanded(DAddr device) {
-    const auto issued_after = VideoCommon::GetInflightIssues().Find(device);
+    const auto issue = VideoCommon::GetInflightIssues().Find(device);
     const u32 completed = Tegra::g_nx2_async_reports_completed[Tegra::Nx2AsyncReportSlot(device)]
                               .load(std::memory_order_acquire);
-    return !issued_after || static_cast<s32>(completed - *issued_after) >= 0;
+    return !issue || !VideoCommon::InflightUnlanded(issue->issued_after, completed);
 }
 
 void ReportInflight() {
@@ -279,14 +279,22 @@ VideoCommon::InflightStep CheckInflight(DmaPusher& dma_pusher, const Puller::Pen
     if (!note) {
         return InflightStep::None;
     }
+    const bool reaches = acquire.WaitsToReach();
+    // An equal or mask word on a page GPU work writes may be newer in the buffer cache than any
+    // report the front noted (as CheckWithoutDrain).
+    if (!reaches && Nx2MayBeGpuWritten(*device, sizeof(u32))) {
+        return InflightStep::None;
+    }
     const auto queued = split.QueuedSemaphoreWriteAt(*device);
     const bool is_queued = queued && queued->position == note->position;
+    // The issue entry first: completed only grows, so a count read after it can only make the
+    // report look landed, which decides as before.
+    const auto issue = VideoCommon::GetInflightIssues().Find(*device);
     const u32 completed = Tegra::g_nx2_async_reports_completed[Tegra::Nx2AsyncReportSlot(*device)]
                               .load(std::memory_order_acquire);
     const auto matches = [&acquire](u32 value) { return acquire.Matches(value); };
     const InflightStep step =
-        VideoCommon::DecideInflight(matches, note, is_queued,
-                                    VideoCommon::GetInflightIssues().Find(*device), completed);
+        VideoCommon::DecideInflight(matches, reaches, note, is_queued, issue, completed);
     auto& stats = GetInflightStats();
     if (step == InflightStep::None) {
         if (!is_queued && InflightLanded(*device)) {

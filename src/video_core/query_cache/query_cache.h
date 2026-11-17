@@ -302,8 +302,11 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     u8* pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
     const u64 report_size = has_timestamp ? 16 : 4;
+    // EDEN_NX2_ACQUIRE_INFLIGHT: a write at once must not overtake a report to the same slot
+    // still waiting for its fence (an acquire may have passed on that one): it lands in order.
     const bool immediate =
-        !is_fence && !Settings::IsGPULevelHigh() && counter_type == QueryType::Payload;
+        !is_fence && !Settings::IsGPULevelHigh() && counter_type == QueryType::Payload &&
+        (!VideoCommon::g_acquire_inflight || Tegra::Nx2AsyncReportsSettled(cpu_addr, report_size));
     // Written later: the buffer cache keeps GPU writes over it until then (NoteReportPending).
     const bool report_noted =
         !immediate && impl->rasterizer.NoteReportPending(cpu_addr, report_size);
@@ -395,13 +398,20 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             Tegra::g_nx2_async_reports_issued[Tegra::Nx2AsyncReportSlot(cpu_addr)].fetch_add(
                 1, std::memory_order_release) + 1;
         if (VideoCommon::g_acquire_inflight) {
-            VideoCommon::GetInflightIssues().Issued(cpu_addr, issued_after);
+            VideoCommon::GetInflightIssues().Wrote(cpu_addr, payload, issued_after);
         }
         VideoCore::g_signaling_query_report_fence = true;
         impl->rasterizer.SignalFence(std::move(operation));
         VideoCore::g_signaling_query_report_fence = false;
     } else {
         if (immediate) {
+            if (VideoCommon::g_acquire_inflight) {
+                // Written now: landed (the count as it stands).
+                VideoCommon::GetInflightIssues().Wrote(
+                    cpu_addr, payload,
+                    Tegra::g_nx2_async_reports_issued[Tegra::Nx2AsyncReportSlot(cpu_addr)].load(
+                        std::memory_order_relaxed));
+            }
             FinishReads(cpu_addr, has_timestamp ? 16 : 4);
             auto& shadow = Tegra::Nx2MirrorShadow::Get();
             if (mirrored && shadow.Diverts(cpu_addr)) {
@@ -439,7 +449,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             Tegra::g_nx2_async_reports_issued[Tegra::Nx2AsyncReportSlot(cpu_addr)].fetch_add(
                 1, std::memory_order_release) + 1;
         if (VideoCommon::g_acquire_inflight) {
-            VideoCommon::GetInflightIssues().Issued(cpu_addr, issued_after);
+            VideoCommon::GetInflightIssues().Wrote(cpu_addr, payload, issued_after);
         }
         impl->rasterizer.SyncOperation(std::move(operation));
     }

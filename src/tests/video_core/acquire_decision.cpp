@@ -72,31 +72,41 @@ TEST_CASE("Peeking at a mirrored semaphore word keeps it for a combined release"
 TEST_CASE("In-flight acquires pass only on a matching release that has not landed",
           "[video_core][nx2_acquire]") {
     using VideoCommon::DecideInflight;
+    using VideoCommon::InflightIssue;
     using VideoCommon::InflightIssues;
     using VideoCommon::InflightNote;
     using VideoCommon::InflightStep;
     using N = std::optional<InflightNote>;
-    using I = std::optional<u32>;
-    // Queued for the back: it runs ahead of anything the acquire's channel sends.
-    CHECK(DecideInflight(Equal(7), N{InflightNote{7, true, 10}}, true, I{}, 0) == InflightStep::Queued);
-    CHECK(DecideInflight(Mask(0x4), N{InflightNote{0x6, true, 10}}, true, I{}, 0) == InflightStep::Queued);
+    using I = std::optional<InflightIssue>;
+    const N seven{InflightNote{7, true, 10}};
+    // Queued for the back: greater-or-equal passes (it runs ahead of the acquire's channel); an
+    // equal or mask acquire can't see writes queued after it, so it decides as before.
+    CHECK(DecideInflight(Equal(7), true, seven, true, I{}, 0) == InflightStep::Queued);
+    CHECK(DecideInflight(Equal(7), false, seven, true, I{}, 0) == InflightStep::None);
     // A payload that does not meet it, an unknown one, or no release: decide as before.
-    CHECK(DecideInflight(Equal(7), N{InflightNote{8, true, 10}}, true, I{}, 0) == InflightStep::None);
-    CHECK(DecideInflight(Equal(7), N{InflightNote{7, false, 10}}, true, I{}, 0) == InflightStep::None);
-    CHECK(DecideInflight(Equal(7), N{}, true, I{}, 0) == InflightStep::None);
+    CHECK(DecideInflight(Equal(7), false, N{InflightNote{8, true, 10}}, false, I{InflightIssue{8, 5}}, 4) == InflightStep::None);
+    CHECK(DecideInflight(Equal(7), false, N{InflightNote{7, false, 10}}, false, I{InflightIssue{7, 5}}, 4) == InflightStep::None);
+    CHECK(DecideInflight(Equal(7), false, N{}, false, I{InflightIssue{7, 5}}, 4) == InflightStep::None);
     // Run as an async report (issue count 5 after it): in flight until 5 completed.
-    CHECK(DecideInflight(Equal(7), N{InflightNote{7, true, 10}}, false, I{5}, 4) == InflightStep::Unlanded);
-    CHECK(DecideInflight(Equal(7), N{InflightNote{7, true, 10}}, false, I{5}, 5) == InflightStep::None);
-    CHECK(DecideInflight(Equal(7), N{InflightNote{7, true, 10}}, false, I{5}, 9) == InflightStep::None);
-    // Run with no async report: it wrote memory at once, memory decides.
-    CHECK(DecideInflight(Equal(7), N{InflightNote{7, true, 10}}, false, I{}, 0) == InflightStep::None);
-    // Counts wrap.
-    CHECK(DecideInflight(Equal(7), N{InflightNote{7, true, 10}}, false, I{2}, 0xffffffffu) == InflightStep::Unlanded);
-    CHECK(DecideInflight(Equal(7), N{InflightNote{7, true, 10}}, false, I{2}, 2) == InflightStep::None);
-    // The issue table answers only for the word it holds.
+    CHECK(DecideInflight(Equal(7), false, seven, false, I{InflightIssue{7, 5}}, 4) == InflightStep::Unlanded);
+    CHECK(DecideInflight(Mask(0x4), false, N{InflightNote{0x6, true, 10}}, false, I{InflightIssue{0x6, 5}}, 4) == InflightStep::Unlanded);
+    CHECK(DecideInflight(Equal(7), false, seven, false, I{InflightIssue{7, 5}}, 5) == InflightStep::None);
+    CHECK(DecideInflight(Equal(7), false, seven, false, I{InflightIssue{7, 5}}, 9) == InflightStep::None);
+    // The back's last write to the word is another one (an un-noted release): decide as before.
+    CHECK(DecideInflight(Equal(7), false, seven, false, I{InflightIssue{6, 5}}, 4) == InflightStep::None);
+    // No write recorded (written at once, forgotten by a reduction): memory decides.
+    CHECK(DecideInflight(Equal(7), false, seven, false, I{}, 0) == InflightStep::None);
+    // 16-bit counts wrap.
+    CHECK(DecideInflight(Equal(7), false, seven, false, I{InflightIssue{7, 2}}, 0x1ffffu) == InflightStep::Unlanded);
+    CHECK(DecideInflight(Equal(7), false, seven, false, I{InflightIssue{7, 2}}, 0x10002u) == InflightStep::None);
+    // The table answers only for the word it holds, with the payload it was written.
     auto issues = std::make_unique<InflightIssues>();
     CHECK(!issues->Find(0x1000));
-    issues->Issued(0x1000, 3);
-    CHECK(issues->Find(0x1000) == I{3});
+    issues->Wrote(0x1000, 7, 0x12345);
+    REQUIRE(issues->Find(0x1000));
+    CHECK(issues->Find(0x1000)->payload == 7);
+    CHECK(issues->Find(0x1000)->issued_after == 0x2345);
     CHECK(!issues->Find(0x1004));
+    issues->Forget(0x1000);
+    CHECK(!issues->Find(0x1000));
 }

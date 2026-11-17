@@ -18,6 +18,7 @@
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/nx2_switch.h"
@@ -26,6 +27,7 @@
 #include "video_core/fire_emblem_upscale.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_inflight_release.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/native_upscale.h"
@@ -41,6 +43,30 @@
 #include "video_core/textures/decoders.h"
 
 namespace Tegra::Engines {
+
+namespace {
+// EDEN_NX2_ACQUIRE_INFLIGHT: a read-modify-write release the query cache doesn't count. It
+// replaces whatever the issue table held for the word, and while a report to the word's slot
+// still waits for its fence it waits too (a delayed fence operation runs in fence order), so it
+// can't read the word before a report an acquire passed on lands. Returns whether it set
+// g_signaling_query_report_fence, which the caller clears after SignalFence.
+bool InflightOrderedRelease(MemoryManager& memory_manager, GPUVAddr address) {
+    if (!VideoCommon::g_acquire_inflight) {
+        return false;
+    }
+    const auto device = memory_manager.GpuToCpuAddress(address);
+    if (!device) {
+        return false;
+    }
+    VideoCommon::GetInflightIssues().Forget(*device);
+    if (Tegra::Nx2AsyncReportsSettled(*device, sizeof(u32)) ||
+        VideoCore::g_signaling_query_report_fence) {
+        return false;
+    }
+    VideoCore::g_signaling_query_report_fence = true;
+    return true;
+}
+} // Anonymous namespace
 
 KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
     : memory_manager{memory_manager_}
@@ -116,6 +142,12 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
     }
     if ((argument >> 3) & 1) {
         const u32 reduction = (argument >> 9) & 7;
+        const bool ordered = InflightOrderedRelease(memory_manager, address);
+        SCOPE_EXIT {
+            if (ordered) {
+                VideoCore::g_signaling_query_report_fence = false;
+            }
+        };
         rasterizer->SignalFence([this, address, payload, reduction] {
             memory_manager.Write<u32>(address, ReduceSemaphore(reduction, false,
                                                                memory_manager.Read<u32>(address), payload));
@@ -371,6 +403,12 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 const bool four_words = (flags >> 30) == 0;
                 if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) return false;
                 if (flags & (1U << 26)) {
+                    const bool ordered = InflightOrderedRelease(memory_manager, address);
+                    SCOPE_EXIT {
+                        if (ordered) {
+                            VideoCore::g_signaling_query_report_fence = false;
+                        }
+                    };
                     rasterizer->SignalFence([this, address, payload, flags] {
                         const auto combine = [&](u32 current) {
                             return ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1, current, payload);
@@ -401,6 +439,12 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // NVN2 tracks QMD completion with a max release (bit 19) into a word other
                     // releases also advance: a plain write would move it backwards and leave
                     // GEQ acquires waiting forever.
+                    const bool ordered = InflightOrderedRelease(memory_manager, address);
+                    SCOPE_EXIT {
+                        if (ordered) {
+                            VideoCore::g_signaling_query_report_fence = false;
+                        }
+                    };
                     rasterizer->SignalFence([this, address, payload] {
                         const auto combine = [payload](u32 current) { return (std::max)(current, payload); };
                         const u32 guest = memory_manager.Read<u32>(address);
