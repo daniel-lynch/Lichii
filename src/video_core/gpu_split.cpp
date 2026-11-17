@@ -30,6 +30,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_acquire_decision.h"
+#include "video_core/nx2_inflight_release.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 
@@ -132,6 +133,14 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     if (g_acquire_nodrain) {
         LOG_INFO(HW_GPU, "GPU thread split: equal and mask semaphore acquires are decided without "
                          "a drain (EDEN_NX2_ACQUIRE_NODRAIN=1)");
+    }
+    const char* const inflight = std::getenv("EDEN_NX2_ACQUIRE_INFLIGHT");
+    g_acquire_inflight = inflight != nullptr && inflight[0] == '1';
+    GetInflightNotes().Clear();
+    GetInflightIssues().Clear();
+    if (g_acquire_inflight) {
+        LOG_INFO(HW_GPU, "GPU thread split: semaphore acquires pass on a matching release in flight "
+                         "(EDEN_NX2_ACQUIRE_INFLIGHT=1)");
     }
     g_acquire_counting = g_acquire_verify || Nx2Profile::Enabled();
     ring = std::make_unique<u64[]>(RingWords);
@@ -362,6 +371,9 @@ bool GpuSplit::WaitForSync() {
 }
 
 void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known) {
+    if (g_acquire_inflight) {
+        GetInflightNotes().Note(device_address, payload, known, write_position);
+    }
     if (semaphore_writes.size() >= semaphore_writes_limit) {
         // The words of releases the back ran hold their values in memory.
         const u64 done = consumed.load(std::memory_order_acquire);

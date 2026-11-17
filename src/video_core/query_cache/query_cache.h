@@ -26,6 +26,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_mesh_count_trace.h"
 #include "video_core/query_cache/bank_base.h"
+#include "video_core/nx2_inflight_release.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_cache/query_base.h"
 #include "video_core/query_cache/query_cache_base.h"
@@ -390,8 +391,12 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         impl->pending_unregister.push_back(query_location);
     });
     if (is_fence) {
-        Tegra::g_nx2_async_reports_issued[Tegra::Nx2AsyncReportSlot(cpu_addr)].fetch_add(
-            1, std::memory_order_release);
+        const u32 issued_after =
+            Tegra::g_nx2_async_reports_issued[Tegra::Nx2AsyncReportSlot(cpu_addr)].fetch_add(
+                1, std::memory_order_release) + 1;
+        if (VideoCommon::g_acquire_inflight) {
+            VideoCommon::GetInflightIssues().Issued(cpu_addr, issued_after);
+        }
         VideoCore::g_signaling_query_report_fence = true;
         impl->rasterizer.SignalFence(std::move(operation));
         VideoCore::g_signaling_query_report_fence = false;
@@ -430,8 +435,12 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             streamer->Free(new_query_id);
             return;
         }
-        Tegra::g_nx2_async_reports_issued[Tegra::Nx2AsyncReportSlot(cpu_addr)].fetch_add(
-            1, std::memory_order_release);
+        const u32 issued_after =
+            Tegra::g_nx2_async_reports_issued[Tegra::Nx2AsyncReportSlot(cpu_addr)].fetch_add(
+                1, std::memory_order_release) + 1;
+        if (VideoCommon::g_acquire_inflight) {
+            VideoCommon::GetInflightIssues().Issued(cpu_addr, issued_after);
+        }
         impl->rasterizer.SyncOperation(std::move(operation));
     }
     auto [cont_addr, base] = gen_caching_indexing(cpu_addr);

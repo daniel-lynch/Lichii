@@ -5,7 +5,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <thread>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -28,6 +30,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_acquire_decision.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_inflight_release.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra::Engines {
@@ -179,6 +182,131 @@ AcquireCheck CheckEqualMaskWithoutDrain(DmaPusher& dma_pusher, const Puller::Pen
     return AcquireCheck::NotMet;
 }
 
+// EDEN_NX2_ACQUIRE_INFLIGHT counts, logged every 10 s by the front. `back_*`: when the back reached
+// the first work sent after a passed acquire, whether the release it passed on had landed.
+struct InflightStats {
+    u64 passed_queued{};
+    u64 passed_unlanded{};
+    u64 verified{};
+    u64 verify_mismatches{};
+    u64 verify_timeouts{};
+    std::atomic<u64> back_landed{};
+    std::atomic<u64> back_unlanded{};
+    std::chrono::steady_clock::time_point next_report{};
+};
+
+InflightStats& GetInflightStats() {
+    static InflightStats stats;
+    return stats;
+}
+
+// Whether the word's last async report landed (or there is none in flight).
+bool InflightLanded(DAddr device) {
+    const auto issued_after = VideoCommon::GetInflightIssues().Find(device);
+    const u32 completed = Tegra::g_nx2_async_reports_completed[Tegra::Nx2AsyncReportSlot(device)]
+                              .load(std::memory_order_acquire);
+    return !issued_after || static_cast<s32>(completed - *issued_after) >= 0;
+}
+
+void ReportInflight() {
+    auto& stats = GetInflightStats();
+    const auto now = std::chrono::steady_clock::now();
+    if (now < stats.next_report) {
+        return;
+    }
+    if (stats.next_report != std::chrono::steady_clock::time_point{}) {
+        LOG_INFO(HW_GPU,
+                 "In-flight acquires in 10 s: {} passed on a queued release, {} on a run report "
+                 "whose fence had not passed; at the back: {} had landed, {} had not; verify: {} "
+                 "landed as passed, {} mismatched, {} timed out",
+                 stats.passed_queued, stats.passed_unlanded,
+                 stats.back_landed.exchange(0, std::memory_order_relaxed),
+                 stats.back_unlanded.exchange(0, std::memory_order_relaxed), stats.verified,
+                 stats.verify_mismatches, stats.verify_timeouts);
+    } else {
+        stats.back_landed.store(0, std::memory_order_relaxed);
+        stats.back_unlanded.store(0, std::memory_order_relaxed);
+    }
+    stats.passed_queued = stats.passed_unlanded = 0;
+    stats.verified = stats.verify_mismatches = stats.verify_timeouts = 0;
+    stats.next_report = now + std::chrono::seconds{10};
+}
+
+// EDEN_NX2_ACQUIRE_VERIFY=1 with an in-flight pass: drain, wait (up to 200 ms) until the word's
+// report landed, then check that memory meets the acquire.
+void VerifyInflight(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, DAddr device) {
+    auto& stats = GetInflightStats();
+    const auto give_up = std::chrono::steady_clock::now() + std::chrono::milliseconds{200};
+    DrainBack();
+    while (!InflightLanded(device)) {
+        if (std::chrono::steady_clock::now() > give_up) {
+            ++stats.verify_timeouts;
+            return;
+        }
+        ReleaseFences(dma_pusher);
+        std::this_thread::sleep_for(std::chrono::microseconds{100});
+    }
+    const u32 word = ReadSemaphoreWord(dma_pusher, acquire.address);
+    if (acquire.Matches(word)) {
+        ++stats.verified;
+        return;
+    }
+    ++stats.verify_mismatches;
+    if (static u32 logged{}; logged++ < 16) {
+        LOG_WARNING(HW_GPU,
+                    "In-flight verify: channel {} passed semaphore {:#x} (op {}, {:#x}) on a "
+                    "release in flight; once it landed the word is {:#x}",
+                    dma_pusher.channel_state.bind_id, acquire.address, acquire.operation,
+                    acquire.value, word);
+    }
+}
+
+// EDEN_NX2_ACQUIRE_INFLIGHT=1 (nx2_inflight_release.h): the last release the front sent to the
+// word has a known payload that meets the acquire and has not landed yet.
+VideoCommon::InflightStep CheckInflight(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
+    using VideoCommon::InflightStep;
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active() || !split.FrontMacros() || !ReleasesLandAtOnce()) {
+        return InflightStep::None;
+    }
+    ReportInflight();
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+    if (!device) {
+        return InflightStep::None;
+    }
+    auto& notes = VideoCommon::GetInflightNotes();
+    const auto note = notes.Find(*device);
+    if (!note) {
+        return InflightStep::None;
+    }
+    const auto queued = split.QueuedSemaphoreWriteAt(*device);
+    const bool is_queued = queued && queued->position == note->position;
+    const u32 completed = Tegra::g_nx2_async_reports_completed[Tegra::Nx2AsyncReportSlot(*device)]
+                              .load(std::memory_order_acquire);
+    const auto matches = [&acquire](u32 value) { return acquire.Matches(value); };
+    const InflightStep step =
+        VideoCommon::DecideInflight(matches, note, is_queued,
+                                    VideoCommon::GetInflightIssues().Find(*device), completed);
+    auto& stats = GetInflightStats();
+    if (step == InflightStep::None) {
+        if (!is_queued && InflightLanded(*device)) {
+            notes.Forget(*device); // Memory holds it, or what the guest wrote since.
+        }
+        return step;
+    }
+    ++(step == InflightStep::Queued ? stats.passed_queued : stats.passed_unlanded);
+    // The first work sent after the acquire: had the release landed when the back got to it?
+    split.Defer([device = *device] {
+        auto& counts = GetInflightStats();
+        (InflightLanded(device) ? counts.back_landed : counts.back_unlanded)
+            .fetch_add(1, std::memory_order_relaxed);
+    }, VideoCommon::GpuSplit::FastDrawNeutral, VideoCommon::GpuSplit::Writes::Noted);
+    if (VideoCommon::g_acquire_verify) {
+        VerifyInflight(dma_pusher, acquire, *device);
+    }
+    return step;
+}
+
 // Checks a greater-or-equal acquire without draining the split. The words Switch 2 syncs on only
 // advance (NVN2 even releases QMD completions as maxima, KeplerCompute::ProcessNativeMethod), so
 // a value that meets one now still does once the back ran the queued work. Only the last release
@@ -187,6 +315,10 @@ AcquireCheck CheckEqualMaskWithoutDrain(DmaPusher& dma_pusher, const Puller::Pen
 AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
     auto& split = VideoCommon::GpuSplit::Get();
     auto& stats = VideoCommon::g_acquire_stats;
+    if (VideoCommon::g_acquire_inflight &&
+        CheckInflight(dma_pusher, acquire) != VideoCommon::InflightStep::None) {
+        return AcquireCheck::MetByQueued;
+    }
     const bool reach = acquire.WaitsToReach();
     if (!reach && !VideoCommon::g_acquire_nodrain) {
         VideoCommon::Count(stats.drain_operation);
