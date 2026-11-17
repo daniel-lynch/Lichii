@@ -979,3 +979,46 @@ TEST_CASE("MemoryTracker: a hot page the GPU writes is tracked and GPU-modified 
         REQUIRE(rasterizer.Count(c + PAGE) == 1);
     }
 }
+
+namespace {
+class BackedRasterizer : public RasterizerInterface {
+public:
+    std::vector<u8> memory = std::vector<u8>(WORD);
+    template <typename T>
+    T* GetPointer(DAddr address) {
+        return address >= c && address < c + WORD ? reinterpret_cast<T*>(memory.data() + (address - c))
+                                                   : nullptr;
+    }
+};
+} // Anonymous namespace
+
+TEST_CASE("MemoryTracker: hot pages verify counts guest writes a skipped upload missed",
+          "[video_core]") {
+    const HotPagesOn hot;
+    const bool saved_verify = VideoCommon::g_hot_pages_verify;
+    VideoCommon::g_hot_pages_verify = true;
+    auto& stats = VideoCommon::g_hot_verify_stats;
+    const u64 checked = stats.checked.load(), stale = stats.stale.load();
+    BackedRasterizer rasterizer;
+    VideoCommon::MemoryTrackerBase<BackedRasterizer> tracker(rasterizer);
+    const auto uploads = [&] {
+        int n = 0;
+        tracker.ForEachUploadRange(c, WORD, [&](u64, u64) { ++n; });
+        return n;
+    };
+    REQUIRE(uploads() == 1);
+    for (int flip = 0; flip < 2; ++flip) {
+        tracker.MarkRegionAsCpuModified(c + PAGE, PAGE);
+        REQUIRE(uploads() == 1);
+    }
+    REQUIRE(rasterizer.Count(c + PAGE) == 0); // hot, hashed at that upload
+    REQUIRE(uploads() == 0);
+    REQUIRE(stats.checked.load() == checked + 1);
+    REQUIRE(stats.stale.load() == stale);
+    rasterizer.memory[PAGE + 7] ^= 0x5a; // a guest write nobody saw
+    REQUIRE(uploads() == 0);
+    REQUIRE(stats.checked.load() == checked + 2);
+    REQUIRE(stats.stale.load() == stale + 1);
+    REQUIRE(stats.last_stale.load() == c + PAGE);
+    VideoCommon::g_hot_pages_verify = saved_verify;
+}

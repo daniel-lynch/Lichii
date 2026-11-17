@@ -11,6 +11,8 @@
 #include <bit>
 #include <cstdlib>
 #include <limits>
+#include <optional>
+#include <unordered_map>
 #include <span>
 #include <utility>
 #include <vector>
@@ -57,6 +59,26 @@ inline bool g_hot_pages = [] {
     const char* const value = std::getenv("EDEN_NX2_HOT_PAGES");
     return value != nullptr && value[0] == '1';
 }();
+
+/// EDEN_NX2_HOT_PAGES_VERIFY=1 (with EDEN_NX2_HOT_PAGES=1): hashes each hot page's guest bytes at
+/// its upload, and again whenever an upload skips it as uploaded already; a changed hash is a guest
+/// write the GPU did not get (BufferCache::TickFrame logs the counts). Costs a 4 KiB hash a page.
+inline bool g_hot_pages_verify = [] {
+    const char* const value = std::getenv("EDEN_NX2_HOT_PAGES_VERIFY");
+    return value != nullptr && value[0] == '1';
+}();
+struct HotVerifyStats {
+    std::atomic<u64> uploads{};  ///< hot pages hashed at an upload
+    std::atomic<u64> checked{};  ///< skipped uploads checked
+    std::atomic<u64> stale{};    ///< of them, guest bytes changed since the upload
+    std::atomic<u64> last_stale{};
+};
+inline HotVerifyStats g_hot_verify_stats;
+/// Page address -> hash at its last hot upload. Only touched under the buffer cache's lock.
+inline std::unordered_map<u64, u64>& HotVerifyHashes() {
+    static std::unordered_map<u64, u64> hashes;
+    return hashes;
+}
 
 template <class DeviceTracker, size_t stack_words, size_t size_bytes>
 struct WordManager {
@@ -301,6 +323,9 @@ struct WordManager {
                 // Hot pages stay modified and untracked: their next use uploads them again,
                 // with no write protection to set and no write fault to take.
                 const u64 hot = hot_pages ? hot_words[index] & mask : 0;
+                if (hot_pages && g_hot_pages_verify) [[unlikely]] {
+                    VerifyHot(index, hot & word, hot_clean);
+                }
                 hot_clean_words[index] |= hot & word;
                 const u64 clear_mask = mask & ~hot;
                 if (type == Type::CPU || type == Type::CachedCPU) {
@@ -402,6 +427,47 @@ struct WordManager {
     /// @param current_bits   Current state of the word
     /// @param new_bits       New state of the word
     /// @tparam add_to_tracker True when the tracker should start tracking the new pages
+    /// EDEN_NX2_HOT_PAGES_VERIFY: hash the pages uploaded now, check the pages skipped.
+    void VerifyHot(size_t index, u64 uploading, u64 skipped) const {
+        if constexpr (requires(DeviceTracker& t) { t.template GetPointer<u8>(VAddr{}); }) {
+            const auto page_address = [&](size_t bit) {
+                return cpu_addr + (index * PAGES_PER_WORD + bit) * BYTES_PER_PAGE;
+            };
+            const auto hash_page = [&](VAddr address) -> std::optional<u64> {
+                const u8* const bytes = tracker->template GetPointer<u8>(address);
+                if (bytes == nullptr) {
+                    return std::nullopt;
+                }
+                u64 hash = 0xcbf29ce484222325ULL;
+                for (size_t i = 0; i < BYTES_PER_PAGE; ++i) {
+                    hash = (hash ^ bytes[i]) * 0x100000001b3ULL;
+                }
+                return hash;
+            };
+            auto& hashes = HotVerifyHashes();
+            for (u64 bits = uploading; bits != 0; bits &= bits - 1) {
+                const VAddr address = page_address(std::countr_zero(bits));
+                if (const auto hash = hash_page(address)) {
+                    hashes[address] = *hash;
+                    g_hot_verify_stats.uploads.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            for (u64 bits = skipped; bits != 0; bits &= bits - 1) {
+                const VAddr address = page_address(std::countr_zero(bits));
+                const auto it = hashes.find(address);
+                const auto hash = hash_page(address);
+                if (it == hashes.end() || !hash) {
+                    continue;
+                }
+                g_hot_verify_stats.checked.fetch_add(1, std::memory_order_relaxed);
+                if (*hash != it->second) {
+                    g_hot_verify_stats.stale.fetch_add(1, std::memory_order_relaxed);
+                    g_hot_verify_stats.last_stale.store(address, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+
     void CollectChangedRanges(bool add_to_tracker, u64 word_index, u64 current_bits, u64 new_bits, CollectedRanges& out_ranges) const {
         u64 changed_bits = (add_to_tracker ? current_bits : ~current_bits) & new_bits;
         VAddr addr = cpu_addr + word_index * BYTES_PER_WORD;
