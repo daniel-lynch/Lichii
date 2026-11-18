@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <thread>
 #include "common/container/unordered_map.h"
@@ -46,6 +47,79 @@
 namespace Vulkan {
 using namespace Common::Literals;
 namespace {
+
+/// EDEN_NX2_QUEUE_PRIORITY=high|realtime asks the driver for a global queue priority above the
+/// default (VK_KHR/EXT_global_priority), so the GPU preempts other processes' work (a browser's
+/// video, the desktop compositor) in our favour. Unset, empty or "medium" keeps the default queue.
+/// Drivers grant HIGH/REALTIME only to privileged processes (CAP_SYS_NICE on Linux); a refusal
+/// (VK_ERROR_NOT_PERMITTED) falls back to the default queue and is logged.
+std::optional<VkQueueGlobalPriorityKHR> RequestedQueuePriority() {
+    const char* const value = std::getenv("EDEN_NX2_QUEUE_PRIORITY");
+    if (value == nullptr || value[0] == '\0') {
+        return std::nullopt;
+    }
+    const std::string_view name{value};
+    if (name == "high") {
+        return VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR;
+    }
+    if (name == "realtime") {
+        return VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR;
+    }
+    if (name != "medium") {
+        LOG_WARNING(Render_Vulkan, "EDEN_NX2_QUEUE_PRIORITY={} is not high, realtime or medium; "
+                                   "using the default queue",
+                    name);
+    }
+    return std::nullopt;
+}
+
+const char* QueuePriorityName(VkQueueGlobalPriorityKHR priority) {
+    switch (priority) {
+    case VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR:
+        return "low";
+    case VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR:
+        return "medium";
+    case VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR:
+        return "high";
+    case VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR:
+        return "realtime";
+    default:
+        return "unknown";
+    }
+}
+
+/// The global priorities the driver lists for a queue family (VK_KHR_global_priority or
+/// VK_EXT_global_priority_query), for the log; empty when it can't be queried.
+std::string QueueFamilyPriorities(VkInstance instance, const vk::InstanceDispatch& dld,
+                                  VkPhysicalDevice physical, u32 family) {
+    const auto get = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties2>(
+        dld.vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceQueueFamilyProperties2"));
+    if (get == nullptr) {
+        return {};
+    }
+    u32 count = 0;
+    get(physical, &count, nullptr);
+    if (family >= count) {
+        return {};
+    }
+    std::vector<VkQueueFamilyGlobalPriorityPropertiesKHR> priorities(
+        count, VkQueueFamilyGlobalPriorityPropertiesKHR{
+                   .sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES_KHR});
+    std::vector<VkQueueFamilyProperties2> families(
+        count, VkQueueFamilyProperties2{.sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2});
+    for (u32 i = 0; i < count; ++i) {
+        families[i].pNext = &priorities[i];
+    }
+    get(physical, &count, families.data());
+    std::string list;
+    const auto& entry = priorities[family];
+    for (u32 i = 0; i < (std::min)(entry.priorityCount, u32{VK_MAX_GLOBAL_PRIORITY_SIZE_KHR});
+         ++i) {
+        list += list.empty() ? "" : ", ";
+        list += QueuePriorityName(entry.priorities[i]);
+    }
+    return list;
+}
 
 /// The guest's HMMA runs on VK_KHR_cooperative_matrix where the device supports it (upstream
 /// #582/#583, which replaced the #475 port). EDEN_NX2_COOPERATIVE_HMMA=0 or
@@ -537,7 +611,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     }
 
     SetupFamilies(surface);
-    const auto queue_cis = GetDeviceQueueCreateInfos();
+    auto queue_cis = GetDeviceQueueCreateInfos();
 
     // GetSuitability has already configured the linked list of features for us.
     // Reuse it here.
@@ -821,7 +895,65 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (host_float16_supported) {
         features.shader_float16_int8.shaderFloat16 = VK_TRUE;
     }
-    logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
+    // EDEN_NX2_QUEUE_PRIORITY: chain a global priority onto every queue for this create only; the
+    // extension is enabled for it alone, and globalPriorityQuery stays off, so a priority the
+    // process may not have comes back as VK_ERROR_NOT_PERMITTED and we retry with the default.
+    std::vector<const char*> device_extensions = ExtensionListForVulkan(loaded_extensions);
+    VkDeviceQueueGlobalPriorityCreateInfoKHR queue_priority_ci{
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR,
+        .pNext = nullptr,
+        .globalPriority = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR,
+    };
+    const char* priority_extension = nullptr;
+    if (const auto requested = RequestedQueuePriority()) {
+        if (supported_extensions.contains(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME)) {
+            priority_extension = VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME;
+        } else if (supported_extensions.contains(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME)) {
+            priority_extension = VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME;
+        }
+        if (priority_extension == nullptr) {
+            LOG_WARNING(Render_Vulkan,
+                        "EDEN_NX2_QUEUE_PRIORITY={}: the device has no global priority extension; "
+                        "using the default queue",
+                        QueuePriorityName(*requested));
+        } else {
+            LOG_INFO(Render_Vulkan,
+                     "EDEN_NX2_QUEUE_PRIORITY={}: requesting it via {}; the driver lists [{}] for "
+                     "queue family {}",
+                     QueuePriorityName(*requested), priority_extension,
+                     QueueFamilyPriorities(instance, dld, physical, graphics_family),
+                     graphics_family);
+            queue_priority_ci.globalPriority = *requested;
+            for (auto& queue_ci : queue_cis) {
+                queue_ci.pNext = &queue_priority_ci;
+            }
+            if (!loaded_extensions.contains(priority_extension)) {
+                device_extensions.push_back(priority_extension);
+            }
+        }
+    }
+    try {
+        logical = vk::Device::Create(physical, queue_cis, device_extensions, first_next, dld);
+        if (priority_extension != nullptr) {
+            LOG_INFO(Render_Vulkan, "Queue global priority {} granted",
+                     QueuePriorityName(queue_priority_ci.globalPriority));
+        }
+    } catch (const vk::Exception& exception) {
+        if (priority_extension == nullptr ||
+            (exception.GetResult() != VK_ERROR_NOT_PERMITTED_KHR &&
+             exception.GetResult() != VK_ERROR_INITIALIZATION_FAILED)) {
+            throw;
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "Queue global priority {} refused ({}); using the default queue (medium). "
+                    "Higher priorities need a privileged process (CAP_SYS_NICE)",
+                    QueuePriorityName(queue_priority_ci.globalPriority), exception.what());
+        for (auto& queue_ci : queue_cis) {
+            queue_ci.pNext = nullptr;
+        }
+        logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions),
+                                     first_next, dld);
+    }
 
     graphics_queue = logical.GetQueue(graphics_family);
     present_queue = logical.GetQueue(present_family);
