@@ -149,6 +149,6 @@ EDEN_NX2_FENCE_BATCH=1
 
 # Ask the driver for a higher GPU queue priority, so other processes' GPU work (a browser playing
 # video, the desktop compositor) is preempted in the game's favour: high or realtime. Unset keeps
-# the default (medium). Drivers grant these only to privileged processes (CAP_SYS_NICE on Linux);
-# a refusal falls back to the default queue and the log says so ("Queue global priority ...").
+# the default (medium). Drivers grant these only to privileged processes (CAP_SYS_NICE on Linux):
+# one not offered or refused falls back to the default queue, and the log says which.
 #EDEN_NX2_QUEUE_PRIORITY=high
